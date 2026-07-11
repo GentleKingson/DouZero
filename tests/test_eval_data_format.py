@@ -682,8 +682,9 @@ def test_max_multiplier_breakdown_consistency():
         ruleset=rs,
     )
     bd = result.multiplier_breakdown
-    # uncapped_multiplier (8) != total_multiplier (capped to 4).
-    assert bd["uncapped_multiplier"] == 8
+    # uncapped_total_multiplier (bid=1 × event=8 = 8) != total_multiplier (capped to 4).
+    assert bd["uncapped_total_multiplier"] == 8
+    assert bd["event_multiplier"] == 8
     assert bd["total_multiplier"] == 4
     assert result.total_multiplier == 4
     assert "max_multiplier_cap" in bd and bd["max_multiplier_cap"] == 4

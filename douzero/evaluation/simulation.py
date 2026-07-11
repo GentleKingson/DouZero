@@ -1,5 +1,6 @@
 import hashlib
 import multiprocessing as mp
+import queue as _queue_mod
 import random
 import traceback
 
@@ -23,8 +24,23 @@ def load_card_play_models(card_play_model_path_dict):
     return players
 
 
+def _safe_worker(target_fn, args, q):
+    """Unified worker wrapper: catches all exceptions (including BaseException-
+    safe crashes that still allow Python-level except) and sends the traceback
+    to the parent via q. This prevents the parent from hanging on q.get() when
+    a worker crashes before putting its result.
+    """
+    try:
+        target_fn(*args, q)
+    except BaseException:
+        q.put(('error', traceback.format_exc()))
+
+
 def mp_simulate(card_play_data_list, card_play_model_path_dict, q):
-    """Legacy-mode worker: replay fixed deals, no bidding."""
+    """Legacy-mode worker: replay fixed deals, no bidding.
+
+    Puts (landlord_wins, farmer_wins, landlord_scores, farmer_scores) into q.
+    """
 
     players = load_card_play_models(card_play_model_path_dict)
 
@@ -83,8 +99,8 @@ def _random_bidding(env, rng):
     return False
 
 
-def mp_simulate_standard(card_play_data_list, card_play_model_path_dict, q,
-                         eval_seed=0, global_indices=None, ruleset=None):
+def mp_simulate_standard(card_play_data_list, card_play_model_path_dict,
+                         eval_seed, global_indices, ruleset, q):
     """Standard-mode multiprocessing simulation.
 
     Each deal is a v2-format dict with a full deck, first_bidder, and
@@ -102,58 +118,53 @@ def mp_simulate_standard(card_play_data_list, card_play_model_path_dict, q,
     if ruleset is None:
         ruleset = RuleSet.standard()
 
-    try:
-        players = load_card_play_models(card_play_model_path_dict)
-        env = GameEnv(players, ruleset=ruleset)
+    players = load_card_play_models(card_play_model_path_dict)
+    env = GameEnv(players, ruleset=ruleset)
 
-        for idx, deal in enumerate(card_play_data_list):
-            game_index = global_indices[idx] if global_indices is not None else idx
-            first_bidder = deal.get('first_bidder', '0')
-            game_seed = _derive_game_seed(eval_seed, game_index, deal['deck'], first_bidder)
-            rng = random.Random(game_seed)
-            # Seed the global random module so RandomAgent (which uses
-            # random.choice) is also deterministic per-game.
-            random.seed(game_seed)
+    for idx, deal in enumerate(card_play_data_list):
+        game_index = global_indices[idx] if global_indices is not None else idx
+        first_bidder = deal.get('first_bidder', '0')
+        game_seed = _derive_game_seed(eval_seed, game_index, deal['deck'], first_bidder)
+        rng = random.Random(game_seed)
+        # Seed the global random module so RandomAgent (which uses
+        # random.choice) is also deterministic per-game.
+        random.seed(game_seed)
 
-            # Deal from the full deck.
-            card_play_data = deal_standard_deck(deal['deck'])
-            # Use the deal's bidding_order (neutral seats), not a hardcoded default.
-            bidding_order = deal.get('bidding_order', ['0', '1', '2'])
+        # Deal from the full deck.
+        card_play_data = deal_standard_deck(deal['deck'])
+        # Use the deal's bidding_order (neutral seats), not a hardcoded default.
+        bidding_order = deal.get('bidding_order', ['0', '1', '2'])
 
-            # Keep retrying until bidding produces a landlord (handles redeal).
-            # Bounded by ruleset.max_redeals.
-            for _attempt in range(ruleset.max_redeals + 1):
-                env.reset()
-                env.card_play_init_standard(card_play_data, bidding_order=bidding_order)
-                if not _random_bidding(env, rng):
-                    break
-                # Redeal: reshuffle the full deck deterministically using the
-                # same game-local RNG (not a global or worker RNG).
-                deck_copy = list(deal['deck'])
-                rng.shuffle(deck_copy)
-                card_play_data = deal_standard_deck(deck_copy)
-            else:
-                # Exceeded max_redeals: force-assign landlord to first bidder.
-                env.reset()
-                env.card_play_init_standard(card_play_data, bidding_order=bidding_order)
-                env.landlord_position = env.bidding_order[0]
-                env.bid_value = 1
-                env._reveal_bottom_cards()
+        # Keep retrying until bidding produces a landlord (handles redeal).
+        # Bounded by ruleset.max_redeals.
+        for _attempt in range(ruleset.max_redeals + 1):
+            env.reset()
+            env.card_play_init_standard(card_play_data, bidding_order=bidding_order)
+            if not _random_bidding(env, rng):
+                break
+            # Redeal: reshuffle the full deck deterministically using the
+            # same game-local RNG (not a global or worker RNG).
+            deck_copy = list(deal['deck'])
+            rng.shuffle(deck_copy)
+            card_play_data = deal_standard_deck(deck_copy)
+        else:
+            # Exceeded max_redeals: force-assign landlord to first bidder.
+            env.reset()
+            env.card_play_init_standard(card_play_data, bidding_order=bidding_order)
+            env.landlord_position = env.bidding_order[0]
+            env.bid_value = 1
+            env._reveal_bottom_cards()
 
-            # Play to terminal.
-            env.game_infoset = env.get_infoset()
-            while not env.game_over:
-                env.step()
+        # Play to terminal.
+        env.game_infoset = env.get_infoset()
+        while not env.game_over:
+            env.step()
 
-        q.put((env.num_wins['landlord'],
-               env.num_wins['farmer'],
-               env.num_scores['landlord'],
-               env.num_scores['farmer']
-             ))
-    except Exception:
-        # Send the traceback to the parent so it can report a precise error
-        # instead of hanging on q.get() forever.
-        q.put(('error', traceback.format_exc()))
+    q.put((env.num_wins['landlord'],
+           env.num_wins['farmer'],
+           env.num_scores['landlord'],
+           env.num_scores['farmer']
+         ))
 
 
 def data_allocation_per_worker(card_play_data_list, num_workers):
@@ -204,32 +215,55 @@ def evaluate(landlord, landlord_up, landlord_down, eval_data, num_workers,
         'landlord_down': landlord_down}
 
     ctx = mp.get_context('spawn')
-    q = ctx.SimpleQueue()
+    # Use Queue (not SimpleQueue) because Queue.get() supports timeout.
+    q = ctx.Queue()
     processes = []
     for worker_data, global_indices in worker_assignments:
         if ruleset == 'standard':
-            p = ctx.Process(
-                target=mp_simulate_standard,
-                args=(worker_data, card_play_model_path_dict, q,
-                      eval_seed, global_indices, active_ruleset))
+            target_fn = mp_simulate_standard
+            fn_args = (worker_data, card_play_model_path_dict,
+                       eval_seed, global_indices, active_ruleset)
         else:
-            p = ctx.Process(
-                target=mp_simulate,
-                args=(worker_data, card_play_model_path_dict, q))
+            target_fn = mp_simulate
+            fn_args = (worker_data, card_play_model_path_dict)
+        # Wrap ALL workers (legacy and standard) in _safe_worker so a crash
+        # in any worker sends an error to q instead of letting the parent
+        # hang on q.get().
+        p = ctx.Process(target=_safe_worker, args=(target_fn, fn_args, q))
         p.start()
         processes.append(p)
 
+    # Join all workers, then check exitcodes.
     for p in processes:
         p.join()
+
+    for i, p in enumerate(processes):
+        if p.exitcode != 0:
+            # Worker was killed (OOM, native crash, etc.) before it could put
+            # anything into q. Terminate remaining workers and raise.
+            for p2 in processes:
+                if p2.is_alive():
+                    p2.terminate()
+            raise RuntimeError(
+                f"Worker {i} exited with code {p.exitcode} (likely OOM or "
+                f"native crash). The evaluation cannot continue."
+            )
 
     num_landlord_wins = 0
     num_farmer_wins = 0
     num_landlord_scores = 0
     num_farmer_scores = 0
 
-    # Collect results; detect child-process errors so we don't hang.
+    # Collect results with a timeout so we never hang indefinitely.
+    _QUEUE_TIMEOUT = 300  # seconds
     for i in range(num_workers):
-        result = q.get()
+        try:
+            result = q.get(timeout=_QUEUE_TIMEOUT)
+        except Exception:
+            raise RuntimeError(
+                f"Worker {i} did not produce a result within "
+                f"{_QUEUE_TIMEOUT}s. The evaluation cannot continue."
+            )
         if isinstance(result, tuple) and len(result) == 2 and result[0] == 'error':
             raise RuntimeError(
                 f"Worker {i} crashed with the following traceback:\n{result[1]}"

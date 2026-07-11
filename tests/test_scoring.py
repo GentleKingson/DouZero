@@ -191,7 +191,7 @@ def test_standard_bomb_and_rocket_combine():
 
 
 def test_standard_bid_bomb_rocket_combined():
-    """bid=3, 2 bombs, rocket: multiplier = 4*2=8, base=3, total=24, landlord=48."""
+    """bid=3, 2 bombs, rocket: total_multiplier = 3*4*2=24, total=1*24=24, landlord=48."""
     rs = RuleSet.standard()
     result = compute_game_result(
         played_cards={},
@@ -202,9 +202,11 @@ def test_standard_bid_bomb_rocket_combined():
         bid_value=3,
         ruleset=rs,
     )
-    expected_mult = 4 * 2  # 2 bombs (4) * rocket (2)
-    expected_total = 3 * expected_mult
-    assert result.total_multiplier == expected_mult
+    # total_multiplier = bid(3) × bombs(4) × rocket(2) = 24.
+    expected_total_mult = 3 * 4 * 2
+    assert result.total_multiplier == expected_total_mult
+    expected_total = 1 * expected_total_mult  # base_score=1
+    assert result.landlord_score == 2 * expected_total
     assert result.landlord_score == 2 * expected_total
     assert result.farmer_score == -expected_total
 
@@ -357,12 +359,12 @@ def test_anti_spring_doubles_score():
 # max_multiplier capping
 # --------------------------------------------------------------------------- #
 def test_max_multiplier_caps_total():
-    """A max_multiplier caps the effective multiplier."""
+    """A max_multiplier caps the TOTAL multiplier (including bid, not just events)."""
     rs = RuleSet.from_dict({
         "ruleset_id": "standard",
         "max_multiplier": 4,
     })
-    # 3 bombs would give multiplier 8, but cap is 4.
+    # bid=1, 3 bombs → event_multiplier=8, total_multiplier=1*8=8, capped to 4.
     result = compute_game_result(
         played_cards={},
         action_counts={"landlord": 5, "landlord_up": 3, "landlord_down": 3},
@@ -373,8 +375,33 @@ def test_max_multiplier_caps_total():
         ruleset=rs,
     )
     assert result.total_multiplier == 4
-    assert result.landlord_score == 2 * 1 * 4  # 2 * base * capped_mult
+    assert result.landlord_score == 2 * 1 * 4  # 2 * base_score * capped_mult
     assert result.farmer_score == -1 * 4
+
+
+def test_max_multiplier_caps_total_including_bid():
+    """max_multiplier caps bid × event_multiplier, not just event_multiplier.
+
+    bid=3, 1 bomb → total_multiplier = 3 * 2 = 6, capped to 4.
+    Without bid in the cap, it would be event=2 < 4 (uncapped) → total=6.
+    With the fix, total_multiplier = min(6, 4) = 4.
+    """
+    rs = RuleSet.from_dict({
+        "ruleset_id": "standard",
+        "max_multiplier": 4,
+    })
+    result = compute_game_result(
+        played_cards={},
+        action_counts={"landlord": 5, "landlord_up": 3, "landlord_down": 3},
+        winner_position="landlord",
+        bomb_count=1,
+        rocket_count=0,
+        bid_value=3,
+        ruleset=rs,
+    )
+    # total_multiplier = min(3*2, 4) = 4.
+    assert result.total_multiplier == 4
+    assert result.multiplier_breakdown["uncapped_total_multiplier"] == 6
 
 
 def test_max_multiplier_does_not_affect_below_cap():
