@@ -1,0 +1,48 @@
+"""Versioned checkpoint manifests and I/O (P01).
+
+This package adds a versioned ``CheckpointManifest`` to the training
+checkpoint (``model.tar``) WITHOUT changing the existing tensor keys or their
+meanings. Backward compatibility is required:
+
+  - Legacy ``model.tar`` (no manifest) must still load (compat path).
+  - New ``model.tar`` (with manifest) is validated against the runtime's
+    schema_version / model_version / feature_version / ruleset_id /
+    checkpoint_kind; mismatches raise a precise error rather than silently
+    partial-loading.
+
+The legacy per-position ``{pos}_weights_{frames}.ckpt`` sidecars (bare
+state_dicts consumed by DeepAgent) keep their permissive load behavior behind
+an explicit opt-in; new code uses the strict loader.
+"""
+
+from douzero.checkpoint.compat import (
+    load_legacy_model_tar,
+    load_legacy_position_ckpt,
+    load_position_state_dict_strict,
+)
+from douzero.checkpoint.io import (
+    TRAINING_CHECKPOINT_TRUSTED,
+    CheckpointCompatibilityError,
+    load_checkpoint,
+    save_checkpoint,
+)
+from douzero.checkpoint.manifest import (
+    CHECKPOINT_KINDS,
+    CURRENT_SCHEMA_VERSION,
+    CheckpointManifest,
+    build_manifest,
+)
+
+__all__ = [
+    "CHECKPOINT_KINDS",
+    "CURRENT_SCHEMA_VERSION",
+    "TRAINING_CHECKPOINT_TRUSTED",
+    "CheckpointCompatibilityError",
+    "CheckpointManifest",
+    "build_manifest",
+    "load_checkpoint",
+    "load_legacy_model_tar",
+    "load_legacy_position_ckpt",
+    "load_position_state_dict_strict",
+    "save_checkpoint",
+]

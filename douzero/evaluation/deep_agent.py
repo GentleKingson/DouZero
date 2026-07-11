@@ -4,13 +4,13 @@ import numpy as np
 from douzero.env.env import get_obs
 
 def _load_model(position, model_path):
+    from douzero.checkpoint import load_legacy_position_ckpt
     from douzero.dmc.models import model_dict
     model = model_dict[position]()
     model_state_dict = model.state_dict()
-    if torch.cuda.is_available():
-        pretrained = torch.load(model_path, map_location='cuda:0')
-    else:
-        pretrained = torch.load(model_path, map_location='cpu')
+    # Legacy per-position sidecar: bare state_dict. The permissive key filter
+    # below is pinned by P00 tests; P16 replaces it with a strict manifest load.
+    pretrained = load_legacy_position_ckpt(model_path)
     pretrained = {k: v for k, v in pretrained.items() if k in model_state_dict}
     model_state_dict.update(pretrained)
     model.load_state_dict(model_state_dict)
