@@ -95,6 +95,24 @@ def train(flags):
             f"testing via `evaluate.py --ruleset standard`. Training "
             f"integration arrives in P05/P06."
         )
+    # P04: training only supports the legacy model_version. The "factorized"
+    # model is a DEPLOYMENT-only, checkpoint-compatible forward that is
+    # numerically equivalent to legacy under the same weights; the actor/learner
+    # loop is not yet wired to it. Reject it here so a config that sets
+    # model_version=factorized cannot start a training run that would silently
+    # use the legacy forward while stamping the checkpoint with the wrong
+    # model_version. Training integration of factorized/v2 arrives in P05/P06.
+    model_version = getattr(flags, 'model_version', 'legacy')
+    if model_version != 'legacy':
+        raise ValueError(
+            f"Training does not yet support model_version="
+            f"{model_version!r}. Only 'legacy' is supported for training. "
+            f"The 'factorized' model (P04) is a deployment-only forward "
+            f"(DeepAgent backend='legacy_factorized') that is numerically "
+            f"equivalent to legacy under the same weights; the actor/learner "
+            f"loop is not yet wired to it. Training integration arrives in "
+            f"P05/P06."
+        )
     if not flags.actor_device_cpu or flags.training_device != 'cpu':
         if not torch.cuda.is_available():
             raise AssertionError("CUDA not available. If you have GPUs, please specify the ID after `--gpu_devices`. Otherwise, please train with CPU with `python3 train.py --actor_device_cpu --training_device cpu`")
