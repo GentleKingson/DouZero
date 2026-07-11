@@ -1,0 +1,21 @@
+# Exclude everything that the CPU test image does not need.
+# Keeps build context small and avoids copying local weights / artifacts.
+.git
+.github
+imgs
+artifacts
+.zcode
+.vscode
+.idea
+douzero_checkpoints
+most_recent_model
+baselines
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/*.pyc
+**/*.ckpt
+**/*.tar
+eval_data.pkl
+.DS_Store

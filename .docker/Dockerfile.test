@@ -1,0 +1,40 @@
+# CPU-only test image for the DouZero baseline freeze (P00).
+#
+# Locked to python:3.11-slim so the suite runs in an isolated environment
+# regardless of the host Python (the host may be newer/older and lack torch).
+# This image does NOT install CUDA; GPU tests are explicitly out of scope.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    # Force CPU: legacy models have no device argument, so we hide CUDA entirely.
+    CUDA_VISIBLE_DEVICES=""
+
+WORKDIR /workspace
+
+# GitPython (a declared runtime dep via requirements.txt) shells out to the
+# `git` binary, which the slim image does not include. Install it so that
+# importing douzero.dmc (which imports file_writer -> git) succeeds. This does
+# not change any production behavior.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install runtime + dev deps first for better layer caching.
+COPY requirements.txt requirements-dev.txt ./
+# Install the CPU-only torch wheel explicitly: the default linux wheel pulls in
+# multi-GB nvidia CUDA libraries that we neither need nor want (the P00 test
+# image is CPU-only). We replace the "torch>=1.6.0" line rather than editing
+# requirements.txt itself, to keep the repo's declared deps unchanged.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu torch && \
+    pip install -r requirements.txt -r requirements-dev.txt
+
+# Install the package itself (editable so tests import the working tree).
+COPY . .
+RUN pip install -e .
+
+# Default entrypoint runs the full suite; run_tests.sh may also be invoked
+# directly with extra args (e.g. `-k model`).
+CMD ["bash", ".docker/run_tests.sh"]
