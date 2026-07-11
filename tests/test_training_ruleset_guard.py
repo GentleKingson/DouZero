@@ -194,6 +194,76 @@ def test_train_feature_version_guard_precedes_cuda_check():
 
 
 # --------------------------------------------------------------------------- #
+# Training guard — model_version (P04)
+# --------------------------------------------------------------------------- #
+def test_train_rejects_factorized_model_version():
+    """train() must raise ValueError when model_version='factorized'.
+
+    The factorized model (P04) is a deployment-only forward; the actor/learner
+    loop is not yet wired to it, so training must refuse it up front rather
+    than silently using the legacy forward while stamping the checkpoint with
+    model_version='factorized'.
+    """
+    from douzero.dmc.dmc import train
+
+    flags = argparse.Namespace(
+        feature_version='legacy',
+        ruleset='legacy',
+        model_version='factorized',
+        actor_device_cpu=True,
+        training_device='cpu',
+    )
+    with pytest.raises(ValueError, match="model_version"):
+        train(flags)
+
+
+def test_train_does_not_reject_legacy_model_version():
+    """train() must NOT raise the model_version guard for legacy."""
+    from douzero.dmc.dmc import train
+
+    flags = argparse.Namespace(
+        feature_version='legacy',
+        ruleset='legacy',
+        model_version='legacy',
+        actor_device_cpu=True,
+        training_device='cpu',
+    )
+    try:
+        train(flags)
+    except ValueError as e:
+        if "model_version" in str(e):
+            pytest.fail("Legacy model_version was rejected by the guard")
+    except Exception:
+        pass
+
+
+def test_train_factorized_guard_runs_before_any_initialization(tmp_path):
+    """The model_version guard must fire BEFORE any init — no side effects."""
+    from unittest.mock import patch
+    from douzero.dmc.dmc import train
+
+    flags = argparse.Namespace(
+        feature_version='legacy',
+        ruleset='legacy',
+        model_version='factorized',
+        actor_device_cpu=True,
+        training_device='cpu',
+        savedir=str(tmp_path),
+        xpid='test_fac_no_side_effect',
+    )
+    with patch('douzero.dmc.file_writer.FileWriter') as mock_fw, \
+         patch('torch.multiprocessing.Process') as mock_proc:
+        with pytest.raises(ValueError, match="model_version"):
+            train(flags)
+        assert mock_fw.call_count == 0, \
+            "train() constructed a FileWriter before the model_version guard"
+        assert mock_proc.call_count == 0, \
+            "train() spawned a subprocess before the model_version guard"
+    assert not (tmp_path / 'test_fac_no_side_effect').exists(), \
+        "train() created a checkpoint directory before the model_version guard"
+
+
+# --------------------------------------------------------------------------- #
 # CLI --help shows both ruleset choices
 # --------------------------------------------------------------------------- #
 def test_train_help_shows_both_ruleset_choices():

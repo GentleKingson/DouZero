@@ -376,9 +376,21 @@ def test_cli_feature_version_rejects_unknown():
         parser.parse_args(["--feature_version", "v3"])
 
 
-def test_cli_model_version_still_legacy_only():
+def test_cli_model_version_rejects_v2_and_accepts_legacy_and_factorized():
+    """P04 widens model_version to {legacy, factorized}; v2 still rejected.
+
+    "factorized" is a deployment-only, checkpoint-compatible forward (P04);
+    "v2" is reserved for Model V2 (P05) and must remain rejected by the CLI
+    until P05 wires it in.
+    """
     from douzero.dmc.arguments import parser
 
+    # legacy and factorized are accepted.
+    ns = parser.parse_args(["--model_version", "legacy"])
+    assert ns.model_version == "legacy"
+    ns = parser.parse_args(["--model_version", "factorized"])
+    assert ns.model_version == "factorized"
+    # v2 is NOT yet a supported model_version (reserved for P05).
     with pytest.raises(SystemExit):
         parser.parse_args(["--model_version", "v2"])
 
