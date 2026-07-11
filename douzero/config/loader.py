@@ -101,6 +101,7 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
         kwargs["optimizer"] = OptimizerConfig(**dict(optimizer_raw))
     cfg = TrainingConfig(**kwargs)
     _validate_types(cfg)
+    _validate_legacy_only_versions(cfg)
     return cfg
 
 
@@ -116,6 +117,7 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "exp_epsilon": float, "batch_size": int, "unroll_length": int,
     "num_buffers": int, "num_threads": int, "max_grad_norm": float,
     "seed": int, "deterministic": bool, "config": str,
+    "feature_version": str, "ruleset": str, "model_version": str,
     "learning_rate": float, "alpha": float, "momentum": float, "epsilon": float,
 }
 
@@ -160,6 +162,34 @@ def _validate_types(cfg: TrainingConfig) -> None:
             _check_field(name, getattr(cfg, name), "training")
 
 
+# P01 only supports the "legacy" feature/rule/model versions. Later phases
+# (P02 rules, P03 observations, P05 model) widen these sets. A YAML or dict
+# config that sets a non-"legacy" value is rejected here so it fails loudly
+# rather than silently producing a run the codebase does not support.
+_LEGACY_ONLY_VERSIONS: dict[str, frozenset[str]] = {
+    "feature_version": frozenset({"legacy"}),
+    "ruleset": frozenset({"legacy"}),
+    "model_version": frozenset({"legacy"}),
+}
+
+
+def _validate_legacy_only_versions(cfg: TrainingConfig) -> None:
+    """Reject version identifiers that P01 does not support (item 4).
+
+    The argparse flags already enforce ``choices=['legacy']`` for CLI input;
+    this validator covers the YAML/dict path so a config file cannot smuggle in
+    an unsupported version either.
+    """
+    for name, allowed in _LEGACY_ONLY_VERSIONS.items():
+        val = getattr(cfg, name)
+        if val not in allowed:
+            raise ValueError(
+                f"Config field {name!r} has unsupported value {val!r}. "
+                f"P01 only supports {sorted(allowed)}. Later phases will widen "
+                f"the allowed set."
+            )
+
+
 def serialize(cfg: TrainingConfig) -> dict:
     """Convert a TrainingConfig to a JSON/YAML-serializable dict."""
     return asdict(cfg)
@@ -179,6 +209,8 @@ _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
     "learning_rate", "alpha", "momentum", "epsilon",
     # P01-added argparse dests (optional; default to legacy values if absent).
     "seed", "deterministic", "config",
+    # Version identifiers carried through config <-> Namespace (item 4).
+    "feature_version", "ruleset", "model_version",
 )
 
 

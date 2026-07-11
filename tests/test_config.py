@@ -264,3 +264,98 @@ def test_null_field_rejected(tmp_path):
     bad.write_text("batch_size:\n", encoding="utf-8")  # null
     with pytest.raises((TypeError, ValueError)):
         load_config(str(bad))
+
+
+# --------------------------------------------------------------------------- #
+# Version identifier fields (item 4): carried through config + validated
+# --------------------------------------------------------------------------- #
+def test_legacy_yaml_carries_version_fields():
+    """configs/legacy.yaml must carry the three version fields (= legacy)."""
+    cfg = load_config(str(LEGACY_YAML))
+    assert cfg.feature_version == "legacy"
+    assert cfg.ruleset == "legacy"
+    assert cfg.model_version == "legacy"
+
+
+def test_version_fields_round_trip_through_namespace():
+    """Config -> Namespace -> Config must preserve the version fields."""
+    from douzero.dmc.arguments import parser
+
+    ns = parser.parse_args([])
+    cfg = from_argparse(ns)
+    ns2 = to_argparse_namespace(cfg)
+    cfg2 = from_argparse(ns2)
+    assert cfg2.feature_version == "legacy"
+    assert cfg2.ruleset == "legacy"
+    assert cfg2.model_version == "legacy"
+
+
+def test_namespace_exposes_version_dests():
+    """to_argparse_namespace must expose feature_version/ruleset/model_version."""
+    ns = to_argparse_namespace(LegacyConfig.training)
+    for name in ("feature_version", "ruleset", "model_version"):
+        assert hasattr(ns, name), f"missing {name}"
+        assert getattr(ns, name) == "legacy"
+
+
+def test_yaml_version_fields_not_lost_with_config_cli(tmp_path):
+    """--config + explicit CLI must NOT silently drop the version fields.
+
+    The version fields from the YAML base must survive the merge even when an
+    unrelated CLI flag (e.g. --batch_size) is present. This is the item-4
+    regression gate: the fields must flow through merge() and reappear in the
+    final Namespace.
+    """
+    from douzero.dmc.arguments import parse_args
+
+    yml = tmp_path / "run.yaml"
+    yml.write_text(
+        "batch_size: 64\nfeature_version: legacy\nruleset: legacy\nmodel_version: legacy\n",
+        encoding="utf-8",
+    )
+    ns = parse_args(["--config", str(yml), "--batch_size", "32"])
+    assert ns.feature_version == "legacy"
+    assert ns.ruleset == "legacy"
+    assert ns.model_version == "legacy"
+    assert ns.batch_size == 32
+
+
+def test_yaml_rejects_unsupported_feature_version(tmp_path):
+    """A YAML config with feature_version=v2 must be rejected (P01=legacy only)."""
+    bad = tmp_path / "v2.yaml"
+    bad.write_text("feature_version: v2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="feature_version"):
+        load_config(str(bad))
+
+
+def test_yaml_rejects_unsupported_ruleset(tmp_path):
+    """A YAML config with ruleset=standard must be rejected (P01=legacy only)."""
+    bad = tmp_path / "std.yaml"
+    bad.write_text("ruleset: standard\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="ruleset"):
+        load_config(str(bad))
+
+
+def test_yaml_rejects_unsupported_model_version(tmp_path):
+    """A YAML config with model_version=v2 must be rejected (P01=legacy only)."""
+    bad = tmp_path / "mv2.yaml"
+    bad.write_text("model_version: v2\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="model_version"):
+        load_config(str(bad))
+
+
+def test_cli_rejects_unsupported_feature_version():
+    """argparse choices must reject --feature_version v2 at the CLI."""
+    from douzero.dmc.arguments import parser
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--feature_version", "v2"])
+
+
+def test_serialize_includes_version_fields():
+    """serialize() must include the version fields in the output dict."""
+    cfg = load_config(str(LEGACY_YAML))
+    d = serialize(cfg)
+    assert d["feature_version"] == "legacy"
+    assert d["ruleset"] == "legacy"
+    assert d["model_version"] == "legacy"
