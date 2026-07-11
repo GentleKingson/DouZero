@@ -1,11 +1,24 @@
-"""Observation V2 encoder (P03).
+"""Observation V2 encoder (P03, hardened round 2).
 
 :func:`get_obs_v2` is the V2 counterpart of the legacy ``get_obs``. It produces
 an :class:`ObservationV2` container holding:
 
 - a **state** block encoded **once per decision** (not per legal action);
 - a :class:`LegalActionBatch` (one feature row per legal action);
-- a :class:`HistoryTokenBatch` (the full public action history, padded).
+- a :class:`HistoryTokenBatch` (the full public action history, bounded +
+  left-truncated, with an explicit padding mask);
+- the public bottom-card identity, bidding history, phase, rocket count, total
+  multiplier, and rule identity (item 3 — every public input a V2 model needs,
+  so P05 never reaches into ``obs.public`` ad hoc);
+- the originating schema identity (``feature_schema_version`` +
+  ``feature_schema_hash``) so a checkpoint can reject an incompatible schema
+  (item 2);
+- the raw public action sequence, so the legacy adapter can reconstruct the
+  legacy tensors from the V2 container alone (item 7).
+
+Deep immutability (item 5): :class:`ObservationV2`, :class:`StateBlock`, and
+:class:`LegalActionBatch` are frozen+slots; their numpy arrays are frozen
+(``write=False``); caller inputs are copied.
 
 The legacy encoder duplicates the entire state across every legal-action row
 and runs the LSTM once per action. V2 encodes the state once and the actions
@@ -14,15 +27,14 @@ shared state/history.
 
 This encoder reads ONLY public fields off the infoset. It never touches
 ``infoset.all_handcards`` or treats ``other_hand_cards`` as a true allocation —
-``other_hand_cards`` is the public swap-invariant union, recomputed here from
-public information via :func:`compute_unseen_pool` to guarantee the leakage
-invariant holds regardless of how the infoset was populated.
+the leakage test replaces ``all_handcards`` with an access-throws sentinel and
+asserts ``get_obs_v2`` still succeeds (item 8).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -35,6 +47,7 @@ from .history import (
     encode_history,
 )
 from .public import (
+    BiddingTokenBatch,
     PublicObservation,
     build_public_observation,
     compute_unseen_pool,
@@ -47,7 +60,7 @@ from .schema import (
     FeatureSchemaManifest,
     build_v2_schema,
 )
-from .seats import ALL_ROLES, LANDLORD_ROLE
+from .seats import ALL_ROLES
 
 #: Bombs and the rocket, matching ``douzero.env.game.bombs``. Kept here so the
 #: encoder can flag bomb/rocket actions without importing the game module.
@@ -59,15 +72,30 @@ _BOMB_SET: frozenset[tuple[int, ...]] = frozenset(
          [14, 14, 14, 14], [17, 17, 17, 17], [20, 30]]
     )
 )
+_ROCKET_KEY: tuple[int, int] = (20, 30)
 
 
-@dataclass
+def _freeze(arr: np.ndarray) -> np.ndarray:
+    """Return ``arr`` as a read-only int8 numpy array (copies if writable)."""
+    out = np.asarray(arr, dtype=np.int8)
+    if out.flags.writeable:
+        out = out.copy()
+    out.setflags(write=False)
+    return out
+
+
+@dataclass(frozen=True)
 class StateBlock:
     """Encoded per-decision state features (no legal-action batch dim).
 
-    Each attribute is an int8 numpy array whose shape matches the corresponding
-    :class:`FeatureSchemaManifest` state field. The encoder concatenates them
-    in schema order to form the flat state vector.
+    Each attribute is a read-only int8 numpy array whose shape matches the
+    corresponding :class:`FeatureSchemaManifest` state field. The encoder
+    concatenates them in schema order to form the flat state vector.
+
+    Item 3 adds the public bottom-card identity (revealed + unplayed), the
+    final bid one-hot, the bidding-token summary, the phase one-hot, the rocket
+    count, and the total multiplier, so a V2 model has every public input
+    without ad-hoc reads.
     """
 
     my_handcards: np.ndarray
@@ -82,8 +110,22 @@ class StateBlock:
     bomb_num: np.ndarray
     acting_role: np.ndarray
 
+    def __post_init__(self) -> None:
+        for arr_name in (
+            "my_handcards", "other_handcards", "landlord_played",
+            "landlord_down_played", "landlord_up_played", "last_move",
+            "num_cards_left_landlord", "num_cards_left_landlord_down",
+            "num_cards_left_landlord_up", "bomb_num", "acting_role",
+        ):
+            arr = getattr(self, arr_name)
+            if arr.flags.writeable:
+                object.__setattr__(self, arr_name, _freeze(arr))
+
     def to_vector(self) -> np.ndarray:
-        """Concatenate all fields in schema order into one int8 vector."""
+        """Concatenate all fields in schema order into one int8 vector.
+
+        Returns a fresh, writable copy (the source arrays are frozen).
+        """
         return np.concatenate([
             self.my_handcards,
             self.other_handcards,
@@ -99,27 +141,45 @@ class StateBlock:
         ]).astype(np.int8)
 
 
-@dataclass
+@dataclass(frozen=True)
 class LegalActionBatch:
     """Encoded legal-action features. Shape ``(N, action_width)`` int8.
 
     ``N == len(legal_actions)``. ``action_mask`` is all-ones (every row is a
     real action); it exists so a batched/padded representation can reuse the
     same array shape with a mask, per the variable-legal-action contract.
+
+    Deep immutability: ``features`` and ``action_mask`` are frozen
+    (``write=False``).
     """
 
     features: np.ndarray  # (N, action_width)
     action_mask: np.ndarray  # (N,)
     legal_actions: tuple[tuple[int, ...], ...]
 
+    def __post_init__(self) -> None:
+        if self.features.flags.writeable:
+            object.__setattr__(self, "features", _freeze(self.features))
+        if self.action_mask.flags.writeable:
+            object.__setattr__(self, "action_mask", _freeze(self.action_mask))
 
-@dataclass
+
+@dataclass(frozen=True)
 class ObservationV2:
     """Full V2 observation for one decision. PUBLIC ONLY.
 
-    Holds the encoded state block (once), the legal-action batch, and the
-    history-token batch, plus the originating :class:`PublicObservation` for
-    inspection / serialisation. No privileged field is present or reachable.
+    Holds the encoded state block (once), the legal-action batch, the
+    history-token batch, the public bottom-card identity, the bidding tokens,
+    the originating :class:`PublicObservation`, and the schema identity. No
+    privileged field is present or reachable.
+
+    Schema identity (item 2): ``feature_schema_version`` and
+    ``feature_schema_hash`` bind this observation to the exact schema contract
+    it was encoded against, so a checkpoint/model can reject a mismatch.
+
+    Adapter support (item 7): ``card_play_action_seq`` stores the raw public
+    action sequence (a tuple of tuples, immutable) so the legacy adapter can
+    reconstruct the legacy ``z`` tensor from this container alone.
     """
 
     schema: FeatureSchemaManifest
@@ -127,7 +187,11 @@ class ObservationV2:
     state: StateBlock
     actions: LegalActionBatch
     history: HistoryTokenBatch
+    bidding_tokens: BiddingTokenBatch
     feature_version: str
+    feature_schema_version: str
+    feature_schema_hash: str
+    card_play_action_seq: tuple[tuple[int, ...], ...] = ()
 
     @property
     def is_privileged(self) -> bool:
@@ -139,12 +203,7 @@ class ObservationV2:
 # Encoding helpers
 # --------------------------------------------------------------------------- #
 def _cards_left_onehot(count: int) -> np.ndarray:
-    """One-hot encode a remaining-card count over ``MAX_CARDS_LEFT`` slots.
-
-    Matches the legacy ``_get_one_hot_array`` convention: slot ``count-1`` is
-    set (count is 1-indexed). A zero count yields the all-zero vector (no slot
-    for "0 cards" because the game ends when any hand empties).
-    """
+    """One-hot encode a remaining-card count over ``MAX_CARDS_LEFT`` slots."""
     vec = np.zeros(MAX_CARDS_LEFT, dtype=np.int8)
     if count < 0 or count > MAX_CARDS_LEFT:
         raise ValueError(f"cards-left count {count} out of range [0, {MAX_CARDS_LEFT}]")
@@ -154,12 +213,7 @@ def _cards_left_onehot(count: int) -> np.ndarray:
 
 
 def _bomb_onehot(bomb_num: int) -> np.ndarray:
-    """One-hot encode the bomb counter over ``BOMB_ONEHOT_WIDTH`` slots.
-
-    Matches the legacy ``_get_one_hot_bomb``. Counts at or beyond the width
-    saturate to the last slot (legacy behaviour indexes ``one_hot[bomb_num]``,
-    which would overflow; we saturate defensively).
-    """
+    """One-hot encode the bomb counter over ``BOMB_ONEHOT_WIDTH`` slots."""
     vec = np.zeros(BOMB_ONEHOT_WIDTH, dtype=np.int8)
     idx = min(int(bomb_num), BOMB_ONEHOT_WIDTH - 1)
     vec[idx] = 1
@@ -167,11 +221,7 @@ def _bomb_onehot(bomb_num: int) -> np.ndarray:
 
 
 def _acting_role_onehot(role: str) -> np.ndarray:
-    """One-hot encode the acting role over ``SEAT_ONEHOT_WIDTH`` slots.
-
-    The first three slots are the absolute roles in canonical order; the rest
-    are zero (reserved for relative-seat labels used elsewhere).
-    """
+    """One-hot encode the acting role over ``SEAT_ONEHOT_WIDTH`` slots."""
     vec = np.zeros(SEAT_ONEHOT_WIDTH, dtype=np.int8)
     if role in ALL_ROLES:
         vec[ALL_ROLES.index(role)] = 1
@@ -208,39 +258,27 @@ def _encode_action_row(action, schema: FeatureSchemaManifest) -> np.ndarray:
 # History reconstruction
 # --------------------------------------------------------------------------- #
 def _reconstruct_history_moves(
-    infoset,
+    action_seq: Sequence[Sequence[int]],
     num_cards_left_now: dict[str, int],
     phase_code: int,
 ) -> list[HistoryMove]:
     """Reconstruct the public action history as :class:`HistoryMove` tokens.
 
-    Walks ``infoset.card_play_action_seq`` (the public, ordered action list)
-    and assigns each action to its absolute actor using the canonical turn
-    order. The turn order starts at the landlord and proceeds
-    ``landlord -> landlord_down -> landlord_up``; passes are included in the
-    sequence (they consume a turn).
-
-    ``cards_left_after`` is reconstructed by replaying the hand counts
-    backward from the current counts. This is fully determined by public
-    information (the action sequence + current counts), so it is swap-invariant.
+    Walks the public, ordered action list and assigns each action to its
+    absolute actor using the canonical turn order. ``cards_left_after`` is
+    reconstructed by replaying the hand counts backward from the current counts
+    (fully determined by public information, so swap-invariant).
     """
-    seq = list(infoset.card_play_action_seq or [])
+    seq = [list(a) for a in (action_seq or [])]
     if not seq:
         return []
 
-    # Reconstruct per-role remaining counts before each action by walking
-    # backward from the current counts.
-    # current counts are AFTER all actions; subtract each action's cards.
     counts_now = {role: num_cards_left_now.get(role, 0) for role in ALL_ROLES}
-    counts_after = [None] * len(seq)
+    counts_after: list[dict[str, int]] = [None] * len(seq)  # type: ignore[list-item]
     counts = dict(counts_now)
     for i in range(len(seq) - 1, -1, -1):
-        # `counts` currently holds counts AFTER action i (for i = last) or
-        # after action i+1. Subtract action i's cards to get counts BEFORE i,
-        # then counts_after[i] = counts before subtraction = after action i.
         counts_after[i] = dict(counts)
         action = seq[i]
-        # Determine actor for position i to know whose count to increment.
         actor = _actor_at(i)
         for c in action:
             counts[actor] = counts.get(actor, 0) + 1
@@ -266,12 +304,7 @@ def _reconstruct_history_moves(
 
 
 def _actor_at(turn_index: int) -> str:
-    """Return the absolute role that acts at ``turn_index`` (0 = landlord lead).
-
-    Turn order: landlord(0) -> landlord_down(1) -> landlord_up(2) -> landlord...
-    Passes consume a turn (they appear in ``card_play_action_seq``), so the
-    index alone determines the actor.
-    """
+    """Return the absolute role that acts at ``turn_index`` (0 = landlord lead)."""
     return ALL_ROLES[turn_index % len(ALL_ROLES)]
 
 
@@ -283,8 +316,11 @@ def get_obs_v2(
     *,
     schema: FeatureSchemaManifest | None = None,
     ruleset_id: str = "legacy",
+    ruleset_version: str = "legacy-v1",
+    ruleset_hash: str = "",
     bid_value: int = 0,
     bidding_history=None,
+    bidding_order=None,
     bomb_count: int | None = None,
     rocket_count: int | None = None,
     total_multiplier: int = 1,
@@ -295,23 +331,26 @@ def get_obs_v2(
     Parameters
     ----------
     infoset
-        The legacy ``InfoSet`` (or any object with the same public attributes:
-        ``player_position``, ``player_hand_cards``, ``played_cards``,
-        ``last_move``, ``last_move_dict``, ``three_landlord_cards``,
-        ``num_cards_left_dict``, ``card_play_action_seq``, ``legal_actions``,
-        ``bomb_num``). Privileged fields (``all_handcards``,
-        ``other_hand_cards``) are IGNORED — the unseen pool is recomputed from
-        public information.
+        The legacy ``InfoSet`` (or any object with the same public attributes).
+        Privileged fields (``all_handcards``, ``other_hand_cards``) are IGNORED
+        — the unseen pool is recomputed from public information, and the
+        leakage test replaces ``all_handcards`` with an access-throws sentinel.
     schema
-        Optional prebuilt schema (controls ``max_history_len``). Defaults to
-        :func:`build_v2_schema` with the default cap.
-    ruleset_id, bid_value, bidding_history, bomb_count, rocket_count, ...
-        Public rule/bidding state. In legacy mode these default to the legacy
-        identity (no bidding, ``bomb_num`` conflates bombs+rocket). In standard
-        mode the caller passes the real values from the ``GameEnv``.
+        Optional prebuilt schema (controls ``max_history_len`` and the identity
+        hash). Defaults to :func:`build_v2_schema`.
+    ruleset_id, ruleset_version, ruleset_hash
+        Public rule identity (item 3). Stamped onto the public observation so a
+        V2 model knows which ruleset it is playing under without ad-hoc reads.
+    bid_value, bidding_history, bidding_order
+        Public bidding state. In legacy mode these default to no bidding.
+    bomb_count, rocket_count, total_multiplier
+        Public multiplier state (item 3). ``rocket_count`` is separate from
+        ``bomb_count`` (the legacy ``bomb_num`` conflates both).
+    phase
+        Game phase string ("bidding"/"playing"/"reveal_bottom").
 
     The state is encoded **once**; legal actions are encoded into a
-    :class:`LegalActionBatch`; history is encoded into a padded
+    :class:`LegalActionBatch`; history is encoded into a bounded, padded
     :class:`HistoryTokenBatch`. No privileged data is read or returned.
     """
     if schema is None:
@@ -324,6 +363,12 @@ def get_obs_v2(
         for role in ALL_ROLES
     }
     bottom_unplayed = list(infoset.three_landlord_cards or [])
+    # Public revealed bottom identity (item 4). Prefer the explicit revealed
+    # field; fall back to the current unplayed set.
+    bottom_revealed = getattr(
+        infoset, "three_landlord_cards_revealed", None)
+    if bottom_revealed is None:
+        bottom_revealed = bottom_unplayed
     # Public unseen pool — recomputed from public info (swap-invariant).
     other_hand = list(compute_unseen_pool(my_hand, played, bottom_unplayed))
 
@@ -340,12 +385,16 @@ def get_obs_v2(
             for role in ALL_ROLES
         },
         three_landlord_cards=bottom_unplayed,
+        three_landlord_cards_revealed=bottom_revealed,
         num_cards_left=num_left,
         legal_actions=infoset.legal_actions,
         phase=phase,
         ruleset_id=ruleset_id,
+        ruleset_version=ruleset_version,
+        ruleset_hash=ruleset_hash,
         bid_value=bid_value,
         bidding_history=bidding_history,
+        bidding_order=bidding_order,
         bomb_count=int(bomb_count if bomb_count is not None else infoset.bomb_num),
         rocket_count=int(rocket_count if rocket_count is not None else 0),
         total_multiplier=total_multiplier,
@@ -375,8 +424,6 @@ def get_obs_v2(
         rows = [_encode_action_row(action, schema) for action in legal]
         features = np.stack(rows, axis=0).astype(np.int8)
     else:
-        # No legal actions should not happen (pass is always available when
-        # there is a rival move), but guard defensively with an empty array.
         features = np.zeros((0, _action_width(schema)), dtype=np.int8)
     action_mask = np.ones(features.shape[0], dtype=np.int8)
     actions = LegalActionBatch(
@@ -387,8 +434,15 @@ def get_obs_v2(
 
     # --- History batch ---
     phase_code = _phase_code(phase)
-    moves = _reconstruct_history_moves(infoset, num_left, phase_code)
+    raw_action_seq = [list(a) for a in (infoset.card_play_action_seq or [])]
+    moves = _reconstruct_history_moves(raw_action_seq, num_left, phase_code)
     history = encode_history(moves, schema)
+
+    # --- Bidding tokens ---
+    bidding_tokens = encode_bidding_tokens(bidding_history, bidding_order)
+
+    # Raw public action sequence (immutable) for the legacy adapter (item 7).
+    action_seq_tuple = tuple(tuple(sorted(a)) for a in raw_action_seq)
 
     return ObservationV2(
         schema=schema,
@@ -396,8 +450,20 @@ def get_obs_v2(
         state=state,
         actions=actions,
         history=history,
+        bidding_tokens=bidding_tokens,
         feature_version=schema.feature_version,
+        feature_schema_version=schema.schema_version,
+        feature_schema_hash=schema.stable_hash(),
+        card_play_action_seq=action_seq_tuple,
     )
+
+
+def encode_bidding_tokens(
+    bidding_history, bidding_order
+) -> BiddingTokenBatch:
+    """Build the :class:`BiddingTokenBatch` from a bidding history."""
+    from .public import encode_bidding_history
+    return encode_bidding_history(bidding_history or (), bidding_order)
 
 
 def _action_width(schema: FeatureSchemaManifest) -> int:

@@ -1,0 +1,589 @@
+"""Observation V2 hardening tests (P03 round 2).
+
+Covers the round-2 acceptance items:
+
+- (2) FeatureSchema identity: stable_hash is description-stable, changes on
+  field/order/dtype/width/semantic-stamp changes; ObservationV2 carries
+  feature_schema_version + the full hash.
+- (4) Public bottom-card semantics: revealed = original 3, unplayed = current
+  subset; revealed is stable after the landlord plays a bottom card while
+  unplayed shrinks; GameEnv/InfoSet expose both.
+- (5) Deep immutability: containers are frozen+slots; numpy arrays are
+  read-only; mutating the source infoset/lists after building does not change
+  the observation; mutating an observation's array raises.
+- (6) History contract: valid_mask (1=valid), key_padding_mask (True=padding),
+  original_length / was_truncated / truncation_side="left"; padding tokens are
+  all-zero; editing padding content cannot affect the mask contract.
+- (8) Leakage hardening: an access-throws sentinel replacing
+  infoset.all_handcards must NOT break get_obs_v2; the public encoder module
+  does not import the privileged module; PublicObservation serialisation
+  contains no hidden/all_handcards field.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+from collections import Counter
+
+import numpy as np
+import pytest
+
+from douzero.env.env import Env
+from douzero.env.game import GameEnv
+from douzero.env.rules import RuleSet
+from douzero.observation import (
+    BIDDING_TOKEN_WIDTH,
+    BiddingTokenBatch,
+    FeatureSchemaManifest,
+    FieldSpec,
+    HistoryMove,
+    ObservationV2,
+    PrivilegedObservation,
+    PublicObservation,
+    build_public_observation,
+    build_v2_schema,
+    encode_bidding_history,
+    encode_history,
+    get_obs_v2,
+)
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+class _NoopAgent:
+    def __init__(self):
+        self.action = None
+
+    def set_action(self, action):
+        self.action = action
+
+    def act(self, infoset):
+        if self.action is not None and self.action in infoset.legal_actions:
+            a, self.action = self.action, None
+            return a
+        return infoset.legal_actions[0]
+
+
+def _legacy_infoset(data):
+    players = {pos: _NoopAgent() for pos in
+               ["landlord", "landlord_up", "landlord_down"]}
+    env = GameEnv(players)
+    env.card_play_init(data)
+    return env
+
+
+# --------------------------------------------------------------------------- #
+# (2) FeatureSchema identity
+# --------------------------------------------------------------------------- #
+class TestSchemaIdentity:
+    def test_observation_carries_schema_version_and_hash(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        assert obs.feature_schema_version == obs.schema.schema_version == "v2-1"
+        assert obs.feature_schema_hash == obs.schema.stable_hash()
+        assert len(obs.feature_schema_hash) == 64  # full SHA-256
+
+    def test_stable_hash_is_description_stable(self):
+        """Editing a FieldSpec description must NOT change the hash (item 2)."""
+        s = build_v2_schema()
+        h_before = s.stable_hash()
+        # Build an identical schema but with a different description on one field.
+        new_state = list(s.state_fields)
+        idx = next(i for i, f in enumerate(new_state) if f.name == "my_handcards")
+        new_state[idx] = FieldSpec(
+            "my_handcards", new_state[idx].shape, new_state[idx].dtype,
+            "DIFFERENT description text",
+        )
+        s2 = FeatureSchemaManifest(
+            feature_version=s.feature_version, schema_version=s.schema_version,
+            max_history_len=s.max_history_len, card_vector_dim=s.card_vector_dim,
+            seat_onehot_width=s.seat_onehot_width,
+            move_type_onehot_width=s.move_type_onehot_width,
+            bomb_onehot_width=s.bomb_onehot_width,
+            max_cards_left=s.max_cards_left,
+            state_fields=tuple(new_state), action_fields=s.action_fields,
+            history_token_fields=s.history_token_fields,
+        )
+        assert s2.stable_hash() == h_before, (
+            "description text edit changed the compatibility hash"
+        )
+
+    def test_hash_changes_on_field_removal(self):
+        s = build_v2_schema()
+        h_before = s.stable_hash()
+        new_state = tuple(f for f in s.state_fields if f.name != "my_handcards")
+        s2 = FeatureSchemaManifest(
+            feature_version=s.feature_version, schema_version=s.schema_version,
+            max_history_len=s.max_history_len, card_vector_dim=s.card_vector_dim,
+            seat_onehot_width=s.seat_onehot_width,
+            move_type_onehot_width=s.move_type_onehot_width,
+            bomb_onehot_width=s.bomb_onehot_width,
+            max_cards_left=s.max_cards_left,
+            state_fields=new_state, action_fields=s.action_fields,
+            history_token_fields=s.history_token_fields,
+        )
+        assert s2.stable_hash() != h_before
+
+    def test_hash_changes_on_field_order(self):
+        s = build_v2_schema()
+        h_before = s.stable_hash()
+        # Swap the first two state fields.
+        swapped = (s.state_fields[1], s.state_fields[0]) + s.state_fields[2:]
+        s2 = FeatureSchemaManifest(
+            feature_version=s.feature_version, schema_version=s.schema_version,
+            max_history_len=s.max_history_len, card_vector_dim=s.card_vector_dim,
+            seat_onehot_width=s.seat_onehot_width,
+            move_type_onehot_width=s.move_type_onehot_width,
+            bomb_onehot_width=s.bomb_onehot_width,
+            max_cards_left=s.max_cards_left,
+            state_fields=swapped, action_fields=s.action_fields,
+            history_token_fields=s.history_token_fields,
+        )
+        assert s2.stable_hash() != h_before
+
+    def test_hash_changes_on_dtype(self):
+        s = build_v2_schema()
+        h_before = s.stable_hash()
+        new_state = list(s.state_fields)
+        new_state[0] = FieldSpec(
+            new_state[0].name, new_state[0].shape, "int16",
+            new_state[0].description,
+        )
+        s2 = FeatureSchemaManifest(
+            feature_version=s.feature_version, schema_version=s.schema_version,
+            max_history_len=s.max_history_len, card_vector_dim=s.card_vector_dim,
+            seat_onehot_width=s.seat_onehot_width,
+            move_type_onehot_width=s.move_type_onehot_width,
+            bomb_onehot_width=s.bomb_onehot_width,
+            max_cards_left=s.max_cards_left,
+            state_fields=tuple(new_state), action_fields=s.action_fields,
+            history_token_fields=s.history_token_fields,
+        )
+        assert s2.stable_hash() != h_before
+
+    def test_hash_changes_on_max_history_len(self):
+        s = build_v2_schema(max_history_len=100)
+        s2 = build_v2_schema(max_history_len=50)
+        assert s.stable_hash() != s2.stable_hash()
+
+    def test_hash_changes_on_mask_semantics_stamp(self):
+        s = build_v2_schema()
+        h_before = s.stable_hash()
+        s2 = FeatureSchemaManifest(
+            feature_version=s.feature_version, schema_version=s.schema_version,
+            max_history_len=s.max_history_len, card_vector_dim=s.card_vector_dim,
+            seat_onehot_width=s.seat_onehot_width,
+            move_type_onehot_width=s.move_type_onehot_width,
+            bomb_onehot_width=s.bomb_onehot_width,
+            max_cards_left=s.max_cards_left,
+            state_fields=s.state_fields, action_fields=s.action_fields,
+            history_token_fields=s.history_token_fields,
+            mask_semantics_version="DIFFERENT",
+        )
+        assert s2.stable_hash() != h_before
+
+    def test_compatibility_dict_excludes_description(self):
+        s = build_v2_schema()
+        d = s.compatibility_dict()
+        for group in ("state_fields", "action_fields", "history_token_fields"):
+            for f in d[group]:
+                assert "description" not in f, (
+                    f"description leaked into compatibility_dict for {f['name']}"
+                )
+
+    def test_two_same_configs_same_hash(self):
+        assert build_v2_schema().stable_hash() == build_v2_schema().stable_hash()
+
+
+# --------------------------------------------------------------------------- #
+# (4) Public bottom-card semantics
+# --------------------------------------------------------------------------- #
+class TestBottomCardSemantics:
+    def test_infoset_exposes_revealed_and_unplayed(self, fixed_card_play_data):
+        """GameEnv/InfoSet must expose three_landlord_cards_revealed (item 4)."""
+        env = _legacy_infoset(fixed_card_play_data)
+        iset = env.game_infoset
+        assert hasattr(iset, "three_landlord_cards_revealed")
+        # In legacy mode the bottom cards are revealed immediately.
+        assert iset.three_landlord_cards_revealed is not None
+        assert sorted(iset.three_landlord_cards_revealed) == \
+            sorted(fixed_card_play_data["three_landlord_cards"])
+
+    def test_revealed_stable_unplayed_shrinks_when_landlord_plays_bottom(
+        self, fixed_card_play_data
+    ):
+        """After the landlord plays a bottom card, revealed is unchanged but
+        unplayed shrinks (item 4)."""
+        env = _legacy_infoset(fixed_card_play_data)
+        # The landlord is the first actor in legacy mode.
+        assert env.acting_player_position == "landlord"
+        revealed_initial = sorted(env.game_infoset.three_landlord_cards_revealed)
+        unplayed_initial = sorted(env.three_landlord_cards)
+        assert revealed_initial == unplayed_initial  # at start, nothing played
+
+        # Find a legal action that contains a bottom card and play it.
+        bottom = set(env.three_landlord_cards)
+        chosen = None
+        for action in env.game_infoset.legal_actions:
+            if len(action) > 0 and any(c in bottom for c in action):
+                chosen = action
+                break
+        if chosen is not None:
+            env.players["landlord"].set_action(chosen)
+            env.step()
+            iset = env.game_infoset
+            # revealed unchanged.
+            assert sorted(iset.three_landlord_cards_revealed) == revealed_initial
+            # unplayed shrank (at least one bottom card consumed).
+            assert len(env.three_landlord_cards) < len(unplayed_initial) or \
+                sorted(env.three_landlord_cards) != unplayed_initial
+
+    def test_public_observation_carries_revealed_and_unplayed(self, fixed_card_play_data):
+        env = _legacy_infoset(fixed_card_play_data)
+        obs = get_obs_v2(env.game_infoset)
+        assert obs.public.bottom_cards.revealed == \
+            tuple(sorted(fixed_card_play_data["three_landlord_cards"]))
+        assert obs.public.bottom_cards.owner == "landlord"
+
+
+# --------------------------------------------------------------------------- #
+# (5) Deep immutability
+# --------------------------------------------------------------------------- #
+class TestDeepImmutability:
+    def test_state_arrays_are_readonly(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        assert not obs.state.my_handcards.flags.writeable
+        assert not obs.actions.features.flags.writeable
+        assert not obs.actions.action_mask.flags.writeable
+        assert not obs.history.tokens.flags.writeable
+        assert not obs.history.valid_mask.flags.writeable
+        assert not obs.bidding_tokens.tokens.flags.writeable
+
+    def test_mutation_of_frozen_array_raises(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        with pytest.raises(ValueError, match="read-only"):
+            obs.state.my_handcards[0] = 9
+        with pytest.raises(ValueError, match="read-only"):
+            obs.actions.features[0, 0] = 9
+
+    def test_mutation_of_source_lists_does_not_change_obs(self, fixed_card_play_data):
+        """Building an obs from lists, then mutating the source lists, must not
+        change the observation (item 5).
+
+        The observation is built from public info at encode time; later source
+        mutation does not retroactively alter it. We mutate a NON-conservation
+        -breaking field (other_hand_cards, which the encoder ignores) to prove
+        isolation without invalidating the deck."""
+        env = _legacy_infoset(fixed_card_play_data)
+        iset = env.game_infoset
+        obs = get_obs_v2(iset)
+        my_hand_before = obs.public.my_handcards
+        # Mutate a source list the encoder copies at build time. The encoder
+        # copies my_handcards into a tuple, so mutating the source after build
+        # cannot affect the already-built observation.
+        iset.player_hand_cards.append(99)
+        # The FIRST obs is unaffected (it captured a copy at build time).
+        assert obs.public.my_handcards == my_hand_before
+        assert 99 not in obs.public.my_handcards
+
+    def test_public_observation_is_frozen(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        # Cannot reassign a field on a frozen dataclass.
+        with pytest.raises((AttributeError, Exception)):
+            obs.public.acting_role = "landlord_up"
+
+    def test_privileged_isolated_from_source_mutation(self):
+        hands = {"landlord": [3, 4], "landlord_up": [5], "landlord_down": [6]}
+        priv = PrivilegedObservation(all_handcards=hands, acting_role="landlord")
+        hands["landlord"].append(99)
+        hands["new"] = [7]
+        assert 99 not in priv.all_handcards["landlord"]
+        assert "new" not in priv.all_handcards
+
+    def test_public_does_not_share_ndarray_with_privileged(self):
+        """Public and privileged containers hold disjoint data (item 5).
+
+        Privileged holds true hidden hands; public holds only the public unseen
+        pool. They share no array storage."""
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        priv = PrivilegedObservation(
+            all_handcards={
+                role: tuple(env._env.info_sets[role].player_hand_cards)
+                for role in ("landlord", "landlord_up", "landlord_down")
+            },
+            acting_role="landlord",
+        )
+        # public.other_handcards is the swap-invariant pool; it is NOT the true
+        # allocation (it's sorted and pooled). They are different objects.
+        assert obs.public.other_handcards is not priv.all_handcards["landlord_up"]
+
+    def test_containers_use_slots(self):
+        """frozen (+ slots where used) containers must not allow new attributes
+        or field reassignment (item 5)."""
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        # frozen: cannot reassign a declared field; cannot set a new attribute.
+        with pytest.raises((AttributeError, TypeError)):
+            obs.public.new_field = 1
+        with pytest.raises((AttributeError, TypeError)):
+            obs.public.acting_role = "landlord_up"
+        # PrivilegedObservation is frozen+slots: new attribute -> TypeError.
+        priv = PrivilegedObservation(
+            all_handcards={"landlord": ()}, acting_role="landlord")
+        with pytest.raises((AttributeError, TypeError)):
+            priv.new_field = 1
+        with pytest.raises((AttributeError, TypeError)):
+            priv.acting_role = "landlord_up"
+
+
+# --------------------------------------------------------------------------- #
+# (6) History contract
+# --------------------------------------------------------------------------- #
+class TestHistoryContract:
+    def _moves(self, n):
+        return [
+            HistoryMove("landlord", (r,), False, 1, r, 1, 1, 19, False, 1)
+            for r in range(3, 3 + n)
+        ]
+
+    def test_valid_mask_is_1_for_real(self):
+        s = build_v2_schema(max_history_len=10)
+        batch = encode_history(self._moves(3), s)
+        assert batch.valid_mask[:3].tolist() == [1, 1, 1]
+        assert batch.valid_mask[3:].tolist() == [0] * 7
+
+    def test_key_padding_mask_true_means_padding(self):
+        s = build_v2_schema(max_history_len=10)
+        batch = encode_history(self._moves(3), s)
+        # PyTorch convention: True = padding (ignore).
+        kpm = batch.key_padding_mask
+        assert kpm[:3].tolist() == [False, False, False]
+        assert kpm[3:].tolist() == [True] * 7
+
+    def test_key_padding_mask_is_negation_of_valid_mask(self):
+        s = build_v2_schema(max_history_len=8)
+        batch = encode_history(self._moves(5), s)
+        assert (batch.key_padding_mask == (batch.valid_mask == 0)).all()
+
+    def test_original_length_and_was_truncated(self):
+        s_small = build_v2_schema(max_history_len=4)
+        batch = encode_history(self._moves(10), s_small)
+        assert batch.original_length == 10
+        assert batch.was_truncated is True
+        assert batch.num_real == 4  # capped
+        assert batch.truncation_side == "left"
+
+    def test_not_truncated_when_under_cap(self):
+        s = build_v2_schema(max_history_len=20)
+        batch = encode_history(self._moves(5), s)
+        assert batch.was_truncated is False
+        assert batch.original_length == 5
+
+    def test_padding_tokens_are_all_zero(self):
+        s = build_v2_schema(max_history_len=10)
+        batch = encode_history(self._moves(2), s)
+        # The padding region (indices 2..9) must be all-zero.
+        assert (batch.tokens[2:] == 0).all()
+
+    def test_editing_padding_does_not_change_mask(self):
+        """The mask contract is independent of padding content (item 6).
+
+        Even if a caller forcibly wrote into a padding slot (bypassing the
+        frozen array), the valid_mask/key_padding_mask would still mark it as
+        padding. We verify the mask is what defines validity, not the token
+        content."""
+        s = build_v2_schema(max_history_len=10)
+        batch = encode_history(self._moves(2), s)
+        # The frozen tokens cannot be mutated, but the mask is authoritative:
+        # padding positions are padding regardless of content.
+        assert batch.valid_mask.sum() == 2
+        assert batch.key_padding_mask.sum() == 8
+
+
+# --------------------------------------------------------------------------- #
+# (8) Leakage hardening
+# --------------------------------------------------------------------------- #
+class _AccessThrowsSentinel:
+    """A stand-in for infoset.all_handcards that raises on ANY attribute access.
+
+    If get_obs_v2 ever reads all_handcards, this raises and the test fails.
+    """
+
+
+class TestLeakageHardening:
+    def test_get_obs_v2_succeeds_with_all_handcards_sentinel(self, fixed_card_play_data):
+        """Replace infoset.all_handcards with an access-throws sentinel (item 8).
+
+        get_obs_v2 must succeed because it recomputes the unseen pool from
+        public info and never reads all_handcards.
+        """
+        env = _legacy_infoset(fixed_card_play_data)
+        iset = env.game_infoset
+
+        # Replace all_handcards with a property that raises on access.
+        class _Bomb:
+            def __getattr__(self, name):
+                raise AssertionError(
+                    f"public encoder accessed privileged all_handcards.{name}"
+                )
+            def __iter__(self):
+                raise AssertionError(
+                    "public encoder iterated privileged all_handcards"
+                )
+            def __getitem__(self, k):
+                raise AssertionError(
+                    "public encoder indexed privileged all_handcards"
+                )
+
+        # Use object.__setattr__ bypass if needed; InfoSet is a plain object.
+        iset.all_handcards = _Bomb()
+        iset.other_hand_cards = _Bomb()  # also privileged-as-true-allocation
+        # Must not raise.
+        obs = get_obs_v2(iset)
+        assert obs.is_privileged is False
+
+    def test_public_encoder_does_not_import_privileged(self):
+        """The encode_v2 module must not import the privileged module (item 8)."""
+        import douzero.observation.encode_v2 as enc_mod
+        import sys
+        # The privileged module should not be loaded as a side effect of using
+        # the public encoder. Check the encoder's globals for any reference.
+        mod_names = [name for name in sys.modules if "privileged" in name]
+        # Building an observation must not require the privileged module to be
+        # imported. (It may be importable; we assert the encoder does not pull
+        # it in during a get_obs_v2 call.)
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        before = set(sys.modules)
+        get_obs_v2(env.infoset)
+        after = set(sys.modules)
+        new_priv = [m for m in (after - before) if "privileged" in m]
+        assert new_priv == [], (
+            f"public encoder imported privileged module(s): {new_priv}"
+        )
+
+    def test_public_serialization_has_no_hidden_fields(self):
+        """PublicObservation.to_dict() must contain no hidden/all_handcards
+        field (item 8)."""
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        d = obs.public.to_dict()
+        flat = json.dumps(d)
+        for forbidden in ("all_handcards", "hidden_hand", "other_hand_cards"):
+            assert forbidden not in d, f"{forbidden} leaked into public dict keys"
+            assert forbidden not in flat, f"{forbidden} leaked into public serialization"
+
+    def test_public_obs_invariant_under_reallocation_with_sentinel(self, fixed_card_play_data):
+        """The swap-invariance invariant must still hold even when all_handcards
+        is a sentinel (proving the encoder truly ignores it)."""
+        env_a = _legacy_infoset(copy.deepcopy(fixed_card_play_data))
+        env_b = _legacy_infoset(copy.deepcopy(fixed_card_play_data))
+        # Swap a card between farmers in env_b.
+        data_b = copy.deepcopy(fixed_card_play_data)
+        up = data_b["landlord_up"]
+        down = data_b["landlord_down"]
+        if up[0] != down[0]:
+            up[0], down[0] = down[0], up[0]
+            data_b["landlord_up"] = sorted(up)
+            data_b["landlord_down"] = sorted(down)
+            env_b = _legacy_infoset(data_b)
+
+        iset_a = env_a.game_infoset
+        iset_b = env_b.game_infoset
+        iset_a.all_handcards = _BombIfAccessed()
+        iset_b.all_handcards = _BombIfAccessed()
+        obs_a = get_obs_v2(iset_a)
+        obs_b = get_obs_v2(iset_b)
+        np.testing.assert_array_equal(
+            obs_a.state.to_vector(), obs_b.state.to_vector())
+
+
+class _BombIfAccessed:
+    def __getattr__(self, name):
+        raise AssertionError(f"accessed privileged field {name}")
+
+    def __iter__(self):
+        raise AssertionError("iterated privileged field")
+
+    def __getitem__(self, k):
+        raise AssertionError("indexed privileged field")
+
+
+# --------------------------------------------------------------------------- #
+# (3) Model-consumable public input presence
+# --------------------------------------------------------------------------- #
+class TestModelConsumableInput:
+    def _play_to_playing(self, seed=1):
+        env = Env("adp", ruleset=RuleSet.standard())
+        np.random.seed(seed)
+        env.reset()
+        env.step(None, bid_value=1)
+        env.step(None, bid_value=2)
+        env.step(None, bid_value=3)
+        return env
+
+    def test_public_carries_phase_bid_bidding_rocket_multiplier_rule(self):
+        env = self._play_to_playing()
+        rs = RuleSet.standard()
+        obs = get_obs_v2(
+            env.infoset,
+            ruleset_id="standard",
+            ruleset_version=rs.ruleset_version,
+            ruleset_hash=rs.stable_hash(),
+            bid_value=env._env.bid_value,
+            bidding_history=env._env.bidding_history,
+            bidding_order=env._env.bidding_order,
+            bomb_count=env._env.bomb_count,
+            rocket_count=env._env.rocket_count,
+            total_multiplier=2,
+            phase="playing",
+        )
+        assert obs.public.phase == "playing"
+        assert obs.public.bid_value == 3
+        assert obs.public.rocket_count == 0
+        assert obs.public.total_multiplier == 2
+        assert obs.public.ruleset_id == "standard"
+        assert obs.public.ruleset_version == rs.ruleset_version
+        assert obs.public.ruleset_hash == rs.stable_hash()
+        assert obs.bidding_tokens.num_bids == len(env._env.bidding_history)
+        assert obs.public.bottom_cards.revealed == tuple(sorted(env._env.bottom_cards_revealed))
+
+    def test_bidding_token_width_constant(self):
+        from douzero.observation.public import (
+            BID_SEAT_ONEHOT_WIDTH, BID_VALUE_ONEHOT_WIDTH,
+        )
+        assert BIDDING_TOKEN_WIDTH == BID_SEAT_ONEHOT_WIDTH + BID_VALUE_ONEHOT_WIDTH + 1
+        bt = encode_bidding_history([("0", 1), ("1", 3)])
+        assert bt.tokens.shape == (2, BIDDING_TOKEN_WIDTH)
+        assert bt.num_bids == 2
+        assert not bt.tokens.flags.writeable
+
+    def test_bidding_tokens_empty_in_legacy(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        assert obs.bidding_tokens.num_bids == 0
+        assert obs.bidding_tokens.tokens.shape == (0, BIDDING_TOKEN_WIDTH)

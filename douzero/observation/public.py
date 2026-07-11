@@ -1,64 +1,161 @@
-"""Public observation V2 (P03).
+"""Public observation V2 (P03, hardened round 2).
 
 The public observation is the ONLY thing a deployment model may see. It is
 built entirely from public information:
 
 - the acting role and the relative-seat context,
 - the acting player's own hand,
-- public bottom cards and their played/unplayed status (with documented
-  ownership — the bottom cards always belong to the landlord),
-- bidding history and the final bid,
+- public bottom cards (revealed identity + current unplayed subset, both with
+  documented landlord ownership),
+- bidding history (as a token batch) and the final bid,
 - each role's remaining-card count,
 - each role's cumulative played cards,
 - the complete public action history,
 - the current move to beat (the last valid action),
-- public bomb / multiplier / rule state,
+- public bomb / rocket / multiplier / phase / rule-identity state,
 - the current legal actions.
+
+Deep immutability (item 5): the public container is ``frozen`` + ``slots``;
+caller-supplied lists/dicts are copied; numpy arrays are frozen
+(``write=False``); no mutable dict/list is exposed by reference; the public
+container shares no ndarray with any privileged container.
 
 It MUST NOT contain true hidden hands, ``all_handcards``, or
 ``other_hand_cards``-as-true-allocation. The unseen-card pool here is the
 *public* union of cards not in the acting hand and not publicly accounted for —
 it is swap-invariant (two hidden allocations with the same public footprint
 produce the same pool), which is the property the leakage test enforces.
-
-Public bottom-card handling (P03 spec point 6):
-
-- Farmers know the bottom cards belong to the landlord.
-- Unplayed public bottom cards are NOT part of the unknown-card pool; they are
-  accounted as landlord-owned.
-- When the landlord plays a card whose rank matches a bottom card, the entity
-  identity cannot be distinguished, so we record a consistent ownership policy:
-  bottom cards are removed from the unplayed set on a first-match basis (this
-  mirrors the legacy ``GameEnv.step`` removal order and is verifiable).
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
-from .cards import DECK, cards_to_vector
+import numpy as np
+
+from .cards import DECK
 from .seats import seats_from
 
 #: Marker stamped on every public container so a guard can accept it without
 #: introspection (the counterpart to ``privileged.PRIVILEGED_KIND``).
 PUBLIC_KIND: str = "public"
 
+#: Maximum number of bidders (three-player DouDizhu).
+MAX_BIDDERS: int = 3
+
+#: One-hot width for a bid value. The standard ruleset uses 0/1/2/3 (4 values);
+#: we reserve a little headroom without exploding the width.
+BID_VALUE_ONEHOT_WIDTH: int = 4
+
+#: One-hot width for the bidder seat index (0/1/2).
+BID_SEAT_ONEHOT_WIDTH: int = MAX_BIDDERS
+
+#: Width of one bidding token: seat one-hot + bid-value one-hot + is_pass flag.
+BIDDING_TOKEN_WIDTH: int = BID_SEAT_ONEHOT_WIDTH + BID_VALUE_ONEHOT_WIDTH + 1
+
+
+def _freeze_array(arr: np.ndarray) -> np.ndarray:
+    """Return ``arr`` as a read-only int8 numpy array (copies if needed)."""
+    out = np.asarray(arr, dtype=np.int8)
+    if out.flags.writeable:
+        out = out.copy()
+    out.setflags(write=False)
+    return out
+
+
+def _bid_value_onehot(value: int) -> np.ndarray:
+    vec = np.zeros(BID_VALUE_ONEHOT_WIDTH, dtype=np.int8)
+    if 0 <= value < BID_VALUE_ONEHOT_WIDTH:
+        vec[value] = 1
+    return vec
+
+
+def _bid_seat_onehot(seat_index: int) -> np.ndarray:
+    vec = np.zeros(BID_SEAT_ONEHOT_WIDTH, dtype=np.int8)
+    if 0 <= seat_index < BID_SEAT_ONEHOT_WIDTH:
+        vec[seat_index] = 1
+    return vec
+
+
+@dataclass(frozen=True)
+class BiddingTokenBatch:
+    """Encoded bidding history as a fixed-width token tensor.
+
+    ``tokens`` has shape ``(num_bids, BIDDING_TOKEN_WIDTH)`` int8 (read-only),
+    one row per bid in chronological order. Each row is
+    ``[seat_one_hot(3), bid_value_one_hot(4), is_pass(1)]``.
+
+    ``num_bids`` is the number of real bids (0 in legacy mode, which has no
+    bidding). There is no padding dimension because the bid count is small and
+    bounded by :data:`MAX_BIDDERS` (plus redeals); a model consumes the
+    variable length via ``num_bids``.
+
+    Deep immutability: ``tokens`` is frozen (``write=False``).
+    """
+
+    tokens: np.ndarray
+    num_bids: int
+
+    def __post_init__(self) -> None:
+        if self.tokens.shape != (self.num_bids, BIDDING_TOKEN_WIDTH):
+            raise ValueError(
+                f"bidding tokens shape {self.tokens.shape} != "
+                f"({self.num_bids}, {BIDDING_TOKEN_WIDTH})"
+            )
+        if self.tokens.flags.writeable:
+            object.__setattr__(self, "tokens", _freeze_array(self.tokens))
+
+
+def encode_bidding_history(
+    bidding_history: Sequence[tuple[str | int, int]],
+    bidding_order: Sequence[str] | None = None,
+) -> BiddingTokenBatch:
+    """Encode a bidding history into a :class:`BiddingTokenBatch`.
+
+    ``bidding_history`` is a sequence of ``(seat, bid_value)`` pairs (the
+    ``GameEnv.bidding_history`` shape). ``bidding_order`` maps a seat to its
+    index; when omitted, seats are indexed by first appearance.
+    """
+    seat_to_index: dict[str, int] = {}
+    if bidding_order is not None:
+        for i, seat in enumerate(bidding_order):
+            seat_to_index[str(seat)] = i
+    history = list(bidding_history or [])
+    rows = []
+    next_index = 0
+    for seat, value in history:
+        seat_str = str(seat)
+        if seat_str not in seat_to_index:
+            seat_to_index[seat_str] = next_index
+            next_index += 1
+        idx = seat_to_index[seat_str]
+        rows.append(np.concatenate([
+            _bid_seat_onehot(idx),
+            _bid_value_onehot(int(value)),
+            np.array([1 if int(value) == 0 else 0], dtype=np.int8),
+        ]))
+    if rows:
+        tokens = np.stack(rows, axis=0).astype(np.int8)
+    else:
+        tokens = np.zeros((0, BIDDING_TOKEN_WIDTH), dtype=np.int8)
+    return BiddingTokenBatch(tokens=tokens, num_bids=len(rows))
+
 
 @dataclass(frozen=True)
 class PublicBottomCards:
     """The three revealed bottom cards and their public ownership.
 
-    ``revealed`` is the entity-identity list of the three bottom cards (public
-    once the landlord is determined). ``unplayed`` is the subset not yet played
-    by the landlord (tracked on a first-match removal basis — see module doc).
-    ``all_played`` is True once the landlord has played all three. The bottom
-    cards always belong to the landlord; ``owner`` records that fact.
+    ``revealed`` is the ORIGINAL entity-identity list of the three bottom cards
+    (public once the landlord is determined; never mutated after reveal).
+    ``unplayed`` is the current subset NOT yet played by the landlord (tracked
+    on a first-match removal basis — see module doc). ``all_played`` is True
+    once the landlord has played all three. The bottom cards always belong to
+    the landlord; ``owner`` records that fact.
 
-    In legacy mode there is no bidding, but ``three_landlord_cards`` is still
-    public (it is the 3-card slice the landlord received). We treat it the same
-    way: revealed from the start, owned by the landlord.
+    Deep immutability: the tuples are immutable by construction; the container
+    is frozen+slots.
     """
 
     revealed: tuple[int, ...]
@@ -84,13 +181,24 @@ class PublicObservation:
     player cannot account for from its own hand and the public history; it is
     invariant under any re-allocation of hidden cards among the opponents.
 
-    Cardinality / conservation invariants (checked in tests):
+    Cardinality / conservation invariant (checked in tests):
 
-    ``my_handcards ∪ other_handcards ∪ all_played ∪ bottom_unplayed == DECK``
+    ``my_handcards ∪ other_handcards ∪ all_played == DECK``
 
-    where ``all_played`` is the union of the three roles' cumulative played
-    cards and ``bottom_unplayed`` are the bottom cards not yet played by the
-    landlord.
+    (the bottom cards are inside the landlord's hand for the landlord, or
+    inside the opponent pool for a farmer, so they are not added separately).
+
+    Deep immutability (item 5): frozen + slots. Caller-supplied lists/dicts are
+    copied at construction (see :func:`build_public_observation`). The encoded
+    tensor batches (``bidding_tokens``) hold frozen numpy arrays. No mutable
+    dict/list field is exposed by reference.
+
+    Model-consumable public input (item 3): in addition to the legacy
+    hand/played/last-move features, this carries the public bottom-card
+    identity (revealed + unplayed), the final bid, the bidding history (as a
+    token batch), the game phase, the rocket count, the total multiplier, and
+    the rule identity — everything a V2 model needs without reaching into
+    ``obs.public`` ad-hoc (item 3 forbids P05 from bypassing the schema).
     """
 
     # Identity
@@ -101,8 +209,9 @@ class PublicObservation:
     # Phase / ruleset public state
     phase: str = "playing"
     ruleset_id: str = "legacy"
+    ruleset_version: str = "legacy-v1"
+    ruleset_hash: str = ""
     bid_value: int = 0
-    bidding_history: tuple[tuple[str, int], ...] = ()
     bomb_count: int = 0
     rocket_count: int = 0
     total_multiplier: int = 1
@@ -118,6 +227,13 @@ class PublicObservation:
     )
     num_cards_left: dict[str, int] = field(default_factory=dict)
 
+    # Bidding history (encoded token batch; empty in legacy mode).
+    bidding_history: tuple[tuple[str, int], ...] = ()
+    bidding_tokens: BiddingTokenBatch = field(
+        default_factory=lambda: BiddingTokenBatch(
+            tokens=np.zeros((0, BIDDING_TOKEN_WIDTH), dtype=np.int8), num_bids=0)
+    )
+
     # Legal actions (the candidate moves; public)
     legal_actions: tuple[tuple[int, ...], ...] = ()
 
@@ -129,8 +245,9 @@ class PublicObservation:
         """Return a JSON-serialisable dict (no numpy arrays).
 
         Used for serialisation-stability tests and for stamping a compact
-        representation into logs. Card vectors are NOT included here; they live
-        only in the encoded tensors produced by the encoder.
+        representation into logs. Deliberately omits the encoded tensor batches
+        (cards vectors, bidding tokens) — those live only in the encoded
+        tensors. No hidden-hand field is ever present (item 8).
         """
         return {
             "kind": self.kind,
@@ -138,8 +255,9 @@ class PublicObservation:
             "seat_context": dict(self.seat_context),
             "phase": self.phase,
             "ruleset_id": self.ruleset_id,
+            "ruleset_version": self.ruleset_version,
+            "ruleset_hash": self.ruleset_hash,
             "bid_value": self.bid_value,
-            "bidding_history": [list(b) for b in self.bidding_history],
             "bomb_count": self.bomb_count,
             "rocket_count": self.rocket_count,
             "total_multiplier": self.total_multiplier,
@@ -150,12 +268,13 @@ class PublicObservation:
             "last_move_dict": {k: list(v) for k, v in self.last_move_dict.items()},
             "bottom_cards": self.bottom_cards.to_dict(),
             "num_cards_left": dict(self.num_cards_left),
+            "bidding_history": [list(b) for b in self.bidding_history],
             "legal_actions": [list(a) for a in self.legal_actions],
         }
 
 
 def _safe_tuple(value: Any) -> tuple[int, ...]:
-    """Coerce a list of ints (or None) into a sorted-int tuple."""
+    """Coerce a list of ints (or None) into a sorted-int tuple (a copy)."""
     if value is None:
         return ()
     return tuple(sorted(int(c) for c in value))
@@ -170,60 +289,91 @@ def build_public_observation(
     last_move,
     last_move_dict: dict[str, list[int]],
     three_landlord_cards,
+    three_landlord_cards_revealed=None,
     num_cards_left: dict[str, int],
     legal_actions,
     phase: str = "playing",
     ruleset_id: str = "legacy",
+    ruleset_version: str = "legacy-v1",
+    ruleset_hash: str = "",
     bid_value: int = 0,
     bidding_history=None,
+    bidding_order=None,
     bomb_count: int = 0,
     rocket_count: int = 0,
     total_multiplier: int = 1,
 ) -> PublicObservation:
     """Assemble a :class:`PublicObservation` from raw game state.
 
-    This is a thin, validation-light constructor used by the encoder. It
-    coerces lists to sorted tuples and builds the seat context from the acting
-    role. The unseen-card pool (``other_handcards``) must already be the public
-    swap-invariant union (the encoder computes it from the infoset).
+    Copies every caller-supplied list/dict so the returned container is deep
+    -immutable and mutation of the source cannot affect it (item 5).
+
+    Public bottom-card semantics (item 4):
+
+    - ``revealed`` = the ORIGINAL three bottom cards
+      (``three_landlord_cards_revealed``, or ``three_landlord_cards`` when the
+      original is unavailable — backward compatible). Never mutated after
+      reveal.
+    - ``unplayed`` = the current subset not yet played by the landlord
+      (``three_landlord_cards``, which GameEnv.step reduces as the landlord
+      plays them).
     """
     seat_context = seats_from(acting_role)
 
-    played_tuples = {role: _safe_tuple(cards) for role, cards in played_cards.items()}
-    bottom_revealed = tuple(sorted(int(c) for c in (three_landlord_cards or ())))
-    # The unplayed bottom cards are those not yet consumed by the landlord's
-    # plays. The caller passes the *current* three_landlord_cards (already
-    # reduced by GameEnv.step as the landlord plays them), so the unplayed set
-    # is exactly its current contents. all_played is True when it is empty.
-    bottom_unplayed = tuple(sorted(int(c) for c in (three_landlord_cards or ())))
+    # Bottom-card identity: prefer the explicit "revealed" original; fall back
+    # to the current three_landlord_cards for backward compatibility.
+    revealed_src = three_landlord_cards_revealed
+    if revealed_src is None:
+        revealed_src = three_landlord_cards
+    revealed = tuple(sorted(int(c) for c in (revealed_src or ())))
+    unplayed = tuple(sorted(int(c) for c in (three_landlord_cards or ())))
     bottom = PublicBottomCards(
-        revealed=bottom_revealed,
-        unplayed=bottom_unplayed,
-        all_played=(len(bottom_unplayed) == 0),
+        revealed=revealed,
+        unplayed=unplayed,
+        all_played=(len(unplayed) == 0),
         owner="landlord",
     )
 
-    legal_tuples = tuple(tuple(sorted(int(c) for c in a)) for a in legal_actions)
+    # Encode the bidding history into an immutable token batch.
+    bidding_tokens = encode_bidding_history(bidding_history or (), bidding_order)
+
+    # Deep-copy all caller-supplied mutable inputs.
+    played_tuples = {
+        role: _safe_tuple(cards)
+        for role, cards in (played_cards or {}).items()
+    }
+    legal_tuples = tuple(
+        tuple(sorted(int(c) for c in a)) for a in (legal_actions or [])
+    )
+    last_move_t = _safe_tuple(last_move)
+    last_move_d = {
+        k: _safe_tuple(v) for k, v in (last_move_dict or {}).items()
+    }
+    num_left = {k: int(v) for k, v in (num_cards_left or {}).items()}
+    bidding_hist_t = tuple(
+        (str(pos), int(val)) for pos, val in (bidding_history or ())
+    )
 
     return PublicObservation(
         acting_role=acting_role,
         seat_context=seat_context,
         phase=phase,
         ruleset_id=ruleset_id,
+        ruleset_version=ruleset_version,
+        ruleset_hash=ruleset_hash,
         bid_value=int(bid_value),
-        bidding_history=tuple(
-            (str(pos), int(val)) for pos, val in (bidding_history or ())
-        ),
         bomb_count=int(bomb_count),
         rocket_count=int(rocket_count),
         total_multiplier=int(total_multiplier),
         my_handcards=_safe_tuple(my_handcards),
         other_handcards=_safe_tuple(other_handcards),
         played_cards=played_tuples,
-        last_move=_safe_tuple(last_move),
-        last_move_dict={k: _safe_tuple(v) for k, v in last_move_dict.items()},
+        last_move=last_move_t,
+        last_move_dict=last_move_d,
         bottom_cards=bottom,
-        num_cards_left={k: int(v) for k, v in num_cards_left.items()},
+        num_cards_left=num_left,
+        bidding_history=bidding_hist_t,
+        bidding_tokens=bidding_tokens,
         legal_actions=legal_tuples,
     )
 
@@ -244,23 +394,14 @@ def compute_unseen_pool(
       holdings, which the farmer cannot distinguish from the landlord's hidden
       cards at the feature level).
 
-    The bottom cards are NOT subtracted here because they are already accounted
-    for in the acting player's hand (the landlord's 20 includes the bottom) or
-    in the opponent pool (for a farmer). This keeps the pool swap-invariant and
-    byte-identical to the legacy ``other_hand_cards``.
-
     ``bottom_unplayed`` is accepted (for call-site compatibility) but ignored;
     use :func:`compute_belief_unknown_pool` for the belief-model pool that
     excludes public bottom cards.
-
-    This is purely public: it depends only on the acting hand and the cumulative
-    played cards. Two hidden allocations with the same public footprint yield
-    the same pool — the swap-invariance the leakage test checks.
     """
     del bottom_unplayed  # accepted for compatibility; see docstring
     full = Counter(DECK)
     full.subtract(Counter(int(c) for c in (my_handcards or [])))
-    for cards in played_cards.values():
+    for cards in (played_cards or {}).values():
         full.subtract(Counter(int(c) for c in (cards or [])))
     pool: list[int] = []
     for card, count in full.items():
@@ -287,18 +428,13 @@ def compute_belief_unknown_pool(
     farmer, because the farmer knows the 3 unplayed public bottom cards belong
     to the landlord and therefore they are not "unknown".
 
-    P03 spec point 6: "unplayed public bottom cards must not enter the
-    unknown-card pool".
-
     For the landlord, the bottom cards are already part of its own hand, so the
-    belief pool equals the parity pool (the bottom is not double-counted).
+    belief pool equals the parity pool.
     """
     parity = compute_unseen_pool(my_handcards, played_cards)
     from .seats import is_landlord
     if is_landlord(acting_role):
-        # The bottom cards are in the landlord's own hand; nothing to exclude.
         return parity
-    # Farmer: remove the public bottom cards from the unknown pool.
     pool_counter = Counter(parity)
     pool_counter.subtract(Counter(int(c) for c in (bottom_unplayed or [])))
     out: list[int] = []

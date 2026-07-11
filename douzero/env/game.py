@@ -93,6 +93,9 @@ class GameEnv(object):
         self.info_sets['landlord_down'].player_hand_cards = \
             card_play_data['landlord_down']
         self.three_landlord_cards = card_play_data['three_landlord_cards']
+        # P03: record the original revealed bottom cards (legacy mode reveals
+        # them immediately; standard mode sets this in _reveal_bottom_cards).
+        self.three_landlord_cards_initial = list(self.three_landlord_cards)
         self.get_acting_player_position()
         self.game_infoset = self.get_infoset()
 
@@ -403,6 +406,16 @@ class GameEnv(object):
             self.acting_player_position].all_handcards = \
             {pos: self.info_sets[pos].player_hand_cards
              for pos in ['landlord', 'landlord_up', 'landlord_down']}
+
+        # P03: expose the public bottom-card identity explicitly.
+        # ``three_landlord_cards_revealed`` is the ORIGINAL three bottom cards
+        # (never mutated once revealed); ``three_landlord_cards`` above is the
+        # current UNPLAYED subset (reduced by GameEnv.step as the landlord plays
+        # them). Both are public. See InfoSet docstring.
+        self.info_sets[
+            self.acting_player_position].three_landlord_cards_revealed = \
+            list(self.three_landlord_cards_initial) \
+            if self.three_landlord_cards_initial is not None else []
 
         return deepcopy(self.info_sets[self.acting_player_position])
 
@@ -717,13 +730,13 @@ class InfoSet(object):
         self.player_position = player_position
         # The hand cands of the current player. A list.
         self.player_hand_cards = None
-        # The number of cards left for each player. It is a dict with str-->int 
+        # The number of cards left for each player. It is a dict with str-->int
         self.num_cards_left_dict = None
         # The three landload cards. A list.
         self.three_landlord_cards = None
         # The historical moves. It is a list of list
         self.card_play_action_seq = None
-        # The union of the hand cards of the other two players for the current player 
+        # The union of the hand cards of the other two players for the current player
         self.other_hand_cards = None
         # The legal actions for the current move. It is a list of list
         self.legal_actions = None
@@ -735,9 +748,12 @@ class InfoSet(object):
         self.last_move_dict = None
         # The played cands so far. It is a list.
         self.played_cards = None
-        # The hand cards of all the players. It is a dict. 
+        # The hand cards of all the players. It is a dict.
         self.all_handcards = None
         # Last player position that plays a valid move, i.e., not `pass`
         self.last_pid = None
         # The number of bombs played so far
         self.bomb_num = None
+        # P03: the ORIGINAL three public bottom cards (never mutated after
+        # reveal). ``three_landlord_cards`` is the current UNPLAYED subset.
+        self.three_landlord_cards_revealed = None

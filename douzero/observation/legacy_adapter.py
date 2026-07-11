@@ -2,15 +2,15 @@
 
 The legacy encoder (``douzero.env.env.get_obs``) produces role-specific
 ``x_batch`` / ``z_batch`` / ``x_no_action`` / ``z`` tensors with per-role field
-orderings and widths (landlord 319/373, farmers 430/484). P03 requires a
-"legacy adapter [that] can reconstruct the original x_batch/z_batch from V2
-or continue to use the old implementation".
+orderings and widths (landlord 319/373, farmers 430/484). P03 requires a legacy
+adapter that reconstructs these from an :class:`ObservationV2` ALONE — no extra
+infoset/history arguments (item 7) — so a legacy model can consume a V2
+observation without any model-side change.
 
-This adapter rebuilds the legacy tensors from a :class:`PublicObservation`
-(or an :class:`ObservationV2`) so a legacy model can consume a V2 observation
-without any code change on the model side. It is a bridge for evaluation and
-transition; it does NOT change legacy behaviour when the legacy encoder is
-called directly.
+Item 7 compliance: :func:`legacy_observation_from_v2` takes only the V2
+observation. The raw public action sequence it needs to rebuild ``z`` is stored
+on :attr:`ObservationV2.card_play_action_seq` (an immutable tuple of tuples),
+so nothing beyond the V2 container is required.
 
 Field-order references (must match ``douzero/env/env.py`` exactly):
 
@@ -28,8 +28,6 @@ Field-order references (must match ``douzero/env/env.py`` exactly):
 
 from __future__ import annotations
 
-from collections import Counter
-
 import numpy as np
 
 from douzero.env.env import (
@@ -41,7 +39,6 @@ from douzero.env.env import (
 )
 
 from .encode_v2 import ObservationV2
-from .public import PublicObservation
 
 #: Legacy landlord x_no_action width (see module docstring).
 LANDLORD_X_NO_ACTION_WIDTH: int = 319
@@ -58,7 +55,7 @@ def _cards_left_onehot_legacy(count: int, max_cards: int) -> np.ndarray:
     return _get_one_hot_array(count, max_cards)
 
 
-def _build_landlord_x_no_action(public: PublicObservation) -> np.ndarray:
+def _build_landlord_x_no_action(public) -> np.ndarray:
     """Reconstruct the landlord ``x_no_action`` vector from public state."""
     my = _cards2array(list(public.my_handcards))
     other = _cards2array(list(public.other_handcards))
@@ -74,13 +71,8 @@ def _build_landlord_x_no_action(public: PublicObservation) -> np.ndarray:
                       up_left, down_left, bomb)).astype(np.int8)
 
 
-def _build_farmer_x_no_action(public: PublicObservation) -> np.ndarray:
-    """Reconstruct a farmer ``x_no_action`` vector from public state.
-
-    ``landlord_up`` and ``landlord_down`` share the same layout; the teammate
-    differs (down's teammate is up, and vice versa), which is resolved from the
-    acting role.
-    """
+def _build_farmer_x_no_action(public) -> np.ndarray:
+    """Reconstruct a farmer ``x_no_action`` vector from public state."""
     my = _cards2array(list(public.my_handcards))
     other = _cards2array(list(public.other_handcards))
     landlord_played = _cards2array(list(public.played_cards.get("landlord", ())))
@@ -110,37 +102,18 @@ def _build_farmer_x_no_action(public: PublicObservation) -> np.ndarray:
                       teammate_left, bomb)).astype(np.int8)
 
 
-def _build_z(public: PublicObservation) -> np.ndarray:
-    """Reconstruct the legacy ``z`` (5, 162) history matrix.
+def legacy_observation_from_v2(obs: ObservationV2) -> dict:
+    """Build the legacy obs dict (x_batch/z_batch/x_no_action/z) from V2 ONLY.
 
-    The legacy encoder builds ``z`` from ``infoset.card_play_action_seq``. The
-    public observation does not store the raw sequence, so the adapter requires
-    the full :class:`ObservationV2` (which carries the originating infoset's
-    action sequence indirectly via its history tokens). For parity we accept
-    the raw action sequence when available.
-    """
-    raise NotImplementedError(
-        "z reconstruction requires the raw action sequence; use "
-        "legacy_observation_from_infoset() for parity, or pass the sequence "
-        "via legacy_observation_from_v2(..., card_play_action_seq=...)."
-    )
-
-
-def legacy_observation_from_v2(
-    obs: ObservationV2,
-    *,
-    card_play_action_seq: list[list[int]] | None = None,
-) -> dict:
-    """Build the legacy obs dict (x_batch/z_batch/x_no_action/z) from V2.
-
-    The legacy ``z`` needs the raw ordered action sequence, which is not stored
-    on :class:`PublicObservation`. Pass it via ``card_play_action_seq``; when
-    omitted, ``z``/``z_batch`` are zero matrices and only ``x_batch``/
-    ``x_no_action`` are populated (sufficient for state-only parity checks).
+    Item 7: this function takes ONLY the :class:`ObservationV2` — no extra
+    infoset or action-sequence argument. The raw public action sequence needed
+    to rebuild ``z`` is read from :attr:`obs.card_play_action_seq` (stored on
+    the V2 container at encode time).
 
     The returned dict matches the legacy ``get_obs`` contract exactly: keys
     ``position``, ``x_batch`` (float32), ``z_batch`` (float32),
-    ``legal_actions``, ``x_no_action`` (int8), ``z`` (int8).
+    ``legal_actions``, ``x_no_action`` (int8), ``z`` (int8). The legal-action
+    order and dtypes are preserved so a legacy model consumes it unchanged.
     """
     public = obs.public
     n = len(public.legal_actions)
@@ -152,7 +125,7 @@ def legacy_observation_from_v2(
 
     # Tile the state features across N action rows and append the per-action
     # card vector (matching the legacy encoder's trailing my_action block).
-    my_action_block = np.zeros((n, 54), dtype=np.int8) if n > 0 else np.zeros((0, 54), dtype=np.int8)
+    my_action_block = np.zeros((max(n, 0), 54), dtype=np.int8)
     for j, action in enumerate(public.legal_actions):
         my_action_block[j, :] = _cards2array(list(action))
     if n > 0:
@@ -163,15 +136,15 @@ def legacy_observation_from_v2(
     else:
         x_batch = np.zeros((0, x_no_action.shape[0] + 54), dtype=np.float32)
 
-    # z reconstruction (optional).
-    if card_play_action_seq is not None:
-        z = _action_seq_list2array(_process_action_seq(card_play_action_seq))
-        z_batch = np.repeat(z[np.newaxis, :, :], n, axis=0).astype(np.float32) if n > 0 \
-            else np.zeros((0, 5, 162), dtype=np.float32)
-        z_int = z.astype(np.int8)
-    else:
-        z_int = np.zeros((5, 162), dtype=np.int8)
-        z_batch = np.zeros((max(n, 0), 5, 162), dtype=np.float32)
+    # z reconstruction from the V2-stored raw action sequence (item 7).
+    action_seq = [list(a) for a in obs.card_play_action_seq]
+    z = _action_seq_list2array(_process_action_seq(action_seq))
+    z_batch = (
+        np.repeat(z[np.newaxis, :, :], n, axis=0).astype(np.float32)
+        if n > 0
+        else np.zeros((0, 5, 162), dtype=np.float32)
+    )
+    z_int = z.astype(np.int8)
 
     return {
         "position": public.acting_role,
