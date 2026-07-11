@@ -1,6 +1,15 @@
 from copy import deepcopy
 from . import move_detector as md, move_selector as ms
 from .move_generator import MovesGener
+from .rules import (
+    PHASE_BIDDING,
+    PHASE_DEAL,
+    PHASE_PLAYING,
+    PHASE_REVEAL_BOTTOM,
+    PHASE_TERMINAL,
+    PLAYER_POSITIONS,
+    RuleSet,
+)
 
 EnvCard2RealCard = {3: '3', 4: '4', 5: '5', 6: '6', 7: '7',
                     8: '8', 9: '9', 10: '10', 11: 'J', 12: 'Q',
@@ -17,7 +26,7 @@ bombs = [[3, 3, 3, 3], [4, 4, 4, 4], [5, 5, 5, 5], [6, 6, 6, 6],
 
 class GameEnv(object):
 
-    def __init__(self, players):
+    def __init__(self, players, ruleset=None):
 
         self.card_play_action_seq = []
 
@@ -52,6 +61,24 @@ class GameEnv(object):
 
         self.bomb_num = 0
         self.last_pid = 'landlord'
+
+        # --- P02 standard-mode fields (unused in legacy; ruleset=None) --- #
+        self.ruleset = ruleset
+        self.phase = PHASE_DEAL if ruleset is not None else None
+        # Per-position count of non-pass actions (for spring detection).
+        self.action_counts = {'landlord': 0, 'landlord_up': 0, 'landlord_down': 0}
+        # Separate bomb / rocket counts (legacy bomb_num conflates both).
+        self.bomb_count = 0
+        self.rocket_count = 0
+        # Bidding state.
+        self.bidding_history = []          # [(position, bid_value), ...]
+        self.bidding_order = []            # ordered list of positions
+        self._bidding_index = 0            # next bidder index
+        self.landlord_position = None      # determined after bidding
+        self.bid_value = 0
+        self.bottom_cards_revealed = []    # the 3 bottom cards (entity identity)
+        self.three_landlord_cards_initial = None  # copy before landlord plays
+        self.game_result = None            # GameResult (set at terminal)
 
     def card_play_init(self, card_play_data):
         self.info_sets['landlord'].player_hand_cards = \
@@ -107,9 +134,18 @@ class GameEnv(object):
 
         if len(action) > 0:
             self.last_pid = self.acting_player_position
+            # P02: track per-position valid (non-pass) action count for
+            # spring detection. This does not affect legacy behaviour.
+            self.action_counts[self.acting_player_position] += 1
 
         if action in bombs:
             self.bomb_num += 1
+            # P02: separate bomb vs rocket counts for standard scoring.
+            # Legacy bomb_num conflates both; this is additive only.
+            if action == [20, 30]:
+                self.rocket_count += 1
+            else:
+                self.bomb_count += 1
 
         self.last_move_dict[
             self.acting_player_position] = action.copy()
@@ -119,7 +155,11 @@ class GameEnv(object):
 
         self.played_cards[self.acting_player_position] += action
 
-        if self.acting_player_position == 'landlord' and \
+        # Track which bottom cards have been played by the landlord. In legacy
+        # mode the landlord is always position 'landlord'; in standard mode
+        # the landlord is self.landlord_position (set after bidding).
+        landlord_pos = self.landlord_position if self.ruleset is not None else 'landlord'
+        if self.acting_player_position == landlord_pos and \
                 len(action) > 0 and \
                 len(self.three_landlord_cards) > 0:
             for card in action:
@@ -129,7 +169,12 @@ class GameEnv(object):
                 else:
                     break
 
-        self.game_done()
+        # P02: standard mode uses its own terminal check (produces GameResult);
+        # legacy mode (ruleset=None) uses the original game_done() unchanged.
+        if self.ruleset is not None:
+            self.game_done_standard()
+        else:
+            self.game_done()
         if not self.game_over:
             self.get_acting_player_position()
             self.game_infoset = self.get_infoset()
@@ -289,6 +334,20 @@ class GameEnv(object):
         self.bomb_num = 0
         self.last_pid = 'landlord'
 
+        # P02 standard-mode fields reset.
+        self.phase = PHASE_DEAL if self.ruleset is not None else None
+        self.action_counts = {'landlord': 0, 'landlord_up': 0, 'landlord_down': 0}
+        self.bomb_count = 0
+        self.rocket_count = 0
+        self.bidding_history = []
+        self.bidding_order = []
+        self._bidding_index = 0
+        self.landlord_position = None
+        self.bid_value = 0
+        self.bottom_cards_revealed = []
+        self.three_landlord_cards_initial = None
+        self.game_result = None
+
     def get_infoset(self):
         self.info_sets[
             self.acting_player_position].last_pid = self.last_pid
@@ -333,6 +392,189 @@ class GameEnv(object):
              for pos in ['landlord', 'landlord_up', 'landlord_down']}
 
         return deepcopy(self.info_sets[self.acting_player_position])
+
+    # ------------------------------------------------------------------ #
+    # P02 standard-mode methods (only called when ruleset is not None).
+    # Legacy path (ruleset=None) never touches these.
+    # ------------------------------------------------------------------ #
+    def card_play_init_standard(self, card_play_data, bidding_order=None):
+        """Initialise for standard mode: deal 17+17+17 + 3 bottom cards.
+
+        Unlike ``card_play_init``, the 3 bottom cards are NOT added to any
+        player's hand yet; they are revealed after the landlord is determined
+        by bidding. ``bidding_order`` defaults to the canonical turn order.
+        """
+        if bidding_order is None:
+            bidding_order = list(PLAYER_POSITIONS)
+        self.bidding_order = list(bidding_order)
+        self._bidding_index = 0
+
+        # Each player gets 17 cards (no bottom cards added to landlord yet).
+        self.info_sets['landlord'].player_hand_cards = \
+            sorted(card_play_data['landlord'])
+        self.info_sets['landlord_up'].player_hand_cards = \
+            sorted(card_play_data['landlord_up'])
+        self.info_sets['landlord_down'].player_hand_cards = \
+            sorted(card_play_data['landlord_down'])
+
+        # Bottom cards are stored but not revealed yet.
+        self.three_landlord_cards = sorted(card_play_data['three_landlord_cards'])
+        self.three_landlord_cards_initial = list(self.three_landlord_cards)
+        self.bottom_cards_revealed = []
+
+        # The first bidder acts first.
+        self.acting_player_position = self.bidding_order[0]
+        self.phase = PHASE_BIDDING
+
+    def step_bidding(self, bid_value):
+        """Process one bid in the BIDDING phase.
+
+        Returns ``True`` if the game should redeal (all pass +
+        ``all_pass_redeal``), ``False`` otherwise. After the last bid, if not
+        a redeal, the landlord is determined, bottom cards are revealed, and
+        the phase transitions to PLAYING.
+        """
+        if self.phase != PHASE_BIDDING:
+            raise IllegalPhaseError(
+                f"step_bidding called in phase {self.phase!r}; "
+                f"expected {PHASE_BIDDING!r}"
+            )
+        if bid_value not in self.ruleset.bid_values:
+            raise IllegalActionError(
+                f"Bid {bid_value!r} is not in allowed bid_values "
+                f"{self.ruleset.bid_values}"
+            )
+
+        pos = self.acting_player_position
+        self.bidding_history.append((pos, bid_value))
+        self._bidding_index += 1
+
+        # Check if bidding is complete (all positions have bid).
+        if self._bidding_index >= len(self.bidding_order):
+            return self._resolve_bidding()
+
+        # Advance to the next bidder.
+        self.acting_player_position = self.bidding_order[self._bidding_index]
+        return False
+
+    def _resolve_bidding(self):
+        """Determine the landlord after all bids are in.
+
+        Returns ``True`` if a redeal is required (all pass). Otherwise sets
+        ``landlord_position``, ``bid_value``, reveals bottom cards, and
+        transitions to PLAYING.
+        """
+        bids = [(pos, val) for pos, val in self.bidding_history]
+        max_bid = max(val for _, val in bids)
+
+        if max_bid == 0:
+            # All pass.
+            if self.ruleset.all_pass_redeal:
+                return True
+            # No redeal: assign landlord to the first bidder by default.
+            self.landlord_position = self.bidding_order[0]
+            self.bid_value = 1  # minimum
+        else:
+            # Highest bidder wins; ties broken by bidding order (first wins).
+            for pos, val in bids:
+                if val == max_bid:
+                    self.landlord_position = pos
+                    self.bid_value = val
+                    break
+
+        self._reveal_bottom_cards()
+        return False
+
+    def _reveal_bottom_cards(self):
+        """Add the 3 bottom cards to the landlord's hand and transition to PLAYING."""
+        self.phase = PHASE_REVEAL_BOTTOM
+        bottom = list(self.three_landlord_cards)
+        self.bottom_cards_revealed = list(bottom)
+        landlord_hand = self.info_sets[self.landlord_position].player_hand_cards
+        landlord_hand.extend(bottom)
+        landlord_hand.sort()
+        self.three_landlord_cards = list(bottom)  # keep for tracking
+
+        # The landlord acts first in the playing phase.
+        self.acting_player_position = self.landlord_position
+        self.last_pid = self.landlord_position
+        self.phase = PHASE_PLAYING
+        self.game_infoset = self.get_infoset()
+
+    def game_done_standard(self):
+        """Terminal check for standard mode: produces a GameResult."""
+        from douzero.env.scoring import compute_game_result
+
+        # Determine the winner (first to empty hand).
+        winner_position = None
+        for pos in ['landlord', 'landlord_up', 'landlord_down']:
+            if len(self.info_sets[pos].player_hand_cards) == 0:
+                winner_position = pos
+                break
+        if winner_position is None:
+            return  # not terminal
+
+        result = compute_game_result(
+            played_cards=self.played_cards,
+            action_counts=dict(self.action_counts),
+            winner_position=winner_position,
+            bomb_count=self.bomb_count,
+            rocket_count=self.rocket_count,
+            bid_value=self.bid_value,
+            ruleset=self.ruleset,
+        )
+        self.game_result = result
+
+        # Backward-compatible utility dict (legacy interface).
+        if result.winner_team == 'landlord':
+            self.player_utility_dict = {'landlord': 1, 'farmer': -1}
+        else:
+            self.player_utility_dict = {'landlord': -1, 'farmer': 1}
+        self.winner = winner_position
+        self.game_over = True
+        self.phase = PHASE_TERMINAL
+
+        # Update num_wins / num_scores (legacy interface, for simulation.py).
+        if result.winner_team == 'landlord':
+            self.num_wins['landlord'] += 1
+        else:
+            self.num_wins['farmer'] += 1
+        self.num_scores['landlord'] += result.landlord_score
+        self.num_scores['farmer'] += result.farmer_score
+
+    def get_bidding_obs(self):
+        """Return the bidding-phase observation for the current bidder.
+
+        Contains only public bidding history and the bidder's own hand.
+        No other player's hand or the bottom cards are included.
+        """
+        if self.phase != PHASE_BIDDING:
+            raise IllegalPhaseError(
+                f"get_bidding_obs called in phase {self.phase!r}; "
+                f"expected {PHASE_BIDDING!r}"
+            )
+        pos = self.acting_player_position
+        return {
+            'phase': 'bidding',
+            'position': pos,
+            'my_handcards': sorted(self.info_sets[pos].player_hand_cards),
+            'bidding_history': list(self.bidding_history),
+            'bidding_order': list(self.bidding_order),
+            'bid_values': list(self.ruleset.bid_values),
+            'num_cards_left': {
+                p: len(self.info_sets[p].player_hand_cards)
+                for p in ['landlord', 'landlord_up', 'landlord_down']
+            },
+        }
+
+
+class IllegalPhaseError(Exception):
+    """Raised when an action is attempted in the wrong game phase."""
+
+
+class IllegalActionError(Exception):
+    """Raised when an illegal bid or action is submitted."""
+
 
 class InfoSet(object):
     """

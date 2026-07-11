@@ -1,7 +1,13 @@
 from collections import Counter
 import numpy as np
 
-from douzero.env.game import GameEnv
+from douzero.env.game import GameEnv, IllegalActionError, IllegalPhaseError
+from douzero.env.rules import (
+    PHASE_BIDDING,
+    PHASE_PLAYING,
+    PHASE_TERMINAL,
+    RuleSet,
+)
 
 Card2Column = {3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7,
                11: 8, 12: 9, 13: 10, 14: 11, 17: 12}
@@ -22,7 +28,7 @@ class Env:
     """
     Doudizhu multi-agent wrapper
     """
-    def __init__(self, objective):
+    def __init__(self, objective, ruleset=None):
         """
         Objective is wp/adp/logadp. It indicates whether considers
         bomb in reward calculation. Here, we use dummy agents.
@@ -33,8 +39,14 @@ class Env:
         to play. For each move, we tell the corresponding
         dummy player which action to play, then the player
         will perform the actual action in the game engine.
+
+        ``ruleset`` is ``None`` (legacy, default) or a :class:`RuleSet`
+        instance. When a standard ruleset is passed, ``reset`` enters the
+        bidding phase and ``step`` dispatches by phase. Legacy behaviour is
+        unchanged when ``ruleset`` is ``None``.
         """
         self.objective = objective
+        self.ruleset = ruleset
 
         # Initialize players
         # We use three dummy player for the target position
@@ -43,9 +55,13 @@ class Env:
             self.players[position] = DummyAgent(position)
 
         # Initialize the internal environment
-        self._env = GameEnv(self.players)
+        self._env = GameEnv(self.players, ruleset=ruleset)
 
         self.infoset = None
+        # Standard-mode: the current bidding observation (None in legacy).
+        self.bidding_obs = None
+        # Standard-mode: redeal flag (set when all bidders pass).
+        self.need_redeal = False
 
     def reset(self):
         """
@@ -54,10 +70,27 @@ class Env:
         This function is usually called when a game is over.
         """
         self._env.reset()
+        self.need_redeal = False
 
         # Randomly shuffle the deck
         _deck = deck.copy()
         np.random.shuffle(_deck)
+
+        if self.ruleset is not None:
+            # Standard mode: deal 17+17+17 + 3 bottom cards, enter bidding.
+            card_play_data = {'landlord': _deck[:17],
+                              'landlord_up': _deck[17:34],
+                              'landlord_down': _deck[34:51],
+                              'three_landlord_cards': _deck[51:54],
+                              }
+            for key in card_play_data:
+                card_play_data[key].sort()
+            self._env.card_play_init_standard(card_play_data)
+            self.bidding_obs = self._env.get_bidding_obs()
+            self.infoset = None
+            return self.bidding_obs
+
+        # Legacy mode (unchanged).
         card_play_data = {'landlord': _deck[:20],
                           'landlord_up': _deck[20:37],
                           'landlord_down': _deck[37:54],
@@ -72,34 +105,82 @@ class Env:
 
         return get_obs(self.infoset)
 
-    def step(self, action):
+    def step(self, action, bid_value=None):
         """
         Step function takes as input the action, which
         is a list of integers, and output the next obervation,
         reward, and a Boolean variable indicating whether the
         current game is finished. It also returns an empty
         dictionary that is reserved to pass useful information.
+
+        In standard bidding mode, ``bid_value`` (an int in
+        ``ruleset.bid_values``) is used instead of ``action``; ``action``
+        may be ``None`` during the bidding phase.
         """
+        # Standard bidding phase: dispatch to step_bidding.
+        if self.ruleset is not None and self._env.phase == PHASE_BIDDING:
+            return self._step_bidding(bid_value)
+
+        # Playing phase (both legacy and standard).
         assert action in self.infoset.legal_actions
         self.players[self._acting_player_position].set_action(action)
         self._env.step()
         self.infoset = self._game_infoset
         done = False
         reward = 0.0
+        info = {}
         if self._game_over:
             done = True
             reward = self._get_reward()
             obs = None
+            # Standard mode: return structured terminal info.
+            if self.ruleset is not None and self._env.game_result is not None:
+                info = self._env.game_result.to_dict()
         else:
             obs = get_obs(self.infoset)
-        return obs, reward, done, {}
+        return obs, reward, done, info
+
+    def _step_bidding(self, bid_value):
+        """Process a bid in the BIDDING phase.
+
+        Returns ``(obs, reward, done, info)``. If all bidders pass and
+        ``all_pass_redeal`` is set, ``done=True`` with ``info={'redeal': True}``
+        and the caller should ``reset()`` for a new deal.
+        """
+        if bid_value is None:
+            raise IllegalActionError(
+                "bid_value must be provided during the bidding phase"
+            )
+        redeal = self._env.step_bidding(bid_value)
+        if redeal:
+            self.need_redeal = True
+            return None, 0.0, True, {'redeal': True}
+
+        if self._env.phase == PHASE_BIDDING:
+            # More bids to go.
+            self.bidding_obs = self._env.get_bidding_obs()
+            return self.bidding_obs, 0.0, False, {}
+
+        # Bidding complete; transitioned to PLAYING.
+        self.bidding_obs = None
+        self.infoset = self._game_infoset
+        return get_obs(self.infoset), 0.0, False, {'bidding_complete': True}
 
     def _get_reward(self):
         """
         This function is called in the end of each
         game. It returns either 1/-1 for win/loss,
         or ADP, i.e., every bomb will double the score.
+
+        In standard mode, the reward is derived from the GameResult's
+        landlord_score (from the landlord's perspective). The actor loop
+        negates this for farmer positions, unchanged.
         """
+        # Standard mode: use the structured GameResult.
+        if self.ruleset is not None and self._env.game_result is not None:
+            return float(self._env.game_result.landlord_score)
+
+        # Legacy mode (unchanged).
         winner = self._game_winner
         bomb_num = self._game_bomb_num
         if winner == 'landlord':
