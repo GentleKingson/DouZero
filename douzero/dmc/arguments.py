@@ -71,8 +71,10 @@ parser.add_argument('--deterministic', action=argparse.BooleanOptionalAction,
                     default=False,
                     help='Force deterministic torch algorithms (P01). Off by default '
                          '(--no-deterministic forces False).')
-parser.add_argument('--feature_version', default='legacy', type=str, choices=['legacy'],
-                    help='Observation feature version (P01). Only "legacy" is supported in P01.')
+parser.add_argument('--feature_version', default='legacy', type=str, choices=['legacy', 'v2'],
+                    help='Observation feature version. "legacy" (default) is the original '
+                         'encoder. "v2" (P03) enables the versioned PublicObservation/observation '
+                         'V2 schema; it is accepted but not yet wired into training until P05/P06.')
 parser.add_argument('--ruleset', default='legacy', type=str, choices=['legacy', 'standard'],
                     help='Rule set identifier (P02). "legacy" (default) reproduces the '
                          'original environment. "standard" adds bidding/scoring but is '

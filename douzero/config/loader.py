@@ -176,7 +176,11 @@ def _validate_types(cfg: TrainingConfig) -> None:
 # config that sets a non-"legacy" value is rejected here so it fails loudly
 # rather than silently producing a run the codebase does not support.
 _LEGACY_ONLY_VERSIONS: dict[str, frozenset[str]] = {
-    "feature_version": frozenset({"legacy"}),
+    # P03 widens the feature_version allowed set to include "v2". The V2
+    # observation schema is opt-in; the legacy encoder remains the default and
+    # is byte-for-byte unchanged. Training still uses the legacy observation
+    # path until P05/P06 wire the V2 model and multi-objective losses.
+    "feature_version": frozenset({"legacy", "v2"}),
     # P02 widens the ruleset allowed set to include "standard".
     "ruleset": frozenset({"legacy", "standard"}),
     "model_version": frozenset({"legacy"}),
@@ -184,18 +188,19 @@ _LEGACY_ONLY_VERSIONS: dict[str, frozenset[str]] = {
 
 
 def _validate_legacy_only_versions(cfg: TrainingConfig) -> None:
-    """Reject version identifiers that P01 does not support (item 4).
+    """Reject version identifiers this codebase does not support.
 
-    The argparse flags already enforce ``choices=['legacy']`` for CLI input;
-    this validator covers the YAML/dict path so a config file cannot smuggle in
-    an unsupported version either.
+    The argparse flags enforce ``choices`` for CLI input; this validator covers
+    the YAML/dict path so a config file cannot smuggle in an unsupported
+    version either. The allowed sets are widened per phase: P02 added
+    ``ruleset="standard"``, P03 added ``feature_version="v2"``.
     """
     for name, allowed in _LEGACY_ONLY_VERSIONS.items():
         val = getattr(cfg, name)
         if val not in allowed:
             raise ValueError(
                 f"Config field {name!r} has unsupported value {val!r}. "
-                f"P01 only supports {sorted(allowed)}. Later phases will widen "
+                f"Supported values are {sorted(allowed)}. Later phases widen "
                 f"the allowed set."
             )
 
