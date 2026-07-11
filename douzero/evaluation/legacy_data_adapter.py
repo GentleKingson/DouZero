@@ -54,8 +54,28 @@ def _validate_standard_deck(deck: list[int]) -> None:
         raise ValueError(f"Big joker (30) must appear once, got {counts[30]}")
 
 
+def _classify_record(deal: dict[str, Any]) -> str:
+    """Classify a record as 'v1' (legacy), 'v2' (standard), or 'unknown'.
+
+    - No ``format_version`` key → ``'v1'`` (legacy).
+    - ``format_version == 2`` → ``'v2'`` (standard).
+    - Any other value (including ``3``, ``None``, strings, etc.) →
+      ``'unknown'``, which the caller rejects.
+    """
+    if "format_version" not in deal:
+        return "v1"
+    if deal["format_version"] == 2:
+        return "v2"
+    return "unknown"
+
+
 def _is_v2_record(deal: dict[str, Any]) -> bool:
-    """Return True if a record is in v2 (standard) format."""
+    """Return True if a record is in v2 (standard) format.
+
+    .. deprecated:: Use :func:`_classify_record` for unknown-version
+       detection. This helper is retained only for the public
+       ``is_standard_format`` / ``is_legacy_format`` helpers.
+    """
     return deal.get("format_version") == 2
 
 
@@ -138,12 +158,20 @@ def _validate_standard_record(deal: dict[str, Any], idx: int,
             f"{first_bidder!r}; expected one of {_NEUTRAL_SEATS}."
         )
 
-    # bidding_order (required, neutral seat permutation).
+    # bidding_order (required, neutral seat permutation). Must be a list —
+    # strings and tuples are rejected so "012" or ("0","1","2") cannot slip
+    # through sorted().
     bidding_order = deal.get("bidding_order")
     if bidding_order is None:
         raise ValueError(
             f"Standard eval data record {idx} is missing 'bidding_order'. "
             f"All v2 records must include bidding_order."
+        )
+    if not isinstance(bidding_order, list):
+        raise TypeError(
+            f"Standard eval data record {idx} has bidding_order of type "
+            f"{type(bidding_order).__name__}; expected a list of neutral "
+            f"seat labels."
         )
     if sorted(bidding_order) != list(_NEUTRAL_SEATS):
         raise ValueError(
@@ -198,13 +226,29 @@ def load_eval_data(path: str, ruleset: str = "legacy",
 
     # Determine the dataset format from ALL records (not just the first).
     # Mixed datasets (some v1, some v2) are rejected in BOTH directions.
-    record_formats = [_is_v2_record(deal) for deal in data]
-    if any(record_formats) and not all(record_formats):
+    # Unknown format_version values (anything other than absent or 2) are
+    # rejected explicitly — they must NOT be silently treated as legacy.
+    record_kinds = [_classify_record(deal) for deal in data]
+    unique_kinds = set(record_kinds)
+    if "unknown" in unique_kinds:
+        # Find the first offending record for a precise error.
+        for idx, kind in enumerate(record_kinds):
+            if kind == "unknown":
+                fv = data[idx].get("format_version")
+                raise ValueError(
+                    f"Eval data record {idx} at {path} has unsupported "
+                    f"format_version {fv!r}. Only v1 (no format_version) "
+                    f"and v2 (format_version=2) are supported."
+                )
+    if len(unique_kinds - {"v1", "v2"}) > 0 or (
+        "v1" in unique_kinds and "v2" in unique_kinds
+    ):
         raise ValueError(
-            f"Eval data at {path} is mixed: some records are v2 (format_version=2) "
-            f"and some are v1 (no format_version). Mixed datasets are not allowed."
+            f"Eval data at {path} is mixed: some records are v2 "
+            f"(format_version=2) and some are v1 (no format_version). "
+            f"Mixed datasets are not allowed."
         )
-    is_standard = all(record_formats)
+    is_standard = "v2" in unique_kinds
 
     if ruleset == "standard" and not is_standard:
         raise ValueError(

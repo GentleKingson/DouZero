@@ -321,6 +321,15 @@ def _validate_ruleset(cfg: RuleSet) -> None:
             f"{cfg.bidding_mode!r}"
         )
 
+    # Standard ruleset must use score bidding. A standard ID with a different
+    # bidding mode (e.g. 'none') is not a valid standard game and must be
+    # rejected rather than silently accepted.
+    if cfg.ruleset_id == RULESET_STANDARD and cfg.bidding_mode != BIDDING_MODE_SCORE_0_1_2_3:
+        raise ValueError(
+            f"standard ruleset must have bidding_mode='score_0_1_2_3', got "
+            f"{cfg.bidding_mode!r}"
+        )
+
     # bid_values: non-negative ints; strict validation for score_0_1_2_3.
     for v in cfg.bid_values:
         if not isinstance(v, int) or isinstance(v, bool):
