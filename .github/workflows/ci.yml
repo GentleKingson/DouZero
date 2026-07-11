@@ -1,4 +1,4 @@
-# P00: deterministic, CPU-only test workflow.
+# P00/P01: deterministic, CPU-only test workflow.
 #
 # Scope: the TEST stage runs fully offline (no network access is needed and no
 # pretrained weights are downloaded). Dependencies are installed from a cache
@@ -10,7 +10,9 @@ name: Tests
 
 on:
   push:
-    branches: [main, "p0*-**"]
+    # Trigger on main pushes. Phase-branch validation is covered by the
+    # pull_request trigger below (every phase branch targets main via a PR).
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -30,6 +32,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # P01: supported Python is 3.11+ (see pyproject.toml requires-python).
+        # 3.11/3.12/3.13 are all mandatory; none uses continue-on-error.
+        python-version: ["3.11", "3.12", "3.13"]
+
     env:
       # Force CPU for every step and inject the commit SHA into the version
       # metadata (douzero/_version.py reads this when the .git dir is absent,
@@ -38,17 +47,17 @@ jobs:
       DOUZERO_GIT_SHA: ${{ github.sha }}
 
     steps:
-      # Pinned to the v4 tag's commit SHA for supply-chain integrity.
-      # actions/checkout@v4 (v4 tag -> this commit)
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # Pinned to the v6 tag's commit SHA for supply-chain integrity.
+      # actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           persist-credentials: false
 
-      # actions/setup-python@v5 (v5 tag -> this commit)
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      # actions/setup-python@v6
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: "pip"
 
       - name: Install dependencies
