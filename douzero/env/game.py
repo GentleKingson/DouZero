@@ -79,6 +79,11 @@ class GameEnv(object):
         self.bottom_cards_revealed = []    # the 3 bottom cards (entity identity)
         self.three_landlord_cards_initial = None  # copy before landlord plays
         self.game_result = None            # GameResult (set at terminal)
+        # Neutral-seat state (used during BIDDING, remapped to roles after).
+        self._seat_infosets = {}
+        self._seat_played_cards = {}
+        self._seat_last_move_dict = {}
+        self._seat_to_role = {}
 
     def card_play_init(self, card_play_data):
         self.info_sets['landlord'].player_hand_cards = \
@@ -128,6 +133,11 @@ class GameEnv(object):
         return self.bomb_num
 
     def step(self):
+        # P02: reject steps after the game is over (standard mode only).
+        if self.ruleset is not None and self.phase == PHASE_TERMINAL:
+            raise IllegalPhaseError(
+                "step() called after the game is over (phase=terminal)"
+            )
         action = self.players[self.acting_player_position].act(
             self.game_infoset)
         assert action in self.game_infoset.legal_actions
@@ -157,9 +167,8 @@ class GameEnv(object):
 
         # Track which bottom cards have been played by the landlord. In legacy
         # mode the landlord is always position 'landlord'; in standard mode
-        # the landlord is self.landlord_position (set after bidding).
-        landlord_pos = self.landlord_position if self.ruleset is not None else 'landlord'
-        if self.acting_player_position == landlord_pos and \
+        # the landlord is 'landlord' (after seat remap).
+        if self.acting_player_position == 'landlord' and \
                 len(action) > 0 and \
                 len(self.three_landlord_cards) > 0:
             for card in action:
@@ -347,6 +356,10 @@ class GameEnv(object):
         self.bottom_cards_revealed = []
         self.three_landlord_cards_initial = None
         self.game_result = None
+        self._seat_infosets = {}
+        self._seat_played_cards = {}
+        self._seat_last_move_dict = {}
+        self._seat_to_role = {}
 
     def get_infoset(self):
         self.info_sets[
@@ -397,42 +410,78 @@ class GameEnv(object):
     # P02 standard-mode methods (only called when ruleset is not None).
     # Legacy path (ruleset=None) never touches these.
     # ------------------------------------------------------------------ #
+    # Neutral seat labels used during the BIDDING phase. The mapping to
+    # landlord/landlord_down/landlord_up roles happens only after the landlord
+    # is determined (in _reveal_bottom_cards via _remap_seats_to_roles).
+    # Seat order: 0 -> 1 -> 2 -> 0 (clockwise). The first bidder is seat 0.
+    NEUTRAL_SEATS: tuple[str, ...] = ("0", "1", "2")
+
     def card_play_init_standard(self, card_play_data, bidding_order=None):
         """Initialise for standard mode: deal 17+17+17 + 3 bottom cards.
 
         Unlike ``card_play_init``, the 3 bottom cards are NOT added to any
         player's hand yet; they are revealed after the landlord is determined
-        by bidding. ``bidding_order`` defaults to the canonical turn order.
+        by bidding.
+
+        ``bidding_order`` defaults to the neutral seat order ``["0", "1", "2"]``.
+        During bidding, ``acting_player_position`` uses these neutral seat
+        labels — NOT the landlord/up/down role names. The role mapping happens
+        in ``_reveal_bottom_cards`` after the landlord is determined.
         """
         if bidding_order is None:
-            bidding_order = list(PLAYER_POSITIONS)
+            bidding_order = list(self.NEUTRAL_SEATS)
         self.bidding_order = list(bidding_order)
         self._bidding_index = 0
 
-        # Each player gets 17 cards (no bottom cards added to landlord yet).
-        self.info_sets['landlord'].player_hand_cards = \
-            sorted(card_play_data['landlord'])
-        self.info_sets['landlord_up'].player_hand_cards = \
-            sorted(card_play_data['landlord_up'])
-        self.info_sets['landlord_down'].player_hand_cards = \
-            sorted(card_play_data['landlord_down'])
+        # Build InfoSets for the three neutral seats. We reuse the existing
+        # InfoSet objects but key them by neutral seat label during bidding.
+        # The original 'landlord'/'landlord_up'/'landlord_down' keys are
+        # populated by _remap_seats_to_roles after the landlord is determined.
+        self._seat_infosets = {
+            "0": InfoSet("0"),
+            "1": InfoSet("1"),
+            "2": InfoSet("2"),
+        }
+        self._seat_infosets["0"].player_hand_cards = sorted(card_play_data['landlord'])
+        self._seat_infosets["1"].player_hand_cards = sorted(card_play_data['landlord_up'])
+        self._seat_infosets["2"].player_hand_cards = sorted(card_play_data['landlord_down'])
 
         # Bottom cards are stored but not revealed yet.
         self.three_landlord_cards = sorted(card_play_data['three_landlord_cards'])
         self.three_landlord_cards_initial = list(self.three_landlord_cards)
         self.bottom_cards_revealed = []
 
+        # Played cards keyed by neutral seat during bidding; remapped later.
+        self._seat_played_cards = {"0": [], "1": [], "2": []}
+        self._seat_last_move_dict = {"0": [], "1": [], "2": []}
+
         # The first bidder acts first.
         self.acting_player_position = self.bidding_order[0]
         self.phase = PHASE_BIDDING
+
+    def get_legal_bids(self) -> list[int]:
+        """Return the list of legal bid values for the current bidder.
+
+        This is the bidding-phase analogue of ``get_legal_card_play_actions``.
+        The environment exposes ONLY the legal actions; the bidding policy
+        (random, SL, RL) lives in the evaluation/agent layer.
+        """
+        if self.phase != PHASE_BIDDING:
+            raise IllegalPhaseError(
+                f"get_legal_bids called in phase {self.phase!r}; "
+                f"expected {PHASE_BIDDING!r}"
+            )
+        return list(self.ruleset.bid_values)
 
     def step_bidding(self, bid_value):
         """Process one bid in the BIDDING phase.
 
         Returns ``True`` if the game should redeal (all pass +
-        ``all_pass_redeal``), ``False`` otherwise. After the last bid, if not
-        a redeal, the landlord is determined, bottom cards are revealed, and
-        the phase transitions to PLAYING.
+        ``all_pass_redeal``), ``False`` otherwise.
+
+        If the bid equals the maximum bid value (3), bidding ends immediately
+        — no subsequent bidder can overbid. Otherwise, bidding continues until
+        all seats have bid or a maximum bid is reached.
         """
         if self.phase != PHASE_BIDDING:
             raise IllegalPhaseError(
@@ -448,6 +497,14 @@ class GameEnv(object):
         pos = self.acting_player_position
         self.bidding_history.append((pos, bid_value))
         self._bidding_index += 1
+
+        # If the maximum bid was played, bidding ends immediately.
+        max_bid = max(self.ruleset.bid_values)
+        if bid_value == max_bid:
+            self.landlord_position = pos
+            self.bid_value = bid_value
+            self._reveal_bottom_cards()
+            return False
 
         # Check if bidding is complete (all positions have bid).
         if self._bidding_index >= len(self.bidding_order):
@@ -485,19 +542,70 @@ class GameEnv(object):
         self._reveal_bottom_cards()
         return False
 
+    def _remap_seats_to_roles(self):
+        """Remap neutral seats to landlord/landlord_down/landlord_up roles.
+
+        After the landlord is determined, the environment must present the
+        game state using role labels so that the legacy ``get_obs`` encoder
+        (which dispatches by player_position == 'landlord' etc.) works
+        correctly. The mapping is:
+
+          - landlord's seat  -> 'landlord'
+          - next seat (clockwise) -> 'landlord_down'  (acts after landlord)
+          - prev seat (clockwise) -> 'landlord_up'    (acts before landlord)
+
+        This swaps ``info_sets``, ``played_cards``, and ``last_move_dict`` so
+        the 'landlord' key always holds the landlord's data. The
+        ``bidding_history`` retains the original neutral seat labels for audit.
+        """
+        landlord_seat = self.landlord_position
+        # Determine next/prev seats from the bidding_order (which is the
+        # clockwise seat order).
+        order = self.bidding_order
+        idx = order.index(landlord_seat)
+        down_seat = order[(idx + 1) % len(order)]
+        up_seat = order[(idx + 2) % len(order)]
+        self._seat_to_role = {
+            landlord_seat: 'landlord',
+            down_seat: 'landlord_down',
+            up_seat: 'landlord_up',
+        }
+
+        # Swap info_sets: move the seat InfoSet data into the role-keyed slots.
+        for seat, role in self._seat_to_role.items():
+            seat_is = self._seat_infosets[seat]
+            role_is = self.info_sets[role]
+            role_is.player_hand_cards = seat_is.player_hand_cards
+            role_is.player_position = role
+
+        # Swap played_cards and last_move_dict.
+        for seat, role in self._seat_to_role.items():
+            self.played_cards[role] = self._seat_played_cards[seat]
+            self.last_move_dict[role] = self._seat_last_move_dict[seat]
+
     def _reveal_bottom_cards(self):
-        """Add the 3 bottom cards to the landlord's hand and transition to PLAYING."""
+        """Add the 3 bottom cards to the landlord's hand and transition to PLAYING.
+
+        This also remaps neutral seats to role labels (see
+        ``_remap_seats_to_roles``) so the legacy ``get_obs`` encoder works.
+        """
         self.phase = PHASE_REVEAL_BOTTOM
         bottom = list(self.three_landlord_cards)
         self.bottom_cards_revealed = list(bottom)
-        landlord_hand = self.info_sets[self.landlord_position].player_hand_cards
+
+        # Remap seats to roles BEFORE adding bottom cards, so the 'landlord'
+        # key points to the landlord's InfoSet.
+        self._remap_seats_to_roles()
+
+        # Add bottom cards to the landlord's hand.
+        landlord_hand = self.info_sets['landlord'].player_hand_cards
         landlord_hand.extend(bottom)
         landlord_hand.sort()
         self.three_landlord_cards = list(bottom)  # keep for tracking
 
         # The landlord acts first in the playing phase.
-        self.acting_player_position = self.landlord_position
-        self.last_pid = self.landlord_position
+        self.acting_player_position = 'landlord'
+        self.last_pid = 'landlord'
         self.phase = PHASE_PLAYING
         self.game_infoset = self.get_infoset()
 
@@ -547,6 +655,10 @@ class GameEnv(object):
 
         Contains only public bidding history and the bidder's own hand.
         No other player's hand or the bottom cards are included.
+
+        Uses neutral seat labels ("0", "1", "2") during the BIDDING phase.
+        Role labels (landlord/landlord_up/landlord_down) are only assigned
+        after the landlord is determined.
         """
         if self.phase != PHASE_BIDDING:
             raise IllegalPhaseError(
@@ -557,13 +669,13 @@ class GameEnv(object):
         return {
             'phase': 'bidding',
             'position': pos,
-            'my_handcards': sorted(self.info_sets[pos].player_hand_cards),
+            'my_handcards': sorted(self._seat_infosets[pos].player_hand_cards),
             'bidding_history': list(self.bidding_history),
             'bidding_order': list(self.bidding_order),
             'bid_values': list(self.ruleset.bid_values),
             'num_cards_left': {
-                p: len(self.info_sets[p].player_hand_cards)
-                for p in ['landlord', 'landlord_up', 'landlord_down']
+                s: len(self._seat_infosets[s].player_hand_cards)
+                for s in self.NEUTRAL_SEATS
             },
         }
 

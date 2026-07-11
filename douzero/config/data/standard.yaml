@@ -43,10 +43,12 @@ model_version: legacy
 # P02 rule configuration. See douzero/env/rules.py for field semantics.
 rules:
   ruleset_id: standard
+  ruleset_version: standard-v1
   bidding_mode: score_0_1_2_3
   bid_values: [0, 1, 2, 3]
   allow_rob: false
   all_pass_redeal: true
+  max_redeals: 10
   bid_multiplier: true
   bomb_multiplier: 2
   rocket_multiplier: 2

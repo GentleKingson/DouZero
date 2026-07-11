@@ -62,6 +62,13 @@ class RuleSet:
     #: loaded.
     ruleset_id: str
 
+    #: Schema version of the ruleset parameters. Bumped when the set of rule
+    #: fields or their semantics change. ``"legacy-v1"`` and ``"standard-v1"``
+    #: are the P02 versions. The full ``ruleset_id + ruleset_version`` plus
+    #: ``ruleset_hash`` (of the complete parameter dict) together form the
+    #: immutable identity used for compatibility checks.
+    ruleset_version: str
+
     #: ``"none"`` (legacy: no bidding phase) or ``"score_0_1_2_3"``.
     bidding_mode: str
 
@@ -76,6 +83,11 @@ class RuleSet:
     #: If all three players bid 0 (pass), redeal instead of assigning the
     #: landlord by default.
     all_pass_redeal: bool = False
+
+    #: Maximum number of redeals before giving up (all-pass loop guard).
+    #: If exceeded, the landlord is assigned to the first bidder with the
+    #: minimum bid. Default 10.
+    max_redeals: int = 10
 
     #: Whether the winning bid value multiplies the base score.
     bid_multiplier: bool = False
@@ -120,10 +132,12 @@ class RuleSet:
         """
         return cls(
             ruleset_id=RULESET_LEGACY,
+            ruleset_version="legacy-v1",
             bidding_mode=BIDDING_MODE_NONE,
             bid_values=(),
             allow_rob=False,
             all_pass_redeal=False,
+            max_redeals=10,
             bid_multiplier=False,
             bomb_multiplier=2,
             rocket_multiplier=2,
@@ -144,10 +158,12 @@ class RuleSet:
         """
         return cls(
             ruleset_id=RULESET_STANDARD,
+            ruleset_version="standard-v1",
             bidding_mode=BIDDING_MODE_SCORE_0_1_2_3,
             bid_values=(0, 1, 2, 3),
             allow_rob=False,
             all_pass_redeal=True,
+            max_redeals=10,
             bid_multiplier=True,
             bomb_multiplier=2,
             rocket_multiplier=2,
@@ -197,6 +213,12 @@ class RuleSet:
                 else BIDDING_MODE_SCORE_0_1_2_3
             )
 
+        # Derive ruleset_version if not explicitly provided.
+        if "ruleset_version" not in raw:
+            raw["ruleset_version"] = (
+                "legacy-v1" if rid == RULESET_LEGACY else "standard-v1"
+            )
+
         # Convert bid_values list -> tuple.
         if "bid_values" in raw and raw["bid_values"] is not None:
             bv = raw["bid_values"]
@@ -236,12 +258,26 @@ class RuleSet:
     def stable_hash(self) -> str:
         """Deterministic SHA-256 of the canonical JSON serialisation.
 
-        Used to stamp a precise rule identity into checkpoint manifests (P16
-        uses the full hash; P02 uses the short ``ruleset_id`` string for
-        compatibility checks).
+        Used to stamp a precise rule identity into checkpoint manifests, eval
+        data, and GameResults. Two RuleSets with the same ``ruleset_id`` but
+        different parameters produce different hashes, so a mismatch is caught
+        rather than silently accepted.
         """
         payload = json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def identity(self) -> dict[str, str]:
+        """Return the full rule identity for compatibility checks.
+
+        Contains ``ruleset_id``, ``ruleset_version``, and ``ruleset_hash``
+        (the first 16 hex chars of ``stable_hash``). All three must match for
+        two RuleSets to be considered compatible.
+        """
+        return {
+            "ruleset_id": self.ruleset_id,
+            "ruleset_version": self.ruleset_version,
+            "ruleset_hash": self.stable_hash()[:16],
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -305,3 +341,11 @@ def _validate_ruleset(cfg: RuleSet) -> None:
                 f"max_multiplier must be None or a positive int, got "
                 f"{cfg.max_multiplier!r}"
             )
+
+    # max_redeals: positive int (loop guard for all-pass redeal).
+    if (not isinstance(cfg.max_redeals, int)
+            or isinstance(cfg.max_redeals, bool)
+            or cfg.max_redeals < 1):
+        raise ValueError(
+            f"max_redeals must be a positive int, got {cfg.max_redeals!r}"
+        )

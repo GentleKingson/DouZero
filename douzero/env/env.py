@@ -44,6 +44,13 @@ class Env:
         instance. When a standard ruleset is passed, ``reset`` enters the
         bidding phase and ``step`` dispatches by phase. Legacy behaviour is
         unchanged when ``ruleset`` is ``None``.
+
+        In standard mode, the bidding phase uses neutral seat labels
+        ("0", "1", "2"). The caller drives bidding by passing ``bid_value``
+        to ``step``. The environment does NOT run any bidding policy
+        internally — the bidding decision (random, SL, RL) is the caller's
+        responsibility (see ``douzero/evaluation/simulation.py`` for the
+        random bidding agent used in evaluation).
         """
         self.objective = objective
         self.ruleset = ruleset
@@ -62,6 +69,8 @@ class Env:
         self.bidding_obs = None
         # Standard-mode: redeal flag (set when all bidders pass).
         self.need_redeal = False
+        # Standard-mode: redeal counter (bounded by ruleset.max_redeals).
+        self._redeal_count = 0
 
     def reset(self):
         """
@@ -71,6 +80,7 @@ class Env:
         """
         self._env.reset()
         self.need_redeal = False
+        self._redeal_count = 0
 
         # Randomly shuffle the deck
         _deck = deck.copy()
@@ -78,6 +88,7 @@ class Env:
 
         if self.ruleset is not None:
             # Standard mode: deal 17+17+17 + 3 bottom cards, enter bidding.
+            # Seats are neutral ("0", "1", "2") during bidding.
             card_play_data = {'landlord': _deck[:17],
                               'landlord_up': _deck[17:34],
                               'landlord_down': _deck[34:51],
@@ -104,6 +115,29 @@ class Env:
         self.infoset = self._game_infoset
 
         return get_obs(self.infoset)
+
+    def redeal(self):
+        """Re-deal a new deck for the same game session (after all-pass redeal).
+
+        Unlike ``reset()``, this does NOT clear ``_redeal_count`` — the
+        redeal guard accumulates across redeals within the same game. Use
+        ``reset()`` to start a completely new game.
+        """
+        self._env.reset()
+        self.need_redeal = False
+        _deck = deck.copy()
+        np.random.shuffle(_deck)
+        card_play_data = {'landlord': _deck[:17],
+                          'landlord_up': _deck[17:34],
+                          'landlord_down': _deck[34:51],
+                          'three_landlord_cards': _deck[51:54],
+                          }
+        for key in card_play_data:
+            card_play_data[key].sort()
+        self._env.card_play_init_standard(card_play_data)
+        self.bidding_obs = self._env.get_bidding_obs()
+        self.infoset = None
+        return self.bidding_obs
 
     def step(self, action, bid_value=None):
         """
@@ -144,8 +178,13 @@ class Env:
         """Process a bid in the BIDDING phase.
 
         Returns ``(obs, reward, done, info)``. If all bidders pass and
-        ``all_pass_redeal`` is set, ``done=True`` with ``info={'redeal': True}``
-        and the caller should ``reset()`` for a new deal.
+        ``all_pass_redeal`` is set, the environment signals a redeal:
+        ``done=True`` with ``info={'redeal': True}``. The caller should call
+        ``redeal()`` (NOT ``reset()``) to re-deal for the next attempt.
+        ``reset()`` starts a new game and clears the redeal count;
+        ``redeal()`` preserves it. The redeal count is bounded by
+        ``ruleset.max_redeals``; if exceeded, the landlord is assigned to the
+        first bidder with the minimum bid.
         """
         if bid_value is None:
             raise IllegalActionError(
@@ -153,8 +192,20 @@ class Env:
             )
         redeal = self._env.step_bidding(bid_value)
         if redeal:
+            self._redeal_count += 1
+            if self._redeal_count > self._env.ruleset.max_redeals:
+                # Exceeded max redeals: force-assign landlord to first bidder.
+                self._env.landlord_position = self._env.bidding_order[0]
+                self._env.bid_value = 1
+                self._env._reveal_bottom_cards()
+                self.bidding_obs = None
+                self.infoset = self._game_infoset
+                return get_obs(self.infoset), 0.0, False, {
+                    'bidding_complete': True,
+                    'max_redeals_exceeded': True,
+                }
             self.need_redeal = True
-            return None, 0.0, True, {'redeal': True}
+            return None, 0.0, True, {'redeal': True, 'redeal_count': self._redeal_count}
 
         if self._env.phase == PHASE_BIDDING:
             # More bids to go.

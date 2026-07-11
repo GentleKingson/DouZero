@@ -84,6 +84,11 @@ class GameResult:
     #: A single farmer's signed score (opposite sign of landlord).
     farmer_score: int = 0
 
+    #: Rule identity (ruleset_id, ruleset_version, ruleset_hash) for audit.
+    ruleset_id: str = ""
+    ruleset_version: str = ""
+    ruleset_hash: str = ""
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable dict (for Env.step info)."""
         return {
@@ -98,6 +103,9 @@ class GameResult:
             "total_multiplier": self.total_multiplier,
             "landlord_score": self.landlord_score,
             "farmer_score": self.farmer_score,
+            "ruleset_id": self.ruleset_id,
+            "ruleset_version": self.ruleset_version,
+            "ruleset_hash": self.ruleset_hash,
         }
 
 
@@ -309,6 +317,9 @@ def compute_game_result(
             total_multiplier=effective_multiplier,
             landlord_score=landlord_score,
             farmer_score=farmer_score,
+            ruleset_id=ruleset.ruleset_id,
+            ruleset_version=ruleset.ruleset_version,
+            ruleset_hash=ruleset.stable_hash()[:16],
         )
 
     # Standard scoring.
@@ -363,4 +374,7 @@ def compute_game_result(
         total_multiplier=multiplier,
         landlord_score=landlord_score,
         farmer_score=farmer_score,
+        ruleset_id=ruleset.ruleset_id,
+        ruleset_version=ruleset.ruleset_version,
+        ruleset_hash=ruleset.stable_hash()[:16],
     )
