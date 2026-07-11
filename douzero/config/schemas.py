@@ -101,7 +101,14 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class RuleConfig:
+    """Rule configuration (P02).
+
+    ``ruleset`` is the CLI/config version string (``"legacy"`` or
+    ``"standard"``). ``ruleset_id`` is the identity recorded in the checkpoint
+    manifest; it mirrors ``ruleset`` for P02 (P16 may append a stable hash).
+    """
     ruleset: str = "legacy"  # legacy | standard (P02 adds the rule engine)
+    ruleset_id: str = "legacy"
 
 
 @dataclass(frozen=True)

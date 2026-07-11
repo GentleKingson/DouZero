@@ -408,10 +408,18 @@ def test_yaml_rejects_unsupported_feature_version(tmp_path):
         load_config(str(bad))
 
 
+def test_yaml_accepts_standard_ruleset(tmp_path):
+    """P02 widens the allowed ruleset set: ruleset=standard is now accepted."""
+    good = tmp_path / "std.yaml"
+    good.write_text("ruleset: standard\n", encoding="utf-8")
+    cfg = load_config(str(good))
+    assert cfg.ruleset == "standard"
+
+
 def test_yaml_rejects_unsupported_ruleset(tmp_path):
-    """A YAML config with ruleset=standard must be rejected (P01=legacy only)."""
-    bad = tmp_path / "std.yaml"
-    bad.write_text("ruleset: standard\n", encoding="utf-8")
+    """A YAML config with an unsupported ruleset value must still be rejected."""
+    bad = tmp_path / "v2.yaml"
+    bad.write_text("ruleset: v2\n", encoding="utf-8")
     with pytest.raises(ValueError, match="ruleset"):
         load_config(str(bad))
 

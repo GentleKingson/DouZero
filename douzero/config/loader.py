@@ -81,8 +81,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     valid_top = {f.name for f in fields(TrainingConfig) if f.name != "optimizer"}
     valid_opt_names = {f.name for f in fields(OptimizerConfig)}
 
-    # 'optimizer' is a valid top-level key (handled separately below).
-    unknown_top = set(raw.keys()) - valid_top - {"optimizer"}
+    # 'optimizer' and 'rules' are valid top-level keys (handled separately).
+    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "rules"}
     if unknown_top:
         raise ValueError(f"Unknown config keys: {sorted(unknown_top)}")
 
@@ -92,6 +92,15 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     unknown_opt = set(optimizer_raw.keys()) - valid_opt_names
     if unknown_opt:
         raise ValueError(f"Unknown optimizer config keys: {sorted(unknown_opt)}")
+
+    # P02: a 'rules' block is accepted but not stored on TrainingConfig (which
+    # only carries the version string). We validate it here so a malformed
+    # rules block fails loudly, and so the ruleset version string is
+    # cross-checked against it.
+    rules_raw = raw.get("rules")
+    if rules_raw is not None:
+        from douzero.env.rules import RuleSet
+        RuleSet.from_dict(rules_raw)  # validates types/ranges; result discarded
 
     kwargs: dict[str, Any] = {}
     for name in valid_top:
@@ -168,7 +177,8 @@ def _validate_types(cfg: TrainingConfig) -> None:
 # rather than silently producing a run the codebase does not support.
 _LEGACY_ONLY_VERSIONS: dict[str, frozenset[str]] = {
     "feature_version": frozenset({"legacy"}),
-    "ruleset": frozenset({"legacy"}),
+    # P02 widens the ruleset allowed set to include "standard".
+    "ruleset": frozenset({"legacy", "standard"}),
     "model_version": frozenset({"legacy"}),
 }
 
