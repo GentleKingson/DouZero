@@ -439,3 +439,50 @@ def test_serialize_includes_version_fields():
     assert d["feature_version"] == "legacy"
     assert d["ruleset"] == "legacy"
     assert d["model_version"] == "legacy"
+
+
+# --------------------------------------------------------------------------- #
+# Override parser option-table hygiene (BooleanOptionalAction must not
+# double-register --no-no-* options)
+# --------------------------------------------------------------------------- #
+def test_override_parser_has_no_double_negation_options():
+    """_build_override_parser must not produce --no-no-* options.
+
+    A BooleanOptionalAction's option_strings already contains both --flag and
+    --no-flag. Re-registering both makes BooleanOptionalAction derive a
+    spurious --no-no-flag. The override parser must register ONLY the positive
+    form so the negation is derived exactly once.
+    """
+    from douzero.dmc.arguments import _build_override_parser
+
+    op = _build_override_parser()
+    opts = set(op._option_string_actions.keys())
+    # Positive and single-negation forms must be present.
+    assert "--deterministic" in opts
+    assert "--no-deterministic" in opts
+    assert "--actor_device_cpu" in opts
+    assert "--no-actor_device_cpu" in opts
+    assert "--load_model" in opts
+    assert "--no-load_model" in opts
+    assert "--disable_checkpoint" in opts
+    assert "--no-disable_checkpoint" in opts
+    # Double-negation forms must NOT exist.
+    no_no = {o for o in opts if o.startswith("--no-no-")}
+    assert not no_no, f"spurious double-negation options: {sorted(no_no)}"
+
+
+def test_override_parser_boolean_still_overrides_correctly(tmp_path):
+    """After the fix, --no-deterministic must still correctly set False.
+
+    Regression guard: the option-table cleanup must not break the actual
+    override behavior (YAML true -> CLI false).
+    """
+    from douzero.dmc.arguments import parse_args
+
+    yml = tmp_path / "run.yaml"
+    yml.write_text("deterministic: true\n", encoding="utf-8")
+    ns = parse_args(["--config", str(yml), "--no-deterministic"])
+    assert ns.deterministic is False
+    # And the positive form still works.
+    ns2 = parse_args(["--config", str(yml), "--deterministic"])
+    assert ns2.deterministic is True

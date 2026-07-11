@@ -24,9 +24,9 @@ from douzero.config.schemas import OptimizerConfig, TrainingConfig
 def _load_yaml(path: str) -> dict:
     """Load a YAML file into a dict without requiring PyYAML at import time.
 
-    PyYAML is not a declared dependency (to keep the dep surface minimal), so
-    we import it lazily. ``configs/legacy.yaml`` is simple enough that callers
-    who want to avoid the dep can construct the dict themselves.
+    PyYAML (``pyyaml``) is a declared runtime dependency (see ``pyproject.toml``
+    ``[project] dependencies``). It is imported lazily here so that plain
+    ``--help`` and module imports never require it; only ``--config <yaml>`` does.
     """
     try:
         import yaml

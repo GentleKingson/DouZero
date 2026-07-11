@@ -48,11 +48,13 @@ can copy it and edit the values you want to change.
 
 ## The version fields
 
-P01 adds optional flags carried (not yet enforced) for later phases:
+P01 adds optional flags. `--seed` and `--deterministic` are wired into the
+unified seeding utility (see `douzero/runtime/seeding.py`); the three version
+identifiers are enforced as `legacy`-only in P01 (later phases widen the set):
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--seed` | `0` | Base RNG seed (`0` = legacy unseeded behavior) |
+| `--seed` | `0` | Base RNG seed (`0` = legacy unseeded behavior; non-zero activates seeding) |
 | `--deterministic` | off | Force deterministic torch algorithms |
 | `--feature_version` | `legacy` | Observation feature version (P03 introduces `v2`) |
 | `--ruleset` | `legacy` | Rule set identifier (P02 introduces `standard`) |

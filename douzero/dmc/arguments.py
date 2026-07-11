@@ -93,12 +93,21 @@ def _build_override_parser():
     for action in parser._actions:
         if action.dest == "help":
             continue
-        # BooleanOptionalAction: re-register as BooleanOptionalAction with
-        # default=SUPPRESS so both --flag (True) and --no-flag (False) appear
-        # only when the user typed them. This is what lets a CLI --no-<flag>
-        # override a YAML true (item 5).
+        # BooleanOptionalAction: re-register with default=SUPPRESS so both
+        # --flag (True) and --no-flag (False) appear only when the user typed
+        # them. This is what lets a CLI --no-<flag> override a YAML true.
+        #
+        # IMPORTANT: a BooleanOptionalAction's option_strings already contains
+        # BOTH "--flag" and "--no-flag". Passing both to add_argument() would
+        # make BooleanOptionalAction generate "--no-no-flag" as well (it derives
+        # the negation from each registered option). We must re-register ONLY
+        # the positive form(s); BooleanOptionalAction re-derives the negation.
         if isinstance(action, _ap.BooleanOptionalAction):
-            op.add_argument(*action.option_strings,
+            positive_options = [
+                opt for opt in action.option_strings
+                if not opt.startswith("--no-")
+            ]
+            op.add_argument(*positive_options,
                             action=_ap.BooleanOptionalAction,
                             dest=action.dest, default=_ap.SUPPRESS)
             continue
