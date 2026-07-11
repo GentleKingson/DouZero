@@ -76,8 +76,15 @@ _ROCKET_KEY: tuple[int, int] = (20, 30)
 
 
 def _freeze(arr: np.ndarray) -> np.ndarray:
-    """Return ``arr`` as a read-only int8 numpy array (copies if writable)."""
-    out = np.asarray(arr, dtype=np.int8)
+    """Return ``arr`` as a read-only numpy array, PRESERVING its dtype.
+
+    The context block's ``total_multiplier`` is encoded as int32 (it is
+    unbounded in the standard ruleset: bid × bombs × rocket × spring can
+    exceed int8's 127), so the freezer must NOT force every array to int8.
+    Each caller passes an already-typed array (int8 for one-hots/card vectors,
+    int32 for the multiplier); this function only copies + sets read-only.
+    """
+    out = np.asarray(arr)
     if out.flags.writeable:
         out = out.copy()
     out.setflags(write=False)
@@ -197,7 +204,14 @@ class PublicContextBlock:
                 object.__setattr__(self, arr_name, _freeze(arr))
 
     def to_vector(self) -> np.ndarray:
-        """Concatenate all fields in schema order into one int8 vector."""
+        """Concatenate all fields in schema order into a single vector.
+
+        Fields are a mix of int8 (one-hots, card vectors, counts) and int32
+        (the unbounded ``total_multiplier``). numpy promotes the concatenation
+        to int32 so the multiplier does not overflow; the result is read-only
+        is irrelevant here (it is a fresh concatenation copy). Models that
+        prefer a packed dtype may cast per-field using the schema.
+        """
         return np.concatenate([
             self.bottom_cards_revealed,
             self.bottom_cards_unplayed,
@@ -206,7 +220,7 @@ class PublicContextBlock:
             self.rocket_count,
             self.total_multiplier,
             self.ruleset_id_onehot,
-        ]).astype(np.int8)
+        ])
 
 
 @dataclass(frozen=True)
@@ -664,7 +678,7 @@ def _build_context_block(public, phase: str, schema) -> "PublicContextBlock":
         bid_value_onehot=_bid_value_onehot(public.bid_value),
         phase_onehot=_phase_onehot(phase),
         rocket_count=np.array([int(public.rocket_count)], dtype=np.int8),
-        total_multiplier=np.array([int(public.total_multiplier)], dtype=np.int8),
+        total_multiplier=np.array([int(public.total_multiplier)], dtype=np.int32),
         ruleset_id_onehot=_ruleset_id_onehot(public.ruleset_id),
     )
 

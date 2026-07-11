@@ -402,8 +402,8 @@ def build_v2_schema(max_history_len: int = 100) -> FeatureSchemaManifest:
                   "one-hot game phase"),
         FieldSpec("rocket_count", (1,), "int8",
                   "number of rockets played (separate from bomb_count)"),
-        FieldSpec("total_multiplier", (1,), "int8",
-                  "public total score multiplier"),
+        FieldSpec("total_multiplier", (1,), "int32",
+                  "public total score multiplier (int32: unbounded in standard ruleset)"),
         FieldSpec("ruleset_id_onehot", (RULESET_ID_ONEHOT_WIDTH,), "int8",
                   "one-hot ruleset id (legacy/standard)"),
     )

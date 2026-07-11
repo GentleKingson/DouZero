@@ -801,3 +801,156 @@ class TestRuleIdentityValidation:
         env.reset()
         with pytest.raises(TypeError):
             get_obs_v2(env.infoset, ruleset="not a ruleset")
+
+
+# --------------------------------------------------------------------------- #
+# (Round 4, blocker 1) Privileged nested deep immutability
+# --------------------------------------------------------------------------- #
+class TestPrivilegedNestedFreeze:
+    """deep_freeze must make EVERY nesting level immutable, not just the top
+    mapping (review round 4, blocker 1)."""
+
+    def test_nested_list_becomes_tuple(self):
+        import numpy as np
+        priv = PrivilegedObservation(
+            all_handcards={"landlord": [3]},
+            acting_role="landlord",
+            hidden_hand_labels={"counts": [1, 2, 3]},
+        )
+        # list -> tuple: .append raises AttributeError (tuples have no append).
+        with pytest.raises(AttributeError):
+            priv.hidden_hand_labels["counts"].append(99)
+        assert isinstance(priv.hidden_hand_labels["counts"], tuple)
+
+    def test_nested_dict_is_readonly(self):
+        priv = PrivilegedObservation(
+            all_handcards={"landlord": [3]},
+            acting_role="landlord",
+            hidden_hand_labels={"meta": {"k": 9}},
+        )
+        # nested dict -> MappingProxyType: subscript assignment raises TypeError.
+        with pytest.raises(TypeError):
+            priv.hidden_hand_labels["meta"]["k"] = 0
+
+    def test_nested_ndarray_is_readonly(self):
+        import numpy as np
+        priv = PrivilegedObservation(
+            all_handcards={"landlord": [3]},
+            acting_role="landlord",
+            hidden_hand_labels={"arr": np.array([1, 2, 3])},
+        )
+        # nested ndarray -> read-only: item assignment raises ValueError.
+        with pytest.raises(ValueError):
+            priv.hidden_hand_labels["arr"][0] = 1
+
+    def test_deeply_nested_structure_all_frozen(self):
+        import numpy as np
+        priv = PrivilegedObservation(
+            all_handcards={"landlord": [3]},
+            acting_role="landlord",
+            hidden_hand_labels={
+                "outer": {"inner_list": [1, {"deep": [2, 3]}], "s": {1, 2}},
+            },
+        )
+        # every level is immutable.
+        with pytest.raises(AttributeError):
+            priv.hidden_hand_labels["outer"]["inner_list"].append(9)
+        with pytest.raises(TypeError):
+            priv.hidden_hand_labels["outer"]["inner_list"][1]["deep"][0] = 9
+        assert isinstance(priv.hidden_hand_labels["outer"]["s"], frozenset)
+
+    def test_to_plain_roundtrip(self):
+        """to_dict must still serialize a deeply-frozen container correctly."""
+        import numpy as np
+        priv = PrivilegedObservation(
+            all_handcards={"landlord": [3, 4]},
+            acting_role="landlord",
+            hidden_hand_labels={"counts": [1, 2], "arr": np.array([5, 6])},
+        )
+        d = priv.to_dict()
+        import json
+        # Must be JSON-serializable.
+        json.dumps(d)
+        assert d["hidden_hand_labels"]["counts"] == [1, 2]
+        assert d["hidden_hand_labels"]["arr"] == [5, 6]
+
+
+# --------------------------------------------------------------------------- #
+# (Round 4, blocker 2) total_multiplier numeric range safety
+# --------------------------------------------------------------------------- #
+class TestMultiplierRange:
+    """The standard ruleset's total_multiplier is unbounded (max_multiplier is
+    None), so the context field must use int32, not int8 (review round 4,
+    blocker 2). bid × bombs × rocket × spring can exceed int8's 127."""
+
+    def test_schema_multiplier_is_int32(self):
+        s = build_v2_schema()
+        spec = s.field_by_name("total_multiplier", "context")
+        assert spec.dtype == "int32", (
+            f"total_multiplier must be int32 (unbounded), got {spec.dtype}"
+        )
+
+    def test_multiplier_127_encoded(self):
+        from douzero.observation.encode_v2 import _build_context_block
+        from douzero.observation import build_public_observation
+        pub = build_public_observation(
+            acting_role="landlord", my_handcards=[3], other_handcards=[],
+            played_cards={"landlord": [], "landlord_up": [], "landlord_down": []},
+            last_move=[], last_move_dict={"landlord": [], "landlord_up": [], "landlord_down": []},
+            three_landlord_cards=[], num_cards_left={"landlord": 1, "landlord_up": 0, "landlord_down": 0},
+            legal_actions=[[3]], total_multiplier=127)
+        ctx = _build_context_block(pub, "playing", build_v2_schema())
+        assert ctx.total_multiplier[0] == 127
+        assert ctx.total_multiplier.dtype == np.int32
+
+    def test_multiplier_128_does_not_overflow(self):
+        from douzero.observation.encode_v2 import _build_context_block
+        from douzero.observation import build_public_observation
+        pub = build_public_observation(
+            acting_role="landlord", my_handcards=[3], other_handcards=[],
+            played_cards={"landlord": [], "landlord_up": [], "landlord_down": []},
+            last_move=[], last_move_dict={"landlord": [], "landlord_up": [], "landlord_down": []},
+            three_landlord_cards=[], num_cards_left={"landlord": 1, "landlord_up": 0, "landlord_down": 0},
+            legal_actions=[[3]], total_multiplier=128)
+        ctx = _build_context_block(pub, "playing", build_v2_schema())
+        # 128 would overflow int8 to -128; int32 holds it.
+        assert ctx.total_multiplier[0] == 128
+        assert ctx.total_multiplier[0] > 0
+
+    def test_multiplier_256_encoded(self):
+        from douzero.observation.encode_v2 import _build_context_block
+        from douzero.observation import build_public_observation
+        pub = build_public_observation(
+            acting_role="landlord", my_handcards=[3], other_handcards=[],
+            played_cards={"landlord": [], "landlord_up": [], "landlord_down": []},
+            last_move=[], last_move_dict={"landlord": [], "landlord_up": [], "landlord_down": []},
+            three_landlord_cards=[], num_cards_left={"landlord": 1, "landlord_up": 0, "landlord_down": 0},
+            legal_actions=[[3]], total_multiplier=256)
+        ctx = _build_context_block(pub, "playing", build_v2_schema())
+        assert ctx.total_multiplier[0] == 256
+        assert ctx.total_multiplier[0] > 0
+
+    def test_multiplier_dtype_change_reflected_in_schema_hash(self):
+        """Changing total_multiplier dtype changes the schema hash."""
+        import dataclasses
+        s = build_v2_schema()
+        h_before = s.stable_hash()
+        new_context = tuple(
+            FieldSpec(f.name, f.shape, "int8" if f.name == "total_multiplier" else f.dtype,
+                      f.description)
+            for f in s.context_fields
+        )
+        s2 = dataclasses.replace(s, context_fields=new_context)
+        assert s2.stable_hash() != h_before
+
+    def test_multiplier_zero_encoded(self):
+        from douzero.observation.encode_v2 import _build_context_block
+        from douzero.observation import build_public_observation
+        pub = build_public_observation(
+            acting_role="landlord", my_handcards=[3], other_handcards=[],
+            played_cards={"landlord": [], "landlord_up": [], "landlord_down": []},
+            last_move=[], last_move_dict={"landlord": [], "landlord_up": [], "landlord_down": []},
+            three_landlord_cards=[], num_cards_left={"landlord": 1, "landlord_up": 0, "landlord_down": 0},
+            legal_actions=[[3]], total_multiplier=0)
+        ctx = _build_context_block(pub, "playing", build_v2_schema())
+        assert ctx.total_multiplier[0] == 0

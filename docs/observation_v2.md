@@ -136,7 +136,16 @@ schema to read `obs.public` ad hoc):
 
 - a **public context block** (`context_fields`): bottom-card revealed/unplayed
   card vectors, bid-value one-hot, phase one-hot, rocket count, total
-  multiplier, and a ruleset-id one-hot. Encoded once into `PublicContextBlock`.
+  multiplier (int32 — unbounded in the standard ruleset), and a ruleset-family
+  id one-hot. Encoded once into `PublicContextBlock`.
+
+  The context block encodes the **ruleset family id** (legacy/standard), not
+  the full `ruleset_version`/`ruleset_hash`. The complete rule identity remains
+  compatibility metadata on `PublicObservation` and must be checked by the
+  checkpoint/runtime boundary (a model is bound to one ruleset hash via the
+  manifest, not via a feature). If a future model must distinguish multiple
+  custom rulesets, it should encode the actual rule parameters as features,
+  not the SHA-256 hash bytes.
 - a **bidding-token block** (`bidding_token_fields`): `[bid_seat(3),
   bid_value(4), is_pass(1)]` per bid. Encoded into `SchemaBiddingTokenBatch`.
 
