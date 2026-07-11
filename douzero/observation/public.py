@@ -31,7 +31,8 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from types import MappingProxyType
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -172,7 +173,7 @@ class PublicBottomCards:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PublicObservation:
     """Everything a deployment model is allowed to see for one decision.
 
@@ -188,10 +189,12 @@ class PublicObservation:
     (the bottom cards are inside the landlord's hand for the landlord, or
     inside the opponent pool for a farmer, so they are not added separately).
 
-    Deep immutability (item 5): frozen + slots. Caller-supplied lists/dicts are
-    copied at construction (see :func:`build_public_observation`). The encoded
-    tensor batches (``bidding_tokens``) hold frozen numpy arrays. No mutable
-    dict/list field is exposed by reference.
+    Deep immutability (item 5): ``frozen`` + ``slots``. Caller-supplied
+    lists/dicts are copied at construction (see
+    :func:`build_public_observation`). Every mapping field is exposed as a
+    read-only :class:`types.MappingProxyType`, so ``obs.played_cards[...] = x``
+    raises ``TypeError``; the encoded tensor batches hold frozen numpy arrays.
+    No mutable dict/list field is exposed by reference.
 
     Model-consumable public input (item 3): in addition to the legacy
     hand/played/last-move features, this carries the public bottom-card
@@ -203,7 +206,7 @@ class PublicObservation:
 
     # Identity
     acting_role: str
-    seat_context: dict[str, str]  # {absolute_role: relative_seat}
+    seat_context: Mapping[str, str]  # read-only {absolute_role: relative_seat}
     kind: str = field(default=PUBLIC_KIND, init=False)
 
     # Phase / ruleset public state
@@ -219,13 +222,13 @@ class PublicObservation:
     # Cards (public)
     my_handcards: tuple[int, ...] = ()
     other_handcards: tuple[int, ...] = ()  # public unseen pool (swap-invariant)
-    played_cards: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    played_cards: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     last_move: tuple[int, ...] = ()
-    last_move_dict: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    last_move_dict: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     bottom_cards: PublicBottomCards = field(
         default_factory=lambda: PublicBottomCards((), (), True)
     )
-    num_cards_left: dict[str, int] = field(default_factory=dict)
+    num_cards_left: Mapping[str, int] = field(default_factory=dict)
 
     # Bidding history (encoded token batch; empty in legacy mode).
     bidding_history: tuple[tuple[str, int], ...] = ()
@@ -238,6 +241,17 @@ class PublicObservation:
     legal_actions: tuple[tuple[int, ...], ...] = ()
 
     def __post_init__(self) -> None:
+        # Wrap every mapping field in a read-only MappingProxyType so the
+        # container is deeply immutable (frozen only blocks field reassignment,
+        # not in-place mutation of an exposed dict — item 5).
+        object.__setattr__(self, "seat_context",
+                           MappingProxyType(dict(self.seat_context)))
+        object.__setattr__(self, "played_cards",
+                           MappingProxyType(dict(self.played_cards)))
+        object.__setattr__(self, "last_move_dict",
+                           MappingProxyType(dict(self.last_move_dict)))
+        object.__setattr__(self, "num_cards_left",
+                           MappingProxyType(dict(self.num_cards_left)))
         if self.kind != PUBLIC_KIND:  # defensive; default already set
             object.__setattr__(self, "kind", PUBLIC_KIND)
 
