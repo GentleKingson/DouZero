@@ -42,11 +42,43 @@ from pathlib import Path
 
 # Force CPU for the whole benchmark. This MUST happen before any model/tensor
 # work: the legacy and factorized models probe torch.cuda.is_available() and
-# DeepAgent migrates tensors/models to CUDA when it returns True. Hiding CUDA
-# here makes the benchmark deterministically CPU-only on any host, so a GPU
-# machine and the CPU CI image measure the same path. GPU benchmarking is
-# deferred to P14 (see module docstring).
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+# DeepAgent migrates tensors/models to CUDA when it returns True.
+#
+# Use UNCONDITIONAL assignment, not setdefault: setdefault only writes when the
+# key is ABSENT, so a caller-supplied ``CUDA_VISIBLE_DEVICES=0`` would survive
+# and silently put DeepAgent on the GPU while the benchmark reports
+# ``device: cpu``. Overwriting guarantees the benchmark is CPU-only on any
+# host, so a GPU machine and the CPU CI image measure the same path. GPU
+# benchmarking is deferred to P14 (see module docstring).
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+
+def _assert_cpu_only():
+    """Self-check that CUDA is actually hidden from torch.
+
+    A CPU-only torch build reports ``cuda.is_available()==False`` regardless of
+    ``CUDA_VISIBLE_DEVICES``, so it cannot alone expose a failure to override a
+    caller-supplied value. This check verifies the ENVIRONMENT VARIABLE itself
+    is empty (the contract this benchmark enforces) AND that torch agrees, so a
+    GPU host with a stale ``CUDA_VISIBLE_DEVICES=0`` fails loudly here instead
+    of silently timing an asynchronous CUDA path with ``perf_counter``.
+    """
+    import torch
+    if os.environ.get("CUDA_VISIBLE_DEVICES", "") != "":
+        raise RuntimeError(
+            "CPU-only factorized benchmark failed to hide CUDA: "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}. "
+            "The benchmark unconditionally sets it to '' at import; if you see "
+            "this, the env var was set after import (e.g. the module was "
+            "imported before the assignment ran)."
+        )
+    if torch.cuda.is_available():
+        raise RuntimeError(
+            "CPU-only factorized benchmark: CUDA is still available to torch "
+            "after setting CUDA_VISIBLE_DEVICES=''. This can happen if torch "
+            "was initialised before the env var was set, or on a build that "
+            "ignores the var. Refusing to time a CUDA path as 'CPU-only'."
+        )
 
 DEFAULT_ROUNDS = 30
 DEFAULT_WARMUP = 3
@@ -338,12 +370,15 @@ def bench_peak_memory(seed, position="landlord", num_acts=100):
                 "tiled z_batch/x_batch is ~0.4 MiB at 287 actions) is far "
                 "smaller than the torch/Python interpreter baseline (~280 "
                 "MiB), so the two backends typically report the SAME rounded "
-                "process peak. This measurement therefore confirms the "
-                "factorized path does NOT increase peak RSS, but process-level "
-                "ru_maxrss is too coarse to resolve the sub-MiB tiled-batch "
-                "saving. An allocation-scoped measurement (e.g. "
-                "tracemalloc, or torch CUDA memory on GPU) would be needed to "
-                "quantify the saving and is deferred to P14."
+                "process peak. This measurement therefore provides a coarse "
+                "regression signal — no peak-RSS increase was observed for the "
+                "factorized path in this benchmark run — but it is NOT a "
+                "strict proof that the factorized path never increases peak "
+                "RSS: ru_maxrss is too coarse to resolve sub-MiB tiled-batch "
+                "differences and is sampled once per subprocess. An "
+                "allocation-scoped measurement (e.g. tracemalloc, or torch "
+                "CUDA memory on GPU) would be needed to quantify the saving "
+                "and is deferred to P14."
             ),
         }
     }
@@ -406,6 +441,10 @@ def main(argv=None):
     parser.add_argument("--num_acts_memory", type=int, default=100,
                         help="Number of act() calls for the peak-RSS measurement.")
     args = parser.parse_args(argv)
+
+    # Fail fast before any timing if CUDA is not actually hidden. This is the
+    # contract that makes the ``device: cpu`` label honest.
+    _assert_cpu_only()
 
     from douzero._version import environment_info
 
