@@ -183,7 +183,12 @@ _LEGACY_ONLY_VERSIONS: dict[str, frozenset[str]] = {
     "feature_version": frozenset({"legacy", "v2"}),
     # P02 widens the ruleset allowed set to include "standard".
     "ruleset": frozenset({"legacy", "standard"}),
-    "model_version": frozenset({"legacy"}),
+    # P04 widens the model_version allowed set to include "factorized". The
+    # factorized model is a deployment-only, checkpoint-compatible forward that
+    # is numerically equivalent to legacy under the same weights; training is
+    # NOT yet wired to it (the dmc.py gate rejects factorized training until
+    # P05/P06). The default stays "legacy".
+    "model_version": frozenset({"legacy", "factorized"}),
 }
 
 

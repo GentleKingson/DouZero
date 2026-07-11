@@ -32,6 +32,7 @@ class RuntimeConfig:
     device: str = "cuda"
     feature_version: str = "legacy"
     ruleset: str = "legacy"
+    # P04 widens to allow "factorized" (deployment-only); default is "legacy".
     model_version: str = "legacy"
 
 
@@ -79,9 +80,11 @@ class TrainingConfig:
     seed: int = 0
     deterministic: bool = False
     config: str = ""  # path to a YAML config, "" means none
-    # Version identifiers (P01 only supports "legacy"; P02/P03/P05 widen these).
-    # Carried through the config so --config + explicit CLI never silently drop
-    # them, and so the checkpoint manifest records the effective versions.
+    # Version identifiers. P01 only supported "legacy"; P02 widened ruleset,
+    # P03 widened feature_version, P04 widened model_version. Defaults stay
+    # "legacy" so existing behavior is unchanged. Carried through the config so
+    # --config + explicit CLI never silently drop them, and so the checkpoint
+    # manifest records the effective versions.
     feature_version: str = "legacy"
     ruleset: str = "legacy"
     model_version: str = "legacy"
@@ -96,7 +99,8 @@ class TrainingConfig:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ModelConfig:
-    version: str = "legacy"  # legacy | v2 (v2 arrives in P05)
+    # legacy | factorized (P04, deployment-only) | v2 (v2 arrives in P05)
+    version: str = "legacy"
 
 
 @dataclass(frozen=True)
