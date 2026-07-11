@@ -59,13 +59,54 @@ class DeepAgent:
         if len(infoset.legal_actions) == 1:
             return infoset.legal_actions[0]
 
+        if self.backend == 'legacy_factorized':
+            return self._act_factorized(infoset)
+        return self._act_legacy(infoset)
+
+    def _act_legacy(self, infoset):
+        """Legacy per-row forward (unchanged from the original DeepAgent).
+
+        Builds the tiled (N, ...) batches via get_obs and forwards them. The
+        default backend; behavior is identical to pre-P04 DeepAgent.
+        """
         obs = get_obs(infoset)
 
         z_batch = torch.from_numpy(obs['z_batch']).float()
         x_batch = torch.from_numpy(obs['x_batch']).float()
         if torch.cuda.is_available():
             z_batch, x_batch = z_batch.cuda(), x_batch.cuda()
-        y_pred = self.model.forward(z_batch, x_batch, return_value=True)['values']
+        with torch.inference_mode():
+            y_pred = self.model.forward(z_batch, x_batch, return_value=True)['values']
+        y_pred = y_pred.detach().cpu().numpy()
+
+        best_action_index = np.argmax(y_pred, axis=0)[0]
+        best_action = infoset.legal_actions[best_action_index]
+
+        return best_action
+
+    def _act_factorized(self, infoset):
+        """Factorized forward: consume the split observation directly.
+
+        Uses get_obs_factorized, which encodes the shared history/state ONCE
+        (never tiling them across the N legal-action rows) and produces only
+        the per-action (N, 54) matrix with an N dimension. The model's
+        forward_factorized runs the LSTM once on the singleton history and
+        broadcasts across the per-action rows.
+        """
+        from douzero.env.env import get_obs_factorized
+
+        obs = get_obs_factorized(infoset)
+        z_single = torch.from_numpy(obs['z_single']).float()
+        x_state_single = torch.from_numpy(obs['x_state_single']).float()
+        x_action = torch.from_numpy(obs['x_action']).float()
+        if torch.cuda.is_available():
+            z_single = z_single.cuda()
+            x_state_single = x_state_single.cuda()
+            x_action = x_action.cuda()
+        with torch.inference_mode():
+            y_pred = self.model.forward_factorized(
+                z_single, x_state_single, x_action, return_value=True
+            )['values']
         y_pred = y_pred.detach().cpu().numpy()
 
         best_action_index = np.argmax(y_pred, axis=0)[0]

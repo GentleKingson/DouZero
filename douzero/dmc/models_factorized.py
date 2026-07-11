@@ -79,6 +79,8 @@ _ACTION_WIDTH: int = 54
 # LSTM input/hidden sizes, matching the legacy models exactly.
 _LSTM_INPUT_SIZE: int = 162
 _LSTM_HIDDEN_SIZE: int = 128
+# History is the last 15 moves reshaped to (5, 162) = 5 timesteps x 3 moves x 54.
+_LSTM_SEQ_LEN: int = 5
 
 # MLP widths, matching the legacy models exactly.
 _MLP_WIDTH: int = 512
@@ -102,16 +104,130 @@ class _LegacyFactorizedBase(nn.Module):
     # Set by subclasses.
     _state_width: int
 
+    def _validate_legacy_batch(self, z_batch, x_batch):
+        """Validate the legacy-batched tensors before slicing.
+
+        Because :meth:`forward` consumes only row 0 of ``z_batch``/``x_state``
+        (the legacy encoder guarantees all rows are identical), a caller that
+        passes rows that are NOT identical would get a silently wrong result
+        (the per-action variation in the state block would be dropped). This
+        guards against that: shape errors raise immediately, and in debug mode
+        (or when ``DUZERO_FACTORIZED_STRICT`` is set) the shared-row invariant
+        is verified too.
+
+        See issue: a drop-in model must not silently accept non-shared input.
+        """
+        if z_batch.ndim != 3:
+            raise ValueError(
+                f"factorized forward expects z_batch.ndim==3 (N, 5, 162), "
+                f"got {z_batch.ndim} (shape {tuple(z_batch.shape)})."
+            )
+        if x_batch.ndim != 2:
+            raise ValueError(
+                f"factorized forward expects x_batch.ndim==2 "
+                f"(N, state_width+54), got {x_batch.ndim} "
+                f"(shape {tuple(x_batch.shape)})."
+            )
+        n_z = z_batch.shape[0]
+        n_x = x_batch.shape[0]
+        if n_z != n_x:
+            raise ValueError(
+                f"factorized forward expects z_batch and x_batch to share the "
+                f"row count (N); got z_batch N={n_z}, x_batch N={n_x}."
+            )
+        if n_z < 1:
+            raise ValueError(
+                "factorized forward expects N>=1 legal actions; got N=0."
+            )
+        if z_batch.shape[1:] != (_LSTM_SEQ_LEN, _LSTM_INPUT_SIZE):
+            raise ValueError(
+                f"factorized forward expects z_batch.shape[1:]=="
+                f"{(_LSTM_SEQ_LEN, _LSTM_INPUT_SIZE)}, got "
+                f"{tuple(z_batch.shape[1:])}."
+            )
+        expected_x_width = self._state_width + _ACTION_WIDTH
+        if x_batch.shape[1] != expected_x_width:
+            raise ValueError(
+                f"factorized forward expects x_batch.shape[1]=="
+                f"{expected_x_width} (state_width {self._state_width} + "
+                f"action {self._ACTION_WIDTH}), got {x_batch.shape[1]}."
+            )
+        # Shared-row invariant: all rows of z_batch must be identical, and all
+        # rows of the state block of x_batch must be identical. This is cheap
+        # to check and catches the silent-failure case. Opt out via the env
+        # var only for hot paths that have already validated upstream.
+        import os
+        if os.environ.get("DUZERO_FACTORIZED_STRICT", "") == "0":
+            return
+        z_single = z_batch[:1]
+        if not torch.equal(z_batch, z_single.expand_as(z_batch)):
+            raise ValueError(
+                "factorized forward received a z_batch whose rows are NOT "
+                "identical. The factorized path encodes the shared history "
+                "once (row 0); non-identical rows would be silently dropped. "
+                "Pass a tiled batch from the legacy encoder, or use "
+                "forward_factorized() with a true singleton."
+            )
+        x_state = x_batch[:, : self._state_width]
+        x_state_single = x_state[:1]
+        if not torch.equal(x_state, x_state_single.expand_as(x_state)):
+            raise ValueError(
+                "factorized forward received an x_batch whose state block "
+                "rows are NOT identical. The factorized path encodes the "
+                "shared state once (row 0); per-row state variation would be "
+                "silently dropped. Pass a tiled batch from the legacy encoder, "
+                "or use forward_factorized() with a true singleton."
+            )
+
+    def _validate_factorized_inputs(self, z_single, x_state_single, x_action):
+        """Validate the split (singleton) inputs to forward_factorized."""
+        if z_single.ndim != 3 or z_single.shape[0] != 1:
+            raise ValueError(
+                f"forward_factorized expects z_single of shape (1, 5, 162), "
+                f"got shape {tuple(z_single.shape)}."
+            )
+        if z_single.shape[1:] != (5, _LSTM_INPUT_SIZE):
+            raise ValueError(
+                f"forward_factorized expects z_single.shape[1:]==(5, 162), "
+                f"got {tuple(z_single.shape[1:])}."
+            )
+        if x_state_single.ndim != 2 or x_state_single.shape[0] != 1:
+            raise ValueError(
+                f"forward_factorized expects x_state_single of shape "
+                f"(1, {self._state_width}), got shape "
+                f"{tuple(x_state_single.shape)}."
+            )
+        if x_state_single.shape[1] != self._state_width:
+            raise ValueError(
+                f"forward_factorized expects x_state_single.shape[1]=="
+                f"{self._state_width}, got {x_state_single.shape[1]}."
+            )
+        if x_action.ndim != 2:
+            raise ValueError(
+                f"forward_factorized expects x_action.ndim==2 (N, 54), got "
+                f"{x_action.ndim} (shape {tuple(x_action.shape)})."
+            )
+        if x_action.shape[0] < 1:
+            raise ValueError(
+                "forward_factorized expects N>=1 legal actions; got N=0."
+            )
+        if x_action.shape[1] != _ACTION_WIDTH:
+            raise ValueError(
+                f"forward_factorized expects x_action.shape[1]==54, got "
+                f"{x_action.shape[1]}."
+            )
+
     def forward(self, z_batch, x_batch, return_value=False, flags=None):
         """Factorized forward over legacy-batched tensors.
 
         Args:
-            z_batch: ``(N, 5, 162)`` legacy history batch. All rows are assumed
+            z_batch: ``(N, 5, 162)`` legacy history batch. All rows MUST be
                 identical (the legacy encoder guarantees this); only row 0 is
-                consumed by the LSTM.
+                consumed by the LSTM. Non-identical rows raise ValueError.
             x_batch: ``(N, state_width + 54)`` legacy state+action batch. The
-                first ``state_width`` columns are the shared state; the last 54
-                are per-action card vectors.
+                first ``state_width`` columns MUST be identical across rows;
+                only the last 54 are per-action card vectors. Shape and
+                shared-row invariants are validated before slicing.
             return_value: when True, return ``{'values': (N, 1)}``. When False,
                 return ``{'action': index}`` via argmax (or epsilon-greedy),
                 matching the legacy contract exactly.
@@ -120,6 +236,7 @@ class _LegacyFactorizedBase(nn.Module):
         Returns:
             dict with ``'values'`` (when ``return_value``) or ``'action'``.
         """
+        self._validate_legacy_batch(z_batch, x_batch)
         n = x_batch.shape[0]
 
         # --- Shared history: ONE LSTM call over the single shared history. ---
@@ -130,8 +247,7 @@ class _LegacyFactorizedBase(nn.Module):
         h_lstm = lstm_out[:, -1, :]                  # (1, 128)
 
         # --- Shared state: slice once, broadcast (view, no copy). ---
-        x_state = x_batch[:, : self._state_width]    # (N, state_width)
-        x_state_single = x_state[:1]                  # (1, state_width)
+        x_state_single = x_batch[:1, : self._state_width]  # (1, state_width)
 
         # --- Per-action card vectors. ---
         x_action = x_batch[:, self._state_width :]    # (N, 54)
@@ -172,8 +288,10 @@ class _LegacyFactorizedBase(nn.Module):
         This is the canonical factorized interface: the shared history and
         shared state are passed as singletons ``(1, ...)`` and only the
         per-action card vectors carry the ``N`` dimension. It exists so callers
-        that already hold split tensors (e.g. from an Observation V2 StateBlock)
-        can skip the legacy-batched representation entirely.
+        that already hold split tensors (e.g. from
+        :func:`~douzero.env.env.get_obs_factorized`) can skip the legacy-batched
+        representation entirely — no tiling, no tiled tensor allocation, no
+        tiled CPU->GPU transfer.
 
         Args:
             z_single: ``(1, 5, 162)`` shared history.
@@ -181,6 +299,7 @@ class _LegacyFactorizedBase(nn.Module):
             x_action: ``(N, 54)`` per-action card vectors.
             return_value, flags: as in :meth:`forward`.
         """
+        self._validate_factorized_inputs(z_single, x_state_single, x_action)
         n = x_action.shape[0]
         lstm_out, _ = self.lstm(z_single)             # (1, 5, 128)
         h_lstm = lstm_out[:, -1, :]                     # (1, 128)
