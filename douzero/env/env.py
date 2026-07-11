@@ -322,7 +322,7 @@ def get_obs(infoset):
     This function obtains observations with imperfect information
     from the infoset. It has three branches since we encode
     different features for different positions.
-    
+
     This function will return dictionary named `obs`. It contains
     several fields. These fields will be used to train the model.
     One can play with those features to improve the performance.
@@ -349,6 +349,201 @@ def get_obs(infoset):
         return _get_obs_landlord_down(infoset)
     else:
         raise ValueError('')
+
+
+# --------------------------------------------------------------------------- #
+# Factorized observation encoder (P04)
+# --------------------------------------------------------------------------- #
+# get_obs_factorized produces the SAME shared-state vector and per-action
+# vectors as the legacy encoders above, but NEVER tiles the shared state or
+# history across the N legal-action rows. It returns:
+#
+#   z_single       : (1, 5, 162) float32   — the shared history, encoded once
+#   x_state_single : (1, D_state) float32  — the shared state, encoded once
+#   x_action       : (N, 54) float32       — per-action card vectors
+#   legal_actions  : list                  — the N legal actions
+#
+# where D_state is 319 (landlord) / 430 (farmers), matching x_no_action. The
+# factorized DeepAgent (backend='legacy_factorized') consumes these directly
+# via model.forward_factorized(z_single, x_state_single, x_action), avoiding:
+#   * the NumPy np.repeat tiling of the shared state/history,
+#   * the CPU tensor allocation for the tiled (N, ...) batches,
+#   * the CPU->GPU transfer of the tiled batches.
+#
+# The shared-state construction below is byte-for-byte identical to the
+# legacy x_no_action (same field order, same helpers); only the tiling is
+# removed. z is identical to the legacy z. Parity is pinned by
+# tests/test_factorized_parity.py (get_obs_factorized vs legacy get_obs).
+def get_obs_factorized(infoset):
+    """Return the factorized (split) observation, never tiling shared state.
+
+    Args:
+        infoset: the game infoset with ``player_position`` set.
+
+    Returns:
+        dict with keys ``position``, ``z_single`` (1,5,162) float32,
+        ``x_state_single`` (1, D_state) float32, ``x_action`` (N, 54)
+        float32, ``legal_actions``. The shared blocks carry a leading 1 so
+        they feed the model's singleton-input forward directly.
+    """
+    if infoset.player_position == 'landlord':
+        return _get_obs_factorized_landlord(infoset)
+    elif infoset.player_position == 'landlord_up':
+        return _get_obs_factorized_landlord_up(infoset)
+    elif infoset.player_position == 'landlord_down':
+        return _get_obs_factorized_landlord_down(infoset)
+    else:
+        raise ValueError(
+            f"Unknown player_position {infoset.player_position!r}; expected "
+            f"'landlord', 'landlord_up', or 'landlord_down'."
+        )
+
+
+def _build_shared_state_landlord(infoset):
+    """Build the landlord shared-state (x_no_action) vector once.
+
+    Field order matches _get_obs_landlord exactly:
+    my(54), other(54), last(54), up_played(54), down_played(54),
+    up_left(17), down_left(17), bomb(15) -> 319.
+    """
+    my_handcards = _cards2array(infoset.player_hand_cards)
+    other_handcards = _cards2array(infoset.other_hand_cards)
+    last_action = _cards2array(infoset.last_move)
+    landlord_up_played_cards = _cards2array(infoset.played_cards['landlord_up'])
+    landlord_down_played_cards = _cards2array(infoset.played_cards['landlord_down'])
+    landlord_up_num_cards_left = _get_one_hot_array(
+        infoset.num_cards_left_dict['landlord_up'], 17)
+    landlord_down_num_cards_left = _get_one_hot_array(
+        infoset.num_cards_left_dict['landlord_down'], 17)
+    bomb_num = _get_one_hot_bomb(infoset.bomb_num)
+    return np.hstack((my_handcards,
+                      other_handcards,
+                      last_action,
+                      landlord_up_played_cards,
+                      landlord_down_played_cards,
+                      landlord_up_num_cards_left,
+                      landlord_down_num_cards_left,
+                      bomb_num))
+
+
+def _build_shared_state_landlord_up(infoset):
+    """Build the landlord_up shared-state (x_no_action) vector once.
+
+    Field order matches _get_obs_landlord_up exactly:
+    my(54), other(54), landlord_played(54), teammate(down)_played(54),
+    last(54), last_landlord(54), last_teammate(54), landlord_left(20),
+    teammate_left(17), bomb(15) -> 430.
+    """
+    my_handcards = _cards2array(infoset.player_hand_cards)
+    other_handcards = _cards2array(infoset.other_hand_cards)
+    last_action = _cards2array(infoset.last_move)
+    landlord_played_cards = _cards2array(infoset.played_cards['landlord'])
+    teammate_played_cards = _cards2array(infoset.played_cards['landlord_down'])
+    last_landlord_action = _cards2array(infoset.last_move_dict['landlord'])
+    last_teammate_action = _cards2array(infoset.last_move_dict['landlord_down'])
+    landlord_num_cards_left = _get_one_hot_array(
+        infoset.num_cards_left_dict['landlord'], 20)
+    teammate_num_cards_left = _get_one_hot_array(
+        infoset.num_cards_left_dict['landlord_down'], 17)
+    bomb_num = _get_one_hot_bomb(infoset.bomb_num)
+    return np.hstack((my_handcards,
+                      other_handcards,
+                      landlord_played_cards,
+                      teammate_played_cards,
+                      last_action,
+                      last_landlord_action,
+                      last_teammate_action,
+                      landlord_num_cards_left,
+                      teammate_num_cards_left,
+                      bomb_num))
+
+
+def _build_shared_state_landlord_down(infoset):
+    """Build the landlord_down shared-state (x_no_action) vector once.
+
+    Field order matches _get_obs_landlord_down exactly:
+    my(54), other(54), landlord_played(54), teammate(up)_played(54),
+    last(54), last_landlord(54), last_teammate(54), landlord_left(20),
+    teammate_left(17), bomb(15) -> 430.
+    """
+    my_handcards = _cards2array(infoset.player_hand_cards)
+    other_handcards = _cards2array(infoset.other_hand_cards)
+    last_action = _cards2array(infoset.last_move)
+    landlord_played_cards = _cards2array(infoset.played_cards['landlord'])
+    teammate_played_cards = _cards2array(infoset.played_cards['landlord_up'])
+    last_landlord_action = _cards2array(infoset.last_move_dict['landlord'])
+    last_teammate_action = _cards2array(infoset.last_move_dict['landlord_up'])
+    landlord_num_cards_left = _get_one_hot_array(
+        infoset.num_cards_left_dict['landlord'], 20)
+    teammate_num_cards_left = _get_one_hot_array(
+        infoset.num_cards_left_dict['landlord_up'], 17)
+    bomb_num = _get_one_hot_bomb(infoset.bomb_num)
+    return np.hstack((my_handcards,
+                      other_handcards,
+                      landlord_played_cards,
+                      teammate_played_cards,
+                      last_action,
+                      last_landlord_action,
+                      last_teammate_action,
+                      landlord_num_cards_left,
+                      teammate_num_cards_left,
+                      bomb_num))
+
+
+def _build_action_matrix(infoset):
+    """Build the (N, 54) per-action card-vector matrix (never tiled)."""
+    num_legal_actions = len(infoset.legal_actions)
+    x_action = np.zeros((num_legal_actions, 54), dtype=np.float32)
+    for j, action in enumerate(infoset.legal_actions):
+        x_action[j, :] = _cards2array(action)
+    return x_action
+
+
+def _get_obs_factorized_landlord(infoset):
+    x_state = _build_shared_state_landlord(infoset).astype(np.float32)
+    x_action = _build_action_matrix(infoset)
+    z = _action_seq_list2array(_process_action_seq(infoset.card_play_action_seq))
+    # Leading 1 so the singleton feeds the model's factorized forward directly.
+    return {
+        'position': 'landlord',
+        'z_single': z[np.newaxis, :, :].astype(np.float32),
+        'x_state_single': x_state[np.newaxis, :],
+        'x_action': x_action,
+        'legal_actions': infoset.legal_actions,
+        # Untiled singletons, for parity/debugging (matching legacy obs keys).
+        'x_no_action': x_state.astype(np.int8),
+        'z': z.astype(np.int8),
+    }
+
+
+def _get_obs_factorized_landlord_up(infoset):
+    x_state = _build_shared_state_landlord_up(infoset).astype(np.float32)
+    x_action = _build_action_matrix(infoset)
+    z = _action_seq_list2array(_process_action_seq(infoset.card_play_action_seq))
+    return {
+        'position': 'landlord_up',
+        'z_single': z[np.newaxis, :, :].astype(np.float32),
+        'x_state_single': x_state[np.newaxis, :],
+        'x_action': x_action,
+        'legal_actions': infoset.legal_actions,
+        'x_no_action': x_state.astype(np.int8),
+        'z': z.astype(np.int8),
+    }
+
+
+def _get_obs_factorized_landlord_down(infoset):
+    x_state = _build_shared_state_landlord_down(infoset).astype(np.float32)
+    x_action = _build_action_matrix(infoset)
+    z = _action_seq_list2array(_process_action_seq(infoset.card_play_action_seq))
+    return {
+        'position': 'landlord_down',
+        'z_single': z[np.newaxis, :, :].astype(np.float32),
+        'x_state_single': x_state[np.newaxis, :],
+        'x_action': x_action,
+        'legal_actions': infoset.legal_actions,
+        'x_no_action': x_state.astype(np.int8),
+        'z': z.astype(np.int8),
+    }
 
 def _get_one_hot_array(num_left_cards, max_num_cards):
     """
