@@ -56,14 +56,17 @@ identifiers are enforced by the config loader:
 |---|---|---|---|
 | `--seed` | `0` | int | Base RNG seed (`0` = legacy unseeded behavior; non-zero activates seeding) |
 | `--deterministic` | off | bool | Force deterministic torch algorithms |
-| `--feature_version` | `legacy` | `legacy` | Observation feature version (P03 introduces `v2`) |
+| `--feature_version` | `legacy` | `legacy`, `v2` | Observation feature version (P03 widens to include `v2`) |
 | `--ruleset` | `legacy` | `legacy`, `standard` | Rule set identifier (P02 widens to include `standard`) |
 | `--model_version` | `legacy` | `legacy` | Model version (P05 introduces `v2`) |
 
 P02 widens `--ruleset` to accept `standard` (in addition to `legacy`).
-`--feature_version` and `--model_version` remain `legacy`-only until P03/P05.
-All version identifiers are recorded in the checkpoint manifest (see
-`docs/checkpoint_compatibility.md`) so incompatible loads are rejected.
+P03 widens `--feature_version` to accept `v2` (the versioned observation schema
+in `douzero/observation/`; the legacy encoder remains the default and is
+byte-for-byte unchanged — see `docs/observation_v2.md`). `--model_version`
+remains `legacy`-only until P05. All version identifiers are recorded in the
+checkpoint manifest (see `docs/checkpoint_compatibility.md`) so incompatible
+loads are rejected.
 
 ### Standard ruleset
 

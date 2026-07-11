@@ -235,10 +235,21 @@ The legacy baseline deliberately omits several things AGENTS.md requires:
   **P02 decision: not fixed.** The anomaly is preserved in both legacy and
   standard modes to keep the P00 frozen snapshots unchanged. Reconciling the
   generator and detector is deferred to a later phase.
-- **No observation versioning.** Feature widths (319/373/430/484) are encoded
-  implicitly in `dense1` shapes and buffer specs. (→ P03)
-- **Privileged data is not type-separated.** `InfoSet` mixes public and private
-  fields; only `get_obs`'s projection keeps them out of deployment. (→ P03)
+- ~~**No observation versioning.** Feature widths (319/373/430/484) are encoded
+  implicitly in `dense1` shapes and buffer specs.~~ **Resolved in P03:** the
+  `douzero/observation/` package introduces a versioned `FeatureSchemaManifest`
+  whose every field width is derived from named constants in
+  `cards.py` / `seats.py` / `schema.py` — no magic 319/373/430/484. Opt-in via
+  `feature_version="v2"`; the legacy encoder is unchanged. See
+  `docs/observation_v2.md`.
+- ~~**Privileged data is not type-separated.** `InfoSet` mixes public and private
+  fields; only `get_obs`'s projection keeps them out of deployment.~~
+  **Resolved in P03:** `PublicObservation` (public only) and
+  `PrivilegedObservation` (true hidden hands, training-only, in a `privileged`
+  module/type) are separate, explicitly named types. The public encoder
+  `get_obs_v2` recomputes the unseen pool from public information and ignores
+  `all_handcards`; a leakage test asserts public obs is identical under hidden
+  reallocation. Training integration → P05/P06.
 - **No belief model.** Opponents' cards are pooled into one `other_hand_cards`
   vector, not modelled as a joint posterior. (→ P07)
 - **Permissive checkpoint loader** silently drops unknown keys. (→ P16)
@@ -259,7 +270,7 @@ The legacy baseline deliberately omits several things AGENTS.md requires:
 |---|---|---|
 | Rule legality | `move_generator` / `move_detector` / `move_selector` | P02 `RuleSet` added (rules.py); move_generator/detector/selector NOT modified (TYPE_15 anomaly deferred) |
 | Bidding/scoring | `GameEnv` (ruleset=None=legacy) / `Env` / `scoring.py` | P02 resolved (standard mode); training integration → P05/P06 |
-| Observation schema | `get_obs` (role encoders) | P03 `PublicObservation` V2 + legacy adapter |
+| Observation schema | `get_obs` (role encoders) | P03 resolved: `douzero/observation/` adds versioned `PublicObservation`/`PrivilegedObservation` + schema + legacy adapter; `get_obs` unchanged (default `feature_version=legacy`) |
 | Model input/widths | `Landlord/FarmerLstmModel.forward(z,x)` | P04 factorized forward (parity); P05 Model V2 |
 | Deployment selection | `DeepAgent.act(infoset)` | P05/P16 `DeepAgentV2` (public-only) |
 | Reward sign | `Env._get_reward` + actor negation | P06 centralised perspective |
