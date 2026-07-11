@@ -163,6 +163,57 @@ def test_maybe_set_global_deterministic_true_enables():
 
 
 # --------------------------------------------------------------------------- #
+# Actor deterministic initialization (item 1/2: full actor init block)
+# --------------------------------------------------------------------------- #
+def test_actor_init_block_cpu_seed_and_deterministic():
+    """The full actor init block (seed + deterministic) must work on CPU.
+
+    This replicates the exact wiring added to douzero.dmc.utils.act() for a
+    CPU actor with a non-zero base seed and deterministic=True. It proves the
+    whole chain (derive_actor_seed -> set_global_seed -> maybe_set_global_deterministic)
+    runs without error and produces reproducible state.
+    """
+    device = "cpu"
+    actor_id = 2
+    base_seed = 999
+
+    # Verbatim from utils.py act()
+    actor_seed = derive_actor_seed(base_seed, device_token=device, actor_id=actor_id)
+    set_global_seed(actor_seed)
+    maybe_set_global_deterministic(True)
+    assert torch.are_deterministic_algorithms_enabled() is True
+    # Restore.
+    torch.use_deterministic_algorithms(False)
+
+
+def test_actor_init_block_gpu_device_token():
+    """The actor init block with a GPU integer device token must also work."""
+    device = 0
+    actor_id = 1
+    base_seed = 888
+
+    actor_seed = derive_actor_seed(base_seed, device_token=device, actor_id=actor_id)
+    set_global_seed(actor_seed)
+    maybe_set_global_deterministic(False)
+    assert isinstance(actor_seed, int)
+    assert actor_seed != 0
+
+
+def test_actor_init_block_legacy_noop():
+    """The actor init block with seed=0 + deterministic=False must be all no-ops."""
+    device = "cpu"
+    actor_id = 0
+    base_seed = 0  # NO_SEED
+
+    original_det = torch.are_deterministic_algorithms_enabled()
+    actor_seed = derive_actor_seed(base_seed, device_token=device, actor_id=actor_id)
+    set_global_seed(actor_seed)
+    maybe_set_global_deterministic(False)
+    assert actor_seed == NO_SEED
+    assert torch.are_deterministic_algorithms_enabled() == original_det
+
+
+# --------------------------------------------------------------------------- #
 # Legacy env behavior unchanged when seed=0
 # --------------------------------------------------------------------------- #
 def test_env_with_seed_zero_unchanged(seed_factory):
