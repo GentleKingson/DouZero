@@ -49,21 +49,30 @@ can copy it and edit the values you want to change.
 ## The version fields
 
 P01 adds optional flags. `--seed` and `--deterministic` are wired into the
-unified seeding utility (see `douzero/runtime/seeding.py`); the three version
-identifiers are enforced as `legacy`-only in P01 (later phases widen the set):
+unified seeding utility (see `douzero/runtime/seeding.py`). The version
+identifiers are enforced by the config loader:
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `--seed` | `0` | Base RNG seed (`0` = legacy unseeded behavior; non-zero activates seeding) |
-| `--deterministic` | off | Force deterministic torch algorithms |
-| `--feature_version` | `legacy` | Observation feature version (P03 introduces `v2`) |
-| `--ruleset` | `legacy` | Rule set identifier (P02 introduces `standard`) |
-| `--model_version` | `legacy` | Model version (P05 introduces `v2`) |
+| Flag | Default | Allowed values | Purpose |
+|---|---|---|---|
+| `--seed` | `0` | int | Base RNG seed (`0` = legacy unseeded behavior; non-zero activates seeding) |
+| `--deterministic` | off | bool | Force deterministic torch algorithms |
+| `--feature_version` | `legacy` | `legacy` | Observation feature version (P03 introduces `v2`) |
+| `--ruleset` | `legacy` | `legacy`, `standard` | Rule set identifier (P02 widens to include `standard`) |
+| `--model_version` | `legacy` | `legacy` | Model version (P05 introduces `v2`) |
 
-In P01 only `legacy` is supported for the version fields; the CLI uses
-`choices=['legacy']` and the YAML/dict loader rejects any other value. They are
-recorded in the checkpoint manifest (see `docs/checkpoint_compatibility.md`) so
-future phases can reject incompatible loads.
+P02 widens `--ruleset` to accept `standard` (in addition to `legacy`).
+`--feature_version` and `--model_version` remain `legacy`-only until P03/P05.
+All version identifiers are recorded in the checkpoint manifest (see
+`docs/checkpoint_compatibility.md`) so incompatible loads are rejected.
+
+### Standard ruleset
+
+When `--ruleset standard` is set, a `rules:` block in the YAML config
+specifies the rule parameters (bidding mode, multipliers, base score, etc.).
+See `configs/standard.yaml` and `docs/rules_and_scoring.md` for details.
+**Training does not yet support `standard`** — `train.py` rejects it with a
+precise error. Standard mode is available for environment testing and
+end-to-end evaluation via `evaluate.py --ruleset standard`.
 
 ## Boolean flags and `--no-<flag>` overrides
 

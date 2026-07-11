@@ -200,28 +200,20 @@ synthetic (init-only) weights.
 
 The legacy baseline deliberately omits several things AGENTS.md requires:
 
-- **No bidding / scoring state machine.** Landlord is whoever gets 20 cards;
-  there is no `0/1/2/3` call, no "rob", no all-pass redeal. (→ P02)
-- **No spring / anti-spring** affecting reward. `bomb_num` counts bombs +
-  rocket only. (→ P02)
-- **No observation versioning.** Feature widths (319/373/430/484) are encoded
-  implicitly in `dense1` shapes and buffer specs. (→ P03)
-- **Privileged data is not type-separated.** `InfoSet` mixes public and private
-  fields; only `get_obs`'s projection keeps them out of deployment. (→ P03)
-- **No belief model.** Opponents' cards are pooled into one `other_hand_cards`
-  vector, not modelled as a joint posterior. (→ P07)
-- **Permissive checkpoint loader** silently drops unknown keys. (→ P16)
-- **No calibration, no paired CI, no ablation harness.** Evaluation reports
-  only raw WP/ADP. (→ P15)
-- **No internal seeding anywhere.** The sole RNG is `np.random.shuffle` in
-  `Env.reset` (`env.py:60`); reproducibility is the caller's responsibility.
-  (→ P01 seeds; P00 adds seeding in tests/tools.)
-- **Generator/detector inconsistency (serial-3+1 with a quad "wing").**
-  `gen_type_11_serial_3_1` builds the single-card wings from
-  `[c for c in hand if c not in serial_3_set]`. When the hand contains a
-  four-of-a-kind, those four equal-rank singles become four wings, producing a
-  16-card move such as `[3,3,3,4,4,4,5,5,5,6,6,6,7,7,7,7]` (four triples + a
-  quad used as four single wings). `get_move_type` then classifies it as
+- ~~**No bidding / scoring state machine.**~~ **Resolved in P02:** a
+  configurable `RuleSet` and a `DEAL→BIDDING→REVEAL_BOTTOM→PLAYING→TERMINAL`
+  state machine are added to `GameEnv` (opt-in via `--ruleset standard`).
+  Legacy mode is unchanged. See `docs/rules_and_scoring.md`. Training does
+  not yet support standard mode (P05/P06).
+- ~~**No spring / anti-spring** affecting reward.~~ **Resolved in P02:**
+  spring/anti-spring detection and multipliers are in `douzero/env/scoring.py`
+  (standard mode only; legacy has `spring_multiplier=0`).
+- **TYPE_15 anomaly (generator/detector inconsistency).**
+  `gen_type_11_serial_3_1` builds serial-3+1 wings by selecting single cards
+  from `[c for c in hand if c not in serial_3_set]`. When the hand contains a
+  four-of-a-kind, those four equal-rank singles become four "wings", yielding
+  a 16-card move such as `[3,3,3,4,4,4,5,5,5,6,6,6,7,7,7,7]` (four triples +
+  a quad used as four single wings). `get_move_type` then classifies it as
   `TYPE_15_WRONG` because its serial-3 branch rejects any card whose
   multiplicity is 4 (`move_detector.py:92`).
 
@@ -240,7 +232,21 @@ The legacy baseline deliberately omits several things AGENTS.md requires:
   `test_legal_actions_snapshot.test_landlord_opening_actions_classify_valid_with_known_exceptions`
   and the response-collapse test
   `test_quad_wing_wrong_move_collapses_response_to_bomb_or_pass`.
-  (→ P02 rule engine should reconcile generator and detector.)
+  **P02 decision: not fixed.** The anomaly is preserved in both legacy and
+  standard modes to keep the P00 frozen snapshots unchanged. Reconciling the
+  generator and detector is deferred to a later phase.
+- **No observation versioning.** Feature widths (319/373/430/484) are encoded
+  implicitly in `dense1` shapes and buffer specs. (→ P03)
+- **Privileged data is not type-separated.** `InfoSet` mixes public and private
+  fields; only `get_obs`'s projection keeps them out of deployment. (→ P03)
+- **No belief model.** Opponents' cards are pooled into one `other_hand_cards`
+  vector, not modelled as a joint posterior. (→ P07)
+- **Permissive checkpoint loader** silently drops unknown keys. (→ P16)
+- **No calibration, no paired CI, no ablation harness.** Evaluation reports
+  only raw WP/ADP. (→ P15)
+- **No internal seeding anywhere.** The sole RNG is `np.random.shuffle` in
+  `Env.reset` (`env.py:60`); reproducibility is the caller's responsibility.
+  (→ P01 seeds; P00 adds seeding in tests/tools.)
 - ~~**`file_writer.py` imports `git` (GitPython) at module load.**~~ **Resolved
   in P01:** the `import git` is now lazy (inside `gather_metadata`), GitPython
   is declared in `install_requires`, and `import douzero.dmc` / `train.py
@@ -251,13 +257,14 @@ The legacy baseline deliberately omits several things AGENTS.md requires:
 
 | Boundary | Where | Later phase |
 |---|---|---|
-| Rule legality | `move_generator` / `move_detector` / `move_selector` | P02 versioned `RuleSet` supersedes |
+| Rule legality | `move_generator` / `move_detector` / `move_selector` | P02 `RuleSet` added (rules.py); move_generator/detector/selector NOT modified (TYPE_15 anomaly deferred) |
+| Bidding/scoring | `GameEnv` (ruleset=None=legacy) / `Env` / `scoring.py` | P02 resolved (standard mode); training integration → P05/P06 |
 | Observation schema | `get_obs` (role encoders) | P03 `PublicObservation` V2 + legacy adapter |
 | Model input/widths | `Landlord/FarmerLstmModel.forward(z,x)` | P04 factorized forward (parity); P05 Model V2 |
 | Deployment selection | `DeepAgent.act(infoset)` | P05/P16 `DeepAgentV2` (public-only) |
 | Reward sign | `Env._get_reward` + actor negation | P06 centralised perspective |
 | Checkpoint manifest | `{pos}_weights_*.ckpt`, `model.tar` | P16 strict `ModelManifest` |
-| Eval deal format | pickled `list[dict]` | P02 adds ruleset_id/bidding; legacy adapter keeps old reads |
+| Eval deal format | pickled `list[dict]` | P02 resolved: v1 (legacy) + v2 (standard with deck/bidding); legacy adapter auto-detects |
 
 ## 12. Reproducing this baseline
 
