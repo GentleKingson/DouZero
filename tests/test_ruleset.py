@@ -360,12 +360,20 @@ def test_cli_rejects_ruleset_v2():
         parser.parse_args(["--ruleset", "v2"])
 
 
-def test_cli_feature_version_still_legacy_only():
-    """P02 does NOT widen feature_version; it stays choices=['legacy']."""
+def test_cli_feature_version_accepts_v2():
+    """P03 widens feature_version: --feature_version v2 is now accepted."""
+    from douzero.dmc.arguments import parser
+
+    ns = parser.parse_args(["--feature_version", "v2"])
+    assert ns.feature_version == "v2"
+
+
+def test_cli_feature_version_rejects_unknown():
+    """An unknown --feature_version value must still be rejected."""
     from douzero.dmc.arguments import parser
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["--feature_version", "v2"])
+        parser.parse_args(["--feature_version", "v3"])
 
 
 def test_cli_model_version_still_legacy_only():

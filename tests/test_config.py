@@ -400,10 +400,18 @@ def test_yaml_version_fields_not_lost_with_config_cli(tmp_path):
     assert ns.batch_size == 32
 
 
+def test_yaml_accepts_v2_feature_version(tmp_path):
+    """P03 widens the allowed feature_version set: feature_version=v2 is accepted."""
+    good = tmp_path / "v2.yaml"
+    good.write_text("feature_version: v2\n", encoding="utf-8")
+    cfg = load_config(str(good))
+    assert cfg.feature_version == "v2"
+
+
 def test_yaml_rejects_unsupported_feature_version(tmp_path):
-    """A YAML config with feature_version=v2 must be rejected (P01=legacy only)."""
-    bad = tmp_path / "v2.yaml"
-    bad.write_text("feature_version: v2\n", encoding="utf-8")
+    """A YAML config with an unsupported feature_version must still be rejected."""
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("feature_version: v3\n", encoding="utf-8")
     with pytest.raises(ValueError, match="feature_version"):
         load_config(str(bad))
 
@@ -432,12 +440,20 @@ def test_yaml_rejects_unsupported_model_version(tmp_path):
         load_config(str(bad))
 
 
+def test_cli_accepts_v2_feature_version():
+    """P03 widens the CLI choices: --feature_version v2 is accepted."""
+    from douzero.dmc.arguments import parser
+
+    ns = parser.parse_args(["--feature_version", "v2"])
+    assert ns.feature_version == "v2"
+
+
 def test_cli_rejects_unsupported_feature_version():
-    """argparse choices must reject --feature_version v2 at the CLI."""
+    """argparse choices must reject an unsupported --feature_version value."""
     from douzero.dmc.arguments import parser
 
     with pytest.raises(SystemExit):
-        parser.parse_args(["--feature_version", "v2"])
+        parser.parse_args(["--feature_version", "v3"])
 
 
 def test_serialize_includes_version_fields():
