@@ -226,6 +226,86 @@ def test_store_true_cli_explicit_overrides_yaml_false(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Boolean override: YAML true -> CLI false (item 5, BooleanOptionalAction)
+# --------------------------------------------------------------------------- #
+def test_cli_no_flag_overrides_yaml_true_to_false(tmp_path):
+    """YAML deterministic=true, CLI --no-deterministic -> False (item 5).
+
+    This is the headline item-5 scenario: a YAML ``true`` boolean that the user
+    wants to flip off from the CLI. Requires BooleanOptionalAction so that
+    ``--no-deterministic`` is a recognized flag.
+    """
+    from douzero.dmc.arguments import parse_args
+
+    yml = tmp_path / "run.yaml"
+    yml.write_text("deterministic: true\n", encoding="utf-8")
+    ns = parse_args(["--config", str(yml), "--no-deterministic"])
+    assert ns.deterministic is False
+
+
+def test_cli_no_flag_overrides_yaml_true_actor_device_cpu(tmp_path):
+    """YAML actor_device_cpu=true, CLI --no-actor_device_cpu -> False."""
+    from douzero.dmc.arguments import parse_args
+
+    yml = tmp_path / "run.yaml"
+    yml.write_text("actor_device_cpu: true\n", encoding="utf-8")
+    ns = parse_args(["--config", str(yml), "--no-actor_device_cpu"])
+    assert ns.actor_device_cpu is False
+
+
+def test_cli_no_flag_overrides_yaml_true_disable_checkpoint(tmp_path):
+    """YAML disable_checkpoint=true, CLI --no-disable_checkpoint -> False."""
+    from douzero.dmc.arguments import parse_args
+
+    yml = tmp_path / "run.yaml"
+    yml.write_text("disable_checkpoint: true\n", encoding="utf-8")
+    ns = parse_args(["--config", str(yml), "--no-disable_checkpoint"])
+    assert ns.disable_checkpoint is False
+
+
+def test_cli_no_flag_overrides_yaml_true_load_model(tmp_path):
+    """YAML load_model=true, CLI --no-load_model -> False."""
+    from douzero.dmc.arguments import parse_args
+
+    yml = tmp_path / "run.yaml"
+    yml.write_text("load_model: true\n", encoding="utf-8")
+    ns = parse_args(["--config", str(yml), "--no-load_model"])
+    assert ns.load_model is False
+
+
+def test_boolean_default_is_false_not_none():
+    """Legacy compat: parse_args([]) must yield False, not None, for booleans.
+
+    BooleanOptionalAction without an explicit default yields None, which would
+    break callers that do ``== False`` checks. The flags declare default=False.
+    """
+    from douzero.dmc.arguments import parser
+
+    ns = parser.parse_args([])
+    assert ns.actor_device_cpu is False
+    assert ns.load_model is False
+    assert ns.disable_checkpoint is False
+    assert ns.deterministic is False
+
+
+def test_positive_boolean_form_still_works():
+    """Legacy compat: --actor_device_cpu (positive) sets True."""
+    from douzero.dmc.arguments import parser
+
+    ns = parser.parse_args(["--actor_device_cpu", "--load_model"])
+    assert ns.actor_device_cpu is True
+    assert ns.load_model is True
+
+
+def test_no_flag_alone_sets_false():
+    """--no-deterministic on its own (no --config) sets deterministic=False."""
+    from douzero.dmc.arguments import parser
+
+    ns = parser.parse_args(["--no-deterministic"])
+    assert ns.deterministic is False
+
+
+# --------------------------------------------------------------------------- #
 # YAML safety / type validation (review item 6)
 # --------------------------------------------------------------------------- #
 def test_wrong_type_rejected(tmp_path):
