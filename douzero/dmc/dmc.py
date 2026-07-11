@@ -58,13 +58,24 @@ def learn(position,
             actor_model.get_model(position).load_state_dict(model.state_dict())
         return stats
 
-def train(flags):  
+def train(flags):
     """
     This is the main funtion for training. It will first
     initilize everything, such as buffers, optimizers, etc.
-    Then it will start subprocesses as actors. Then, it will call
+    Then it will start subprocesses as actors. Then it will call
     learning function with  multiple threads.
     """
+    # P02: training only supports the legacy ruleset. Standard mode adds
+    # bidding/scoring which requires model/buffer changes (P05/P06).
+    ruleset = getattr(flags, 'ruleset', 'legacy')
+    if ruleset != 'legacy':
+        raise ValueError(
+            f"Training does not yet support ruleset={ruleset!r}. "
+            f"Only 'legacy' is supported for training in P02. "
+            f"Standard ruleset is available for evaluation and environment "
+            f"testing via `evaluate.py --ruleset standard`. Training "
+            f"integration arrives in P05/P06."
+        )
     if not flags.actor_device_cpu or flags.training_device != 'cpu':
         if not torch.cuda.is_available():
             raise AssertionError("CUDA not available. If you have GPUs, please specify the ID after `--gpu_devices`. Otherwise, please train with CPU with `python3 train.py --actor_device_cpu --training_device cpu`")
