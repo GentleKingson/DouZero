@@ -25,8 +25,12 @@ Two checkpoint formats coexist:
 2. **Per-position eval sidecars `{position}_weights_{frames}.ckpt`** — bare
    `state_dict` files consumed by `DeepAgent`. **Unchanged in P01.** Their
    permissive key filtering (`{k:v for k,v in pretrained.items() if k in
-   model_state_dict}`) is pinned by P00 tests; P16 replaces it with a strict,
-   manifest-backed load.
+   model_state_dict}`) is the legacy behavior; it is **not** behind an explicit
+   opt-in at the `DeepAgent` call site (the filter runs unconditionally in the
+   existing code). P00 tests pin this behavior; P16 will replace it with a
+   strict, manifest-backed, explicitly-opt-in load. Until then, the honest
+   status is: the permissive filter is the unchanged legacy default, not a new
+   opt-in gate.
 
 ## The manifest
 
@@ -38,9 +42,10 @@ Two checkpoint formats coexist:
 | `model_version` | model version (`legacy` in P01; `v2` arrives in P05) |
 | `feature_version` | observation feature version (`legacy` in P01; `v2` in P03) |
 | `ruleset_id` | rule set (`legacy` in P01; `standard` in P02) |
+| `checkpoint_kind` | one of `training_checkpoint` / `position_weights` / `privileged_teacher` / `public_policy` |
 | `git_sha` | commit SHA, or `"unknown"` (always a string, never None) |
 | `python_version` | interpreter version at save time |
-| `torch_version` | torch version at save time |
+| `torch_version` | torch version at save time (native `str`, not `TorchVersion`) |
 | `effective_config` | the full flag dict for auditability |
 | `frames`, `position_frames` | training progress counters |
 | `created_at` | ISO-8601 UTC timestamp |
@@ -51,23 +56,47 @@ Two checkpoint formats coexist:
 
 - **manifest present + compatible** → returns `(bundle, manifest)`.
 - **manifest present + incompatible** → raises `CheckpointCompatibilityError`
-  with the offending field and expected/actual values. The three checked
-  fields are `schema_version`, `feature_version`, `ruleset_id`. There is **no**
-  permissive fallback — a mismatch always raises.
+  with the offending field and expected/actual values. **Five fields are
+  checked**: `schema_version`, `model_version`, `feature_version`,
+  `ruleset_id`, and `checkpoint_kind`. There is **no** permissive fallback — a
+  mismatch on any one always raises.
 - **manifest absent (legacy pre-P01 checkpoint)** → delegates to
   `load_legacy_model_tar`, returns `(bundle, manifest=None)`. No version
   validation is possible because there is no manifest; callers assume the
   legacy feature/rule identity (acceptable in P01 because only `legacy`
   exists).
 
+## Security: weights_only by default
+
+Both `load_checkpoint` and `load_legacy_model_tar` default to
+`weights_only=True` (PyTorch's safe unpickling mode, which restricts
+deserialization to tensors, primitives, and standard containers). A P01
+training bundle (RMSProp optimizer state dicts + plain-dict stats/flags/
+manifest) loads cleanly under this safe mode.
+
+A checkpoint that embeds objects safe mode cannot reconstruct (e.g. a pickled
+`argparse.Namespace`, a `datetime`, or a custom stats object) requires the
+caller to explicitly pass `allow_unsafe_pickle=True`, which switches to
+`weights_only=False` and logs a warning. This keeps untrusted checkpoints safe
+by default — arbitrary code execution via pickle is never the default path.
+
+The removed `TRAINING_CHECKPOINT_TRUSTED` constant (always `True`) was a
+pseudo-gate that provided no real protection; it has been deleted.
+
 ## Round-trip and tests
 
 `tests/test_checkpoint_manifest.py` pins:
-- new-format `model.tar` round-trips (tensors + manifest intact);
+- new-format `model.tar` round-trips under the safe default (`weights_only=True`);
 - legacy `model.tar` (no manifest) still loads;
-- incompatible `feature_version` / `ruleset_id` / `schema_version` each raise
-  a precise `CheckpointCompatibilityError`;
-- `git_sha` is `"unknown"` (string) when git is unavailable.
+- incompatible `schema_version` / `model_version` / `feature_version` /
+  `ruleset_id` / `checkpoint_kind` each raise a precise
+  `CheckpointCompatibilityError`;
+- `git_sha` is `"unknown"` (string) when git is unavailable;
+- a checkpoint with a non-safe global is **refused** under the default and
+  accepted only via `allow_unsafe_pickle=True` (or hard-refused under
+  `TORCH_FORCE_WEIGHTS_ONLY_LOAD=1`);
+- `manifest.torch_version` is a native `str` (not `TorchVersion`), so the
+  manifest is `weights_only=True`-loadable.
 
 The legacy `tests/test_checkpoint_loader.py` (P00) still passes, confirming
 the eval-sidecar path is unchanged.
