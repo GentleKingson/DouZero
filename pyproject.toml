@@ -1,0 +1,21 @@
+# P00 baseline-freeze engineering scaffold.
+#
+# Scope: this file only configures the build backend and pytest. It does NOT
+# change package metadata, dependencies, or import behavior -- setup.py remains
+# the packaging source of truth so legacy installs are unaffected. Later phases
+# (P01) may consolidate packaging here.
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+# Tests must be deterministic, offline, and independent of downloaded weights.
+# A hard timeout guards against any accidental infinite loop in move generation
+# or environment rollout.
+addopts = "-ra -q"
+filterwarnings = [
+    "error::DeprecationWarning:douzero.*",
+]
