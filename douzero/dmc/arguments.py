@@ -73,8 +73,10 @@ parser.add_argument('--deterministic', action=argparse.BooleanOptionalAction,
                          '(--no-deterministic forces False).')
 parser.add_argument('--feature_version', default='legacy', type=str, choices=['legacy'],
                     help='Observation feature version (P01). Only "legacy" is supported in P01.')
-parser.add_argument('--ruleset', default='legacy', type=str, choices=['legacy'],
-                    help='Rule set identifier (P01). Only "legacy" is supported in P01.')
+parser.add_argument('--ruleset', default='legacy', type=str, choices=['legacy', 'standard'],
+                    help='Rule set identifier (P02). "legacy" (default) reproduces the '
+                         'original environment. "standard" adds bidding/scoring but is '
+                         'not yet supported for training.')
 parser.add_argument('--model_version', default='legacy', type=str, choices=['legacy'],
                     help='Model version (P01). Only "legacy" is supported in P01.')
 

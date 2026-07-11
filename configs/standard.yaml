@@ -1,0 +1,64 @@
+# Standard DouDizhu configuration (P02).
+#
+# This file activates the standard ruleset: 0/1/2/3 score bidding, all-pass
+# redeal, spring/anti-spring, and full terminal scoring. It is NOT yet
+# supported for training (train.py rejects --ruleset standard); it is intended
+# for environment testing and end-to-end bidding+cardplay evaluation.
+#
+# Loaded via douzero.config.load_config(). CLI flags override these values.
+
+# General
+xpid: douzero
+save_interval: 30
+objective: adp
+
+# Training settings
+actor_device_cpu: false
+gpu_devices: "0"
+num_actor_devices: 1
+num_actors: 5
+training_device: "0"
+load_model: false
+disable_checkpoint: false
+savedir: douzero_checkpoints
+
+# Hyperparameters
+total_frames: 100000000000
+exp_epsilon: 0.01
+batch_size: 32
+unroll_length: 100
+num_buffers: 50
+num_threads: 4
+max_grad_norm: 40.0
+
+# P01-added knobs (defaults preserve legacy behavior)
+seed: 0
+deterministic: false
+# Version identifiers. P02 widens ruleset to "standard"; feature/model stay
+# "legacy" (observation and model changes arrive in P03/P05).
+feature_version: legacy
+ruleset: standard
+model_version: legacy
+
+# P02 rule configuration. See douzero/env/rules.py for field semantics.
+rules:
+  ruleset_id: standard
+  bidding_mode: score_0_1_2_3
+  bid_values: [0, 1, 2, 3]
+  allow_rob: false
+  all_pass_redeal: true
+  bid_multiplier: true
+  bomb_multiplier: 2
+  rocket_multiplier: 2
+  spring_multiplier: 2
+  anti_spring_multiplier: 2
+  allow_double: false
+  base_score: 1
+  max_multiplier: null
+
+# Optimizer (RMSProp)
+optimizer:
+  learning_rate: 0.0001
+  alpha: 0.99
+  momentum: 0
+  epsilon: 1.0e-5
