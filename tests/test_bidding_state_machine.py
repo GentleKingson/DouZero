@@ -177,16 +177,57 @@ def test_bidding_in_wrong_phase_raises():
 
 
 def test_illegal_bid_value_raises():
-    """A bid value not in ruleset.bid_values must raise."""
+    """An illegal bid value (not in bid_values) must raise."""
     players = {p: _StubAgent() for p in ["landlord", "landlord_up", "landlord_down"]}
     env = GameEnv(players, ruleset=RuleSet.standard())
     deck = _make_standard_deck()
     data = _deal_standard(deck)
     env.card_play_init_standard(data)
-    with pytest.raises(IllegalActionError, match="not in allowed"):
+    # 4 is not in bid_values (0,1,2,3).
+    with pytest.raises(IllegalActionError, match="illegal"):
         env.step_bidding(4)
-    with pytest.raises(IllegalActionError, match="not in allowed"):
+    # -1 is not in bid_values.
+    with pytest.raises(IllegalActionError, match="illegal"):
         env.step_bidding(-1)
+
+
+def test_low_bid_after_higher_bid_rejected():
+    """A bid not strictly higher than the current max must be rejected.
+
+    Standard rule: a bidder may pass (0) or bid strictly higher than the
+    current highest bid. [2, 1] → the second bid of 1 is illegal (1 < 2).
+    """
+    env = Env("adp", ruleset=RuleSet.standard())
+    np.random.seed(42)
+    env.reset()
+    env.step(None, bid_value=2)  # seat 0 bids 2
+    with pytest.raises(IllegalActionError, match="illegal"):
+        env.step(None, bid_value=1)  # seat 1 bids 1 → illegal (1 < 2)
+
+
+def test_equal_bid_rejected():
+    """A bid equal to the current max must be rejected (must be strictly higher).
+
+    [2, 2] → the second bid of 2 is illegal (2 is not > 2).
+    """
+    env = Env("adp", ruleset=RuleSet.standard())
+    np.random.seed(42)
+    env.reset()
+    env.step(None, bid_value=2)  # seat 0 bids 2
+    with pytest.raises(IllegalActionError, match="illegal"):
+        env.step(None, bid_value=2)  # seat 1 bids 2 → illegal (not > 2)
+
+
+def test_get_legal_bids_excludes_low_after_high():
+    """After a bid of 2, legal bids should be [0, 3] only."""
+    players = {p: _StubAgent() for p in ["landlord", "landlord_up", "landlord_down"]}
+    env = GameEnv(players, ruleset=RuleSet.standard())
+    deck = _make_standard_deck()
+    data = _deal_standard(deck)
+    env.card_play_init_standard(data)
+    env.step_bidding(2)
+    legal = env.get_legal_bids()
+    assert legal == [0, 3]
 
 
 def test_env_step_bidding_requires_bid_value():
@@ -270,17 +311,22 @@ def test_highest_bidder_becomes_landlord():
     assert env._env.landlord_position == bidding_order[1]
 
 
-def test_tie_break_by_bidding_order():
-    """Bid [2, 0, 2] → first bidder of 2 is the landlord."""
+def test_ascending_bids_no_ties_possible():
+    """Since bids must be strictly ascending, ties are impossible.
+
+    [2, 0, 3] → seat 2 bids 3 (the max), bidding ends immediately.
+    The landlord is the single highest bidder — no tie-breaking needed.
+    """
     env = Env("adp", ruleset=RuleSet.standard())
     np.random.seed(42)
     env.reset()
     bidding_order = list(env._env.bidding_order)
-    env.step(None, bid_value=2)
-    env.step(None, bid_value=0)
-    env.step(None, bid_value=2)
-    assert env._env.bid_value == 2
-    assert env._env.landlord_position == bidding_order[0]
+    env.step(None, bid_value=2)  # seat 0 bids 2
+    env.step(None, bid_value=0)  # seat 1 passes
+    env.step(None, bid_value=3)  # seat 2 bids 3 → max, ends immediately
+    assert env._env.bid_value == 3
+    assert env._env.landlord_position == bidding_order[2]
+    assert env._env.phase == PHASE_PLAYING
 
 
 def test_all_pass_triggers_redeal():

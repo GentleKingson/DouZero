@@ -211,3 +211,101 @@ def test_checkpoint_validation_rejects_ruleset_mismatch(tmp_path):
 
     with pytest.raises(CheckpointCompatibilityError, match="ruleset_id"):
         load_checkpoint(ckpt_path, expected_ruleset_id='standard')
+
+
+def test_checkpoint_manifest_records_ruleset_version_and_hash():
+    """Manifest must record ruleset_version and ruleset_hash."""
+    from douzero.checkpoint.manifest import build_manifest
+    from douzero.env.rules import RuleSet
+
+    # Legacy manifest.
+    flags = argparse.Namespace(ruleset='legacy')
+    manifest = build_manifest(flags, frames=0, position_frames={})
+    assert manifest.ruleset_version == 'legacy-v1'
+    assert manifest.ruleset_hash == RuleSet.legacy().stable_hash()
+
+    # Standard manifest.
+    flags = argparse.Namespace(ruleset='standard')
+    manifest = build_manifest(flags, frames=0, position_frames={})
+    assert manifest.ruleset_version == 'standard-v1'
+    assert manifest.ruleset_hash == RuleSet.standard().stable_hash()
+
+
+def test_checkpoint_same_id_different_hash_rejected(tmp_path):
+    """A checkpoint with same ruleset_id but different hash must be rejected."""
+    import torch
+    from douzero.checkpoint.io import CheckpointCompatibilityError, load_checkpoint
+    from douzero.checkpoint.manifest import CheckpointManifest
+
+    # Create a manifest with standard ID but a wrong hash.
+    manifest = CheckpointManifest(
+        schema_version=1,
+        model_version='legacy',
+        feature_version='legacy',
+        ruleset_id='standard',
+        ruleset_version='standard-v1',
+        ruleset_hash='0' * 64,  # wrong hash
+        checkpoint_kind='training_checkpoint',
+        git_sha='unknown',
+        python_version='3.11',
+        torch_version='2.0',
+        effective_config={},
+        frames=0,
+        position_frames={},
+        created_at='2026-01-01T00:00:00+00:00',
+    )
+    bundle = {
+        'model_state_dict': {},
+        'optimizer_state_dict': {},
+        'stats': {},
+        'flags': {},
+        'frames': 0,
+        'position_frames': {},
+        'manifest': manifest.to_dict(),
+    }
+    ckpt_path = str(tmp_path / "wrong_hash.tar")
+    torch.save(bundle, ckpt_path)
+
+    with pytest.raises(CheckpointCompatibilityError, match="ruleset_hash"):
+        load_checkpoint(ckpt_path, expected_ruleset_id='standard')
+
+
+def test_p01_checkpoint_without_ruleset_version_loads(tmp_path):
+    """A P01 manifest (no ruleset_version/hash) must load with legacy defaults."""
+    import torch
+    from douzero.checkpoint.io import load_checkpoint
+
+    # Simulate a P01 manifest: no ruleset_version/ruleset_hash fields.
+    p01_manifest = {
+        "schema_version": 1,
+        "model_version": "legacy",
+        "feature_version": "legacy",
+        "ruleset_id": "legacy",
+        "checkpoint_kind": "training_checkpoint",
+        "git_sha": "unknown",
+        "python_version": "3.11",
+        "torch_version": "2.0",
+        "effective_config": {},
+        "frames": 0,
+        "position_frames": {},
+        "created_at": "2026-01-01T00:00:00+00:00",
+    }
+    bundle = {
+        'model_state_dict': {},
+        'optimizer_state_dict': {},
+        'stats': {},
+        'flags': {},
+        'frames': 0,
+        'position_frames': {},
+        'manifest': p01_manifest,
+    }
+    ckpt_path = str(tmp_path / "p01.tar")
+    torch.save(bundle, ckpt_path)
+
+    loaded_bundle, loaded_manifest = load_checkpoint(
+        ckpt_path, expected_ruleset_id='legacy'
+    )
+    # Backfilled defaults.
+    assert loaded_manifest.ruleset_version == 'legacy-v1'
+    from douzero.env.rules import RuleSet
+    assert loaded_manifest.ruleset_hash == RuleSet.legacy().stable_hash()
