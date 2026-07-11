@@ -52,12 +52,15 @@ from douzero.observation.privileged import (
     is_privileged,
 )
 from douzero.observation.public import (
+    BIDDING_TOKEN_WIDTH,
+    BiddingTokenBatch,
     PUBLIC_KIND,
     PublicBottomCards,
     PublicObservation,
     build_public_observation,
     compute_belief_unknown_pool,
     compute_unseen_pool,
+    encode_bidding_history,
 )
 from douzero.observation.schema import (
     FEATURE_VERSION_LEGACY,
@@ -102,9 +105,10 @@ __all__ = [
     "HistoryMove", "HistoryTokenBatch", "encode_history",
     "encode_history_token",
     # public
-    "PUBLIC_KIND", "PublicBottomCards", "PublicObservation",
-    "build_public_observation", "compute_belief_unknown_pool",
-    "compute_unseen_pool",
+    "BIDDING_TOKEN_WIDTH", "BiddingTokenBatch", "PUBLIC_KIND",
+    "PublicBottomCards", "PublicObservation", "build_public_observation",
+    "compute_belief_unknown_pool", "compute_unseen_pool",
+    "encode_bidding_history",
     # privileged
     "PRIVILEGED_KIND", "PrivilegedObservation", "is_privileged",
     # encoder

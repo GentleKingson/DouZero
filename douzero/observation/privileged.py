@@ -31,7 +31,7 @@ from typing import Any
 PRIVILEGED_KIND: str = "privileged"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class PrivilegedObservation:
     """True hidden hands + training labels — NEVER passed to a deployment model.
 
@@ -40,7 +40,7 @@ class PrivilegedObservation:
     all_handcards
         Mapping ``{role: tuple[int, ...]}`` of every role's true hand. This is
         the perfect-information allocation; it MUST NOT appear in any public
-        observation or model input.
+        observation or model input. Deep-copied at construction (item 5).
     hidden_hand_labels
         Optional training-only labels for the belief model (e.g. the per-rank
         count allocation for a chosen opponent). ``None`` when not applicable.
@@ -53,6 +53,11 @@ class PrivilegedObservation:
     kind
         Always :data:`PRIVILEGED_KIND`. Lets a guard reject this object without
         inspecting its contents.
+
+    Deep immutability (item 5): ``frozen`` + ``slots``; caller-supplied
+    ``all_handcards`` and ``hidden_hand_labels`` are deep-copied so mutating the
+    source cannot affect the container. The container shares no ndarray with
+    any public container (it holds none at all).
     """
 
     all_handcards: dict[str, tuple[int, ...]]
@@ -63,6 +68,17 @@ class PrivilegedObservation:
     kind: str = field(default=PRIVILEGED_KIND, init=False)
 
     def __post_init__(self) -> None:
+        # Deep-copy caller-supplied mutable inputs so the container is isolated
+        # from later source mutation (item 5). Tuples are immutable; we copy the
+        # outer dict and re-wrap each hand as a tuple of ints.
+        copied_hands = {
+            str(role): tuple(sorted(int(c) for c in hand))
+            for role, hand in self.all_handcards.items()
+        }
+        object.__setattr__(self, "all_handcards", copied_hands)
+        if self.hidden_hand_labels is not None:
+            object.__setattr__(
+                self, "hidden_hand_labels", dict(self.hidden_hand_labels))
         # Use object.__setattr__ because the dataclass is frozen.
         if self.kind != PRIVILEGED_KIND:  # defensive; default already set
             object.__setattr__(self, "kind", PRIVILEGED_KIND)

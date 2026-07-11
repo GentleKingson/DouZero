@@ -63,21 +63,43 @@ class HistoryMove:
     phase: int
 
 
-@dataclass
+@dataclass(frozen=True)
 class HistoryTokenBatch:
     """Encoded history-token tensor + padding mask.
 
-    ``tokens`` has shape ``(max_history_len, token_width)`` int8.
-    ``mask`` has shape ``(max_history_len,)`` int8 with ``1`` for real tokens
-    and ``0`` for padding. ``num_real`` is the count of real tokens
-    (``num_real <= max_history_len``); older moves beyond the cap are dropped.
+    ``tokens`` has shape ``(max_history_len, token_width)`` int8 (read-only).
+    Padding slots are all-zero.
+
+    Mask conventions (item 6 — explicit and PyTorch-compatible):
+
+    - ``valid_mask``: int8, shape ``(max_history_len,)``, ``1`` for a real
+      token and ``0`` for padding.
+    - ``key_padding_mask``: bool, shape ``(max_history_len,)``, ``True`` for
+      PADDING and ``False`` for a real token (the PyTorch Transformer convention
+      where True means "ignore this position"). It is the exact boolean
+      negation of ``valid_mask``.
+
+    Bounded-history contract (item 6 / AGENTS.md "bounded history"):
+
+    - ``original_length``: the number of public moves in the full game history
+      before truncation.
+    - ``was_truncated``: True iff ``original_length > max_history_len`` (some
+      oldest moves were dropped).
+    - ``truncation_side``: always ``"left"`` for this schema — oldest moves are
+      dropped, real tokens are left-aligned. Changing this would bump
+      ``TRUNCATION_SEMANTICS_VERSION``.
+    - ``num_real``: the count of real tokens actually encoded
+      (``min(original_length, max_history_len)``).
     """
 
     tokens: np.ndarray
-    mask: np.ndarray
+    valid_mask: np.ndarray
     num_real: int
     max_history_len: int
     token_width: int
+    original_length: int
+    was_truncated: bool
+    truncation_side: str = "left"
 
     def __post_init__(self) -> None:
         if self.tokens.shape != (self.max_history_len, self.token_width):
@@ -85,15 +107,42 @@ class HistoryTokenBatch:
                 f"tokens shape {self.tokens.shape} != "
                 f"({self.max_history_len}, {self.token_width})"
             )
-        if self.mask.shape != (self.max_history_len,):
+        if self.valid_mask.shape != (self.max_history_len,):
             raise ValueError(
-                f"mask shape {self.mask.shape} != ({self.max_history_len},)"
+                f"valid_mask shape {self.valid_mask.shape} != "
+                f"({self.max_history_len},)"
             )
         if not (0 <= self.num_real <= self.max_history_len):
             raise ValueError(
                 f"num_real {self.num_real} out of range "
                 f"[0, {self.max_history_len}]"
             )
+        if self.truncation_side != "left":
+            raise ValueError(
+                f"truncation_side must be 'left' for this schema, got "
+                f"{self.truncation_side!r}"
+            )
+        # Freeze the mask array (item 5: deep immutability).
+        vm = np.asarray(self.valid_mask, dtype=np.int8)
+        if vm.flags.writeable:
+            vm = vm.copy()
+        vm.setflags(write=False)
+        object.__setattr__(self, "valid_mask", vm)
+
+    @property
+    def key_padding_mask(self) -> np.ndarray:
+        """Boolean mask, True at PADDING positions (PyTorch convention).
+
+        ``key_padding_mask[i] is True`` means position ``i`` is padding and
+        should be ignored by attention. It is the boolean negation of
+        ``valid_mask``.
+        """
+        return self.valid_mask == 0
+
+    @property
+    def mask(self) -> np.ndarray:
+        """Backward-compatible alias for :attr:`valid_mask` (1=valid, 0=pad)."""
+        return self.valid_mask
 
 
 def _role_onehot(role: str) -> np.ndarray:
@@ -144,27 +193,38 @@ def encode_history(
 ) -> HistoryTokenBatch:
     """Encode a sequence of public moves into a padded :class:`HistoryTokenBatch`.
 
-    Only the most recent ``schema.max_history_len`` moves are kept (older moves
-    are dropped), matching the "support configurable max_history_len" contract.
-    Real tokens are placed at the start; the remainder is zero padding with a
-    zero mask.
+    Bounded history: only the most recent ``schema.max_history_len`` moves are
+    kept (older moves are dropped — left-truncation), matching the "bounded
+    history" contract. Real tokens are placed at the start (left-aligned); the
+    remainder is all-zero padding with a zero ``valid_mask``.
+
+    ``original_length`` records the full move count before truncation, and
+    ``was_truncated`` is True iff some oldest moves were dropped.
     """
     max_len = schema.max_history_len
     width = _history_token_width(schema)
     tokens = np.zeros((max_len, width), dtype=np.int8)
-    mask = np.zeros(max_len, dtype=np.int8)
+    valid_mask = np.zeros(max_len, dtype=np.int8)
 
+    original_length = len(moves)
     # Keep the most recent max_len moves (drop oldest beyond the cap).
-    recent = list(moves)[-max_len:]
+    recent = list(moves)[-max_len:] if max_len > 0 else []
     for i, move in enumerate(recent):
         tokens[i, :] = encode_history_token(move)
-        mask[i] = 1
+        valid_mask[i] = 1
+
+    # Freeze the token buffer so callers cannot mutate the encoded history.
+    tokens.setflags(write=False)
+
     return HistoryTokenBatch(
         tokens=tokens,
-        mask=mask,
+        valid_mask=valid_mask,
         num_real=len(recent),
         max_history_len=max_len,
         token_width=width,
+        original_length=original_length,
+        was_truncated=(original_length > max_len),
+        truncation_side="left",
     )
 
 

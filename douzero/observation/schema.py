@@ -22,6 +22,8 @@ A :class:`FeatureSchemaManifest` is:
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -56,6 +58,40 @@ SEAT_ONEHOT_WIDTH: int = len(RELATIVE_SEATS)  # 6
 #: (16 labels, including TYPE_15_WRONG). Pass is TYPE_0.
 MOVE_TYPE_ONEHOT_WIDTH: int = 16
 
+# --------------------------------------------------------------------------- #
+# Semantic version stamps for the schema's invariants (item 2).
+#
+# Each stamp identifies a *contract*, not a width. Two schemas with the same
+# stamps produce observations that a model can consume interchangeably. Bump a
+# stamp when the corresponding contract changes in a way that breaks a model:
+# e.g. the card encoding layout changes, the seat one-hot order changes, the
+# padding-mask polarity flips, or the history truncation side changes.
+#
+# A pure description-text edit does NOT bump any stamp, so stable_hash() is
+# stable under documentation churn (item 2: "description wording changes must
+# not change the compatibility hash").
+# --------------------------------------------------------------------------- #
+#: Version of the 54-dim card encoding contract (rank-major multiplicities +
+#: trailing jokers). Matches the legacy ``_cards2array`` layout.
+CARD_ENCODING_VERSION: str = "rank-multiplicity-54-v1"
+
+#: Version of the move-type enumeration contract (TYPE_0..TYPE_15).
+MOVE_TYPE_ENCODING_VERSION: str = "detector-type0-15-v1"
+
+#: Version of the relative-seat enumeration order used in one-hot fields.
+SEAT_MAPPING_VERSION: str = "self-next-previous-landlord-teammate-opponent-v1"
+
+#: Version of the history-token field set/order contract.
+HISTORY_ENCODING_VERSION: str = "token-v1"
+
+#: Version of the mask semantics: ``valid_mask`` uses 1=valid / 0=padding and
+#: ``key_padding_mask`` uses True=padding (PyTorch convention).
+MASK_SEMANTICS_VERSION: str = "valid1-pad0-v1"
+
+#: Version of the history truncation contract: bounded to ``max_history_len``,
+#: left-truncated (oldest moves dropped), real tokens left-aligned.
+TRUNCATION_SEMANTICS_VERSION: str = "left-truncate-v1"
+
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -63,6 +99,10 @@ class FieldSpec:
 
     ``shape`` excludes the leading legal-action batch dimension (``N``), which
     is variable and recorded separately. ``dtype`` is the numpy dtype string.
+
+    ``description`` is documentation only; it is excluded from the schema
+    compatibility hash (:func:`FeatureSchemaManifest.stable_hash`) so wording
+    edits do not change a model's identity contract (item 2).
     """
 
     name: str
@@ -78,6 +118,14 @@ class FieldSpec:
             "description": self.description,
         }
 
+    def identity_dict(self) -> dict[str, Any]:
+        """The identity-relevant subset (excludes the description text)."""
+        return {
+            "name": self.name,
+            "shape": list(self.shape),
+            "dtype": self.dtype,
+        }
+
 
 @dataclass(frozen=True)
 class FeatureSchemaManifest:
@@ -87,6 +135,13 @@ class FeatureSchemaManifest:
     :mod:`douzero.observation.cards` / :mod:`.seats` / this module, never a
     bare integer literal. Two manifests compare equal iff every field matches,
     so a checkpoint can reject an incompatible schema precisely.
+
+    The schema identity (used for checkpoint compatibility and ObservationV2
+    stamping) is captured by :meth:`compatibility_dict` / :meth:`stable_hash`.
+    Identity includes the semantic version stamps (card encoding, seat mapping,
+    mask semantics, truncation semantics), the field name/shape/dtype for every
+    group, and ``max_history_len``. It deliberately EXCLUDES ``description``
+    text, so documentation churn does not change the hash (item 2).
     """
 
     feature_version: str
@@ -100,6 +155,13 @@ class FeatureSchemaManifest:
     state_fields: tuple[FieldSpec, ...]
     action_fields: tuple[FieldSpec, ...]
     history_token_fields: tuple[FieldSpec, ...]
+    # Semantic version stamps (item 2). Defaults bind to the current contracts.
+    card_encoding_version: str = CARD_ENCODING_VERSION
+    move_type_encoding_version: str = MOVE_TYPE_ENCODING_VERSION
+    seat_mapping_version: str = SEAT_MAPPING_VERSION
+    history_encoding_version: str = HISTORY_ENCODING_VERSION
+    mask_semantics_version: str = MASK_SEMANTICS_VERSION
+    truncation_semantics_version: str = TRUNCATION_SEMANTICS_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -114,6 +176,12 @@ class FeatureSchemaManifest:
             "state_fields": [f.to_dict() for f in self.state_fields],
             "action_fields": [f.to_dict() for f in self.action_fields],
             "history_token_fields": [f.to_dict() for f in self.history_token_fields],
+            "card_encoding_version": self.card_encoding_version,
+            "move_type_encoding_version": self.move_type_encoding_version,
+            "seat_mapping_version": self.seat_mapping_version,
+            "history_encoding_version": self.history_encoding_version,
+            "mask_semantics_version": self.mask_semantics_version,
+            "truncation_semantics_version": self.truncation_semantics_version,
         }
 
     def field_by_name(self, name: str, group: str = "state") -> FieldSpec:
@@ -129,6 +197,43 @@ class FeatureSchemaManifest:
             if spec.name == name:
                 return spec
         raise KeyError(f"No {group!r} field named {name!r}")
+
+    def compatibility_dict(self) -> dict[str, Any]:
+        """The identity-relevant subset of the schema (description-stable).
+
+        Two schemas with equal ``compatibility_dict()`` produce observations a
+        model can consume interchangeably. Excludes ``description`` text and
+        the documentation-only ``feature_version`` label (the ``schema_version``
+        and semantic stamps carry the real identity).
+        """
+        return {
+            "schema_version": self.schema_version,
+            "max_history_len": self.max_history_len,
+            "card_vector_dim": self.card_vector_dim,
+            "seat_onehot_width": self.seat_onehot_width,
+            "move_type_onehot_width": self.move_type_onehot_width,
+            "bomb_onehot_width": self.bomb_onehot_width,
+            "max_cards_left": self.max_cards_left,
+            "card_encoding_version": self.card_encoding_version,
+            "move_type_encoding_version": self.move_type_encoding_version,
+            "seat_mapping_version": self.seat_mapping_version,
+            "history_encoding_version": self.history_encoding_version,
+            "mask_semantics_version": self.mask_semantics_version,
+            "truncation_semantics_version": self.truncation_semantics_version,
+            "state_fields": [f.identity_dict() for f in self.state_fields],
+            "action_fields": [f.identity_dict() for f in self.action_fields],
+            "history_token_fields": [f.identity_dict() for f in self.history_token_fields],
+        }
+
+    def stable_hash(self) -> str:
+        """Deterministic SHA-256 of :meth:`compatibility_dict`.
+
+        Stable under ``description`` text edits (item 2). Changes when a field's
+        name/shape/dtype changes, when a field is added/removed/reordered, when
+        ``max_history_len`` changes, or when any semantic version stamp changes.
+        """
+        payload = json.dumps(self.compatibility_dict(), sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def build_v2_schema(max_history_len: int = 100) -> FeatureSchemaManifest:
