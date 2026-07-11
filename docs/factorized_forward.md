@@ -62,6 +62,14 @@ practice bit-identical). The parity tests
 (`tests/test_factorized_parity.py`) pin this for all three roles, action
 counts 1/2/many, and many random deals.
 
+> **CPU only.** Numerical and argmax parity are **tested on CPU**. GPU
+> numerical and argmax parity are **not yet measured**: mathematical
+> equivalence does not imply bitwise or universal argmax identity across
+> CPU/GPU (different kernels, reduction order, and cuDNN RNN
+> non-determinism can change results). The factorized backend is safe to use
+> on GPU, but "identical selection to legacy on GPU" is an empirical claim
+> that must be measured before being asserted.
+
 ## Checkpoint compatibility
 
 The factorized models intentionally declare the **same submodule names and
@@ -94,7 +102,29 @@ agent = DeepAgent("landlord", "path/to/landlord.ckpt",
 
 `backend` defaults to `"legacy"`, so all existing callers are unchanged. The
 factorized backend accepts the **same** `.ckpt` and produces the **same**
-selected action (pinned by `test_deepagent_factorized_matches_legacy_selection`).
+selected action (pinned by `test_deepagent_factorized_matches_legacy_split_path`
+and `test_deepagent_factorized_uses_split_observation`).
+
+The factorized backend consumes a **split observation** that never tiles the
+shared state or history. `DeepAgent._act_factorized` calls
+`get_obs_factorized(infoset)` (which returns `z_single (1,5,162)`,
+`x_state_single (1, D_state)`, `x_action (N, 54)` directly — no `np.repeat` on
+the shared blocks) and `model.forward_factorized(...)`. This removes the
+NumPy tiling allocation, the tiled CPU tensor allocation, and the tiled
+CPU→GPU transfer. The legacy backend (`_act_legacy`) is unchanged except
+that both backends now run under `torch.inference_mode()` (the original
+`act()` built an autograd graph during inference; `inference_mode` reduces
+memory without changing outputs under `eval()`).
+
+### Input validation
+
+The factorized model's `forward` (legacy-batched interface) validates shapes
+and the shared-row invariant before slicing: non-identical `z_batch` rows or
+non-identical state-block rows raise `ValueError` instead of silently using
+row 0. `forward_factorized` (split interface) validates the singleton
+shapes. Opt out of the shared-row check via `DUZERO_FACTORIZED_STRICT=0` for
+hot paths that validate upstream. Tests in
+`tests/test_factorized_parity.py` pin the rejection of malformed input.
 
 ### Configuration
 
@@ -144,11 +174,22 @@ computation over identical rows.
 | 10 | [10] | [1] |
 | N | [N] | [1] |
 
-The benchmark (`benchmarks/bench_factorized.py`) reports the latency
-consequence at action-count buckets 1/10/50/full. Run it:
+The benchmark (`benchmarks/bench_factorized.py`) reports:
+- **model-forward-only** latency (legacy vs factorized, split-obs path) at
+  action-count buckets 1/10/50/full — isolates the model cost;
+- **end-to-end `DeepAgent.act`** latency (encode + tensor + forward + argmax)
+  for all three roles — the real deployment number;
+- **CPU peak RSS** for the full act path;
+- **LSTM rows per decision** (the work-reduction proof above).
+
+The model-forward-only numbers are **not** end-to-end DeepAgent numbers;
+both are reported separately and labelled clearly. Run it:
 
 ```bash
+# CPU (default). Does NOT force-hide CUDA at import; --device cuda works
+# when a GPU is present.
 python benchmarks/bench_factorized.py --rounds 30
+python benchmarks/bench_factorized.py --device cuda --rounds 30
 ```
 
 ## Validation
@@ -186,12 +227,13 @@ docker run --rm douzero-p04-test python benchmarks/bench_factorized.py --rounds 
 
 | File | Role |
 |---|---|
-| `douzero/dmc/models_factorized.py` | Factorized role models + wrapper + `split_legacy_batch` |
-| `douzero/evaluation/deep_agent.py` | `backend` selection (`legacy` / `legacy_factorized`) |
+| `douzero/dmc/models_factorized.py` | Factorized role models + wrapper + `split_legacy_batch` + input validation |
+| `douzero/env/env.py` | `get_obs_factorized` — split observation encoder (no tiling of shared state/history) |
+| `douzero/evaluation/deep_agent.py` | `backend` selection; `_act_factorized` consumes split obs + `inference_mode` |
 | `douzero/dmc/arguments.py` | `--model_version` choices widened to `{legacy, factorized}` |
 | `douzero/config/loader.py` | Allowed `model_version` set widened |
 | `douzero/config/schemas.py` | Version-field comments updated |
 | `douzero/dmc/dmc.py` | Training gate rejects `model_version != legacy` |
-| `tests/test_factorized_parity.py` | Numerical parity, state_dict, LSTM-count, DeepAgent parity |
+| `tests/test_factorized_parity.py` | Numerical parity, state_dict, LSTM-count, split-obs parity, invariant enforcement, DeepAgent parity |
 | `tests/test_config.py`, `tests/test_ruleset.py`, `tests/test_training_ruleset_guard.py` | Config/CLI/guard tests widened |
-| `benchmarks/bench_factorized.py` | Legacy vs factorized latency + LSTM call count |
+| `benchmarks/bench_factorized.py` | model-forward-only + end-to-end DeepAgent.act latency + CPU peak RSS + LSTM rows |
