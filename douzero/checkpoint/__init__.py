@@ -10,6 +10,11 @@ meanings. Backward compatibility is required:
     checkpoint_kind; mismatches raise a precise error rather than silently
     partial-loading.
 
+Security: checkpoint loads default to ``weights_only=True`` (safe unpickling).
+A checkpoint that embeds objects safe mode cannot reconstruct requires the
+caller to explicitly pass ``allow_unsafe_pickle=True`` to
+``load_checkpoint`` / ``load_legacy_model_tar``.
+
 The legacy per-position ``{pos}_weights_{frames}.ckpt`` sidecars (bare
 state_dicts consumed by DeepAgent) keep their permissive load behavior behind
 an explicit opt-in; new code uses the strict loader.
@@ -21,7 +26,6 @@ from douzero.checkpoint.compat import (
     load_position_state_dict_strict,
 )
 from douzero.checkpoint.io import (
-    TRAINING_CHECKPOINT_TRUSTED,
     CheckpointCompatibilityError,
     load_checkpoint,
     save_checkpoint,
@@ -36,7 +40,6 @@ from douzero.checkpoint.manifest import (
 __all__ = [
     "CHECKPOINT_KINDS",
     "CURRENT_SCHEMA_VERSION",
-    "TRAINING_CHECKPOINT_TRUSTED",
     "CheckpointCompatibilityError",
     "CheckpointManifest",
     "build_manifest",

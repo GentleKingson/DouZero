@@ -4,15 +4,17 @@ Save format: ``model.tar`` keeps the legacy six keys and adds a ``manifest``
 key (stored as a plain dict, never a pickled dataclass). Legacy loaders that
 ignore unknown keys are unaffected; the new loader validates the manifest.
 
-Security: PyTorch >=2.6 defaults to ``weights_only=True``. We do NOT rely on
-the version-dependent default -- every ``torch.load`` call sets it explicitly:
+Security model: the DEFAULT load path uses ``weights_only=True`` (PyTorch's
+safe unpickling mode), which restricts deserialization to tensors, primitives,
+and standard containers. A P01 training bundle (RMSProp optimizer state dicts
++ plain-dict stats/flags/manifest) is loadable under ``weights_only=True``.
 
-  - position-weights sidecar (pure state_dict): ``weights_only=True`` (safe).
-  - training ``model.tar``: ``weights_only=False`` is REQUIRED because the
-    bundle contains optimizer state dicts and arbitrary Python objects (stats,
-    flags, manifest). This is an explicit, documented, trusted-path choice:
-    the training checkpoint is a locally-produced artifact, not an untrusted
-    download. The constant ``TRAINING_CHECKPOINT_TRUSTED`` documents this.
+Some legacy or externally-produced checkpoints embed arbitrary Python objects
+(e.g. a pickled Namespace, custom stats objects) that ``weights_only=True``
+cannot reconstruct. For those, the caller must explicitly opt in via
+``allow_unsafe_pickle=True``, which switches the load to ``weights_only=False``
+and logs a warning. The default is always safe (``weights_only=True``), so an
+untrusted checkpoint cannot execute arbitrary code by default.
 
 Load behavior:
   - manifest present + compatible -> return (bundle, manifest)
@@ -24,6 +26,7 @@ Load behavior:
 from __future__ import annotations
 
 import argparse
+import logging
 from typing import Any
 
 import torch
@@ -36,6 +39,8 @@ from douzero.checkpoint.manifest import (
     build_manifest,
 )
 
+_log = logging.getLogger(__name__)
+
 
 class CheckpointCompatibilityError(Exception):
     """Raised when a checkpoint's manifest is incompatible with the runtime.
@@ -43,13 +48,6 @@ class CheckpointCompatibilityError(Exception):
     The message includes the offending field and expected/actual values so the
     failure is actionable. We never fall back to a permissive partial load.
     """
-
-
-# Documented trust flag for the training-checkpoint load path. The model.tar
-# bundle must load with weights_only=False (it contains optimizer states and
-# arbitrary Python objects); this is acceptable ONLY because the checkpoint is a
-# locally-produced training artifact, never an untrusted download.
-TRAINING_CHECKPOINT_TRUSTED = True
 
 
 def save_checkpoint(
@@ -63,10 +61,9 @@ def save_checkpoint(
 ) -> CheckpointManifest:
     """Save a model.tar with the legacy six keys PLUS a manifest.
 
-    Returns the manifest that was stamped in. The manifest is serialized via
-    ``to_dict()`` (plain dict) so it round-trips under weights_only=True loads
-    of the manifest itself; the full bundle still needs weights_only=False at
-    load time (see TRAINING_CHECKPOINT_TRUSTED) because of optimizer states.
+    Returns the manifest that was stamped in. The manifest and all bundle
+    values are tensors + plain dicts of primitives, so the saved file is
+    loadable under ``weights_only=True`` (the safe default).
     """
     manifest = build_manifest(
         flags, frames, position_frames, checkpoint_kind="training_checkpoint"
@@ -93,6 +90,7 @@ def load_checkpoint(
     expected_checkpoint_kind: str = "training_checkpoint",
     expected_schema_version: int = CURRENT_SCHEMA_VERSION,
     training_device: str | None = None,
+    allow_unsafe_pickle: bool = False,
 ) -> tuple[dict, CheckpointManifest | None]:
     """Load a model.tar, validating its manifest when present.
 
@@ -100,22 +98,34 @@ def load_checkpoint(
     checkpoints that predate manifests. Raises CheckpointCompatibilityError on
     a version mismatch (never silently partial-loads).
 
-    The training bundle requires weights_only=False (optimizer states); this is
-    the documented trusted path (TRAINING_CHECKPOINT_TRUSTED).
+    Security: the default is ``weights_only=True`` (safe unpickling). If the
+    checkpoint embeds objects that safe mode cannot reconstruct (e.g. a pickled
+    Namespace from an old or external checkpoint), the caller must explicitly
+    pass ``allow_unsafe_pickle=True`` to switch to ``weights_only=False``. This
+    keeps untrusted checkpoints safe by default.
     """
-    if not TRAINING_CHECKPOINT_TRUSTED:
-        raise RuntimeError(
-            "Refusing to load a training checkpoint: the trusted path is disabled."
+    weights_only = not allow_unsafe_pickle
+    if not weights_only:
+        _log.warning(
+            "Loading checkpoint %s with weights_only=False (allow_unsafe_pickle=True). "
+            "This permits arbitrary code execution via pickle; only use this for "
+            "trusted, locally-produced checkpoints.", path,
         )
     bundle = torch.load(
         path,
         map_location=_resolve_map_location(training_device),
-        weights_only=False,
+        weights_only=weights_only,
     )
     if not isinstance(bundle, dict) or "manifest" not in bundle:
         # Legacy checkpoint (no manifest) -- delegate to the compat path. This
-        # returns the same bundle with manifest=None.
-        return load_legacy_model_tar(path, training_device=training_device)
+        # returns the same bundle with manifest=None. The caller's
+        # allow_unsafe_pickle choice is forwarded so the re-read is consistent.
+        return load_legacy_model_tar(
+            path,
+            training_device=training_device,
+            allow_unsafe_pickle=allow_unsafe_pickle,
+            _already_loaded_bundle=bundle,
+        )
 
     manifest = CheckpointManifest.from_dict(bundle["manifest"])
     _validate_manifest(manifest, expected_schema_version, expected_model_version,
