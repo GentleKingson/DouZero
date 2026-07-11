@@ -1,0 +1,236 @@
+"""Tests for the evaluation data format and legacy adapter (P02 Slice 4).
+
+Covers:
+- legacy data generation (4-key dict, no format_version)
+- standard data generation (deck, first_bidder, ruleset_id, format_version=2)
+- legacy adapter reads old format
+- legacy adapter reads new format
+- format/ruleset mismatch raises precise errors
+- standard data is reproducible (same seed → same deck)
+- generate_eval_data smoke test (legacy and standard)
+"""
+
+from __future__ import annotations
+
+import pickle
+
+import numpy as np
+import pytest
+
+from douzero.evaluation.legacy_data_adapter import (
+    deal_standard_deck,
+    is_legacy_format,
+    is_standard_format,
+    load_eval_data,
+)
+from generate_eval_data import generate, generate_standard
+
+
+# --------------------------------------------------------------------------- #
+# Data generation
+# --------------------------------------------------------------------------- #
+def test_legacy_generate_produces_4_key_dict():
+    """Legacy generate() must produce the original 4-key format."""
+    np.random.seed(42)
+    data = generate()
+    assert set(data.keys()) == {
+        'landlord', 'landlord_up', 'landlord_down', 'three_landlord_cards'
+    }
+    assert len(data['landlord']) == 20
+    assert len(data['landlord_up']) == 17
+    assert len(data['landlord_down']) == 17
+    assert len(data['three_landlord_cards']) == 3
+    # No format_version key in legacy.
+    assert 'format_version' not in data
+    assert 'ruleset_id' not in data
+
+
+def test_standard_generate_produces_v2_format():
+    """Standard generate_standard() must produce the v2 format."""
+    np.random.seed(42)
+    data = generate_standard()
+    assert data['format_version'] == 2
+    assert data['ruleset_id'] == 'standard'
+    assert len(data['deck']) == 54
+    assert data['first_bidder'] in ('landlord', 'landlord_up', 'landlord_down')
+    assert 'bidding_order' in data
+    assert len(data['bidding_order']) == 3
+
+
+def test_standard_deck_is_valid_54_cards():
+    """The standard deck must be a valid 54-card deck."""
+    np.random.seed(42)
+    data = generate_standard()
+    from collections import Counter
+    counts = Counter(data['deck'])
+    for rank in range(3, 15):
+        assert counts[rank] == 4
+    assert counts[17] == 4
+    assert counts[20] == 1
+    assert counts[30] == 1
+    assert sum(counts.values()) == 54
+
+
+def test_standard_data_reproducible_with_same_seed():
+    """Same numpy seed → same deck."""
+    np.random.seed(42)
+    a = generate_standard()
+    np.random.seed(42)
+    b = generate_standard()
+    assert a['deck'] == b['deck']
+
+
+def test_standard_data_differs_with_different_seed():
+    """Different seeds → different decks (with overwhelming probability)."""
+    np.random.seed(42)
+    a = generate_standard()
+    np.random.seed(99)
+    b = generate_standard()
+    assert a['deck'] != b['deck']
+
+
+# --------------------------------------------------------------------------- #
+# Legacy adapter
+# --------------------------------------------------------------------------- #
+def test_load_legacy_data(tmp_path):
+    """load_eval_data reads legacy format with ruleset='legacy'."""
+    np.random.seed(42)
+    data = [generate() for _ in range(5)]
+    pkl = tmp_path / "legacy.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    loaded = load_eval_data(str(pkl), ruleset="legacy")
+    assert len(loaded) == 5
+    assert set(loaded[0].keys()) == {
+        'landlord', 'landlord_up', 'landlord_down', 'three_landlord_cards'
+    }
+
+
+def test_load_standard_data(tmp_path):
+    """load_eval_data reads standard format with ruleset='standard'."""
+    np.random.seed(42)
+    data = [generate_standard() for _ in range(5)]
+    pkl = tmp_path / "standard.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    loaded = load_eval_data(str(pkl), ruleset="standard")
+    assert len(loaded) == 5
+    assert loaded[0]['format_version'] == 2
+
+
+def test_load_legacy_data_rejects_standard_request(tmp_path):
+    """Legacy data + ruleset='standard' must raise."""
+    np.random.seed(42)
+    data = [generate() for _ in range(3)]
+    pkl = tmp_path / "legacy.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="legacy format"):
+        load_eval_data(str(pkl), ruleset="standard")
+
+
+def test_load_standard_data_rejects_legacy_request(tmp_path):
+    """Standard data + ruleset='legacy' must raise."""
+    np.random.seed(42)
+    data = [generate_standard() for _ in range(3)]
+    pkl = tmp_path / "standard.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="standard format"):
+        load_eval_data(str(pkl), ruleset="legacy")
+
+
+def test_is_legacy_format():
+    np.random.seed(42)
+    assert is_legacy_format([generate()])
+    assert not is_legacy_format([generate_standard()])
+
+
+def test_is_standard_format():
+    np.random.seed(42)
+    assert is_standard_format([generate_standard()])
+    assert not is_standard_format([generate()])
+
+
+def test_load_empty_list_returns_empty(tmp_path):
+    """An empty dataset must load without error."""
+    pkl = tmp_path / "empty.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump([], f)
+    assert load_eval_data(str(pkl), ruleset="legacy") == []
+
+
+def test_load_non_list_raises(tmp_path):
+    """A non-list dataset must raise."""
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump({"not": "a list"}, f)
+    with pytest.raises(TypeError, match="list"):
+        load_eval_data(str(pkl))
+
+
+# --------------------------------------------------------------------------- #
+# deal_standard_deck helper
+# --------------------------------------------------------------------------- #
+def test_deal_standard_deck_splits_correctly():
+    """deal_standard_deck must produce 17+17+17+3."""
+    deck = list(range(3, 15)) * 4 + [17] * 4 + [20, 30]
+    dealt = deal_standard_deck(deck)
+    assert len(dealt['landlord']) == 17
+    assert len(dealt['landlord_up']) == 17
+    assert len(dealt['landlord_down']) == 17
+    assert len(dealt['three_landlord_cards']) == 3
+    # Total = 54.
+    total = sum(len(v) for v in dealt.values())
+    assert total == 54
+
+
+def test_deal_standard_deck_wrong_size_raises():
+    with pytest.raises(ValueError, match="54 cards"):
+        deal_standard_deck([1, 2, 3])
+
+
+# --------------------------------------------------------------------------- #
+# generate_eval_data smoke test (subprocess)
+# --------------------------------------------------------------------------- #
+def test_generate_eval_data_smoke_legacy(tmp_path):
+    """generate_eval_data.py --ruleset legacy must produce a valid pickle."""
+    import subprocess
+    import sys
+    out = tmp_path / "eval_legacy"
+    result = subprocess.run(
+        [sys.executable, "generate_eval_data.py",
+         "--output", str(out), "--num_games", "12", "--ruleset", "legacy"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    pkl = str(out) + ".pkl"
+    data = load_eval_data(pkl, ruleset="legacy")
+    assert len(data) == 12
+    assert is_legacy_format(data)
+
+
+def test_generate_eval_data_smoke_standard(tmp_path):
+    """generate_eval_data.py --ruleset standard must produce a valid pickle."""
+    import subprocess
+    import sys
+    out = tmp_path / "eval_standard"
+    result = subprocess.run(
+        [sys.executable, "generate_eval_data.py",
+         "--output", str(out), "--num_games", "12", "--ruleset", "standard"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    pkl = str(out) + ".pkl"
+    data = load_eval_data(pkl, ruleset="standard")
+    assert len(data) == 12
+    assert is_standard_format(data)
+    # Each deal must have a valid 54-card deck.
+    from collections import Counter
+    for deal in data:
+        counts = Counter(deal['deck'])
+        for rank in range(3, 15):
+            assert counts[rank] == 4
+        assert counts[17] == 4
+        assert counts[20] == 1
+        assert counts[30] == 1

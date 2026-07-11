@@ -12,9 +12,14 @@ def get_parser():
     parser = argparse.ArgumentParser(description='DouZero: random data generator')
     parser.add_argument('--output', default='eval_data', type=str)
     parser.add_argument('--num_games', default=10000, type=int)
+    parser.add_argument('--ruleset', default='legacy', type=str,
+                        choices=['legacy', 'standard'],
+                        help='Deal format: legacy (4-key card_play_data) or '
+                             'standard (full deck + first_bidder + ruleset_id)')
     return parser
-    
+
 def generate():
+    """Generate a legacy deal: landlord gets 20, up 17, down 17, bottom 3."""
     _deck = deck.copy()
     np.random.shuffle(_deck)
     card_play_data = {'landlord': _deck[:20],
@@ -27,16 +32,40 @@ def generate():
     return card_play_data
 
 
+def generate_standard():
+    """Generate a standard deal: full deck order + first_bidder + ruleset_id.
+
+    The deal is stored as the complete 54-card deck order (not pre-sliced
+    into hands) so that the evaluation pipeline can deal 17+17+17+3 and
+    run bidding. ``first_bidder`` is the first seat to bid.
+    """
+    _deck = deck.copy()
+    np.random.shuffle(_deck)
+    return {
+        'format_version': 2,
+        'ruleset_id': 'standard',
+        'deck': list(_deck),
+        'first_bidder': 'landlord',
+        'bidding_order': ['landlord', 'landlord_down', 'landlord_up'],
+        'bidding_script': None,
+    }
+
+
 if __name__ == '__main__':
     flags = get_parser().parse_args()
     output_pickle = flags.output + '.pkl'
 
     print("output_pickle:", output_pickle)
+    print("ruleset:", flags.ruleset)
     print("generating data...")
 
     data = []
-    for _ in range(flags.num_games):
-        data.append(generate())
+    if flags.ruleset == 'standard':
+        for _ in range(flags.num_games):
+            data.append(generate_standard())
+    else:
+        for _ in range(flags.num_games):
+            data.append(generate())
 
     print("saving pickle file...")
     with open(output_pickle,'wb') as g:
