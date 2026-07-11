@@ -27,19 +27,20 @@ from typing import Dict
 # it here would force every ``import douzero.dmc`` / ``douzero.dmc.models`` and
 # every ``train.py --help`` to require GitPython -- even when no git metadata is
 # requested. The import now lives inside ``gather_metadata`` (lazy), so plain
-# imports and ``--help`` work without GitPython installed. GitPython is still a
-# declared runtime dependency (setup.py install_requires) for actual training,
-# where ``FileWriter`` calls ``gather_metadata``.
+# imports and ``--help`` work without GitPython installed.
+#
+# Git metadata is best-effort: a missing GitPython, a missing ``git`` binary,
+# or a non-repo working directory degrades the recorded metadata (commit/branch
+# become None with an error_type tag) but does NOT block training. The training
+# loop itself never depends on git; only the run log does.
 
 
 def gather_metadata() -> Dict:
     date_start = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
     # gathering git metadata
-    # Lazy import: only training/run-logging needs GitPython. A missing
-    # GitPython, a missing ``git`` binary, or a detached HEAD must degrade to
-    # git_data with an error_type rather than crash the whole run. We catch the
-    # EXPECTED failure modes specifically (not a bare `except Exception`) so a
-    # real bug (typo, encoding error) is not silently swallowed.
+    # Lazy import: only run-logging needs GitPython. We catch the EXPECTED
+    # failure modes specifically (not a bare `except Exception`) so a real bug
+    # (typo, encoding error) is not silently swallowed.
     try:
         import git
     except ImportError:
@@ -57,15 +58,20 @@ def gather_metadata() -> Dict:
             )
         except git.InvalidGitRepositoryError:
             git_data = dict(commit=None, error_type="InvalidGitRepositoryError")
+        except git.GitCommandNotFound as exc:
+            # GitPython imported successfully, but the ``git`` binary is not on
+            # PATH (e.g. a slim container). GitCommandNotFound inherits from
+            # CommandError -> GitError -> Exception, NOT OSError, so it must be
+            # caught explicitly.
+            git_data = dict(commit=None, error_type=type(exc).__name__)
         except TypeError:
             # Detached HEAD has no active_branch.name.
             git_data = dict(commit=None, error_type="DetachedHead")
-        except OSError as e:
-            # git binary missing / executable failure (GitPython raises OSError
-            # / GitCommandNotFound, which subclasses OSError).
+        except OSError as exc:
+            # Low-level executable / I/O failure from the git binary.
             git_data = dict(
                 commit=None,
-                error_type=type(e).__name__,
+                error_type=type(exc).__name__,
             )
     # gathering slurm metadata
     if 'SLURM_JOB_ID' in os.environ:
