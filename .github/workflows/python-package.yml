@@ -86,6 +86,7 @@ jobs:
           import douzero.dmc
           import douzero.env
           import douzero.evaluation
+          import douzero.observation
 
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
           package_path = Path(douzero.__file__).resolve()
