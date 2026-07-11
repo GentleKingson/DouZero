@@ -3,7 +3,10 @@
 > Status: **P03 complete.** This page documents the versioned observation V2
 > schema introduced in P03. The legacy encoder
 > (`douzero/env/env.py:get_obs`) is unchanged and remains the default; V2 is
-> opt-in via `feature_version="v2"`. Training integration arrives in P05/P06.
+> opt-in via `feature_version="v2"`. **V2 is NOT yet wired into training** —
+> `train()` rejects `feature_version="v2"` until P05/P06 integrate the V2 model
+> and buffers. V2 observations can be built and round-tripped today (evaluation
+> adapters, tests); they just are not consumed by the actor/learner.
 
 P03 separates **public** information (everything a deployment model may see)
 from **privileged** information (true hidden hands, training-only) and gives
@@ -28,14 +31,19 @@ different hidden allocations produce **identical** public observations.
 ```
 douzero/observation/
   __init__.py        public re-exports
-  cards.py           versioned 54-dim card encoding (source of truth)
+  cards.py           versioned 54-dim card encoding — the V2 source of truth
+                     (the legacy _cards2array in env.py is a frozen compatibility
+                     copy; new code should use cards.cards_to_vector)
   seats.py           canonical relative-seat mapping
   schema.py          FeatureSchemaManifest (every width derived from constants)
-  history.py         HistoryTokenBatch + configurable max_history_len + mask
-  public.py          PublicObservation + public unseen-pool helpers
+                     + stable_hash / compatibility_dict (identity stamps)
+  history.py         HistoryTokenBatch: bounded history + left-truncation + mask
+  public.py          PublicObservation + public unseen-pool helpers +
+                     BiddingTokenBatch
   privileged.py      PrivilegedObservation (training-only)
   encode_v2.py       get_obs_v2 -> ObservationV2 (state once + action batch)
-  legacy_adapter.py  reconstruct legacy x_batch/z_batch from V2 (parity bridge)
+  legacy_adapter.py  reconstruct legacy x_batch/z_batch from V2 ALONE (no extra
+                     args; parity bridge)
 ```
 
 ## 3. Public observation
@@ -122,25 +130,66 @@ The state block is encoded **once per decision** (no legal-action batch dim);
 the legal actions are encoded into a `LegalActionBatch` (one row per action);
 the history is a padded `HistoryTokenBatch`.
 
-## 6. History tokens
+## 6. History tokens (bounded history, left-truncation)
+
+The V2 history is a **bounded** history: it keeps at most `max_history_len`
+tokens (configurable; default 100, which comfortably covers a full game). When
+the public action history exceeds the cap, the **oldest** moves are dropped
+(left-truncation) and the real tokens are left-aligned. This bounded/truncated
+contract is recorded by the `TRUNCATION_SEMANTICS_VERSION` stamp.
 
 Each history token carries the required P03 fields: `actor_role`, `is_pass`,
 `move_type`, `main_rank`, `length`, `card_count`, `cards_encoding`,
 `cards_left_after`, `bomb_flag`, `phase`, and a `valid` padding mask.
 
-`max_history_len` is configurable (default 100, which comfortably covers a full
-game). Real tokens are placed at the start of the sequence; the rest is
-zero-padding with a zero mask. Older moves beyond the cap are dropped.
+Mask contract (explicit, item 6):
 
-## 7. Legacy adapter
+- `valid_mask`: int8, `1` for a real token, `0` for padding.
+- `key_padding_mask`: bool, `True` for **padding** (the PyTorch Transformer
+  convention where True means "ignore this position"). It is the exact boolean
+  negation of `valid_mask`.
+- `original_length`: the full move count before truncation.
+- `was_truncated`: `True` iff some oldest moves were dropped.
+- `truncation_side`: always `"left"` for this schema.
 
-`legacy_observation_from_v2(obs, card_play_action_seq=...)` rebuilds the legacy
-`x_batch` / `z_batch` / `x_no_action` / `z` tensors from a V2 observation. This
-is a transition bridge so a legacy model can consume a V2 observation without
-any model-side change. Parity is asserted per role in
-`tests/test_observation_legacy_adapter.py`.
+Padding slots are all-zero. Editing padding content cannot affect the mask
+contract: the mask is what defines validity, not the token content.
 
-## 8. Enabling V2
+## 7. Schema identity (stable hash)
+
+`FeatureSchemaManifest.stable_hash()` is a description-stable SHA-256 of
+`compatibility_dict()`, which includes every field's name/shape/dtype (per
+group), `max_history_len`, and the semantic version stamps (card encoding,
+move-type encoding, seat mapping, history encoding, mask semantics, truncation
+semantics). `description` text is excluded, so documentation churn does not
+change a model's identity contract.
+
+`ObservationV2` carries `feature_schema_version` and `feature_schema_hash` (the
+full 64-char hash) so a checkpoint/model can reject an incompatible schema
+precisely. The hash changes on any field name/shape/dtype/order change,
+`max_history_len` change, or stamp change.
+
+## 8. Deep immutability
+
+`ObservationV2`, `StateBlock`, `LegalActionBatch`, `BiddingTokenBatch`, and
+`HistoryTokenBatch` are `frozen` dataclasses; `PrivilegedObservation` is
+`frozen` + `slots`. Every numpy array they hold is read-only (`write=False`).
+Caller-supplied lists/dicts are copied at construction, so mutating the source
+infoset after building an observation does not retroactively alter it, and the
+public and privileged containers share no ndarray.
+
+## 9. Legacy adapter (depends only on ObservationV2)
+
+`legacy_observation_from_v2(obs)` rebuilds the legacy `x_batch` / `z_batch` /
+`x_no_action` / `z` tensors from a V2 observation **alone** — it takes no extra
+infoset or action-sequence argument. The raw public action sequence it needs to
+rebuild `z` is stored on `ObservationV2.card_play_action_seq` (an immutable
+tuple of tuples) at encode time. This is a transition bridge so a legacy model
+can consume a V2 observation without any model-side change. Parity is asserted
+per role, for short and long (>15-move) histories, and across varying
+legal-action counts in `tests/test_observation_legacy_adapter.py`.
+
+## 10. Enabling V2
 
 V2 is opt-in and does not change the default:
 
@@ -149,14 +198,37 @@ V2 is opt-in and does not change the default:
 - Programmatic: `get_obs_v2(infoset)`.
 
 The legacy `get_obs` path, the legacy checkpoints, and the legacy training loop
-are byte-for-byte unchanged. Training does not yet consume V2 observations;
-that wiring arrives in P05 (Model V2) and P06 (multi-objective training).
+are byte-for-byte unchanged. **Training does not yet consume V2 observations**:
+`train()` rejects `feature_version="v2"` up front (before any CUDA/checkpoint/
+actor initialisation) until P05 (Model V2) and P06 (multi-objective training)
+wire the V2 schema into the actor/learner and buffers.
 
-## 9. Tests
+## 11. Deployment boundary note (no DeepAgentV2 yet)
+
+There is **no `DeepAgentV2` yet** — it arrives in P05/P16. Until then the
+imperfect-information boundary for the V2 path is enforced by:
+
+- the public encoder recomputing the unseen pool from public info and ignoring
+  `infoset.all_handcards` (the leakage test replaces `all_handcards` with an
+  access-throws sentinel and asserts `get_obs_v2` still succeeds);
+- the public encoder not importing the `privileged` module;
+- `PublicObservation` serialization containing no hidden-hand field.
+
+A canonical type guard (`DeepAgentV2` rejecting `PrivilegedObservation` by
+type) will be added together with `DeepAgentV2` itself in P05/P16.
+
+## 12. Tests
 
 - `tests/test_observation_v2.py` — cards parity, relative seats, schema shapes,
   serialisation, the leakage invariant (public obs identical under hidden
   reallocation; privileged changes; encoder ignores `all_handcards`), card
   conservation, encode-once, standard-mode bottom cards.
+- `tests/test_observation_v2_hardening.py` — schema identity (description-stable
+  hash, hash changes), public bottom-card semantics (revealed vs unplayed),
+  deep immutability (frozen/readonly arrays/source-isolation), the history
+  contract (valid_mask/key_padding_mask/truncation), leakage hardening
+  (access-throws sentinel, no privileged import, no hidden field), and
+  model-consumable public-input presence.
 - `tests/test_observation_legacy_adapter.py` — V2 → legacy tensor parity for
-  all three roles, and legacy widths derived from constants.
+  all three roles (short and >15-move histories, varying legal-action counts),
+  the no-arg adapter signature, and legacy widths derived from constants.
