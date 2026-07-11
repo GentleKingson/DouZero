@@ -1,9 +1,10 @@
-"""Tests for the training ruleset guard (P02 Slice 5).
+"""Tests for the training ruleset and feature_version guards (P02/P03).
 
 Verifies that:
 - train() rejects ruleset='standard' with a precise error
-- train() accepts ruleset='legacy' (does not raise the guard error)
-- the --ruleset CLI flag shows both choices in --help
+- train() rejects feature_version='v2' with a precise error, BEFORE any init
+- train() accepts the legacy defaults (does not raise the guard error)
+- the --ruleset / --feature_version CLI flags show their choices in --help
 - checkpoint manifest records the correct ruleset_id
 """
 
@@ -15,7 +16,7 @@ import pytest
 
 
 # --------------------------------------------------------------------------- #
-# Training guard
+# Training guard — ruleset (P02)
 # --------------------------------------------------------------------------- #
 def test_train_rejects_standard_ruleset():
     """train() must raise ValueError when ruleset='standard'."""
@@ -99,6 +100,97 @@ def test_train_standard_guard_has_no_side_effects(tmp_path):
     # No checkpoint directory should have been created.
     assert not (tmp_path / 'test_no_side_effect').exists(), \
         "train() created a checkpoint directory before the guard"
+
+
+# --------------------------------------------------------------------------- #
+# Training guard — feature_version (P03)
+# --------------------------------------------------------------------------- #
+def test_train_rejects_v2_feature_version():
+    """train() must raise ValueError when feature_version='v2'.
+
+    The V2 observation schema is accepted by configuration but not yet wired
+    into the actor/learner, so training must refuse it up front rather than
+    silently producing a checkpoint stamped with the wrong feature identity.
+    """
+    from douzero.dmc.dmc import train
+
+    flags = argparse.Namespace(
+        feature_version='v2',
+        ruleset='legacy',
+        actor_device_cpu=True,
+        training_device='cpu',
+    )
+    with pytest.raises(ValueError, match="feature_version"):
+        train(flags)
+
+
+def test_train_does_not_reject_legacy_feature_version():
+    """train() must NOT raise the feature_version guard for legacy."""
+    from douzero.dmc.dmc import train
+
+    flags = argparse.Namespace(
+        feature_version='legacy',
+        ruleset='legacy',
+        actor_device_cpu=True,
+        training_device='cpu',
+    )
+    try:
+        train(flags)
+    except ValueError as e:
+        if "feature_version" in str(e):
+            pytest.fail("Legacy feature_version was rejected by the guard")
+    except Exception:
+        pass
+
+
+def test_train_v2_guard_runs_before_any_initialization(tmp_path):
+    """The feature_version guard must fire BEFORE CUDA/FileWriter/checkpoint/
+    model/buffer/actor init — no subprocess, no checkpoint dir, no side effects.
+
+    This is the critical ordering property: an identity-mismatched run must fail
+    fast without spawning actors or writing artifacts that would need cleanup.
+    """
+    from unittest.mock import patch
+    from douzero.dmc.dmc import train
+
+    flags = argparse.Namespace(
+        feature_version='v2',
+        ruleset='legacy',
+        actor_device_cpu=True,
+        training_device='cpu',
+        savedir=str(tmp_path),
+        xpid='test_v2_no_side_effect',
+    )
+    with patch('douzero.dmc.file_writer.FileWriter') as mock_fw, \
+         patch('torch.multiprocessing.Process') as mock_proc:
+        with pytest.raises(ValueError, match="feature_version"):
+            train(flags)
+        # No FileWriter, no subprocess before the guard.
+        assert mock_fw.call_count == 0, \
+            "train() constructed a FileWriter before the feature_version guard"
+        assert mock_proc.call_count == 0, \
+            "train() spawned a subprocess before the feature_version guard"
+    assert not (tmp_path / 'test_v2_no_side_effect').exists(), \
+        "train() created a checkpoint directory before the feature_version guard"
+
+
+def test_train_feature_version_guard_precedes_cuda_check():
+    """The feature_version guard must run before the CUDA-availability check.
+
+    We force a CUDA-required config (actor_device_cpu=False) with a v2 feature
+    version; the guard must raise ValueError (feature_version), NOT the
+    AssertionError about CUDA. This proves the guard precedes CUDA init.
+    """
+    from douzero.dmc.dmc import train
+
+    flags = argparse.Namespace(
+        feature_version='v2',
+        ruleset='legacy',
+        actor_device_cpu=False,  # would trigger the CUDA check
+        training_device='0',
+    )
+    with pytest.raises(ValueError, match="feature_version"):
+        train(flags)
 
 
 # --------------------------------------------------------------------------- #

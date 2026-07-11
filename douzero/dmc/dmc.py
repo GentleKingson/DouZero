@@ -63,8 +63,27 @@ def train(flags):
     This is the main funtion for training. It will first
     initilize everything, such as buffers, optimizers, etc.
     Then it will start subprocesses as actors. Then it will call
-    learning function with  multiple threads.
+    learning function with multiple threads.
     """
+    # P03: training only supports the legacy observation feature version. The
+    # V2 observation schema (douzero/observation/) is accepted by configuration
+    # but is NOT yet wired into the actor/learner — the buffers, models, and
+    # loss all assume the legacy x_batch/z_batch tensors. Rejecting a V2 run
+    # here, BEFORE any CUDA/FileWriter/checkpoint/model/buffer/actor
+    # initialisation, prevents an identity-mismatched training run from
+    # silently producing checkpoints stamped with the wrong feature_version or
+    # from spawning actor subprocesses that cannot be cleanly reaped. Training
+    # integration of V2 arrives in P05/P06.
+    feature_version = getattr(flags, 'feature_version', 'legacy')
+    if feature_version != 'legacy':
+        raise ValueError(
+            f"Training does not yet support feature_version="
+            f"{feature_version!r}. Only 'legacy' is supported for training. "
+            f"The observation V2 schema (douzero/observation/) is accepted by "
+            f"configuration but is not yet wired into the actor/learner. "
+            f"Training integration arrives in P05/P06."
+        )
+
     # P02: training only supports the legacy ruleset. Standard mode adds
     # bidding/scoring which requires model/buffer changes (P05/P06).
     ruleset = getattr(flags, 'ruleset', 'legacy')
