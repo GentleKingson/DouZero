@@ -1,20 +1,60 @@
-# P00 baseline-freeze engineering scaffold.
-#
-# Scope: this file only configures the build backend and pytest. It does NOT
-# change package metadata, dependencies, or import behavior -- setup.py remains
-# the packaging source of truth so legacy installs are unaffected. Later phases
-# (P01) may consolidate packaging here.
+# P01: project metadata now lives here (PEP 621). setup.py is retained as a
+# thin shim for backward compatibility with tooling that invokes it directly,
+# but pyproject.toml is the single source of truth for name/version/deps/
+# requires-python/classifiers. P00 kept setup.py authoritative and deferred
+# this consolidation to P01.
 
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "douzero"
+description = "DouZero DouDizhu AI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Daochen Zha", email = "daochen.zha@tamu.edu" },
+]
+keywords = ["DouDizhu", "AI", "Reinforcement Learning", "RL", "Torch", "Poker"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch",
+    "rlcard",
+    "GitPython",
+    "pyyaml",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/kwai/DouZero"
+
+# Version is read from douzero/_version.py so there is one source of truth.
+[tool.setuptools.dynamic]
+version = { attr = "douzero._version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["douzero*"]
+
+[tool.setuptools.package-data]
+# Ship the bundled legacy.yaml config inside the wheel so load_legacy_config()
+# works from an installed wheel (no repo checkout needed).
+"douzero.config.data" = ["*.yaml"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
 # Tests must be deterministic, offline, and independent of downloaded weights.
-# A hard timeout guards against any accidental infinite loop in move generation
-# or environment rollout.
+# A hard timeout is enforced via the pytest-timeout plugin in the CI/Docker
+# runners (no hard timeout is set in addopts here to avoid surprises when
+# running on slower local hardware).
 addopts = "-ra -q"
 filterwarnings = [
     "error::DeprecationWarning:douzero.*",

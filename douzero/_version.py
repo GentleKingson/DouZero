@@ -20,6 +20,11 @@ __all__ = ["__version__", "git_sha", "environment_info"]
 # phases can import it without importing setuptools at runtime.
 __version__ = "1.1.0"
 
+# Sentinel used to distinguish "git_sha() has not been called yet" from a
+# cached (possibly 'unknown') result. None cannot serve that role because the
+# function now always returns a string.
+_SENTINEL = object()
+
 
 def _run_git(args: list[str], cwd: str | None = None) -> str | None:
     try:
@@ -38,16 +43,19 @@ def _run_git(args: list[str], cwd: str | None = None) -> str | None:
     return out.stdout.strip() or None
 
 
-def git_sha() -> str | None:
-    """Return the current git commit SHA, or None if git is unavailable.
+def git_sha() -> str:
+    """Return the current git commit SHA, or 'unknown' if git is unavailable.
 
-    The value is cached after the first successful call. Reading from the
-    DOUZERO_GIT_SHA environment variable takes precedence (useful in frozen
-    containers where the .git directory is absent).
+    The value is cached after the first call (success or failure). Reading from
+    the DOUZERO_GIT_SHA environment variable takes precedence (useful in frozen
+    containers / CI where the .git directory is absent). On any failure (no git
+    binary, not a repo, git not installed) the function returns the explicit
+    string 'unknown' rather than None, so manifest metadata is always a string
+    and never a silent null.
     """
-    cached = getattr(git_sha, "_cached", None)
-    if cached is not None:
-        return cached
+    cached = getattr(git_sha, "_cached", _SENTINEL)
+    if cached is not _SENTINEL:
+        return cached  # type: ignore[return-value]
 
     env_override = os.environ.get("DOUZERO_GIT_SHA")
     if env_override:
@@ -56,8 +64,9 @@ def git_sha() -> str | None:
 
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sha = _run_git(["rev-parse", "HEAD"], cwd=repo_root)
-    git_sha._cached = sha  # type: ignore[attr-defined]
-    return sha
+    result = sha if sha is not None else "unknown"
+    git_sha._cached = result  # type: ignore[attr-defined]
+    return result
 
 
 def environment_info() -> dict:
