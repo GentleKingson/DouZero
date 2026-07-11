@@ -135,7 +135,10 @@ def build_manifest(
         checkpoint_kind=checkpoint_kind,
         git_sha=git_sha(),
         python_version=env.get("python_version", "unknown"),
-        torch_version=env.get("torch_version") or "unknown",
+        # str() guarantees a native Python str (torch's TorchVersion is a str
+        # subclass that breaks weights_only=True pickle). Belt-and-braces: the
+        # environment_info() also coerces, but this keeps the manifest robust.
+        torch_version=str(env.get("torch_version") or "unknown"),
         effective_config=effective,
         frames=int(frames),
         position_frames={k: int(v) for k, v in position_frames.items()},

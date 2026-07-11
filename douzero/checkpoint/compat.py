@@ -9,10 +9,12 @@ These read checkpoint formats that predate the P01 manifest:
 
 Security:
   - Position-weights sidecars are pure state_dicts, so they load with
-    ``weights_only=True`` (safe).
-  - Legacy ``model.tar`` bundles contain arbitrary Python objects (stats/flags)
-    and require ``weights_only=False``. This is the documented trusted path
-    (the legacy bundle is a locally-produced training artifact).
+    ``weights_only=True`` (safe, the default).
+  - Legacy ``model.tar`` bundles default to ``weights_only=True``. A bundle
+    that embeds arbitrary pickled Python objects (e.g. a pickled Namespace)
+    that safe mode cannot reconstruct requires the caller to explicitly pass
+    ``allow_unsafe_pickle=True``. This keeps untrusted checkpoints safe by
+    default.
 
 Position-checkpoint strictness: the DEFAULT position-ckpt loader now requires
 exact key-set and shape match (no permissive partial load). The legacy
@@ -23,9 +25,12 @@ callers get strictness by default.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import torch
+
+_log = logging.getLogger(__name__)
 
 
 def _resolve_map_location(training_device: str | None):
@@ -40,7 +45,11 @@ def _resolve_map_location(training_device: str | None):
 
 
 def load_legacy_model_tar(
-    path: str, *, training_device: str | None = None
+    path: str,
+    *,
+    training_device: str | None = None,
+    allow_unsafe_pickle: bool = False,
+    _already_loaded_bundle: dict | None = None,
 ) -> tuple[dict, None]:
     """Read a pre-P01 model.tar (no manifest). Returns (bundle, None).
 
@@ -48,16 +57,28 @@ def load_legacy_model_tar(
     possible because there is no manifest -- callers assume legacy feature/
     rule identity.
 
-    ``weights_only=False`` is required and is the documented trusted path: the
-    bundle contains arbitrary Python objects (stats/flags dicts), and a legacy
-    checkpoint is a locally-produced training artifact, not an untrusted
-    download.
+    Security: defaults to ``weights_only=True``. A legacy bundle that embeds
+    objects safe mode cannot reconstruct requires
+    ``allow_unsafe_pickle=True`` (which logs a warning and uses
+    ``weights_only=False``). If ``io.load_checkpoint`` already loaded the
+    bundle while probing for a manifest, it passes that bundle via
+    ``_already_loaded_bundle`` so we do not read the file twice.
     """
-    bundle = torch.load(
-        path,
-        map_location=_resolve_map_location(training_device),
-        weights_only=False,
-    )
+    if _already_loaded_bundle is not None:
+        bundle = _already_loaded_bundle
+    else:
+        weights_only = not allow_unsafe_pickle
+        if not weights_only:
+            _log.warning(
+                "Loading legacy checkpoint %s with weights_only=False "
+                "(allow_unsafe_pickle=True). Only use this for trusted, "
+                "locally-produced checkpoints.", path,
+            )
+        bundle = torch.load(
+            path,
+            map_location=_resolve_map_location(training_device),
+            weights_only=weights_only,
+        )
     if not isinstance(bundle, dict):
         raise TypeError(f"Legacy checkpoint at {path} is not a dict: {type(bundle)}")
     return bundle, None

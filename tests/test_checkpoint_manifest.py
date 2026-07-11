@@ -15,6 +15,7 @@ Acceptance gates:
 from __future__ import annotations
 
 import argparse
+import os
 
 import pytest
 import torch
@@ -259,3 +260,137 @@ def test_manifest_git_sha_unknown_when_no_git(monkeypatch):
 
     m = build_manifest(_ns(), frames=0, position_frames={p: 0 for p in POSITIONS})
     assert m.git_sha == "unknown"
+
+
+# --------------------------------------------------------------------------- #
+# Security: weights_only=True by default; unsafe pickle opt-in (item 3)
+# --------------------------------------------------------------------------- #
+def test_safe_training_checkpoint_round_trip(tmp_path, seed_factory):
+    """A P01 training checkpoint must load under the safe default (weights_only=True).
+
+    This is the core item-3 gate: the default load_checkpoint() call uses no
+    allow_unsafe_pickle flag and must succeed for a locally-saved P01 bundle.
+    """
+    seed_factory(920)
+    learner, optimizers = _make_models_and_optimizers()
+    position_frames = {p: 5 for p in POSITIONS}
+    path = str(tmp_path / "safe.tar")
+    save_checkpoint(path, learner.get_models(), optimizers, {"loss_landlord": 1.0},
+                    _ns(), 5, position_frames)
+    # Default call: no allow_unsafe_pickle -> weights_only=True.
+    bundle, manifest = load_checkpoint(path)
+    assert manifest is not None
+    assert manifest.frames == 5
+    for p in POSITIONS:
+        assert p in bundle["model_state_dict"]
+
+
+def test_unsafe_pickle_rejected_by_default(tmp_path):
+    """A checkpoint with a non-safe global must be REFUSED by the safe default.
+
+    We craft a bundle containing a datetime object (a common, benign-but-not-
+    weights-only-safe global) and assert the default load raises. The
+    allow_unsafe_pickle=True path succeeds UNLESS the environment has set
+    TORCH_FORCE_WEIGHTS_ONLY_LOAD=1 (a hard security override that rejects
+    weights_only=False even when the caller opts in).
+    """
+    import datetime as _dt
+
+    bundle = {
+        "model_state_dict": {},
+        "optimizer_state_dict": {},
+        "stats": {"created_at": _dt.datetime(2026, 1, 1)},  # non-safe object
+        "frames": 0,
+        "position_frames": {},
+        "manifest": {
+            "schema_version": 1, "model_version": "legacy",
+            "feature_version": "legacy", "ruleset_id": "legacy",
+            "checkpoint_kind": "training_checkpoint",
+            "git_sha": "unknown", "python_version": "3.11",
+            "torch_version": "2.13", "effective_config": {},
+            "frames": 0, "position_frames": {},
+            "created_at": "2026-01-01T00:00:00+00:00",
+        },
+    }
+    path = str(tmp_path / "unsafe.tar")
+    torch.save(bundle, path)
+
+    # Default: weights_only=True -> must refuse (UnpicklingError).
+    with pytest.raises(Exception):
+        load_checkpoint(path)
+
+    # Explicit opt-in: weights_only=False -> succeeds, unless the environment
+    # hard-forces weights_only (a security override we cannot disable).
+    force_safe = os.environ.get("TORCH_FORCE_WEIGHTS_ONLY_LOAD") == "1"
+    if force_safe:
+        with pytest.raises(Exception):
+            load_checkpoint(path, allow_unsafe_pickle=True)
+    else:
+        bundle2, manifest = load_checkpoint(path, allow_unsafe_pickle=True)
+        assert manifest is not None
+        assert isinstance(bundle2["stats"]["created_at"], _dt.datetime)
+
+
+def test_no_trusted_constant_or_weights_only_false_default():
+    """The TRAINING_CHECKPOINT_TRUSTED pseudo-gate must be gone (item 3)."""
+    import douzero.checkpoint as ckpt_mod
+
+    assert not hasattr(ckpt_mod, "TRAINING_CHECKPOINT_TRUSTED")
+    assert not hasattr(ckpt_mod.io, "TRAINING_CHECKPOINT_TRUSTED")
+
+
+def test_legacy_model_tar_safe_default_round_trip(tmp_path):
+    """A legacy model.tar (no manifest) with safe contents loads under the default."""
+    path = str(tmp_path / "legacy_safe.tar")
+    torch.save(
+        {"model_state_dict": {}, "frames": 3, "stats": {"a": 1}, "flags": {"x": 1}},
+        path,
+    )
+    bundle, manifest = load_checkpoint(path)
+    assert manifest is None
+    assert bundle["frames"] == 3
+
+
+def test_legacy_model_tar_unsafe_default_refused(tmp_path):
+    """A legacy model.tar with a non-safe object is refused under the default.
+
+    The allow_unsafe_pickle=True opt-in succeeds unless the environment hard-
+    forces weights_only (TORCH_FORCE_WEIGHTS_ONLY_LOAD=1).
+    """
+    import datetime as _dt
+
+    path = str(tmp_path / "legacy_unsafe.tar")
+    torch.save(
+        {"model_state_dict": {}, "frames": 3, "stats": {"ts": _dt.datetime(2026, 1, 1)}},
+        path,
+    )
+    # Default (safe) must raise.
+    with pytest.raises(Exception):
+        load_checkpoint(path)
+    # Opt-in succeeds (or is hard-refused under weights_only forcing).
+    force_safe = os.environ.get("TORCH_FORCE_WEIGHTS_ONLY_LOAD") == "1"
+    if force_safe:
+        with pytest.raises(Exception):
+            load_checkpoint(path, allow_unsafe_pickle=True)
+    else:
+        bundle, manifest = load_checkpoint(path, allow_unsafe_pickle=True)
+        assert manifest is None
+        assert bundle["frames"] == 3
+
+
+def test_manifest_torch_version_is_plain_str(tmp_path, seed_factory):
+    """The manifest torch_version must be a native str (not TorchVersion).
+
+    A TorchVersion object (str subclass) breaks weights_only=True loading, so
+    the manifest must coerce it. This test guards the regression.
+    """
+    seed_factory(921)
+    learner, optimizers = _make_models_and_optimizers()
+    path = str(tmp_path / "ver.tar")
+    manifest = save_checkpoint(path, learner.get_models(), optimizers, {},
+                               _ns(), 0, {p: 0 for p in POSITIONS})
+    assert type(manifest.torch_version) is str  # exact type, not a subclass
+    # And it loads under the safe default (the real proof).
+    _, loaded = load_checkpoint(path)
+    assert loaded is not None
+    assert type(loaded.torch_version) is str

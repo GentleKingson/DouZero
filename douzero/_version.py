@@ -88,7 +88,11 @@ def environment_info() -> dict:
     for name in ("numpy", "torch", "rlcard"):
         try:
             mod = __import__(name)
-            info[name + "_version"] = getattr(mod, "__version__", "unknown")
+            # str() coerces non-native str subclasses (e.g. torch's TorchVersion)
+            # so the value pickles cleanly under weights_only=True. Without this,
+            # a TorchVersion object in the manifest triggers an "Unsupported
+            # global" error on safe checkpoint loads.
+            info[name + "_version"] = str(getattr(mod, "__version__", "unknown"))
         except Exception:  # noqa: BLE001 - best-effort metadata
             info[name + "_version"] = None
     # CUDA availability only when torch is present.
