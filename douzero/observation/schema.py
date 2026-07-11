@@ -58,6 +58,26 @@ SEAT_ONEHOT_WIDTH: int = len(RELATIVE_SEATS)  # 6
 #: (16 labels, including TYPE_15_WRONG). Pass is TYPE_0.
 MOVE_TYPE_ONEHOT_WIDTH: int = 16
 
+#: One-hot width for a bid value. Standard bidding uses 0/1/2/3 (4 slots).
+BID_VALUE_ONEHOT_WIDTH: int = 4
+
+#: One-hot width for the game phase (bidding/reveal_bottom/playing + reserved).
+PHASE_ONEHOT_WIDTH: int = 4
+
+#: Maximum number of bidding tokens (3 bidders per round × bounded redeals;
+#: the encoded tensor is variable-length but the schema records the cap used
+#: for any fixed-width projection).
+MAX_BIDDING_TOKENS: int = 16
+
+#: Width of one bidding token (seat one-hot + bid-value one-hot + is_pass).
+#: Kept in sync with ``public.BIDDING_TOKEN_WIDTH``.
+BIDDING_TOKEN_WIDTH: int = 3 + BID_VALUE_ONEHOT_WIDTH + 1
+
+#: Length of the rule-identity fingerprint embedded in the context block. It
+#: is NOT the full ruleset_hash; it is a fixed-width compact id (the ruleset_id
+#: one-hot over legacy/standard + a numeric multiplier scalar).
+RULESET_ID_ONEHOT_WIDTH: int = 2
+
 # --------------------------------------------------------------------------- #
 # Semantic version stamps for the schema's invariants (item 2).
 #
@@ -91,6 +111,14 @@ MASK_SEMANTICS_VERSION: str = "valid1-pad0-v1"
 #: Version of the history truncation contract: bounded to ``max_history_len``,
 #: left-truncated (oldest moves dropped), real tokens left-aligned.
 TRUNCATION_SEMANTICS_VERSION: str = "left-truncate-v1"
+
+#: Version of the public-context block contract (item 3): the schema-described
+#: tensor block carrying bottom-card identity, bid, phase, rocket count, total
+#: multiplier, and rule-identity fingerprint.
+CONTEXT_ENCODING_VERSION: str = "context-v1"
+
+#: Version of the bidding-token field set/order contract (item 3).
+BIDDING_ENCODING_VERSION: str = "bidding-token-v1"
 
 
 @dataclass(frozen=True)
@@ -155,6 +183,14 @@ class FeatureSchemaManifest:
     state_fields: tuple[FieldSpec, ...]
     action_fields: tuple[FieldSpec, ...]
     history_token_fields: tuple[FieldSpec, ...]
+    # Item 3: schema-described public-context + bidding-token groups.
+    context_fields: tuple[FieldSpec, ...] = ()
+    bidding_token_fields: tuple[FieldSpec, ...] = ()
+    bid_value_onehot_width: int = BID_VALUE_ONEHOT_WIDTH
+    phase_onehot_width: int = PHASE_ONEHOT_WIDTH
+    ruleset_id_onehot_width: int = RULESET_ID_ONEHOT_WIDTH
+    bidding_token_width: int = BIDDING_TOKEN_WIDTH
+    max_bidding_tokens: int = MAX_BIDDING_TOKENS
     # Semantic version stamps (item 2). Defaults bind to the current contracts.
     card_encoding_version: str = CARD_ENCODING_VERSION
     move_type_encoding_version: str = MOVE_TYPE_ENCODING_VERSION
@@ -162,6 +198,8 @@ class FeatureSchemaManifest:
     history_encoding_version: str = HISTORY_ENCODING_VERSION
     mask_semantics_version: str = MASK_SEMANTICS_VERSION
     truncation_semantics_version: str = TRUNCATION_SEMANTICS_VERSION
+    context_encoding_version: str = CONTEXT_ENCODING_VERSION
+    bidding_encoding_version: str = BIDDING_ENCODING_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,23 +211,34 @@ class FeatureSchemaManifest:
             "move_type_onehot_width": self.move_type_onehot_width,
             "bomb_onehot_width": self.bomb_onehot_width,
             "max_cards_left": self.max_cards_left,
+            "bid_value_onehot_width": self.bid_value_onehot_width,
+            "phase_onehot_width": self.phase_onehot_width,
+            "ruleset_id_onehot_width": self.ruleset_id_onehot_width,
+            "bidding_token_width": self.bidding_token_width,
+            "max_bidding_tokens": self.max_bidding_tokens,
             "state_fields": [f.to_dict() for f in self.state_fields],
             "action_fields": [f.to_dict() for f in self.action_fields],
             "history_token_fields": [f.to_dict() for f in self.history_token_fields],
+            "context_fields": [f.to_dict() for f in self.context_fields],
+            "bidding_token_fields": [f.to_dict() for f in self.bidding_token_fields],
             "card_encoding_version": self.card_encoding_version,
             "move_type_encoding_version": self.move_type_encoding_version,
             "seat_mapping_version": self.seat_mapping_version,
             "history_encoding_version": self.history_encoding_version,
             "mask_semantics_version": self.mask_semantics_version,
             "truncation_semantics_version": self.truncation_semantics_version,
+            "context_encoding_version": self.context_encoding_version,
+            "bidding_encoding_version": self.bidding_encoding_version,
         }
 
     def field_by_name(self, name: str, group: str = "state") -> FieldSpec:
-        """Look up a field spec by name within a group (state/action/history)."""
+        """Look up a field spec by name within a group."""
         groups = {
             "state": self.state_fields,
             "action": self.action_fields,
             "history": self.history_token_fields,
+            "context": self.context_fields,
+            "bidding": self.bidding_token_fields,
         }
         if group not in groups:
             raise ValueError(f"Unknown field group {group!r}")
@@ -205,6 +254,9 @@ class FeatureSchemaManifest:
         model can consume interchangeably. Excludes ``description`` text and
         the documentation-only ``feature_version`` label (the ``schema_version``
         and semantic stamps carry the real identity).
+
+        Item 3: the context and bidding-token groups are covered, so a model
+        cannot silently gain/lose a public input.
         """
         return {
             "schema_version": self.schema_version,
@@ -214,15 +266,24 @@ class FeatureSchemaManifest:
             "move_type_onehot_width": self.move_type_onehot_width,
             "bomb_onehot_width": self.bomb_onehot_width,
             "max_cards_left": self.max_cards_left,
+            "bid_value_onehot_width": self.bid_value_onehot_width,
+            "phase_onehot_width": self.phase_onehot_width,
+            "ruleset_id_onehot_width": self.ruleset_id_onehot_width,
+            "bidding_token_width": self.bidding_token_width,
+            "max_bidding_tokens": self.max_bidding_tokens,
             "card_encoding_version": self.card_encoding_version,
             "move_type_encoding_version": self.move_type_encoding_version,
             "seat_mapping_version": self.seat_mapping_version,
             "history_encoding_version": self.history_encoding_version,
             "mask_semantics_version": self.mask_semantics_version,
             "truncation_semantics_version": self.truncation_semantics_version,
+            "context_encoding_version": self.context_encoding_version,
+            "bidding_encoding_version": self.bidding_encoding_version,
             "state_fields": [f.identity_dict() for f in self.state_fields],
             "action_fields": [f.identity_dict() for f in self.action_fields],
             "history_token_fields": [f.identity_dict() for f in self.history_token_fields],
+            "context_fields": [f.identity_dict() for f in self.context_fields],
+            "bidding_token_fields": [f.identity_dict() for f in self.bidding_token_fields],
         }
 
     def stable_hash(self) -> str:
@@ -231,6 +292,7 @@ class FeatureSchemaManifest:
         Stable under ``description`` text edits (item 2). Changes when a field's
         name/shape/dtype changes, when a field is added/removed/reordered, when
         ``max_history_len`` changes, or when any semantic version stamp changes.
+        Covers the context and bidding-token groups (item 3).
         """
         payload = json.dumps(self.compatibility_dict(), sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -326,6 +388,35 @@ def build_v2_schema(max_history_len: int = 100) -> FeatureSchemaManifest:
                   "padding mask: 1 for a real token, 0 for padding"),
     )
 
+    # Item 3: the public-context block. A V2 model consumes every field here
+    # from the schema-described PublicContextBlock tensor, so P05 never needs
+    # to reach into obs.public ad hoc (which would create an unversioned input).
+    context_fields: tuple[FieldSpec, ...] = (
+        FieldSpec("bottom_cards_revealed", (CARD_VECTOR_DIM,), "int8",
+                  "public bottom cards (original identity), landlord-owned"),
+        FieldSpec("bottom_cards_unplayed", (CARD_VECTOR_DIM,), "int8",
+                  "public bottom cards not yet played by the landlord"),
+        FieldSpec("bid_value_onehot", (BID_VALUE_ONEHOT_WIDTH,), "int8",
+                  "one-hot final bid value (0 in legacy)"),
+        FieldSpec("phase_onehot", (PHASE_ONEHOT_WIDTH,), "int8",
+                  "one-hot game phase"),
+        FieldSpec("rocket_count", (1,), "int8",
+                  "number of rockets played (separate from bomb_count)"),
+        FieldSpec("total_multiplier", (1,), "int8",
+                  "public total score multiplier"),
+        FieldSpec("ruleset_id_onehot", (RULESET_ID_ONEHOT_WIDTH,), "int8",
+                  "one-hot ruleset id (legacy/standard)"),
+    )
+
+    # Item 3: the bidding-token group (variable-length, schema-described).
+    bidding_token_fields: tuple[FieldSpec, ...] = (
+        FieldSpec("bid_seat", (3,), "int8",
+                  "one-hot bidder seat index (0/1/2)"),
+        FieldSpec("bid_value", (BID_VALUE_ONEHOT_WIDTH,), "int8",
+                  "one-hot bid value (0=pass/1/2/3)"),
+        FieldSpec("is_pass", (1,), "int8", "1 if the bid was a pass"),
+    )
+
     return FeatureSchemaManifest(
         feature_version=FEATURE_VERSION_V2,
         schema_version=SCHEMA_VERSION_V2,
@@ -338,6 +429,8 @@ def build_v2_schema(max_history_len: int = 100) -> FeatureSchemaManifest:
         state_fields=state_fields,
         action_fields=action_fields,
         history_token_fields=history_token_fields,
+        context_fields=context_fields,
+        bidding_token_fields=bidding_token_fields,
     )
 
 
@@ -354,6 +447,16 @@ def action_width(schema: FeatureSchemaManifest) -> int:
 def history_token_width(schema: FeatureSchemaManifest) -> int:
     """Total flat width of one history token (no sequence dim)."""
     return sum(int(np_prod(spec.shape)) for spec in schema.history_token_fields)
+
+
+def context_width(schema: FeatureSchemaManifest) -> int:
+    """Total flat width of the public-context block (item 3)."""
+    return sum(int(np_prod(spec.shape)) for spec in schema.context_fields)
+
+
+def bidding_token_width(schema: FeatureSchemaManifest) -> int:
+    """Total flat width of one bidding token (item 3)."""
+    return sum(int(np_prod(spec.shape)) for spec in schema.bidding_token_fields)
 
 
 def np_prod(shape: tuple[int, ...]) -> int:

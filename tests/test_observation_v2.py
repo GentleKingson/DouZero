@@ -498,9 +498,10 @@ class TestStandardMode:
         env = self._play_to_playing()
         obs = get_obs_v2(
             env.infoset,
-            ruleset_id="standard",
+            ruleset=RuleSet.standard(),
             bid_value=env._env.bid_value,
             bidding_history=env._env.bidding_history,
+            bidding_order=env._env.bidding_order,
             phase="playing",
         )
         assert obs.public.bottom_cards.owner == "landlord"
@@ -545,7 +546,7 @@ class TestStandardMode:
         env = self._play_to_playing()
         obs = get_obs_v2(
             env.infoset,
-            ruleset_id="standard",
+            ruleset=RuleSet.standard(),
             bid_value=env._env.bid_value,
             phase="playing",
         )

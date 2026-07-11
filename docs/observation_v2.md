@@ -130,6 +130,19 @@ The state block is encoded **once per decision** (no legal-action batch dim);
 the legal actions are encoded into a `LegalActionBatch` (one row per action);
 the history is a padded `HistoryTokenBatch`.
 
+In addition to the state/action/history groups, the schema describes two
+further model-consumable tensor blocks (item 3, so P05 never bypasses the
+schema to read `obs.public` ad hoc):
+
+- a **public context block** (`context_fields`): bottom-card revealed/unplayed
+  card vectors, bid-value one-hot, phase one-hot, rocket count, total
+  multiplier, and a ruleset-id one-hot. Encoded once into `PublicContextBlock`.
+- a **bidding-token block** (`bidding_token_fields`): `[bid_seat(3),
+  bid_value(4), is_pass(1)]` per bid. Encoded into `SchemaBiddingTokenBatch`.
+
+Both groups are covered by `stable_hash()`, so adding/removing/reordering any
+field changes the schema identity.
+
 ## 6. History tokens (bounded history, left-truncation)
 
 The V2 history is a **bounded** history: it keeps at most `max_history_len`
@@ -188,6 +201,23 @@ tuple of tuples) at encode time. This is a transition bridge so a legacy model
 can consume a V2 observation without any model-side change. Parity is asserted
 per role, for short and long (>15-move) histories, and across varying
 legal-action counts in `tests/test_observation_legacy_adapter.py`.
+
+## 9b. Rule identity (never empty, never inconsistent)
+
+`get_obs_v2` resolves the ruleset identity so the stamped hash is never empty
+and never self-contradictory (review round 3, blocker 3):
+
+- **Preferred:** pass `ruleset=RuleSet.legacy()` / `RuleSet.standard()`. The
+  encoder derives `ruleset_id` / `ruleset_version` / `ruleset_hash` from
+  `RuleSet.identity()`.
+- **Validated fallback:** pass `ruleset_id` (+ optional version/hash). Legacy
+  auto-fills the canonical legacy hash when omitted; standard requires an
+  explicit version AND hash and rejects `standard` + `legacy-v1`; a hash that
+  disagrees with the canonical one is rejected; passing both `ruleset=` and
+  `ruleset_id=` is rejected.
+
+The legacy default (`get_obs_v2(infoset)` with no rule arguments) now stamps
+the full canonical legacy hash, not an empty string.
 
 ## 10. Enabling V2
 

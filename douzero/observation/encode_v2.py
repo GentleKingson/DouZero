@@ -92,10 +92,12 @@ class StateBlock:
     corresponding :class:`FeatureSchemaManifest` state field. The encoder
     concatenates them in schema order to form the flat state vector.
 
-    Item 3 adds the public bottom-card identity (revealed + unplayed), the
-    final bid one-hot, the bidding-token summary, the phase one-hot, the rocket
-    count, and the total multiplier, so a V2 model has every public input
-    without ad-hoc reads.
+    This is the legacy-parity state block (hand/played/last-move/counts/bomb/
+    acting-role). The additional public inputs (bottom-card identity, bid,
+    phase, rocket count, total multiplier, rule identity, bidding tokens) live
+    in the separate :class:`PublicContextBlock` / :class:`SchemaBiddingTokenBatch`
+    (item 3) — both schema-described — so P05 consumes every public input from
+    versioned tensor blocks rather than reaching into ``obs.public`` ad hoc.
     """
 
     my_handcards: np.ndarray
@@ -165,6 +167,71 @@ class LegalActionBatch:
 
 
 @dataclass(frozen=True)
+class PublicContextBlock:
+    """Schema-described public-context features (item 3), encoded once.
+
+    Carries the public bottom-card identity (revealed + unplayed), the final
+    bid one-hot, the phase one-hot, the rocket count, the total multiplier, and
+    the ruleset-id one-hot. Every field's name/shape/dtype is described by
+    :attr:`FeatureSchemaManifest.context_fields`, so a model consumes it from a
+    versioned tensor block rather than reaching into ``obs.public`` ad hoc.
+
+    Deep immutability: all arrays are frozen (``write=False``).
+    """
+
+    bottom_cards_revealed: np.ndarray
+    bottom_cards_unplayed: np.ndarray
+    bid_value_onehot: np.ndarray
+    phase_onehot: np.ndarray
+    rocket_count: np.ndarray
+    total_multiplier: np.ndarray
+    ruleset_id_onehot: np.ndarray
+
+    def __post_init__(self) -> None:
+        for arr_name in (
+            "bottom_cards_revealed", "bottom_cards_unplayed", "bid_value_onehot",
+            "phase_onehot", "rocket_count", "total_multiplier", "ruleset_id_onehot",
+        ):
+            arr = getattr(self, arr_name)
+            if arr.flags.writeable:
+                object.__setattr__(self, arr_name, _freeze(arr))
+
+    def to_vector(self) -> np.ndarray:
+        """Concatenate all fields in schema order into one int8 vector."""
+        return np.concatenate([
+            self.bottom_cards_revealed,
+            self.bottom_cards_unplayed,
+            self.bid_value_onehot,
+            self.phase_onehot,
+            self.rocket_count,
+            self.total_multiplier,
+            self.ruleset_id_onehot,
+        ]).astype(np.int8)
+
+
+@dataclass(frozen=True)
+class SchemaBiddingTokenBatch:
+    """Schema-described bidding-token tensor (item 3).
+
+    ``tokens`` has shape ``(num_bids, bidding_token_width)`` int8 (read-only),
+    matching :attr:`FeatureSchemaManifest.bidding_token_fields`:
+    ``[bid_seat(3), bid_value(4), is_pass(1)]`` per row. ``num_bids`` is the
+    real bid count (0 in legacy). This is the schema-bound counterpart of
+    :class:`~douzero.observation.public.BiddingTokenBatch`; both are kept so
+    the legacy-agnostic public container and the schema-described model input
+    each have a single owner, and they are built consistently from the same
+    bidding history.
+    """
+
+    tokens: np.ndarray
+    num_bids: int
+
+    def __post_init__(self) -> None:
+        if self.tokens.flags.writeable:
+            object.__setattr__(self, "tokens", _freeze(self.tokens))
+
+
+@dataclass(frozen=True)
 class ObservationV2:
     """Full V2 observation for one decision. PUBLIC ONLY.
 
@@ -188,6 +255,8 @@ class ObservationV2:
     actions: LegalActionBatch
     history: HistoryTokenBatch
     bidding_tokens: BiddingTokenBatch
+    context: PublicContextBlock
+    schema_bidding_tokens: SchemaBiddingTokenBatch
     feature_version: str
     feature_schema_version: str
     feature_schema_hash: str
@@ -315,9 +384,10 @@ def get_obs_v2(
     infoset,
     *,
     schema: FeatureSchemaManifest | None = None,
-    ruleset_id: str = "legacy",
-    ruleset_version: str = "legacy-v1",
-    ruleset_hash: str = "",
+    ruleset: "RuleSet | None" = None,
+    ruleset_id: str | None = None,
+    ruleset_version: str | None = None,
+    ruleset_hash: str | None = None,
     bid_value: int = 0,
     bidding_history=None,
     bidding_order=None,
@@ -338,9 +408,18 @@ def get_obs_v2(
     schema
         Optional prebuilt schema (controls ``max_history_len`` and the identity
         hash). Defaults to :func:`build_v2_schema`.
+    ruleset
+        Preferred way to supply the public rule identity (item 3 / Blocker 3).
+        When provided, ``ruleset_id`` / ``ruleset_version`` / ``ruleset_hash``
+        are derived from it and the three-argument form MUST NOT be passed
+        (passing both raises). The encoder never has to guess a hash.
     ruleset_id, ruleset_version, ruleset_hash
-        Public rule identity (item 3). Stamped onto the public observation so a
-        V2 model knows which ruleset it is playing under without ad-hoc reads.
+        Alternative (validated) rule-identity arguments. These are checked for
+        consistency: legacy auto-fills the canonical legacy hash when the hash
+        is omitted; standard requires version+hash and rejects ``standard`` +
+        ``legacy-v1``; a provided hash that disagrees with the id/version is
+        rejected. At least one of ``ruleset`` or ``ruleset_id`` must be supplied
+        (omitting both defaults to legacy with the canonical hash).
     bid_value, bidding_history, bidding_order
         Public bidding state. In legacy mode these default to no bidding.
     bomb_count, rocket_count, total_multiplier
@@ -351,10 +430,16 @@ def get_obs_v2(
 
     The state is encoded **once**; legal actions are encoded into a
     :class:`LegalActionBatch`; history is encoded into a bounded, padded
-    :class:`HistoryTokenBatch`. No privileged data is read or returned.
+    :class:`HistoryTokenBatch`; the public-context block and schema bidding
+    tokens are encoded once (item 3). No privileged data is read or returned.
     """
     if schema is None:
         schema = build_v2_schema()
+
+    # Resolve the rule identity consistently (Blocker 3): never an empty hash.
+    rs_id, rs_version, rs_hash = _resolve_rule_identity(
+        ruleset, ruleset_id, ruleset_version, ruleset_hash
+    )
 
     acting_role = infoset.player_position
     my_hand = list(infoset.player_hand_cards or [])
@@ -389,9 +474,9 @@ def get_obs_v2(
         num_cards_left=num_left,
         legal_actions=infoset.legal_actions,
         phase=phase,
-        ruleset_id=ruleset_id,
-        ruleset_version=ruleset_version,
-        ruleset_hash=ruleset_hash,
+        ruleset_id=rs_id,
+        ruleset_version=rs_version,
+        ruleset_hash=rs_hash,
         bid_value=bid_value,
         bidding_history=bidding_history,
         bidding_order=bidding_order,
@@ -438,8 +523,13 @@ def get_obs_v2(
     moves = _reconstruct_history_moves(raw_action_seq, num_left, phase_code)
     history = encode_history(moves, schema)
 
-    # --- Bidding tokens ---
+    # --- Bidding tokens (public container + schema-described model block) ---
     bidding_tokens = encode_bidding_tokens(bidding_history, bidding_order)
+    schema_bidding_tokens = _encode_schema_bidding_tokens(
+        bidding_history, bidding_order, schema)
+
+    # --- Public context block (item 3, schema-described) ---
+    context = _build_context_block(public, phase, schema)
 
     # Raw public action sequence (immutable) for the legacy adapter (item 7).
     action_seq_tuple = tuple(tuple(sorted(a)) for a in raw_action_seq)
@@ -451,6 +541,8 @@ def get_obs_v2(
         actions=actions,
         history=history,
         bidding_tokens=bidding_tokens,
+        context=context,
+        schema_bidding_tokens=schema_bidding_tokens,
         feature_version=schema.feature_version,
         feature_schema_version=schema.schema_version,
         feature_schema_hash=schema.stable_hash(),
@@ -464,6 +556,151 @@ def encode_bidding_tokens(
     """Build the :class:`BiddingTokenBatch` from a bidding history."""
     from .public import encode_bidding_history
     return encode_bidding_history(bidding_history or (), bidding_order)
+
+
+def _resolve_rule_identity(
+    ruleset,
+    ruleset_id: str | None,
+    ruleset_version: str | None,
+    ruleset_hash: str | None,
+) -> tuple[str, str, str]:
+    """Resolve a consistent (id, version, hash) rule identity (Blocker 3).
+
+    Preferred path: pass a ``RuleSet``; its ``identity()`` is authoritative and
+    the three-argument form must NOT also be passed. Fallback path: validate
+    the three arguments for consistency (legacy auto-fills its canonical hash;
+    standard requires version+hash and rejects ``standard``+``legacy-v1``; a
+    disagreeing hash is rejected). The returned hash is NEVER empty.
+    """
+    from douzero.env.rules import RuleSet
+
+    if ruleset is not None:
+        if not isinstance(ruleset, RuleSet):
+            raise TypeError(
+                f"ruleset must be a RuleSet instance, got {type(ruleset).__name__}"
+            )
+        if any(v is not None for v in (ruleset_id, ruleset_version, ruleset_hash)):
+            raise ValueError(
+                "Pass EITHER ruleset= OR (ruleset_id/ruleset_version/"
+                "ruleset_hash), not both. Mixing them is ambiguous."
+            )
+        ident = ruleset.identity()
+        return ident["ruleset_id"], ident["ruleset_version"], ident["ruleset_hash"]
+
+    # Fallback: derive/validate from the three-argument form.
+    rid = ruleset_id if ruleset_id is not None else "legacy"
+    if rid == "legacy":
+        canonical = RuleSet.legacy()
+        expected_version = canonical.ruleset_version
+        expected_hash = canonical.stable_hash()
+        if ruleset_version is not None and ruleset_version != expected_version:
+            raise ValueError(
+                f"legacy ruleset_version must be {expected_version!r}, got "
+                f"{ruleset_version!r}"
+            )
+        if ruleset_hash is not None and ruleset_hash != expected_hash:
+            raise ValueError(
+                "ruleset_hash disagrees with the canonical legacy ruleset hash"
+            )
+        return rid, expected_version, expected_hash
+
+    if rid == "standard":
+        if ruleset_version is None or ruleset_hash is None:
+            raise ValueError(
+                "ruleset='standard' requires explicit ruleset_version AND "
+                "ruleset_hash (derive them from RuleSet.standard().identity()). "
+                "Pass ruleset=RuleSet.standard() to get them automatically."
+            )
+        canonical = RuleSet.standard()
+        if ruleset_version != canonical.ruleset_version:
+            raise ValueError(
+                f"standard ruleset_version must be "
+                f"{canonical.ruleset_version!r}, got {ruleset_version!r}"
+            )
+        if ruleset_hash != canonical.stable_hash():
+            raise ValueError(
+                "ruleset_hash disagrees with the canonical standard ruleset hash"
+            )
+        return rid, ruleset_version, ruleset_hash
+
+    raise ValueError(
+        f"ruleset_id must be 'legacy' or 'standard', got {rid!r}"
+    )
+
+
+def _phase_onehot(phase: str) -> np.ndarray:
+    """One-hot encode the game phase over PHASE_ONEHOT_WIDTH slots."""
+    from .schema import PHASE_ONEHOT_WIDTH
+    vec = np.zeros(PHASE_ONEHOT_WIDTH, dtype=np.int8)
+    mapping = {"bidding": 0, "reveal_bottom": 1, "playing": 2}
+    idx = mapping.get(phase, 3)  # 3 = reserved/unknown
+    vec[idx] = 1
+    return vec
+
+
+def _bid_value_onehot(value: int) -> np.ndarray:
+    from .schema import BID_VALUE_ONEHOT_WIDTH
+    vec = np.zeros(BID_VALUE_ONEHOT_WIDTH, dtype=np.int8)
+    if 0 <= value < BID_VALUE_ONEHOT_WIDTH:
+        vec[value] = 1
+    return vec
+
+
+def _ruleset_id_onehot(ruleset_id: str) -> np.ndarray:
+    from .schema import RULESET_ID_ONEHOT_WIDTH
+    vec = np.zeros(RULESET_ID_ONEHOT_WIDTH, dtype=np.int8)
+    mapping = {"legacy": 0, "standard": 1}
+    idx = mapping.get(ruleset_id)
+    if idx is not None:
+        vec[idx] = 1
+    return vec
+
+
+def _build_context_block(public, phase: str, schema) -> "PublicContextBlock":
+    """Build the schema-described :class:`PublicContextBlock` (item 3)."""
+    return PublicContextBlock(
+        bottom_cards_revealed=cards_to_vector(public.bottom_cards.revealed),
+        bottom_cards_unplayed=cards_to_vector(public.bottom_cards.unplayed),
+        bid_value_onehot=_bid_value_onehot(public.bid_value),
+        phase_onehot=_phase_onehot(phase),
+        rocket_count=np.array([int(public.rocket_count)], dtype=np.int8),
+        total_multiplier=np.array([int(public.total_multiplier)], dtype=np.int8),
+        ruleset_id_onehot=_ruleset_id_onehot(public.ruleset_id),
+    )
+
+
+def _encode_schema_bidding_tokens(bidding_history, bidding_order, schema):
+    """Build the schema-described :class:`SchemaBiddingTokenBatch` (item 3).
+
+    Each row is ``[bid_seat(3), bid_value(4), is_pass(1)]`` matching
+    :attr:`FeatureSchemaManifest.bidding_token_fields`.
+    """
+    history = list(bidding_history or [])
+    seat_to_index: dict[str, int] = {}
+    if bidding_order is not None:
+        for i, seat in enumerate(bidding_order):
+            seat_to_index[str(seat)] = i
+    rows = []
+    next_index = 0
+    for seat, value in history:
+        seat_str = str(seat)
+        if seat_str not in seat_to_index:
+            seat_to_index[seat_str] = next_index
+            next_index += 1
+        idx = seat_to_index[seat_str]
+        seat_oh = np.zeros(3, dtype=np.int8)
+        if 0 <= idx < 3:
+            seat_oh[idx] = 1
+        rows.append(np.concatenate([
+            seat_oh,
+            _bid_value_onehot(int(value)),
+            np.array([1 if int(value) == 0 else 0], dtype=np.int8),
+        ]).astype(np.int8))
+    if rows:
+        tokens = np.stack(rows, axis=0).astype(np.int8)
+    else:
+        tokens = np.zeros((0, 8), dtype=np.int8)  # 3 + 4 + 1
+    return SchemaBiddingTokenBatch(tokens=tokens, num_bids=len(rows))
 
 
 def _action_width(schema: FeatureSchemaManifest) -> int:
