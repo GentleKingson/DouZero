@@ -128,8 +128,15 @@ def train(flags):
 
     # Load models if any
     if flags.load_model and os.path.exists(checkpointpath):
-        checkpoint_states = torch.load(
-            checkpointpath, map_location=("cuda:"+str(flags.training_device) if flags.training_device != "cpu" else "cpu")
+        from douzero.checkpoint import load_checkpoint
+
+        expected_feature = getattr(flags, "feature_version", "legacy")
+        expected_ruleset = getattr(flags, "ruleset", "legacy")
+        checkpoint_states, ckpt_manifest = load_checkpoint(
+            checkpointpath,
+            expected_feature_version=expected_feature,
+            expected_ruleset_id=expected_ruleset,
+            training_device=flags.training_device,
         )
         for k in ['landlord', 'landlord_up', 'landlord_down']:
             learner_model.get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
@@ -191,16 +198,19 @@ def train(flags):
     def checkpoint(frames):
         if flags.disable_checkpoint:
             return
+        from douzero.checkpoint import save_checkpoint
+
         log.info('Saving checkpoint to %s', checkpointpath)
         _models = learner_model.get_models()
-        torch.save({
-            'model_state_dict': {k: _models[k].state_dict() for k in _models},
-            'optimizer_state_dict': {k: optimizers[k].state_dict() for k in optimizers},
-            "stats": stats,
-            'flags': vars(flags),
-            'frames': frames,
-            'position_frames': position_frames
-        }, checkpointpath)
+        save_checkpoint(
+            checkpointpath,
+            learner_models=_models,
+            optimizers=optimizers,
+            stats=stats,
+            flags=flags,
+            frames=frames,
+            position_frames=position_frames,
+        )
 
         # Save the weights for evaluation purpose
         for position in ['landlord', 'landlord_up', 'landlord_down']:
