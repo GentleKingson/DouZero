@@ -5,7 +5,8 @@ Measures CPU latency/throughput for:
   * model-forward-only (legacy vs factorized) at several legal-action counts;
   * the full ``DeepAgent.act`` path (observation encoding + tensor build +
     forward + argmax) for both backends;
-  * CPU peak memory for the full act path;
+  * CPU peak RSS for the full act path, measured in ISOLATED subprocesses so
+    each backend's ``ru_maxrss`` reflects only its own allocations;
   * the LSTM input batch size per decision (the P04 work-reduction proof:
     legacy feeds the LSTM N identical rows, factorized feeds it 1).
 
@@ -14,13 +15,19 @@ medians and p95s on the current host and makes no preset assumption about the
 speedup. The model-forward-only numbers are NOT end-to-end DeepAgent numbers;
 both are reported separately and labelled clearly.
 
-GPU: by default this benchmark runs CPU-only (the test image has no CUDA).
-Pass ``--device cuda`` to attempt GPU timing; the script does NOT force-hide
-CUDA at import time, so a real GPU is usable when present.
+This benchmark is **CPU-only**. CUDA is force-hidden at import so the models
+(which probe ``torch.cuda.is_available()``) deterministically run on CPU. GPU
+timing, GPU memory, and CPU/GPU parity comparison are **out of scope for P04**
+and deferred to P14 (Actor/Learner, AMP, DDP and throughput optimization),
+where a device-correct benchmark with ``torch.cuda.Event`` synchronization and
+``reset_peak_memory_stats`` / ``max_memory_allocated`` belongs. Measuring GPU
+latency without CUDA-event synchronization would be incorrect (CUDA ops are
+asynchronous; ``time.perf_counter`` without ``torch.cuda.synchronize()`` does
+not bound the kernel time).
 
 Usage:
     python benchmarks/bench_factorized.py
-    python benchmarks/bench_factorized.py --rounds 50 --device cuda
+    python benchmarks/bench_factorized.py --rounds 50
     python benchmarks/bench_factorized.py --output artifacts/benchmark/bench_factorized.json
 """
 
@@ -28,9 +35,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import time
 from pathlib import Path
+
+# Force CPU for the whole benchmark. This MUST happen before any model/tensor
+# work: the legacy and factorized models probe torch.cuda.is_available() and
+# DeepAgent migrates tensors/models to CUDA when it returns True. Hiding CUDA
+# here makes the benchmark deterministically CPU-only on any host, so a GPU
+# machine and the CPU CI image measure the same path. GPU benchmarking is
+# deferred to P14 (see module docstring).
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 DEFAULT_ROUNDS = 30
 DEFAULT_WARMUP = 3
@@ -63,17 +79,20 @@ def _bench(fn, rounds, warmup):
     }
 
 
-def _peak_rss_kb():
-    """Peak resident set size of the current process in KiB (best effort)."""
-    try:
-        import resource
-        # ru_maxrss is in KiB on Linux, bytes on macOS.
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        if hasattr(__import__("sys"), "platform") and __import__("sys").platform == "darwin":
-            return rss // 1024  # bytes -> KiB
-        return rss  # already KiB on Linux
-    except Exception:
-        return None
+def _peak_rss_kb_child():
+    """Peak resident set size of the CURRENT (child) process in KiB.
+
+    Uses RUSAGE_SELF, which for a freshly-spawned child reflects only that
+    child's own allocations (not the parent's). This is what makes the per-
+    backend peak-RSS comparison valid: each backend runs in its own child.
+    """
+    import sys
+    import resource
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # ru_maxrss is KiB on Linux, bytes on macOS.
+    if sys.platform == "darwin":
+        return rss // 1024  # bytes -> KiB
+    return rss  # already KiB on Linux
 
 
 class _LstmBatchRecorder:
@@ -203,7 +222,7 @@ def bench_deep_agent_act(rounds, warmup, seed, position="landlord"):
     Measures the REAL deployment path (both backends), including get_obs /
     get_obs_factorized, tensor construction, the forward, and np.argmax. This
     is the number that matters for inference latency; the model-forward-only
-    numbers above isolate the model cost.
+    numbers above isolate the model cost. CPU-only (CUDA is hidden at import).
     """
     import os
     import tempfile
@@ -240,20 +259,24 @@ def bench_deep_agent_act(rounds, warmup, seed, position="landlord"):
                 if fact_stats["median_ms"] else None
             ),
             "note": (
-                "Full DeepAgent.act path: observation encoding + tensor build "
-                "+ forward + argmax. The factorized backend uses "
+                "Full DeepAgent.act path (CPU-only): observation encoding + "
+                "tensor build + forward + argmax. The factorized backend uses "
                 "get_obs_factorized (no tiling) + forward_factorized."
             ),
         }
     }
 
 
-def bench_peak_memory(seed, position="landlord"):
-    """CPU peak RSS for the full DeepAgent.act path (legacy vs factorized).
+# --------------------------------------------------------------------------- #
+# Peak RSS — measured in ISOLATED subprocesses (review blocker #2)
+# --------------------------------------------------------------------------- #
+def _peak_rss_child_main(position, backend, seed, num_acts, q):
+    """Child-process target: run one backend and report the child's peak RSS.
 
-    Reports the peak resident set size after a run of N act() calls. This is a
-    coarse process-level metric (not allocation-scoped), but it surfaces
-    large-tile regressions. GPU memory is not measured here (CPU-only image).
+    Runs in a fresh process so ``ru_maxrss`` reflects ONLY this backend's
+    allocations (not the other backend's, and not the parent's). Both backends
+    load the same checkpoint, run the same infoset, and perform the same number
+    of act() calls.
     """
     import os
     import tempfile
@@ -266,28 +289,61 @@ def bench_peak_memory(seed, position="landlord"):
     legacy = model_dict[position]()
     ckpt = os.path.join(tempfile.mkdtemp(prefix="bench_mem_"), f"{position}.ckpt")
     torch.save(legacy.state_dict(), ckpt)
-    agent_legacy = DeepAgent(position, ckpt, backend="legacy")
-    agent_fact = DeepAgent(position, ckpt, backend="legacy_factorized")
+    agent = DeepAgent(position, ckpt, backend=backend)
+    for _ in range(3):  # warmup
+        agent.act(infoset)
+    for _ in range(num_acts):
+        agent.act(infoset)
+    q.put(_peak_rss_kb_child())
 
-    # Warm up, then take the peak RSS after a burst of act() calls.
-    for _ in range(3):
-        agent_legacy.act(infoset)
-        agent_fact.act(infoset)
-    base_rss = _peak_rss_kb()
-    for _ in range(100):
-        agent_legacy.act(infoset)
-    legacy_rss = _peak_rss_kb()
-    for _ in range(100):
-        agent_fact.act(infoset)
-    fact_rss = _peak_rss_kb()
+
+def bench_peak_memory(seed, position="landlord", num_acts=100):
+    """CPU peak RSS for the full DeepAgent.act path, per backend, in isolation.
+
+    Each backend runs in its OWN subprocess so ``ru_maxrss`` (the process
+    lifetime peak) reflects only that backend's allocations. Running both
+    backends in one process would be invalid: ``ru_maxrss`` never decreases, so
+    the second-measured backend would inherit the first's peak and the
+    comparison could never show the factorized backend as lower.
+
+    GPU memory is not measured (CPU-only benchmark; GPU memory measurement
+    belongs in P14 with device-correct tooling).
+    """
+    import torch
+    ctx = torch.multiprocessing.get_context("spawn")
+    results = {}
+    for backend in ("legacy", "legacy_factorized"):
+        q = ctx.SimpleQueue()
+        p = ctx.Process(
+            target=_peak_rss_child_main,
+            args=(position, backend, seed, num_acts, q),
+        )
+        p.start()
+        p.join()
+        if p.exitcode != 0:
+            results[backend] = {"error": f"child exited with code {p.exitcode}"}
+            continue
+        results[backend] = {"peak_rss_kib": q.get()}
     return {
         f"peak_rss_kib_{position}": {
-            "baseline_after_warmup": base_rss,
-            "legacy_after_100_acts": legacy_rss,
-            "factorized_after_100_acts": fact_rss,
+            "legacy": results["legacy"],
+            "factorized": results["legacy_factorized"],
+            "num_acts": num_acts,
             "note": (
-                "Process peak RSS (KiB). Coarse, process-level; not "
-                "allocation-scoped. CPU-only; GPU memory not measured."
+                "Process peak RSS (KiB) per backend, each measured in an "
+                "ISOLATED child process so ru_maxrss reflects only that "
+                "backend's allocations (not the other backend's or the "
+                "parent's). CPU-only; GPU memory not measured (deferred to "
+                "P14). NOTE: the tiled-batch memory difference (the landlord "
+                "tiled z_batch/x_batch is ~0.4 MiB at 287 actions) is far "
+                "smaller than the torch/Python interpreter baseline (~280 "
+                "MiB), so the two backends typically report the SAME rounded "
+                "process peak. This measurement therefore confirms the "
+                "factorized path does NOT increase peak RSS, but process-level "
+                "ru_maxrss is too coarse to resolve the sub-MiB tiled-batch "
+                "saving. An allocation-scoped measurement (e.g. "
+                "tracemalloc, or torch CUDA memory on GPU) would be needed to "
+                "quantify the saving and is deferred to P14."
             ),
         }
     }
@@ -328,16 +384,15 @@ def bench_lstm_call_counts(seed):
 
 def _maybe_gpu_parity_note():
     """Return a note on GPU parity status (review blocker #3)."""
-    import torch
-    cuda = torch.cuda.is_available()
     return {
-        "cuda_available": cuda,
+        "cuda_hidden_for_benchmark": True,
         "parity_note": (
-            "CPU numerical parity is tested (tests/test_factorized_parity.py). "
-            "GPU numerical and argmax parity are NOT yet measured. "
-            "Mathematical equivalence does not imply bitwise or universal "
-            "argmax identity across CPU/GPU (different kernels, reduction "
-            "order, cuDNN non-determinism)."
+            "CPU numerical and argmax parity are tested "
+            "(tests/test_factorized_parity.py). GPU numerical and argmax "
+            "parity are NOT measured. Mathematical equivalence does not imply "
+            "bitwise or universal argmax identity across CPU/GPU (different "
+            "kernels, reduction order, cuDNN RNN non-determinism). GPU timing "
+            "and memory are deferred to P14."
         ),
     }
 
@@ -348,11 +403,8 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--seed", type=int, default=20240611)
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
-    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
-                        help="Device for timing. 'cpu' (default) or 'cuda'. "
-                             "Unlike the legacy benchmark, this script does NOT "
-                             "force-hide CUDA at import, so --device cuda works "
-                             "when a GPU is present.")
+    parser.add_argument("--num_acts_memory", type=int, default=100,
+                        help="Number of act() calls for the peak-RSS measurement.")
     args = parser.parse_args(argv)
 
     from douzero._version import environment_info
@@ -364,8 +416,9 @@ def main(argv=None):
     # End-to-end DeepAgent.act for all three roles.
     for position in ["landlord", "landlord_up", "landlord_down"]:
         results.update(bench_deep_agent_act(args.rounds, args.warmup, seed, position))
-    # CPU peak memory.
-    results.update(bench_peak_memory(seed, position="landlord"))
+    # CPU peak memory (isolated subprocesses per backend).
+    results.update(bench_peak_memory(seed, position="landlord",
+                                     num_acts=args.num_acts_memory))
     # LSTM work-reduction proof.
     results.update(bench_lstm_call_counts(seed))
     # GPU parity status note.
@@ -373,19 +426,22 @@ def main(argv=None):
 
     env_info = environment_info()
     bundle = {
-        "schema_version": "p04-bench-v2",
+        "schema_version": "p04-bench-v3",
         "description": (
-            "P04 factorized vs legacy benchmark. model_forward_only isolates "
-            "the model cost; deep_agent_act_* is the full deployment path "
-            "(encode + tensor + forward + argmax). The factorized backend "
-            "uses get_obs_factorized (no tiling) + forward_factorized. "
-            "Numbers are host-specific and measure DETERMINISTIC paths; they "
-            "are not playing-strength claims."
+            "P04 factorized vs legacy benchmark (CPU-ONLY). CUDA is hidden at "
+            "import; GPU timing/memory deferred to P14. model_forward_only "
+            "isolates the model cost; deep_agent_act_* is the full deployment "
+            "path (encode + tensor + forward + argmax); peak_rss is measured "
+            "per backend in isolated subprocesses. The factorized backend uses "
+            "get_obs_factorized (no tiling) + forward_factorized. Numbers are "
+            "host-specific and measure DETERMINISTIC paths; they are not "
+            "playing-strength claims."
         ),
         "environment": env_info,
         "config": {
             "rounds": args.rounds, "warmup": args.warmup, "seed": seed,
-            "device": args.device,
+            "num_acts_memory": args.num_acts_memory,
+            "device": "cpu",
         },
         "results": results,
     }
@@ -405,7 +461,7 @@ def main(argv=None):
 
 def _to_markdown(bundle):
     lines = [
-        "# DouZero Factorized Forward Benchmark (P04)",
+        "# DouZero Factorized Forward Benchmark (P04, CPU-only)",
         "",
         f"- host: `{bundle['environment'].get('platform')}`",
         f"- python: `{bundle['environment'].get('python_version')}`",
@@ -443,18 +499,23 @@ def _to_markdown(bundle):
                 f"| {role} | {val['legacy']['median_ms']} "
                 f"| {val['factorized']['median_ms']} | {val['speedup_median']} |"
             )
+    num_acts_mem = bundle['config'].get('num_acts_memory', '?')
     lines += [
         "",
-        "## CPU peak RSS (landlord, process-level, KiB)",
+        "## CPU peak RSS (landlord, isolated subprocess per backend, "
+        f"{num_acts_mem} acts)",
         "",
+        "| backend | peak RSS (KiB) |",
+        "|---|---:|",
     ]
     for key, val in bundle["results"].items():
         if key.startswith("peak_rss_kib_"):
-            lines.append(
-                f"- baseline (warm): {val['baseline_after_warmup']}\n"
-                f"- legacy after 100 acts: {val['legacy_after_100_acts']}\n"
-                f"- factorized after 100 acts: {val['factorized_after_100_acts']}"
-            )
+            for backend in ("legacy", "factorized"):
+                entry = val[backend]
+                rss = entry.get("peak_rss_kib", entry.get("error"))
+                lines.append(f"| {backend} | {rss} |")
+            lines.append("")
+            lines.append(f"_{val.get('note', '')}_")
     lines += [
         "",
         "## LSTM rows processed per decision",
@@ -472,7 +533,7 @@ def _to_markdown(bundle):
         "",
         "## GPU parity status",
         "",
-        f"- cuda_available: `{gpu.get('cuda_available')}`",
+        f"- cuda_hidden_for_benchmark: `{gpu.get('cuda_hidden_for_benchmark')}`",
         f"- {gpu.get('parity_note', '')}",
     ]
     return "\n".join(lines)

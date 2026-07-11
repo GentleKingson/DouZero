@@ -27,9 +27,12 @@ These tests pin:
     backend='legacy' under identical weights and infoset;
   * finite outputs and determinism (same input -> same output twice).
 
-CPU-only (the legacy models have no device argument and probe CUDA directly).
-GPU is optional and not exercised here; the parity holds bit-for-bit on GPU
-too but CI runs CPU-only.
+CPU-only. Numerical and argmax parity are TESTED on CPU. GPU numerical and
+argmax parity are NOT measured: mathematical equivalence does not imply
+bitwise or universal argmax identity across CPU/GPU (different kernels,
+reduction order, and cuDNN RNN non-determinism can change results). GPU
+parity must be measured empirically before it is asserted; that measurement
+is deferred to P14.
 """
 
 from __future__ import annotations

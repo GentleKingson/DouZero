@@ -179,17 +179,23 @@ The benchmark (`benchmarks/bench_factorized.py`) reports:
   action-count buckets 1/10/50/full — isolates the model cost;
 - **end-to-end `DeepAgent.act`** latency (encode + tensor + forward + argmax)
   for all three roles — the real deployment number;
-- **CPU peak RSS** for the full act path;
+- **CPU peak RSS** for the full act path, measured in **isolated subprocesses**
+  (one per backend) so each backend's `ru_maxrss` reflects only its own
+  allocations — running both in one process would be invalid because
+  `ru_maxrss` is a process-lifetime maximum that never decreases;
 - **LSTM rows per decision** (the work-reduction proof above).
 
-The model-forward-only numbers are **not** end-to-end DeepAgent numbers;
-both are reported separately and labelled clearly. Run it:
+The benchmark is **CPU-only**: CUDA is force-hidden at import so the models
+deterministically run on CPU on any host. The model-forward-only numbers are
+**not** end-to-end DeepAgent numbers; both are reported separately and
+labelled clearly. GPU timing, GPU memory, and CPU/GPU parity comparison are
+out of scope for P04 and deferred to P14, where a device-correct benchmark
+(`torch.cuda.Event` synchronization, `reset_peak_memory_stats` /
+`max_memory_allocated`) belongs. Measuring GPU latency without CUDA-event
+synchronization would be incorrect (CUDA ops are asynchronous). Run it:
 
 ```bash
-# CPU (default). Does NOT force-hide CUDA at import; --device cuda works
-# when a GPU is present.
 python benchmarks/bench_factorized.py --rounds 30
-python benchmarks/bench_factorized.py --device cuda --rounds 30
 ```
 
 ## Validation
@@ -236,4 +242,4 @@ docker run --rm douzero-p04-test python benchmarks/bench_factorized.py --rounds 
 | `douzero/dmc/dmc.py` | Training gate rejects `model_version != legacy` |
 | `tests/test_factorized_parity.py` | Numerical parity, state_dict, LSTM-count, split-obs parity, invariant enforcement, DeepAgent parity |
 | `tests/test_config.py`, `tests/test_ruleset.py`, `tests/test_training_ruleset_guard.py` | Config/CLI/guard tests widened |
-| `benchmarks/bench_factorized.py` | model-forward-only + end-to-end DeepAgent.act latency + CPU peak RSS + LSTM rows |
+| `benchmarks/bench_factorized.py` | model-forward-only + end-to-end DeepAgent.act latency + isolated-subprocess CPU peak RSS + LSTM rows (CPU-only; GPU deferred to P14) |
