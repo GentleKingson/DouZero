@@ -79,6 +79,12 @@ class TrainingConfig:
     seed: int = 0
     deterministic: bool = False
     config: str = ""  # path to a YAML config, "" means none
+    # Version identifiers (P01 only supports "legacy"; P02/P03/P05 widen these).
+    # Carried through the config so --config + explicit CLI never silently drop
+    # them, and so the checkpoint manifest records the effective versions.
+    feature_version: str = "legacy"
+    ruleset: str = "legacy"
+    model_version: str = "legacy"
 
     # Sub-configs
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)

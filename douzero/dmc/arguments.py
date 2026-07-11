@@ -62,11 +62,11 @@ parser.add_argument('--seed', default=0, type=int,
                     help='Base RNG seed (P01). 0 = legacy behavior (unseeded).')
 parser.add_argument('--deterministic', action='store_true',
                     help='Force deterministic torch algorithms (P01). Off by default.')
-parser.add_argument('--feature_version', default='legacy', type=str,
+parser.add_argument('--feature_version', default='legacy', type=str, choices=['legacy'],
                     help='Observation feature version (P01). Only "legacy" is supported in P01.')
-parser.add_argument('--ruleset', default='legacy', type=str,
+parser.add_argument('--ruleset', default='legacy', type=str, choices=['legacy'],
                     help='Rule set identifier (P01). Only "legacy" is supported in P01.')
-parser.add_argument('--model_version', default='legacy', type=str,
+parser.add_argument('--model_version', default='legacy', type=str, choices=['legacy'],
                     help='Model version (P01). Only "legacy" is supported in P01.')
 
 

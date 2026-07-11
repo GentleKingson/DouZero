@@ -35,6 +35,10 @@ max_grad_norm: 40.0
 # P01-added knobs (defaults preserve legacy behavior)
 seed: 0
 deterministic: false
+# Version identifiers (P01 only supports "legacy"; later phases widen these).
+feature_version: legacy
+ruleset: legacy
+model_version: legacy
 
 # Optimizer (RMSProp)
 optimizer:
