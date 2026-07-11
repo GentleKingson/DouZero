@@ -53,3 +53,80 @@ parser.add_argument('--momentum', default=0, type=float,
                     help='RMSProp momentum')
 parser.add_argument('--epsilon', default=1e-5, type=float,
                     help='RMSProp epsilon')
+
+# P01 additions (optional; defaults preserve legacy behavior). These are
+# appended so the original 23 flags and their defaults are unchanged.
+parser.add_argument('--config', default='', type=str,
+                    help='Optional path to a YAML config file (P01). CLI flags override the file.')
+parser.add_argument('--seed', default=0, type=int,
+                    help='Base RNG seed (P01). 0 = legacy behavior (unseeded).')
+parser.add_argument('--deterministic', action='store_true',
+                    help='Force deterministic torch algorithms (P01). Off by default.')
+parser.add_argument('--feature_version', default='legacy', type=str,
+                    help='Observation feature version (P01). Only "legacy" is supported in P01.')
+parser.add_argument('--ruleset', default='legacy', type=str,
+                    help='Rule set identifier (P01). Only "legacy" is supported in P01.')
+parser.add_argument('--model_version', default='legacy', type=str,
+                    help='Model version (P01). Only "legacy" is supported in P01.')
+
+
+def _build_override_parser():
+    """Build a parser whose defaults are SUPPRESS, for detecting explicit CLI flags.
+
+    When `--config` is used, we re-parse with this parser so that ONLY flags the
+    user actually typed appear in the Namespace. This cleanly solves the
+    "argparse default vs explicit value" ambiguity (including store_true): an
+    absent flag simply does not appear, so it never clobbers a YAML value.
+    """
+    import argparse as _ap
+
+    op = _ap.ArgumentParser(add_help=False)
+    for action in parser._actions:
+        if action.dest == "help":
+            continue
+        # Re-register each option string with default=SUPPRESS.
+        kwargs = {"default": _ap.SUPPRESS}
+        if action.type is not None:
+            kwargs["type"] = action.type
+        if action.choices:
+            kwargs["choices"] = action.choices
+        if action.const is not None and not action.option_strings:
+            continue  # positional; skip (we have none)
+        if action.nargs == 0:
+            # store_true / store_false
+            op.add_argument(*action.option_strings, action="store_true",
+                            dest=action.dest, default=_ap.SUPPRESS)
+        else:
+            op.add_argument(*action.option_strings, dest=action.dest, **kwargs)
+    return op
+
+
+def parse_args(argv=None):
+    """Parse args with optional YAML config support (P01).
+
+    Behavior:
+      - No ``--config``: identical to ``parser.parse_args()`` (legacy path).
+      - With ``--config <path>``: load the YAML as the base, then overlay ONLY
+        the CLI flags the user explicitly typed on top (CLI wins). This is done
+        by re-parsing with default=SUPPRESS, so absent flags (including
+        store_true defaults) never clobber YAML values.
+
+    The returned object is always an argparse Namespace, so ``train(flags)``
+    is unchanged. PyYAML is imported lazily so plain ``--help`` never requires it.
+    """
+    import sys
+
+    if argv is None:
+        argv = sys.argv[1:]
+    flags = parser.parse_args(argv)
+    if not flags.config:
+        return flags
+    # Re-parse with SUPPRESS defaults to detect which flags were explicit.
+    override_parser = _build_override_parser()
+    explicit_ns, _unknown = override_parser.parse_known_args(argv)
+    # Load YAML base and overlay only the explicit CLI overrides.
+    from douzero.config import load_config, merge, to_argparse_namespace
+
+    base = load_config(flags.config)
+    merged = merge(base, explicit_ns)
+    return to_argparse_namespace(merged)

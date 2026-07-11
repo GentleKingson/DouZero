@@ -1,0 +1,44 @@
+# Legacy DouZero configuration (P01).
+#
+# This file is the YAML form of the EXACT defaults declared in
+# douzero/dmc/arguments.py. It exists so that `--config configs/legacy.yaml`
+# reproduces the original training configuration field-for-field. Any edit here
+# is a behavior change and must be intentional.
+#
+# Loaded via douzero.config.load_config(). CLI flags override these values when
+# both are present.
+
+# General
+xpid: douzero
+save_interval: 30
+objective: adp
+
+# Training settings
+actor_device_cpu: false
+gpu_devices: "0"
+num_actor_devices: 1
+num_actors: 5
+training_device: "0"
+load_model: false
+disable_checkpoint: false
+savedir: douzero_checkpoints
+
+# Hyperparameters
+total_frames: 100000000000
+exp_epsilon: 0.01
+batch_size: 32
+unroll_length: 100
+num_buffers: 50
+num_threads: 4
+max_grad_norm: 40.0
+
+# P01-added knobs (defaults preserve legacy behavior)
+seed: 0
+deterministic: false
+
+# Optimizer (RMSProp)
+optimizer:
+  learning_rate: 0.0001
+  alpha: 0.99
+  momentum: 0
+  epsilon: 1.0e-5
