@@ -39,11 +39,17 @@ def generate_standard():
     into hands) so that the evaluation pipeline can deal 17+17+17+3 and
     run bidding. ``first_bidder`` is the first seat to bid.
     """
+    from douzero.env.rules import RuleSet
+
+    rs = RuleSet.standard()
     _deck = deck.copy()
     np.random.shuffle(_deck)
     return {
         'format_version': 2,
-        'ruleset_id': 'standard',
+        'schema_version': 1,
+        'ruleset_id': rs.ruleset_id,
+        'ruleset_version': rs.ruleset_version,
+        'ruleset_hash': rs.stable_hash()[:16],
         'deck': list(_deck),
         'first_bidder': 'landlord',
         'bidding_order': ['landlord', 'landlord_down', 'landlord_up'],

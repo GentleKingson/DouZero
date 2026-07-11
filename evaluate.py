@@ -20,6 +20,8 @@ if __name__ == '__main__':
             choices=['legacy', 'standard'],
             help='Ruleset: legacy (cardplay-only, default) or standard '
                  '(end-to-end bidding+cardplay with random bidding)')
+    parser.add_argument('--eval_seed', type=int, default=0,
+            help='Base seed for deterministic standard-mode bidding (0 = default)')
     args = parser.parse_args()
 
     os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
@@ -31,4 +33,5 @@ if __name__ == '__main__':
              args.landlord_down,
              args.eval_data,
              args.num_workers,
-             ruleset=ruleset)
+             ruleset=ruleset,
+             eval_seed=args.eval_seed)

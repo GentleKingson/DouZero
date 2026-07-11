@@ -28,16 +28,16 @@ from douzero.env.rules import (
 def test_legacy_ruleset_reproduces_original_environment():
     rs = RuleSet.legacy()
     assert rs.ruleset_id == RULESET_LEGACY
+    assert rs.ruleset_version == "legacy-v1"
     assert rs.bidding_mode == BIDDING_MODE_NONE
     assert rs.bid_values == ()
     assert rs.allow_rob is False
     assert rs.all_pass_redeal is False
+    assert rs.max_redeals == 10
     assert rs.bid_multiplier is False
-    # Legacy uses base_score=2 so the effective multiplier is 2**bomb_num.
     assert rs.base_score == 2
     assert rs.bomb_multiplier == 2
     assert rs.rocket_multiplier == 2
-    # No spring in legacy.
     assert rs.spring_multiplier == 0
     assert rs.anti_spring_multiplier == 0
     assert rs.allow_double is False
@@ -47,10 +47,12 @@ def test_legacy_ruleset_reproduces_original_environment():
 def test_standard_ruleset_has_bidding_and_spring():
     rs = RuleSet.standard()
     assert rs.ruleset_id == RULESET_STANDARD
+    assert rs.ruleset_version == "standard-v1"
     assert rs.bidding_mode == BIDDING_MODE_SCORE_0_1_2_3
     assert rs.bid_values == (0, 1, 2, 3)
     assert rs.allow_rob is False
     assert rs.all_pass_redeal is True
+    assert rs.max_redeals == 10
     assert rs.bid_multiplier is True
     assert rs.base_score == 1
     assert rs.bomb_multiplier == 2
@@ -198,6 +200,38 @@ def test_stable_hash_changes_on_field_change():
     base = RuleSet.standard()
     modified = RuleSet.from_dict({"ruleset_id": "standard", "base_score": 2})
     assert base.stable_hash() != modified.stable_hash()
+
+
+def test_identity_returns_full_rule_identity():
+    """identity() must return ruleset_id, ruleset_version, and ruleset_hash."""
+    rs = RuleSet.standard()
+    ident = rs.identity()
+    assert ident["ruleset_id"] == "standard"
+    assert ident["ruleset_version"] == "standard-v1"
+    assert len(ident["ruleset_hash"]) == 16  # first 16 hex chars
+
+
+def test_identity_differs_for_different_params():
+    """Same ruleset_id but different params must produce different hashes."""
+    base = RuleSet.standard()
+    modified = RuleSet.from_dict({"ruleset_id": "standard", "base_score": 2})
+    assert base.identity()["ruleset_hash"] != modified.identity()["ruleset_hash"]
+    assert base.identity()["ruleset_id"] == modified.identity()["ruleset_id"]
+
+
+def test_from_dict_rejects_zero_max_redeals():
+    with pytest.raises(ValueError, match="max_redeals"):
+        RuleSet.from_dict({"ruleset_id": "standard", "max_redeals": 0})
+
+
+def test_from_dict_rejects_negative_max_redeals():
+    with pytest.raises(ValueError, match="max_redeals"):
+        RuleSet.from_dict({"ruleset_id": "standard", "max_redeals": -1})
+
+
+def test_from_dict_custom_max_redeals():
+    rs = RuleSet.from_dict({"ruleset_id": "standard", "max_redeals": 3})
+    assert rs.max_redeals == 3
 
 
 # --------------------------------------------------------------------------- #

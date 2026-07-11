@@ -46,11 +46,14 @@ def test_legacy_generate_produces_4_key_dict():
 
 
 def test_standard_generate_produces_v2_format():
-    """Standard generate_standard() must produce the v2 format."""
+    """Standard generate_standard() must produce the v2 format with rule identity."""
     np.random.seed(42)
     data = generate_standard()
     assert data['format_version'] == 2
+    assert data['schema_version'] == 1
     assert data['ruleset_id'] == 'standard'
+    assert data['ruleset_version'] == 'standard-v1'
+    assert len(data['ruleset_hash']) == 16
     assert len(data['deck']) == 54
     assert data['first_bidder'] in ('landlord', 'landlord_up', 'landlord_down')
     assert 'bidding_order' in data
@@ -234,3 +237,106 @@ def test_generate_eval_data_smoke_standard(tmp_path):
         assert counts[17] == 4
         assert counts[20] == 1
         assert counts[30] == 1
+
+
+# --------------------------------------------------------------------------- #
+# schema_version and ruleset_hash validation
+# --------------------------------------------------------------------------- #
+def test_standard_data_missing_schema_version_rejected(tmp_path):
+    """A v2 dataset without schema_version must be rejected."""
+    np.random.seed(42)
+    data = [generate_standard()]
+    del data[0]['schema_version']
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="schema_version"):
+        load_eval_data(str(pkl), ruleset="standard")
+
+
+def test_standard_data_unknown_schema_version_rejected(tmp_path):
+    """A v2 dataset with an unsupported schema_version must be rejected."""
+    np.random.seed(42)
+    data = [generate_standard()]
+    data[0]['schema_version'] = 99
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="schema_version"):
+        load_eval_data(str(pkl), ruleset="standard")
+
+
+def test_standard_data_ruleset_hash_mismatch_rejected(tmp_path):
+    """A v2 dataset with a wrong ruleset_hash must be rejected."""
+    np.random.seed(42)
+    data = [generate_standard()]
+    data[0]['ruleset_hash'] = "deadbeefdeadbeef"
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="ruleset_hash"):
+        load_eval_data(str(pkl), ruleset="standard")
+
+
+def test_standard_data_bad_deck_rejected(tmp_path):
+    """A v2 dataset with an invalid deck must be rejected."""
+    np.random.seed(42)
+    data = [generate_standard()]
+    data[0]['deck'] = [3] * 54  # all rank 3 — invalid
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="Rank"):
+        load_eval_data(str(pkl), ruleset="standard")
+
+
+def test_standard_data_short_deck_rejected(tmp_path):
+    """A v2 dataset with a short deck must be rejected."""
+    np.random.seed(42)
+    data = [generate_standard()]
+    data[0]['deck'] = data[0]['deck'][:50]
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="54 cards"):
+        load_eval_data(str(pkl), ruleset="standard")
+
+
+# --------------------------------------------------------------------------- #
+# Worker-count reproducibility
+# --------------------------------------------------------------------------- #
+def test_worker_count_reproducibility(tmp_path):
+    """num_workers=1 and num_workers>1 must produce identical results.
+
+    The per-game seed is derived from eval_seed + global_game_index +
+    deck_hash, so the same game always produces the same bidding sequence
+    and card-play regardless of which worker processes it.
+    """
+    import subprocess
+    import sys
+
+    # Generate 12 standard deals with a fixed seed.
+    np.random.seed(42)
+    data = [generate_standard() for _ in range(12)]
+    pkl = tmp_path / "eval_std.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+
+    def run(num_workers):
+        result = subprocess.run(
+            [sys.executable, "evaluate.py",
+             "--landlord", "random", "--landlord_up", "random",
+             "--landlord_down", "random",
+             "--eval_data", str(pkl), "--num_workers", str(num_workers),
+             "--ruleset", "standard", "--eval_seed", "42"],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        return result.stdout
+
+    out1 = run(1)
+    out2 = run(2)
+    out3 = run(3)
+    # All three runs must produce identical output.
+    assert out1 == out2, f"1-worker != 2-worker:\n{out1}\n{out2}"
+    assert out1 == out3, f"1-worker != 3-worker:\n{out1}\n{out3}"

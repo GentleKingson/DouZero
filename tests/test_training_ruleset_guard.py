@@ -72,6 +72,35 @@ def test_train_rejects_missing_ruleset_defaults_to_legacy():
         pass
 
 
+def test_train_standard_guard_has_no_side_effects(tmp_path):
+    """The standard-ruleset guard must fail BEFORE any CUDA/model/process/
+    checkpoint initialization — no subprocess, no checkpoint, no side effects.
+
+    We verify this by checking that after the guard raises:
+    - No checkpoint directory was created.
+    - No subprocess was spawned (we check via a mock).
+    """
+    from unittest.mock import patch
+    from douzero.dmc.dmc import train
+
+    flags = argparse.Namespace(
+        ruleset='standard',
+        actor_device_cpu=True,
+        training_device='cpu',
+        savedir=str(tmp_path),
+        xpid='test_no_side_effect',
+    )
+    # Patch multiprocessing.Process to detect if any subprocess would be spawned.
+    with patch('torch.multiprocessing.Process') as mock_proc:
+        with pytest.raises(ValueError, match="Training does not yet support"):
+            train(flags)
+        # No subprocess should have been started.
+        assert mock_proc.call_count == 0, "train() spawned a subprocess before the guard"
+    # No checkpoint directory should have been created.
+    assert not (tmp_path / 'test_no_side_effect').exists(), \
+        "train() created a checkpoint directory before the guard"
+
+
 # --------------------------------------------------------------------------- #
 # CLI --help shows both ruleset choices
 # --------------------------------------------------------------------------- #

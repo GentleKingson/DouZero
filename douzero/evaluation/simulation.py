@@ -1,3 +1,4 @@
+import hashlib
 import multiprocessing as mp
 import pickle
 import random
@@ -37,60 +38,99 @@ def mp_simulate(card_play_data_list, card_play_model_path_dict, q):
            env.num_scores['farmer']
          ))
 
+def _derive_game_seed(eval_seed, game_index, deck):
+    """Derive a deterministic per-game seed from the eval seed, game index,
+    and deck hash.
+
+    This ensures that the same game (same deck, same index) always produces
+    the same bidding sequence regardless of worker count or scheduling. The
+    seed is NOT derived from PID or worker index.
+    """
+    deck_hash = hashlib.sha256(str(deck).encode()).hexdigest()[:8]
+    token = f"douzero-eval|{eval_seed}|{game_index}|{deck_hash}"
+    digest = hashlib.sha256(token.encode()).digest()
+    return int.from_bytes(digest[:4], "big") & 0xFFFFFFFF
+
 def _random_bidding(env, rng):
     """Run a random bidding sequence and return True if the game should redeal.
 
     Each bidder bids a random value from the ruleset's bid_values. If all
     pass and ``all_pass_redeal`` is set, redeal (caller loops). Otherwise the
-    landlord is determined and the game transitions to PLAYING.
+    landlord is determined and the game transitions to PLAYING. If a maximum
+    bid (3) is played, bidding ends immediately and the phase transitions to
+    PLAYING — this function detects that and stops early.
+
+    This is a bidding POLICY that lives in the evaluation/agent layer. The
+    GameEnv itself only exposes ``get_legal_bids`` and ``step_bidding``; it
+    never runs a bidding policy internally.
     """
+    from douzero.env.rules import PHASE_BIDDING
     for _ in range(len(env.bidding_order)):
-        bid = rng.choice(env.ruleset.bid_values)
+        if env.phase != PHASE_BIDDING:
+            # Bidding ended early (e.g., a max bid of 3 was played).
+            return False
+        legal_bids = env.get_legal_bids()
+        bid = rng.choice(legal_bids)
         redeal = env.step_bidding(bid)
         if redeal:
             return True
     return False
 
-def mp_simulate_standard(card_play_data_list, card_play_model_path_dict, q, seed=0):
+def mp_simulate_standard(card_play_data_list, card_play_model_path_dict, q,
+                         eval_seed=0, global_indices=None):
     """Standard-mode multiprocessing simulation.
 
     Each deal is a v2-format dict with a full deck. The worker deals
     17+17+17+3, runs random bidding (with redeal on all-pass), then plays
     to terminal using the loaded agents.
+
+    The per-game bidding seed is derived from ``eval_seed`` and the game's
+    GLOBAL index (from ``global_indices``), so the same game always produces
+    the same bidding sequence regardless of which worker processes it. If
+    ``global_indices`` is None, sequential indices (0, 1, 2, ...) are used.
     """
     from douzero.evaluation.legacy_data_adapter import deal_standard_deck
 
     players = load_card_play_models(card_play_model_path_dict)
     ruleset = RuleSet.standard()
     env = GameEnv(players, ruleset=ruleset)
-    rng = random.Random(seed)
 
     for idx, deal in enumerate(card_play_data_list):
+        game_index = global_indices[idx] if global_indices is not None else idx
+        game_seed = _derive_game_seed(eval_seed, game_index, deal['deck'])
+        rng = random.Random(game_seed)
+        # Seed the global random module so RandomAgent (which uses
+        # random.choice) is also deterministic per-game. This ensures
+        # worker-count-independent reproducibility.
+        random.seed(game_seed)
+
         # Deal from the full deck.
         card_play_data = deal_standard_deck(deal['deck'])
-        bidding_order = deal.get('bidding_order', ['landlord', 'landlord_down', 'landlord_up'])
 
         # Keep retrying until bidding produces a landlord (handles redeal).
-        for _attempt in range(100):
+        # Bounded by ruleset.max_redeals.
+        for _attempt in range(ruleset.max_redeals + 1):
             env.reset()
-            env.card_play_init_standard(card_play_data, bidding_order=bidding_order)
+            env.card_play_init_standard(card_play_data)
             if not _random_bidding(env, rng):
                 break
-            # Redeal: reshuffle the same deck for a new attempt.
-            rng.shuffle(card_play_data['landlord'])
-            # Actually need a fresh shuffle of the full deck.
+            # Redeal: reshuffle the full deck deterministically using the
+            # same game-local RNG (not a global or worker RNG).
             deck_copy = list(deal['deck'])
             rng.shuffle(deck_copy)
             card_play_data = deal_standard_deck(deck_copy)
         else:
-            # Could not resolve bidding after 100 attempts; skip this deal.
-            continue
+            # Exceeded max_redeals: force-assign landlord to first bidder.
+            env.reset()
+            env.card_play_init_standard(card_play_data)
+            env.landlord_position = env.bidding_order[0]
+            env.bid_value = 1
+            env._reveal_bottom_cards()
 
         # Play to terminal.
         env.game_infoset = env.get_infoset()
         while not env.game_over:
             env.step()
-        # reset() is called at the top of the loop; no need here.
 
     q.put((env.num_wins['landlord'],
            env.num_wins['farmer'],
@@ -99,18 +139,28 @@ def mp_simulate_standard(card_play_data_list, card_play_model_path_dict, q, seed
          ))
 
 def data_allocation_per_worker(card_play_data_list, num_workers):
-    card_play_data_list_each_worker = [[] for k in range(num_workers)]
+    """Split data round-robin, tracking the global game index for each game.
+
+    Returns a list of (worker_data, global_indices) tuples so each worker
+    knows its games' original global indices for deterministic seed
+    derivation. This ensures the same game always gets the same seed
+    regardless of worker count.
+    """
+    worker_data = [[] for _ in range(num_workers)]
+    worker_indices = [[] for _ in range(num_workers)]
     for idx, data in enumerate(card_play_data_list):
-        card_play_data_list_each_worker[idx % num_workers].append(data)
+        w = idx % num_workers
+        worker_data[w].append(data)
+        worker_indices[w].append(idx)
+    return list(zip(worker_data, worker_indices))
 
-    return card_play_data_list_each_worker
-
-def evaluate(landlord, landlord_up, landlord_down, eval_data, num_workers, ruleset=None):
+def evaluate(landlord, landlord_up, landlord_down, eval_data, num_workers,
+             ruleset=None, eval_seed=0):
 
     with open(eval_data, 'rb') as f:
         card_play_data_list = pickle.load(f)
 
-    card_play_data_list_each_worker = data_allocation_per_worker(
+    worker_assignments = data_allocation_per_worker(
         card_play_data_list, num_workers)
     del card_play_data_list
 
@@ -127,15 +177,16 @@ def evaluate(landlord, landlord_up, landlord_down, eval_data, num_workers, rules
     ctx = mp.get_context('spawn')
     q = ctx.SimpleQueue()
     processes = []
-    for idx, card_paly_data in enumerate(card_play_data_list_each_worker):
+    for worker_data, global_indices in worker_assignments:
         if ruleset == 'standard':
             p = ctx.Process(
                 target=mp_simulate_standard,
-                args=(card_paly_data, card_play_model_path_dict, q, idx))
+                args=(worker_data, card_play_model_path_dict, q,
+                      eval_seed, global_indices))
         else:
             p = ctx.Process(
                 target=mp_simulate,
-                args=(card_paly_data, card_play_model_path_dict, q))
+                args=(worker_data, card_play_model_path_dict, q))
         p.start()
         processes.append(p)
 

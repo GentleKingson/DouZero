@@ -464,6 +464,27 @@ def test_game_result_to_dict_round_trip():
     assert d["spring"] is True
     assert d["landlord_score"] > 0
     assert isinstance(d["multiplier_breakdown"], dict)
+    # Rule identity stamped.
+    assert d["ruleset_id"] == "standard"
+    assert d["ruleset_version"] == "standard-v1"
+    assert len(d["ruleset_hash"]) == 16
+
+
+def test_game_result_legacy_has_legacy_identity():
+    """Legacy GameResult must have ruleset_id='legacy'."""
+    rs = RuleSet.legacy()
+    result = compute_game_result(
+        played_cards={},
+        action_counts={"landlord": 5, "landlord_up": 3, "landlord_down": 3},
+        winner_position="landlord",
+        bomb_count=0,
+        rocket_count=0,
+        bid_value=0,
+        ruleset=rs,
+    )
+    assert result.ruleset_id == "legacy"
+    assert result.ruleset_version == "legacy-v1"
+    assert len(result.ruleset_hash) == 16
 
 
 # --------------------------------------------------------------------------- #
