@@ -67,6 +67,25 @@ To run a subset inside the container:
 docker run --rm douzero-p00-test python -m pytest -k model
 ```
 
+## CI Python matrix
+
+P01 raised the minimum supported Python to **3.11** (see `pyproject.toml`
+`requires-python`). The Docker image stays pinned to `python:3.11-slim` for a
+fast, reproducible local/CPU path; the GitHub Actions matrix covers the full
+supported range so cross-version regressions are caught upstream:
+
+- **`Tests` workflow** (`.github/workflows/ci.yml`): mandatory matrix
+  **3.11 / 3.12 / 3.13**, CPU-only, `DOUZERO_GIT_SHA` injected, runs
+  `compileall`, the three `--help`, `pytest -q`, and a 2-deal baseline smoke.
+- **`Building` workflow** (`.github/workflows/python-package.yml`): same matrix,
+  `python -m build` + `pip install dist/*.whl` + import smoke from outside the
+  repo (proves the wheel is importable, not the source tree).
+
+Python 3.14 is not yet in the mandatory matrix; it will be added (initially as
+a non-blocking smoke) once `rlcard` / `GitPython` compatibility on 3.14 is
+confirmed. The `actions/setup-python` action is pinned to the v5 tag commit
+SHA; migration to v6 (Node 24, requires runner ≥ 2.327.1) is a tracked TODO.
+
 ## Running locally without Docker
 
 If torch/numpy/rlcard are already installed on the host:

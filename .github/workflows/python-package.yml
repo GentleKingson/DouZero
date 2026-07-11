@@ -1,12 +1,11 @@
 # Legacy "Building" workflow, modernized.
 #
 # Responsibility: package build + install smoke ONLY. Behavioral tests live in
-# .github/workflows/ci.yml (added by P00). The two workflows are intentionally
-# kept separate and must not be merged.
+# .github/workflows/ci.yml. The two workflows are intentionally kept separate
+# and must not be merged.
 #
-# Python support policy is decided separately (planned: P01). This workflow
-# does NOT change the declared minimum Python version in setup.py -- it only
-# picks a single runner interpreter (3.11) to exercise the build/install path.
+# P01: supported Python is now 3.11+ (pyproject.toml requires-python); this
+# workflow tests the build/install/import path across 3.11/3.12/3.13.
 
 name: Building
 
@@ -30,18 +29,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # P01: supported Python is 3.11+ (see pyproject.toml requires-python).
+        python-version: ["3.11", "3.12", "3.13"]
+
+    env:
+      # Inject the commit SHA into version metadata for parity with ci.yml
+      # (douzero/_version.py reads this when .git is absent).
+      DOUZERO_GIT_SHA: ${{ github.sha }}
+
     steps:
-      # Pinned to the commit SHA of the actions/checkout v4 tag for
-      # supply-chain integrity. actions/checkout@v4
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      # Pinned to the v6 tag's commit SHA for supply-chain integrity.
+      # actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           persist-credentials: false
 
-      # actions/setup-python@v5
-      - name: Set up Python 3.11
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      # actions/setup-python@v6
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: "pip"
 
       - name: Build wheel and install
@@ -60,14 +70,10 @@ jobs:
           # resolve to ./douzero instead of the freshly installed wheel, making
           # the smoke test meaningless.
           #
-          # We import douzero, douzero.env, douzero.evaluation only. We
-          # deliberately do NOT import douzero.dmc: douzero/dmc/file_writer.py
-          # does `import git` (GitPython) at module load, but setup.py's
-          # install_requires lists only ['torch','rlcard'] -- GitPython is in
-          # requirements.txt but NOT install_requires, so a plain
-          # `pip install dist/*.whl` does not pull it. That metadata gap is a
-          # pre-existing issue on main and is out of scope for this CI
-          # modernization (dependency/Python policy is planned for P01).
+          # All four top-level packages are imported. douzero.dmc is safe to
+          # import from a plain wheel install: GitPython is declared in
+          # install_requires, and file_writer.py imports it lazily inside
+          # gather_metadata (so module load no longer requires GitPython).
           cd "$RUNNER_TEMP"
 
           python - <<'PY'
@@ -75,6 +81,9 @@ jobs:
           from pathlib import Path
 
           import douzero
+          import douzero.config
+          import douzero.checkpoint
+          import douzero.dmc
           import douzero.env
           import douzero.evaluation
 
@@ -86,6 +95,9 @@ jobs:
           )
 
           print("douzero import OK:", package_path)
+          print("douzero.config import OK")
+          print("douzero.checkpoint import OK")
+          print("douzero.dmc import OK")
           print("douzero.env import OK")
           print("douzero.evaluation import OK")
           PY
