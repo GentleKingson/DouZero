@@ -128,9 +128,19 @@ def load_checkpoint(
         )
 
     manifest = CheckpointManifest.from_dict(bundle["manifest"])
+
+    # Compute the expected rule identity from the canonical RuleSet.
+    from douzero.env.rules import RuleSet
+    if expected_ruleset_id == "standard":
+        expected_rs = RuleSet.standard()
+    else:
+        expected_rs = RuleSet.legacy()
+
     _validate_manifest(manifest, expected_schema_version, expected_model_version,
                        expected_feature_version, expected_ruleset_id,
-                       expected_checkpoint_kind, path)
+                       expected_checkpoint_kind, path,
+                       expected_ruleset_version=expected_rs.ruleset_version,
+                       expected_ruleset_hash=expected_rs.stable_hash())
     return bundle, manifest
 
 
@@ -142,8 +152,17 @@ def _validate_manifest(
     expected_ruleset_id: str,
     expected_checkpoint_kind: str,
     path: str,
+    expected_ruleset_version: str | None = None,
+    expected_ruleset_hash: str | None = None,
 ) -> None:
-    """Validate all version/identity fields; raise on any mismatch."""
+    """Validate all version/identity fields; raise on any mismatch.
+
+    When ``expected_ruleset_version`` and ``expected_ruleset_hash`` are
+    provided, they are checked against the manifest. P01 checkpoints that lack
+    these fields are backfilled with the legacy identity in
+    ``CheckpointManifest.from_dict``, so a legacy checkpoint with the legacy
+    runtime still passes.
+    """
     ctx = f"Checkpoint at {path} (git_sha={manifest.git_sha}, frames={manifest.frames})"
 
     if manifest.schema_version != expected_schema_version:
@@ -165,6 +184,19 @@ def _validate_manifest(
         raise CheckpointCompatibilityError(
             f"Checkpoint ruleset_id mismatch: checkpoint has "
             f"{manifest.ruleset_id!r}, runtime expects {expected_ruleset_id!r}. {ctx}"
+        )
+    if expected_ruleset_version is not None and manifest.ruleset_version != expected_ruleset_version:
+        raise CheckpointCompatibilityError(
+            f"Checkpoint ruleset_version mismatch: checkpoint has "
+            f"{manifest.ruleset_version!r}, runtime expects "
+            f"{expected_ruleset_version!r}. {ctx}"
+        )
+    if expected_ruleset_hash is not None and manifest.ruleset_hash != expected_ruleset_hash:
+        raise CheckpointCompatibilityError(
+            f"Checkpoint ruleset_hash mismatch: checkpoint has "
+            f"{manifest.ruleset_hash!r}, runtime expects "
+            f"{expected_ruleset_hash!r}. Same ruleset_id but different rule "
+            f"parameters. {ctx}"
         )
     if manifest.checkpoint_kind != expected_checkpoint_kind:
         raise CheckpointCompatibilityError(

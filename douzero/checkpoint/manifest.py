@@ -50,6 +50,8 @@ class CheckpointManifest:
     model_version: str
     feature_version: str
     ruleset_id: str
+    ruleset_version: str
+    ruleset_hash: str
     checkpoint_kind: str
     git_sha: str
     python_version: str
@@ -66,6 +68,8 @@ class CheckpointManifest:
             "model_version": self.model_version,
             "feature_version": self.feature_version,
             "ruleset_id": self.ruleset_id,
+            "ruleset_version": self.ruleset_version,
+            "ruleset_hash": self.ruleset_hash,
             "checkpoint_kind": self.checkpoint_kind,
             "git_sha": self.git_sha,
             "python_version": self.python_version,
@@ -78,8 +82,22 @@ class CheckpointManifest:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CheckpointManifest":
-        """Reconstruct from a plain dict (the inverse of to_dict)."""
-        return cls(**d)
+        """Reconstruct from a plain dict (the inverse of to_dict).
+
+        Backward-compatible with P01 manifests that lack ``ruleset_version``
+        and ``ruleset_hash``: missing fields default to the legacy identity.
+        """
+        # P01 manifests don't have ruleset_version/ruleset_hash. Fill in the
+        # legacy defaults so old checkpoints load without error. The loader
+        # (io.py) then validates the identity against the expected runtime.
+        d_copy = dict(d)
+        if "ruleset_version" not in d_copy:
+            d_copy["ruleset_version"] = "legacy-v1"
+        if "ruleset_hash" not in d_copy:
+            # Legacy ruleset hash (computed from RuleSet.legacy()).
+            from douzero.env.rules import RuleSet
+            d_copy["ruleset_hash"] = RuleSet.legacy().stable_hash()
+        return cls(**d_copy)
 
 
 def build_manifest(
@@ -118,6 +136,15 @@ def build_manifest(
     ruleset_id = _get("ruleset", "legacy")
     model_version = _get("model_version", "legacy")
 
+    # Compute the full rule identity from the canonical RuleSet.
+    from douzero.env.rules import RuleSet
+    if ruleset_id == "standard":
+        rs = RuleSet.standard()
+    else:
+        rs = RuleSet.legacy()
+    ruleset_version = rs.ruleset_version
+    ruleset_hash = rs.stable_hash()
+
     # Effective config: the full flag dict, for auditability. For a Namespace
     # we use vars(); for a dict we copy. This is informational only.
     if flags is None:
@@ -132,6 +159,8 @@ def build_manifest(
         model_version=model_version,
         feature_version=feature_version,
         ruleset_id=ruleset_id,
+        ruleset_version=ruleset_version,
+        ruleset_hash=ruleset_hash,
         checkpoint_kind=checkpoint_kind,
         git_sha=git_sha(),
         python_version=env.get("python_version", "unknown"),

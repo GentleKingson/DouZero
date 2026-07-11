@@ -37,22 +37,26 @@ def generate_standard():
 
     The deal is stored as the complete 54-card deck order (not pre-sliced
     into hands) so that the evaluation pipeline can deal 17+17+17+3 and
-    run bidding. ``first_bidder`` is the first seat to bid.
+    run bidding. Uses neutral seat labels ("0", "1", "2") for first_bidder
+    and bidding_order, matching the standard state machine's BIDDING phase.
     """
     from douzero.env.rules import RuleSet
 
     rs = RuleSet.standard()
     _deck = deck.copy()
     np.random.shuffle(_deck)
+    # Randomly choose the first bidder seat (0, 1, or 2).
+    first = np.random.randint(0, 3)
+    order = [str((first + i) % 3) for i in range(3)]
     return {
         'format_version': 2,
         'schema_version': 1,
         'ruleset_id': rs.ruleset_id,
         'ruleset_version': rs.ruleset_version,
-        'ruleset_hash': rs.stable_hash()[:16],
+        'ruleset_hash': rs.stable_hash(),
         'deck': list(_deck),
-        'first_bidder': 'landlord',
-        'bidding_order': ['landlord', 'landlord_down', 'landlord_up'],
+        'first_bidder': str(first),
+        'bidding_order': order,
         'bidding_script': None,
     }
 

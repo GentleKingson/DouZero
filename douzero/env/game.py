@@ -462,7 +462,10 @@ class GameEnv(object):
     def get_legal_bids(self) -> list[int]:
         """Return the list of legal bid values for the current bidder.
 
-        This is the bidding-phase analogue of ``get_legal_card_play_actions``.
+        Standard DouDizhu bidding: a bidder may either pass (0) or bid a
+        value **strictly higher** than the current highest bid. A bid of 3
+        (the maximum) ends bidding immediately since no higher bid is possible.
+
         The environment exposes ONLY the legal actions; the bidding policy
         (random, SL, RL) lives in the evaluation/agent layer.
         """
@@ -471,7 +474,14 @@ class GameEnv(object):
                 f"get_legal_bids called in phase {self.phase!r}; "
                 f"expected {PHASE_BIDDING!r}"
             )
-        return list(self.ruleset.bid_values)
+        current_max = max(
+            (bid for _, bid in self.bidding_history),
+            default=0,
+        )
+        return [
+            bid for bid in self.ruleset.bid_values
+            if bid == 0 or bid > current_max
+        ]
 
     def step_bidding(self, bid_value):
         """Process one bid in the BIDDING phase.
@@ -479,19 +489,22 @@ class GameEnv(object):
         Returns ``True`` if the game should redeal (all pass +
         ``all_pass_redeal``), ``False`` otherwise.
 
-        If the bid equals the maximum bid value (3), bidding ends immediately
-        — no subsequent bidder can overbid. Otherwise, bidding continues until
-        all seats have bid or a maximum bid is reached.
+        The bid must be legal per ``get_legal_bids()``: either pass (0) or a
+        value strictly higher than the current highest bid. If the maximum
+        bid (3) is played, bidding ends immediately.
         """
         if self.phase != PHASE_BIDDING:
             raise IllegalPhaseError(
                 f"step_bidding called in phase {self.phase!r}; "
                 f"expected {PHASE_BIDDING!r}"
             )
-        if bid_value not in self.ruleset.bid_values:
+        legal = self.get_legal_bids()
+        if bid_value not in legal:
+            current_max = max((b for _, b in self.bidding_history), default=0)
             raise IllegalActionError(
-                f"Bid {bid_value!r} is not in allowed bid_values "
-                f"{self.ruleset.bid_values}"
+                f"Bid {bid_value!r} is illegal. Current max bid is "
+                f"{current_max}; legal bids are {legal}. A bid must be 0 "
+                f"(pass) or strictly higher than {current_max}."
             )
 
         pos = self.acting_player_position
@@ -520,6 +533,9 @@ class GameEnv(object):
         Returns ``True`` if a redeal is required (all pass). Otherwise sets
         ``landlord_position``, ``bid_value``, reveals bottom cards, and
         transitions to PLAYING.
+
+        Since bids must be strictly ascending (enforced by get_legal_bids),
+        ties are impossible — the landlord is the single highest bidder.
         """
         bids = [(pos, val) for pos, val in self.bidding_history]
         max_bid = max(val for _, val in bids)
@@ -532,7 +548,8 @@ class GameEnv(object):
             self.landlord_position = self.bidding_order[0]
             self.bid_value = 1  # minimum
         else:
-            # Highest bidder wins; ties broken by bidding order (first wins).
+            # Highest bidder wins. Ties are impossible because bids must be
+            # strictly ascending; the highest bidder is unique.
             for pos, val in bids:
                 if val == max_bid:
                     self.landlord_position = pos

@@ -346,10 +346,13 @@ def compute_game_result(
         breakdown["anti_spring"] = anti_component
         multiplier *= anti_component
 
-    breakdown["total_multiplier"] = multiplier
+    breakdown["uncapped_multiplier"] = multiplier
 
     if ruleset.max_multiplier is not None and multiplier > ruleset.max_multiplier:
+        breakdown["max_multiplier_cap"] = ruleset.max_multiplier
         multiplier = ruleset.max_multiplier
+
+    breakdown["total_multiplier"] = multiplier
 
     total = base * multiplier
 

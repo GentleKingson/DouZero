@@ -97,8 +97,11 @@ class RuleSet:
     bomb_multiplier: int = 2
 
     #: Multiplier applied when the rocket (king bomb) is played. 2 means the
-    #: rocket doubles the score (in addition to counting as a bomb for
-    #: ``bomb_count``).
+    #: rocket doubles the score. In standard mode the rocket is counted
+    #: separately from bombs (``bomb_count`` excludes the rocket), so the
+    #: rocket gets its own multiplier on top of the bomb multiplier. In legacy
+    #: mode the rocket IS counted as a bomb (legacy ``bomb_num`` conflates
+    #: both), so ``rocket_multiplier`` is not applied separately.
     rocket_multiplier: int = 2
 
     #: Multiplier applied on spring (地主春天). 0 disables spring detection.
@@ -219,7 +222,7 @@ class RuleSet:
                 "legacy-v1" if rid == RULESET_LEGACY else "standard-v1"
             )
 
-        # Convert bid_values list -> tuple.
+        # Convert bid_values list -> tuple, rejecting non-int types.
         if "bid_values" in raw and raw["bid_values"] is not None:
             bv = raw["bid_values"]
             if not isinstance(bv, (list, tuple)):
@@ -227,7 +230,20 @@ class RuleSet:
                     f"RuleSet bid_values must be a list/tuple, got "
                     f"{type(bv).__name__}: {bv!r}"
                 )
-            raw["bid_values"] = tuple(int(v) for v in bv)
+            converted = []
+            for v in bv:
+                # Reject bools (subclass of int), strings, floats with fractional part.
+                if isinstance(v, bool):
+                    raise TypeError(
+                        f"RuleSet bid_values must contain ints, got bool: {v!r}"
+                    )
+                if not isinstance(v, int):
+                    raise TypeError(
+                        f"RuleSet bid_values must contain ints, got "
+                        f"{type(v).__name__}: {v!r}"
+                    )
+                converted.append(v)
+            raw["bid_values"] = tuple(converted)
 
         # Apply the canonical defaults for the chosen ruleset, then overlay.
         base = cls.legacy() if rid == RULESET_LEGACY else cls.standard()
@@ -304,7 +320,7 @@ def _validate_ruleset(cfg: RuleSet) -> None:
             f"{cfg.bidding_mode!r}"
         )
 
-    # bid_values: non-negative ints; 0 only allowed for standard bidding.
+    # bid_values: non-negative ints; strict validation for score_0_1_2_3.
     for v in cfg.bid_values:
         if not isinstance(v, int) or isinstance(v, bool):
             raise TypeError(f"bid_values must be ints, got {type(v).__name__}: {v!r}")
@@ -314,6 +330,14 @@ def _validate_ruleset(cfg: RuleSet) -> None:
         if not cfg.bid_values:
             raise ValueError(
                 "score_0_1_2_3 bidding_mode requires non-empty bid_values"
+            )
+        # score_0_1_2_3 must use exactly (0, 1, 2, 3) — no duplicates,
+        # no out-of-range values, must be sorted.
+        expected = (0, 1, 2, 3)
+        if tuple(sorted(cfg.bid_values)) != expected:
+            raise ValueError(
+                f"score_0_1_2_3 bidding_mode requires bid_values to be "
+                f"exactly {expected}, got {cfg.bid_values!r}"
             )
 
     # Multiplier fields: positive ints (spring/anti-spring may be 0 = disabled).
