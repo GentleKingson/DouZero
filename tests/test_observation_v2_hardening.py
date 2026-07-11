@@ -90,6 +90,7 @@ class TestSchemaIdentity:
 
     def test_stable_hash_is_description_stable(self):
         """Editing a FieldSpec description must NOT change the hash (item 2)."""
+        import dataclasses
         s = build_v2_schema()
         h_before = s.stable_hash()
         # Build an identical schema but with a different description on one field.
@@ -99,54 +100,30 @@ class TestSchemaIdentity:
             "my_handcards", new_state[idx].shape, new_state[idx].dtype,
             "DIFFERENT description text",
         )
-        s2 = FeatureSchemaManifest(
-            feature_version=s.feature_version, schema_version=s.schema_version,
-            max_history_len=s.max_history_len, card_vector_dim=s.card_vector_dim,
-            seat_onehot_width=s.seat_onehot_width,
-            move_type_onehot_width=s.move_type_onehot_width,
-            bomb_onehot_width=s.bomb_onehot_width,
-            max_cards_left=s.max_cards_left,
-            state_fields=tuple(new_state), action_fields=s.action_fields,
-            history_token_fields=s.history_token_fields,
-        )
+        s2 = dataclasses.replace(s, state_fields=tuple(new_state))
         assert s2.stable_hash() == h_before, (
             "description text edit changed the compatibility hash"
         )
 
     def test_hash_changes_on_field_removal(self):
+        import dataclasses
         s = build_v2_schema()
         h_before = s.stable_hash()
         new_state = tuple(f for f in s.state_fields if f.name != "my_handcards")
-        s2 = FeatureSchemaManifest(
-            feature_version=s.feature_version, schema_version=s.schema_version,
-            max_history_len=s.max_history_len, card_vector_dim=s.card_vector_dim,
-            seat_onehot_width=s.seat_onehot_width,
-            move_type_onehot_width=s.move_type_onehot_width,
-            bomb_onehot_width=s.bomb_onehot_width,
-            max_cards_left=s.max_cards_left,
-            state_fields=new_state, action_fields=s.action_fields,
-            history_token_fields=s.history_token_fields,
-        )
+        s2 = dataclasses.replace(s, state_fields=new_state)
         assert s2.stable_hash() != h_before
 
     def test_hash_changes_on_field_order(self):
+        import dataclasses
         s = build_v2_schema()
         h_before = s.stable_hash()
         # Swap the first two state fields.
         swapped = (s.state_fields[1], s.state_fields[0]) + s.state_fields[2:]
-        s2 = FeatureSchemaManifest(
-            feature_version=s.feature_version, schema_version=s.schema_version,
-            max_history_len=s.max_history_len, card_vector_dim=s.card_vector_dim,
-            seat_onehot_width=s.seat_onehot_width,
-            move_type_onehot_width=s.move_type_onehot_width,
-            bomb_onehot_width=s.bomb_onehot_width,
-            max_cards_left=s.max_cards_left,
-            state_fields=swapped, action_fields=s.action_fields,
-            history_token_fields=s.history_token_fields,
-        )
+        s2 = dataclasses.replace(s, state_fields=swapped)
         assert s2.stable_hash() != h_before
 
     def test_hash_changes_on_dtype(self):
+        import dataclasses
         s = build_v2_schema()
         h_before = s.stable_hash()
         new_state = list(s.state_fields)
@@ -154,16 +131,30 @@ class TestSchemaIdentity:
             new_state[0].name, new_state[0].shape, "int16",
             new_state[0].description,
         )
-        s2 = FeatureSchemaManifest(
-            feature_version=s.feature_version, schema_version=s.schema_version,
-            max_history_len=s.max_history_len, card_vector_dim=s.card_vector_dim,
-            seat_onehot_width=s.seat_onehot_width,
-            move_type_onehot_width=s.move_type_onehot_width,
-            bomb_onehot_width=s.bomb_onehot_width,
-            max_cards_left=s.max_cards_left,
-            state_fields=tuple(new_state), action_fields=s.action_fields,
-            history_token_fields=s.history_token_fields,
+        s2 = dataclasses.replace(s, state_fields=tuple(new_state))
+        assert s2.stable_hash() != h_before
+
+    def test_hash_changes_on_context_field_removal(self):
+        """Removing a context field must change the hash (item 3)."""
+        import dataclasses
+        s = build_v2_schema()
+        h_before = s.stable_hash()
+        new_context = tuple(
+            f for f in s.context_fields if f.name != "rocket_count")
+        s2 = dataclasses.replace(s, context_fields=new_context)
+        assert s2.stable_hash() != h_before
+
+    def test_hash_changes_on_bidding_token_width(self):
+        """Changing a bidding-token field width must change the hash (item 3)."""
+        import dataclasses
+        s = build_v2_schema()
+        h_before = s.stable_hash()
+        new_bidding = tuple(
+            FieldSpec(f.name, (5,) if f.name == "bid_seat" else f.shape,
+                      f.dtype, f.description)
+            for f in s.bidding_token_fields
         )
+        s2 = dataclasses.replace(s, bidding_token_fields=new_bidding)
         assert s2.stable_hash() != h_before
 
     def test_hash_changes_on_max_history_len(self):
@@ -587,3 +578,226 @@ class TestModelConsumableInput:
         obs = get_obs_v2(env.infoset)
         assert obs.bidding_tokens.num_bids == 0
         assert obs.bidding_tokens.tokens.shape == (0, BIDDING_TOKEN_WIDTH)
+
+
+# --------------------------------------------------------------------------- #
+# (Blocker 1, round 3) Mapping deep immutability
+# --------------------------------------------------------------------------- #
+class TestMappingImmutability:
+    """frozen+slots does NOT freeze interior dicts (review round 3, blocker 1).
+
+    Every mapping field on PublicObservation / PrivilegedObservation must be
+    exposed read-only, so ``obs.public.played_cards['landlord'] = ...`` raises.
+    """
+
+    def test_public_mapping_fields_are_readonly(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        from types import MappingProxyType
+        for field_name in (
+            "seat_context", "played_cards", "last_move_dict", "num_cards_left",
+        ):
+            assert isinstance(getattr(obs.public, field_name), MappingProxyType), (
+                f"{field_name} is not a read-only MappingProxyType"
+            )
+
+    def test_public_mapping_mutation_raises(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        # Subscript assignment on a MappingProxyType raises TypeError.
+        with pytest.raises(TypeError):
+            obs.public.played_cards["landlord"] = (3, 3, 3, 3)
+        with pytest.raises(TypeError):
+            obs.public.num_cards_left["landlord"] = 999
+        with pytest.raises(TypeError):
+            obs.public.seat_context["x"] = "y"
+        with pytest.raises(TypeError):
+            obs.public.last_move_dict["landlord"] = (1,)
+
+    def test_privileged_all_handcards_is_readonly(self):
+        priv = PrivilegedObservation(
+            all_handcards={"landlord": [3, 4], "landlord_up": [5]},
+            acting_role="landlord",
+        )
+        from types import MappingProxyType
+        assert isinstance(priv.all_handcards, MappingProxyType)
+        with pytest.raises(TypeError):
+            priv.all_handcards["landlord"] = (9,)
+
+    def test_privileged_hidden_labels_deep_frozen(self):
+        """hidden_hand_labels nested values cannot be mutated via the container."""
+        priv = PrivilegedObservation(
+            all_handcards={"landlord": [3]},
+            acting_role="landlord",
+            hidden_hand_labels={"counts": [1, 2, 3], "meta": {"k": 9}},
+        )
+        # Top-level mapping is read-only.
+        with pytest.raises(TypeError):
+            priv.hidden_hand_labels["counts"] = [0]
+        # Source mutation does not affect the container.
+        src = {"counts": [1]}
+        p2 = PrivilegedObservation(
+            all_handcards={"landlord": [3]}, acting_role="landlord",
+            hidden_hand_labels=src)
+        src["counts"].append(99)
+        assert 99 not in p2.hidden_hand_labels["counts"]
+
+
+# --------------------------------------------------------------------------- #
+# (Blocker 2, round 3) Public inputs bound to the schema
+# --------------------------------------------------------------------------- #
+class TestSchemaBoundPublicInputs:
+    """Every model-consumable public input must live in a schema-described
+    tensor block (review round 3, blocker 2), not just on obs.public."""
+
+    def test_schema_has_context_and_bidding_groups(self):
+        s = build_v2_schema()
+        assert len(s.context_fields) >= 7
+        assert len(s.bidding_token_fields) >= 3
+        ctx_names = {f.name for f in s.context_fields}
+        assert {
+            "bottom_cards_revealed", "bottom_cards_unplayed", "bid_value_onehot",
+            "phase_onehot", "rocket_count", "total_multiplier", "ruleset_id_onehot",
+        } <= ctx_names
+
+    def test_observation_carries_context_block(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        assert obs.context is not None
+        assert obs.schema_bidding_tokens is not None
+        # context block arrays read-only.
+        assert not obs.context.bottom_cards_revealed.flags.writeable
+        assert not obs.schema_bidding_tokens.tokens.flags.writeable
+
+    def test_context_block_width_matches_schema(self):
+        s = build_v2_schema()
+        expected = sum(int(np.prod(f.shape)) for f in s.context_fields)
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        assert obs.context.to_vector().shape == (expected,)
+
+    def test_context_block_reflects_standard_state(self):
+        env = Env("adp", ruleset=RuleSet.standard())
+        np.random.seed(1)
+        env.reset()
+        env.step(None, bid_value=1)
+        env.step(None, bid_value=2)
+        env.step(None, bid_value=3)
+        obs = get_obs_v2(
+            env.infoset,
+            ruleset=RuleSet.standard(),
+            bid_value=3,
+            bidding_history=env._env.bidding_history,
+            bidding_order=env._env.bidding_order,
+            phase="playing",
+        )
+        # bid_value 3 -> one-hot index 3 set.
+        assert obs.context.bid_value_onehot[3] == 1
+        # phase "playing" -> index 2 set.
+        assert obs.context.phase_onehot[2] == 1
+        # ruleset "standard" -> index 1 set.
+        assert obs.context.ruleset_id_onehot[1] == 1
+        # bottom revealed present in the block.
+        assert obs.context.bottom_cards_revealed.sum() == 3
+        # 3 bids encoded.
+        assert obs.schema_bidding_tokens.num_bids == 3
+        # schema bidding token width = 3 + 4 + 1 = 8.
+        assert obs.schema_bidding_tokens.tokens.shape == (3, 8)
+
+    def test_hash_covers_context_and_bidding_groups(self):
+        """stable_hash must change when context/bidding groups change."""
+        import dataclasses
+        s = build_v2_schema()
+        h = s.stable_hash()
+        # Empty context -> different hash.
+        s2 = dataclasses.replace(s, context_fields=())
+        assert s2.stable_hash() != h
+        # Empty bidding -> different hash.
+        s3 = dataclasses.replace(s, bidding_token_fields=())
+        assert s3.stable_hash() != h
+
+
+# --------------------------------------------------------------------------- #
+# (Blocker 3, round 3) RuleSet identity validation
+# --------------------------------------------------------------------------- #
+class TestRuleIdentityValidation:
+    """get_obs_v2 must never produce an empty/inconsistent ruleset hash
+    (review round 3, blocker 3)."""
+
+    def test_legacy_default_fills_canonical_hash(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        assert obs.public.ruleset_hash != ""
+        assert len(obs.public.ruleset_hash) == 64
+        assert obs.public.ruleset_hash == RuleSet.legacy().stable_hash()
+
+    def test_ruleset_preferred_path(self):
+        env = Env("adp", ruleset=RuleSet.standard())
+        np.random.seed(1)
+        env.reset()
+        env.step(None, bid_value=1)
+        env.step(None, bid_value=2)
+        env.step(None, bid_value=3)
+        obs = get_obs_v2(env.infoset, ruleset=RuleSet.standard())
+        assert obs.public.ruleset_id == "standard"
+        assert obs.public.ruleset_hash == RuleSet.standard().stable_hash()
+        assert obs.public.ruleset_version == RuleSet.standard().ruleset_version
+
+    def test_standard_without_version_hash_rejected(self):
+        env = Env("adp", ruleset=RuleSet.standard())
+        np.random.seed(1)
+        env.reset()
+        env.step(None, bid_value=3)
+        with pytest.raises(ValueError, match="standard"):
+            get_obs_v2(env.infoset, ruleset_id="standard")
+
+    def test_standard_legacy_version_contradiction_rejected(self):
+        env = Env("adp", ruleset=RuleSet.standard())
+        np.random.seed(1)
+        env.reset()
+        env.step(None, bid_value=3)
+        with pytest.raises(ValueError):
+            get_obs_v2(
+                env.infoset,
+                ruleset_id="standard",
+                ruleset_version="legacy-v1",
+                ruleset_hash=RuleSet.standard().stable_hash(),
+            )
+
+    def test_both_ruleset_and_id_rejected(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        with pytest.raises(ValueError, match="EITHER"):
+            get_obs_v2(env.infoset, ruleset=RuleSet.legacy(), ruleset_id="legacy")
+
+    def test_legacy_wrong_hash_rejected(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        with pytest.raises(ValueError, match="disagrees"):
+            get_obs_v2(env.infoset, ruleset_id="legacy", ruleset_hash="wrong")
+
+    def test_unknown_id_rejected(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        with pytest.raises(ValueError):
+            get_obs_v2(env.infoset, ruleset_id="v3")
+
+    def test_non_ruleset_object_rejected(self):
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        with pytest.raises(TypeError):
+            get_obs_v2(env.infoset, ruleset="not a ruleset")

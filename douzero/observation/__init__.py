@@ -36,6 +36,8 @@ from douzero.observation.cards import (
 from douzero.observation.encode_v2 import (
     LegalActionBatch,
     ObservationV2,
+    PublicContextBlock,
+    SchemaBiddingTokenBatch,
     StateBlock,
     get_obs_v2,
 )
@@ -112,7 +114,8 @@ __all__ = [
     # privileged
     "PRIVILEGED_KIND", "PrivilegedObservation", "is_privileged",
     # encoder
-    "LegalActionBatch", "ObservationV2", "StateBlock", "get_obs_v2",
+    "LegalActionBatch", "ObservationV2", "PublicContextBlock",
+    "SchemaBiddingTokenBatch", "StateBlock", "get_obs_v2",
     # legacy adapter
     "legacy_observation_from_v2",
 ]
