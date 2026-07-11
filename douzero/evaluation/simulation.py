@@ -2,6 +2,7 @@ import hashlib
 import multiprocessing as mp
 import queue as _queue_mod
 import random
+import time
 import traceback
 
 from douzero.env.game import GameEnv
@@ -34,6 +35,20 @@ def _safe_worker(target_fn, args, q):
         target_fn(*args, q)
     except BaseException:
         q.put(('error', traceback.format_exc()))
+
+
+def _test_hang_forever(*args):
+    """Test-only worker that hangs forever (never puts to q).
+
+    Used by the worker-timeout test to prove the parent's bounded ``join()``
+    terminates a genuinely stuck worker. Accepts any positional args (the
+    worker_data, path dict, and q) so it can be swapped in for ``mp_simulate``
+    via ``_safe_worker(target_fn, args, q)`` which calls ``target_fn(*args, q)``.
+    Defined at module level so the spawn context can pickle it by qualified
+    name. Not used in production.
+    """
+    while True:
+        time.sleep(0.1)
 
 
 def mp_simulate(card_play_data_list, card_play_model_path_dict, q):
@@ -185,7 +200,7 @@ def data_allocation_per_worker(card_play_data_list, num_workers):
 
 
 def evaluate(landlord, landlord_up, landlord_down, eval_data, num_workers,
-             ruleset=None, eval_seed=0, ruleset_obj=None):
+             ruleset=None, eval_seed=0, ruleset_obj=None, worker_timeout=3600):
     """Run evaluation. Uses the adapter to validate data format BEFORE spawning
     workers, so format/schema/hash/deck mismatches fail with a precise error
     instead of crashing inside a child process.
@@ -193,6 +208,10 @@ def evaluate(landlord, landlord_up, landlord_down, eval_data, num_workers,
     ``ruleset_obj`` is an optional RuleSet instance built from config. When
     provided, it is passed to the workers and used as the active rule set
     (overriding the hardcoded RuleSet.standard()).
+
+    ``worker_timeout`` bounds the whole worker join phase in seconds. A worker
+    stuck in a native call or infinite loop is terminated and a ``RuntimeError``
+    is raised, so the parent never blocks forever on an unbounded ``join()``.
     """
     from douzero.evaluation.legacy_data_adapter import load_eval_data
 
@@ -228,14 +247,32 @@ def evaluate(landlord, landlord_up, landlord_down, eval_data, num_workers,
             fn_args = (worker_data, card_play_model_path_dict)
         # Wrap ALL workers (legacy and standard) in _safe_worker so a crash
         # in any worker sends an error to q instead of letting the parent
-        # hang on q.get().
+        # hanging on q.get().
         p = ctx.Process(target=_safe_worker, args=(target_fn, fn_args, q))
         p.start()
         processes.append(p)
 
-    # Join all workers, then check exitcodes.
+    # Join all workers with a BOUNDED deadline. A bare p.join() has no
+    # timeout, so a worker stuck in a native call or infinite loop would
+    # block the parent forever and the timeout on q.get() below would never
+    # be reached. ``worker_timeout`` bounds the WHOLE join phase.
+    deadline = time.monotonic() + worker_timeout
     for p in processes:
-        p.join()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        p.join(timeout=remaining)
+
+    hung = [p for p in processes if p.is_alive()]
+    if hung:
+        for p in hung:
+            p.terminate()
+        for p in hung:
+            p.join(timeout=5)
+        raise RuntimeError(
+            f"Evaluation workers exceeded the {worker_timeout}s timeout and "
+            f"were terminated. {len(hung)} worker(s) were still alive."
+        )
 
     for i, p in enumerate(processes):
         if p.exitcode != 0:
@@ -254,12 +291,14 @@ def evaluate(landlord, landlord_up, landlord_down, eval_data, num_workers,
     num_landlord_scores = 0
     num_farmer_scores = 0
 
-    # Collect results with a timeout so we never hang indefinitely.
+    # Collect results with a timeout so we never hang indefinitely. By this
+    # point all workers have exited (join returned), so the queue should be
+    # populated; the timeout is a defensive backstop.
     _QUEUE_TIMEOUT = 300  # seconds
     for i in range(num_workers):
         try:
             result = q.get(timeout=_QUEUE_TIMEOUT)
-        except Exception:
+        except _queue_mod.Empty:
             raise RuntimeError(
                 f"Worker {i} did not produce a result within "
                 f"{_QUEUE_TIMEOUT}s. The evaluation cannot continue."

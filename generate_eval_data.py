@@ -69,13 +69,62 @@ def generate_standard(ruleset=None):
     }
 
 
-def _load_ruleset_from_config(config_path):
-    """Load a RuleSet from a YAML config file (shared by generate + evaluate)."""
+def _load_ruleset_from_config(config_path, *, expected_id="standard"):
+    """Load a RuleSet from a YAML config file, merging over a canonical base.
+
+    The YAML ``rules:`` block (or top-level mapping) is treated as an OVERLAY
+    on top of the canonical RuleSet for ``expected_id`` (``"standard"`` by
+    default, since custom configs are only meaningful for the standard mode).
+    A partial overlay such as ``{bomb_multiplier: 4}`` therefore yields
+    "standard + bomb×4", not a legacy RuleSet.
+
+    Parameters
+    ----------
+    config_path
+        Path to the YAML file.
+    expected_id
+        The required ``ruleset_id`` of the result (``"standard"`` or
+        ``"legacy"``). If the YAML explicitly sets ``ruleset_id`` to a
+        different value, or the result does not match, a ``ValueError`` is
+        raised immediately at the CLI boundary — never inside a worker.
+    """
     from douzero.env.rules import RuleSet
     import yaml
     with open(config_path, 'r', encoding='utf-8') as fh:
         raw = yaml.safe_load(fh) or {}
-    return RuleSet.from_dict(raw.get('rules', raw))
+    overrides = raw.get('rules', raw)
+    if not isinstance(overrides, dict):
+        raise ValueError(
+            f"ruleset_config {config_path!r} must contain a mapping under "
+            f"'rules:' or at top level, got {type(overrides).__name__}."
+        )
+
+    # Reject an explicit ruleset_id that contradicts the CLI mode.
+    explicit_id = overrides.get("ruleset_id")
+    if explicit_id is not None and explicit_id != expected_id:
+        raise ValueError(
+            f"ruleset_config {config_path!r} declares ruleset_id "
+            f"{explicit_id!r} but the CLI requested {expected_id!r}. "
+            f"A {expected_id!r} config cannot override into a different "
+            f"rule family."
+        )
+
+    # Build the merged overlay on top of the canonical base for expected_id.
+    base = (RuleSet.standard() if expected_id == "standard"
+            else RuleSet.legacy())
+    merged = base.to_dict()
+    # bid_values comes back as a list from to_dict; keep as-is so from_dict
+    # re-validates and converts it.
+    merged.update(overrides)
+    if "ruleset_id" not in merged:
+        merged["ruleset_id"] = expected_id
+    ruleset = RuleSet.from_dict(merged)
+    if ruleset.ruleset_id != expected_id:
+        raise ValueError(
+            f"ruleset_config {config_path!r} produced ruleset_id "
+            f"{ruleset.ruleset_id!r} but the CLI requested {expected_id!r}."
+        )
+    return ruleset
 
 
 if __name__ == '__main__':
