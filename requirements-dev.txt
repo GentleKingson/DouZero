@@ -1,0 +1,7 @@
+# Development-only dependencies. The runtime requirements stay in
+# requirements.txt / setup.py and are intentionally NOT pinned here.
+#
+# P00 note: these are only needed to run tests and benchmarks; they are not
+# required to import or train douzero.
+pytest>=7.0
+pytest-timeout>=2.1

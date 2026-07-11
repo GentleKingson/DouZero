@@ -8,3 +8,24 @@ dist/
 douzero_checkpoints
 most_recent_model
 eval_data.pkl
+
+# --- P00 additions -----------------------------------------------------------
+# Keep the working tree clean without touching the original ignores above.
+
+# Locally generated test/benchmark/baseline artifacts (regenerate on demand).
+artifacts/
+
+# Local pretrained weights and checkpoints -- never commit user weights.
+baselines/*/
+*.ckpt
+*.tar
+
+# Python test / type cache.
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / agent tooling directories.
+.zcode/
+.vscode/
+.idea/
