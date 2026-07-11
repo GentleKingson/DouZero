@@ -22,23 +22,51 @@ import os
 import time
 from typing import Dict
 
-import git
+# NOTE: ``git`` (GitPython) is intentionally NOT imported at module load.
+# It is only needed by ``gather_metadata`` to stamp run metadata, and importing
+# it here would force every ``import douzero.dmc`` / ``douzero.dmc.models`` and
+# every ``train.py --help`` to require GitPython -- even when no git metadata is
+# requested. The import now lives inside ``gather_metadata`` (lazy), so plain
+# imports and ``--help`` work without GitPython installed. GitPython is still a
+# declared runtime dependency (setup.py install_requires) for actual training,
+# where ``FileWriter`` calls ``gather_metadata``.
 
 
 def gather_metadata() -> Dict:
     date_start = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
     # gathering git metadata
+    # Lazy import: only training/run-logging needs GitPython. A missing
+    # GitPython, a missing ``git`` binary, or a detached HEAD must degrade to
+    # git_data with an error_type rather than crash the whole run. We catch the
+    # EXPECTED failure modes specifically (not a bare `except Exception`) so a
+    # real bug (typo, encoding error) is not silently swallowed.
     try:
-        repo = git.Repo(search_parent_directories=True)
-        git_sha = repo.commit().hexsha
-        git_data = dict(
-            commit=git_sha,
-            branch=repo.active_branch.name,
-            is_dirty=repo.is_dirty(),
-            path=repo.git_dir,
-        )
-    except git.InvalidGitRepositoryError:
-        git_data = None
+        import git
+    except ImportError:
+        # GitPython not installed at all.
+        git_data = dict(commit=None, error_type="GitPythonNotInstalled")
+    else:
+        try:
+            repo = git.Repo(search_parent_directories=True)
+            git_sha = repo.commit().hexsha
+            git_data = dict(
+                commit=git_sha,
+                branch=repo.active_branch.name,
+                is_dirty=repo.is_dirty(),
+                path=repo.git_dir,
+            )
+        except git.InvalidGitRepositoryError:
+            git_data = dict(commit=None, error_type="InvalidGitRepositoryError")
+        except TypeError:
+            # Detached HEAD has no active_branch.name.
+            git_data = dict(commit=None, error_type="DetachedHead")
+        except OSError as e:
+            # git binary missing / executable failure (GitPython raises OSError
+            # / GitCommandNotFound, which subclasses OSError).
+            git_data = dict(
+                commit=None,
+                error_type=type(e).__name__,
+            )
     # gathering slurm metadata
     if 'SLURM_JOB_ID' in os.environ:
         slurm_env_keys = [k for k in os.environ if k.startswith('SLURM')]
