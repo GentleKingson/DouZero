@@ -61,21 +61,21 @@ def test_different_seeds_differ():
 # Per-actor seed derivation
 # --------------------------------------------------------------------------- #
 def test_derive_actor_seed_is_deterministic():
-    s1 = derive_actor_seed(42, device_id=0, actor_id=3)
-    s2 = derive_actor_seed(42, device_id=0, actor_id=3)
+    s1 = derive_actor_seed(42, device_token=0, actor_id=3)
+    s2 = derive_actor_seed(42, device_token=0, actor_id=3)
     assert s1 == s2
 
 
 def test_derive_actor_seed_differs_per_actor():
-    s0 = derive_actor_seed(42, device_id=0, actor_id=0)
-    s1 = derive_actor_seed(42, device_id=0, actor_id=1)
-    s2 = derive_actor_seed(42, device_id=1, actor_id=0)
+    s0 = derive_actor_seed(42, device_token=0, actor_id=0)
+    s1 = derive_actor_seed(42, device_token=0, actor_id=1)
+    s2 = derive_actor_seed(42, device_token=1, actor_id=0)
     assert len({s0, s1, s2}) == 3  # all distinct
 
 
 def test_derive_actor_seed_zero_base_is_noop():
     """When base_seed=0 (NO_SEED), the derived seed must also be NO_SEED."""
-    assert derive_actor_seed(NO_SEED, device_id=0, actor_id=0) == NO_SEED
+    assert derive_actor_seed(NO_SEED, device_token=0, actor_id=0) == NO_SEED
 
 
 def test_derive_actor_seed_never_returns_zero():
@@ -91,9 +91,58 @@ def test_derive_actor_seed_is_stable_across_processes():
     # We verify by checking the implementation uses hashlib, not hash().
     # Functional check: two calls in the same process are equal (already tested),
     # and the value is derived from sha256 (deterministic across processes).
-    s = derive_actor_seed(7, device_id=1, actor_id=2)
+    s = derive_actor_seed(7, device_token=1, actor_id=2)
     assert isinstance(s, int)
     assert s > 0
+
+
+def test_derive_actor_seed_accepts_cpu_device_token():
+    """``device_token="cpu"`` must NOT crash (no int(str("cpu")) coercion)."""
+    s = derive_actor_seed(42, device_token="cpu", actor_id=0)
+    assert isinstance(s, int)
+    assert s != 0
+
+
+def test_derive_actor_seed_in_numpy_safe_range():
+    """Derived seeds must fit in [1, 2**32 - 1] so np.random.seed accepts them."""
+    max_np = (1 << 32) - 1
+    for base in (1, 42, 99999, 2**31, 2**63):
+        for dev in (0, 1, 2, "cpu"):
+            for act in range(8):
+                s = derive_actor_seed(base, dev, act)
+                assert 1 <= s <= max_np, f"seed {s} out of range for ({base},{dev},{act})"
+
+
+def test_derive_actor_seed_cpu_and_gpu_differ():
+    """A CPU actor and GPU actor 0 must get different seeds (different token)."""
+    cpu_seed = derive_actor_seed(42, device_token="cpu", actor_id=0)
+    gpu_seed = derive_actor_seed(42, device_token=0, actor_id=0)
+    assert cpu_seed != gpu_seed
+
+
+def test_derived_seed_actually_seeds_numpy_and_torch():
+    """The full chain set_global_seed(derive_actor_seed(...)) must not raise."""
+    # This catches the regression where a 63-bit seed would crash np.random.seed.
+    seed = derive_actor_seed(12345, device_token="cpu", actor_id=2)
+    set_global_seed(seed)  # must not raise
+    import numpy as np
+    import torch
+    a = (np.random.random(), torch.rand(1).item())
+    set_global_seed(seed)
+    b = (np.random.random(), torch.rand(1).item())
+    assert a == b  # reproducible
+
+
+def test_derived_seed_full_chain_gpu_device_token():
+    """Same full-chain check but with a GPU integer device token."""
+    seed = derive_actor_seed(12345, device_token=0, actor_id=1)
+    set_global_seed(seed)
+    import numpy as np
+    import torch
+    a = (np.random.random(), torch.rand(1).item())
+    set_global_seed(seed)
+    b = (np.random.random(), torch.rand(1).item())
+    assert a == b
 
 
 # --------------------------------------------------------------------------- #

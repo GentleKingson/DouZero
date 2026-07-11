@@ -116,12 +116,21 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
     positions = ['landlord', 'landlord_up', 'landlord_down']
     try:
         T = flags.unroll_length
-        # P01: per-actor deterministic seed (opt-in; no-op when seed=0).
-        from douzero.runtime import derive_actor_seed, set_global_seed
+        # P01: per-actor deterministic seed + optional determinism (opt-in;
+        # both are no-ops when seed=0 / deterministic=False). ``device`` is the
+        # device token passed to act(); it is "cpu" for CPU actors or a GPU
+        # index for CUDA actors. derive_actor_seed accepts both (it never
+        # coerces to int, which would crash for "cpu").
+        from douzero.runtime import (
+            derive_actor_seed,
+            maybe_set_global_deterministic,
+            set_global_seed,
+        )
 
         base_seed = getattr(flags, "seed", 0)
-        actor_seed = derive_actor_seed(base_seed, device_id=int(str(device)), actor_id=i)
+        actor_seed = derive_actor_seed(base_seed, device_token=device, actor_id=i)
         set_global_seed(actor_seed)
+        maybe_set_global_deterministic(getattr(flags, "deterministic", False))
         log.info('Device %s Actor %i started.', str(device), i)
 
         env = create_env(flags)
