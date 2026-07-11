@@ -83,8 +83,9 @@ supported range so cross-version regressions are caught upstream:
 
 Python 3.14 is not yet in the mandatory matrix; it will be added (initially as
 a non-blocking smoke) once `rlcard` / `GitPython` compatibility on 3.14 is
-confirmed. The `actions/setup-python` action is pinned to the v5 tag commit
-SHA; migration to v6 (Node 24, requires runner ≥ 2.327.1) is a tracked TODO.
+confirmed. Both workflows pin `actions/checkout` and `actions/setup-python` to
+**v6** tag commit SHAs (`df4cb1c0…` and `ece7cb06…` respectively; Node 24,
+requires runner ≥ 2.327.1).
 
 ## Running locally without Docker
 

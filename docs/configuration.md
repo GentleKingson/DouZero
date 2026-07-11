@@ -58,9 +58,29 @@ P01 adds optional flags carried (not yet enforced) for later phases:
 | `--ruleset` | `legacy` | Rule set identifier (P02 introduces `standard`) |
 | `--model_version` | `legacy` | Model version (P05 introduces `v2`) |
 
-In P01 only `legacy` is supported for the version fields; they are recorded in
-the checkpoint manifest (see `docs/checkpoint_compatibility.md`) so future
-phases can reject incompatible loads.
+In P01 only `legacy` is supported for the version fields; the CLI uses
+`choices=['legacy']` and the YAML/dict loader rejects any other value. They are
+recorded in the checkpoint manifest (see `docs/checkpoint_compatibility.md`) so
+future phases can reject incompatible loads.
+
+## Boolean flags and `--no-<flag>` overrides
+
+The four boolean flags (`--actor_device_cpu`, `--load_model`,
+`--disable_checkpoint`, `--deterministic`) use `argparse.BooleanOptionalAction`.
+This means:
+
+- `--<flag>` sets it to `True` (the legacy `store_true` behavior, unchanged).
+- `--no-<flag>` sets it to `False` (new in P01).
+
+The `--no-<flag>` form lets you override a YAML `true` from the CLI. For
+example, if `configs/run.yaml` has `deterministic: true`, you can force it off:
+
+```
+python train.py --config configs/run.yaml --no-deterministic
+```
+
+The default is `False` for all four flags, matching the pre-P01 `store_true`
+defaults exactly.
 
 ## Programmatic use
 
