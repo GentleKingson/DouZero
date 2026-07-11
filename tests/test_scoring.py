@@ -467,7 +467,7 @@ def test_game_result_to_dict_round_trip():
     # Rule identity stamped.
     assert d["ruleset_id"] == "standard"
     assert d["ruleset_version"] == "standard-v1"
-    assert len(d["ruleset_hash"]) == 16
+    assert len(d["ruleset_hash"]) == 64  # full SHA-256
 
 
 def test_game_result_legacy_has_legacy_identity():
@@ -484,7 +484,7 @@ def test_game_result_legacy_has_legacy_identity():
     )
     assert result.ruleset_id == "legacy"
     assert result.ruleset_version == "legacy-v1"
-    assert len(result.ruleset_hash) == 16
+    assert len(result.ruleset_hash) == 64  # full SHA-256
 
 
 # --------------------------------------------------------------------------- #

@@ -16,6 +16,10 @@ def get_parser():
                         choices=['legacy', 'standard'],
                         help='Deal format: legacy (4-key card_play_data) or '
                              'standard (full deck + first_bidder + ruleset_id)')
+    parser.add_argument('--ruleset_config', default='', type=str,
+                        help='Optional YAML file with rule parameters for standard '
+                             'mode. The generated data records the RuleSet hash so '
+                             'that evaluate.py --ruleset_config <same.yaml> accepts it.')
     return parser
 
 def generate():
@@ -32,17 +36,21 @@ def generate():
     return card_play_data
 
 
-def generate_standard():
+def generate_standard(ruleset=None):
     """Generate a standard deal: full deck order + first_bidder + ruleset_id.
 
     The deal is stored as the complete 54-card deck order (not pre-sliced
     into hands) so that the evaluation pipeline can deal 17+17+17+3 and
     run bidding. Uses neutral seat labels ("0", "1", "2") for first_bidder
     and bidding_order, matching the standard state machine's BIDDING phase.
+
+    ``ruleset`` is an optional RuleSet instance. When provided, its identity
+    (id/version/hash) is recorded so that ``evaluate.py --ruleset_config``
+    with the same YAML accepts the data. Defaults to ``RuleSet.standard()``.
     """
     from douzero.env.rules import RuleSet
 
-    rs = RuleSet.standard()
+    rs = ruleset if ruleset is not None else RuleSet.standard()
     _deck = deck.copy()
     np.random.shuffle(_deck)
     # Randomly choose the first bidder seat (0, 1, or 2).
@@ -61,6 +69,15 @@ def generate_standard():
     }
 
 
+def _load_ruleset_from_config(config_path):
+    """Load a RuleSet from a YAML config file (shared by generate + evaluate)."""
+    from douzero.env.rules import RuleSet
+    import yaml
+    with open(config_path, 'r', encoding='utf-8') as fh:
+        raw = yaml.safe_load(fh) or {}
+    return RuleSet.from_dict(raw.get('rules', raw))
+
+
 if __name__ == '__main__':
     flags = get_parser().parse_args()
     output_pickle = flags.output + '.pkl'
@@ -71,8 +88,11 @@ if __name__ == '__main__':
 
     data = []
     if flags.ruleset == 'standard':
+        # Build the RuleSet from config if provided (shared loader).
+        rs = (_load_ruleset_from_config(flags.ruleset_config)
+              if flags.ruleset_config else None)
         for _ in range(flags.num_games):
-            data.append(generate_standard())
+            data.append(generate_standard(ruleset=rs))
     else:
         for _ in range(flags.num_games):
             data.append(generate())

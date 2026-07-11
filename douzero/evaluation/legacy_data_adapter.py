@@ -54,13 +54,21 @@ def _validate_standard_deck(deck: list[int]) -> None:
         raise ValueError(f"Big joker (30) must appear once, got {counts[30]}")
 
 
+def _is_v2_record(deal: dict[str, Any]) -> bool:
+    """Return True if a record is in v2 (standard) format."""
+    return deal.get("format_version") == 2
+
+
 def _validate_standard_record(deal: dict[str, Any], idx: int,
                               expected_ruleset) -> None:
     """Validate a single v2 standard record.
 
-    Checks: schema_version, ruleset_id, ruleset_version, ruleset_hash
-    (required and matching), deck validity, first_bidder/bidding_order
-    (neutral seat permutation).
+    All identity fields are REQUIRED (not optional):
+    format_version, schema_version, ruleset_id, ruleset_version, ruleset_hash,
+    deck, first_bidder, bidding_order.
+
+    When ``expected_ruleset`` is provided, ruleset_id/version/hash must match
+    it exactly — not just exist.
     """
     # schema_version (required).
     sv = deal.get("schema_version")
@@ -74,14 +82,34 @@ def _validate_standard_record(deal: dict[str, Any], idx: int,
             f"{sv!r}; expected 1."
         )
 
-    # ruleset_hash (required, not optional).
+    # ruleset_id / ruleset_version (required, must match active ruleset).
+    for field in ("ruleset_id", "ruleset_version"):
+        if field not in deal:
+            raise ValueError(
+                f"Standard eval data record {idx} is missing {field!r}."
+            )
+
+    # ruleset_hash (required, not optional). Must match active ruleset.
     actual_hash = deal.get("ruleset_hash")
     if actual_hash is None:
         raise ValueError(
             f"Standard eval data record {idx} is missing 'ruleset_hash'. "
             f"All v2 records must include ruleset_hash."
         )
+
     if expected_ruleset is not None:
+        if deal["ruleset_id"] != expected_ruleset.ruleset_id:
+            raise ValueError(
+                f"Standard eval data record {idx} has ruleset_id "
+                f"{deal['ruleset_id']!r} but active RuleSet has "
+                f"{expected_ruleset.ruleset_id!r}."
+            )
+        if deal["ruleset_version"] != expected_ruleset.ruleset_version:
+            raise ValueError(
+                f"Standard eval data record {idx} has ruleset_version "
+                f"{deal['ruleset_version']!r} but active RuleSet has "
+                f"{expected_ruleset.ruleset_version!r}."
+            )
         expected_hash = expected_ruleset.stable_hash()
         if actual_hash != expected_hash:
             raise ValueError(
@@ -90,40 +118,43 @@ def _validate_standard_record(deal: dict[str, Any], idx: int,
                 f"{expected_hash!r}. The rule parameters do not match."
             )
 
-    # ruleset_id / ruleset_version (informational but must be present).
-    for field in ("ruleset_id", "ruleset_version"):
-        if field not in deal:
-            raise ValueError(
-                f"Standard eval data record {idx} is missing {field!r}."
-            )
-
-    # Deck validity.
+    # Deck validity (required).
     if "deck" not in deal:
         raise ValueError(
             f"Standard eval data record {idx} is missing 'deck'."
         )
     _validate_standard_deck(deal["deck"])
 
-    # first_bidder / bidding_order (neutral seat permutation).
+    # first_bidder (required, neutral seat).
     first_bidder = deal.get("first_bidder")
-    if first_bidder is not None:
-        if not isinstance(first_bidder, str) or first_bidder not in _NEUTRAL_SEATS:
-            raise ValueError(
-                f"Standard eval data record {idx} has first_bidder "
-                f"{first_bidder!r}; expected one of {_NEUTRAL_SEATS}."
-            )
+    if first_bidder is None:
+        raise ValueError(
+            f"Standard eval data record {idx} is missing 'first_bidder'. "
+            f"All v2 records must include first_bidder."
+        )
+    if not isinstance(first_bidder, str) or first_bidder not in _NEUTRAL_SEATS:
+        raise ValueError(
+            f"Standard eval data record {idx} has first_bidder "
+            f"{first_bidder!r}; expected one of {_NEUTRAL_SEATS}."
+        )
+
+    # bidding_order (required, neutral seat permutation).
     bidding_order = deal.get("bidding_order")
-    if bidding_order is not None:
-        if sorted(bidding_order) != list(_NEUTRAL_SEATS):
-            raise ValueError(
-                f"Standard eval data record {idx} has bidding_order "
-                f"{bidding_order!r}; expected a permutation of {_NEUTRAL_SEATS}."
-            )
-        if first_bidder is not None and bidding_order[0] != first_bidder:
-            raise ValueError(
-                f"Standard eval data record {idx}: first_bidder "
-                f"{first_bidder!r} != bidding_order[0] {bidding_order[0]!r}."
-            )
+    if bidding_order is None:
+        raise ValueError(
+            f"Standard eval data record {idx} is missing 'bidding_order'. "
+            f"All v2 records must include bidding_order."
+        )
+    if sorted(bidding_order) != list(_NEUTRAL_SEATS):
+        raise ValueError(
+            f"Standard eval data record {idx} has bidding_order "
+            f"{bidding_order!r}; expected a permutation of {_NEUTRAL_SEATS}."
+        )
+    if bidding_order[0] != first_bidder:
+        raise ValueError(
+            f"Standard eval data record {idx}: first_bidder "
+            f"{first_bidder!r} != bidding_order[0] {bidding_order[0]!r}."
+        )
 
 
 def load_eval_data(path: str, ruleset: str = "legacy",
@@ -140,8 +171,8 @@ def load_eval_data(path: str, ruleset: str = "legacy",
         format does not match, a :class:`ValueError` is raised.
     expected_ruleset
         Optional active :class:`RuleSet` instance. For standard data, the
-        ``ruleset_hash`` of every record is validated against this RuleSet's
-        hash.
+        ``ruleset_id``, ``ruleset_version``, and ``ruleset_hash`` of every
+        record are validated against this RuleSet exactly.
 
     Returns
     -------
@@ -158,14 +189,22 @@ def load_eval_data(path: str, ruleset: str = "legacy",
     if len(data) == 0:
         return data
 
-    # Detect format from the first element.
-    first = data[0]
-    if not isinstance(first, dict):
-        raise TypeError(
-            f"Eval data elements must be dicts, got {type(first).__name__}"
-        )
+    # Every record must be a dict.
+    for idx, deal in enumerate(data):
+        if not isinstance(deal, dict):
+            raise TypeError(
+                f"Eval data record {idx} must be a dict, got {type(deal).__name__}."
+            )
 
-    is_standard = "format_version" in first and first.get("format_version") == 2
+    # Determine the dataset format from ALL records (not just the first).
+    # Mixed datasets (some v1, some v2) are rejected in BOTH directions.
+    record_formats = [_is_v2_record(deal) for deal in data]
+    if any(record_formats) and not all(record_formats):
+        raise ValueError(
+            f"Eval data at {path} is mixed: some records are v2 (format_version=2) "
+            f"and some are v1 (no format_version). Mixed datasets are not allowed."
+        )
+    is_standard = all(record_formats)
 
     if ruleset == "standard" and not is_standard:
         raise ValueError(
@@ -180,21 +219,9 @@ def load_eval_data(path: str, ruleset: str = "legacy",
             f"regenerate with `generate_eval_data.py --ruleset legacy`."
         )
 
-    # Validate EVERY record (not just the first).
+    # Validate EVERY standard record.
     if is_standard:
         for idx, deal in enumerate(data):
-            if not isinstance(deal, dict):
-                raise TypeError(
-                    f"Standard eval data record {idx} must be a dict, got "
-                    f"{type(deal).__name__}."
-                )
-            # Reject mixed legacy records inside a standard dataset.
-            if deal.get("format_version") != 2:
-                raise ValueError(
-                    f"Eval data record {idx} has a different format than "
-                    f"record 0 (expected format_version=2). Mixed datasets "
-                    f"are not allowed."
-                )
             _validate_standard_record(deal, idx, expected_ruleset)
 
     return data

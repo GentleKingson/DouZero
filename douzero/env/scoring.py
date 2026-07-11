@@ -319,7 +319,7 @@ def compute_game_result(
             farmer_score=farmer_score,
             ruleset_id=ruleset.ruleset_id,
             ruleset_version=ruleset.ruleset_version,
-            ruleset_hash=ruleset.stable_hash()[:16],
+            ruleset_hash=ruleset.stable_hash(),
         )
 
     # Standard scoring.
@@ -379,5 +379,5 @@ def compute_game_result(
         farmer_score=farmer_score,
         ruleset_id=ruleset.ruleset_id,
         ruleset_version=ruleset.ruleset_version,
-        ruleset_hash=ruleset.stable_hash()[:16],
+        ruleset_hash=ruleset.stable_hash(),
     )

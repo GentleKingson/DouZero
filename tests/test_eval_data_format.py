@@ -309,8 +309,144 @@ def test_standard_data_short_deck_rejected(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Worker-count reproducibility
+# Required v2 fields (not optional)
 # --------------------------------------------------------------------------- #
+def test_missing_first_bidder_rejected(tmp_path):
+    """A v2 record without first_bidder must be rejected (not defaulted)."""
+    np.random.seed(42)
+    data = [generate_standard()]
+    del data[0]['first_bidder']
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="first_bidder"):
+        load_eval_data(str(pkl), ruleset="standard")
+
+
+def test_missing_bidding_order_rejected(tmp_path):
+    """A v2 record without bidding_order must be rejected (not defaulted)."""
+    np.random.seed(42)
+    data = [generate_standard()]
+    del data[0]['bidding_order']
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="bidding_order"):
+        load_eval_data(str(pkl), ruleset="standard")
+
+
+def test_missing_ruleset_id_rejected(tmp_path):
+    """A v2 record without ruleset_id must be rejected."""
+    np.random.seed(42)
+    data = [generate_standard()]
+    del data[0]['ruleset_id']
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="ruleset_id"):
+        load_eval_data(str(pkl), ruleset="standard")
+
+
+def test_ruleset_id_mismatch_with_active_rejected(tmp_path):
+    """A v2 record with wrong ruleset_id must be rejected vs active ruleset."""
+    from douzero.env.rules import RuleSet
+    np.random.seed(42)
+    data = [generate_standard()]
+    data[0]['ruleset_id'] = 'legacy'  # wrong
+    pkl = tmp_path / "bad.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(data, f)
+    with pytest.raises(ValueError, match="ruleset_id"):
+        load_eval_data(str(pkl), ruleset="standard",
+                       expected_ruleset=RuleSet.standard())
+
+
+def test_mixed_legacy_first_then_standard_rejected(tmp_path):
+    """Mixed dataset: first legacy, second standard — must be rejected."""
+    np.random.seed(42)
+    legacy_deal = generate()
+    standard_deal = generate_standard()
+    mixed = [legacy_deal, standard_deal]
+    pkl = tmp_path / "mixed.pkl"
+    with open(pkl, "wb") as f:
+        pickle.dump(mixed, f)
+    # Requesting legacy should still detect the mix.
+    with pytest.raises(ValueError, match="mixed"):
+        load_eval_data(str(pkl), ruleset="legacy")
+
+
+# --------------------------------------------------------------------------- #
+# Custom ruleset_config CLI round-trip
+# --------------------------------------------------------------------------- #
+def test_custom_ruleset_config_generate_and_evaluate_round_trip(tmp_path):
+    """generate_eval_data.py --ruleset_config and evaluate.py --ruleset_config
+    with the same YAML must produce compatible data."""
+    import subprocess
+    import sys
+    import yaml as _yaml
+
+    # Create a custom rules YAML.
+    custom = {"rules": {"ruleset_id": "standard", "bomb_multiplier": 3}}
+    cfg_path = tmp_path / "custom.yaml"
+    with open(cfg_path, "w") as f:
+        _yaml.dump(custom, f)
+
+    # Generate standard data with custom rules.
+    out = tmp_path / "eval_custom"
+    result = subprocess.run(
+        [sys.executable, "generate_eval_data.py",
+         "--output", str(out), "--num_games", "6",
+         "--ruleset", "standard", "--ruleset_config", str(cfg_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+
+    # Evaluate with the same custom rules — must succeed (hash matches).
+    result2 = subprocess.run(
+        [sys.executable, "evaluate.py",
+         "--landlord", "random", "--landlord_up", "random",
+         "--landlord_down", "random",
+         "--eval_data", str(out) + ".pkl", "--num_workers", "1",
+         "--ruleset", "standard", "--eval_seed", "42",
+         "--ruleset_config", str(cfg_path)],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert result2.returncode == 0, f"stderr: {result2.stderr}"
+    assert "WP results" in result2.stdout
+
+
+def test_custom_ruleset_config_mismatch_rejected(tmp_path):
+    """Data generated with custom rules must be rejected when evaluated
+    with canonical (default) rules."""
+    import subprocess
+    import sys
+    import yaml as _yaml
+
+    custom = {"rules": {"ruleset_id": "standard", "bomb_multiplier": 3}}
+    cfg_path = tmp_path / "custom.yaml"
+    with open(cfg_path, "w") as f:
+        _yaml.dump(custom, f)
+
+    out = tmp_path / "eval_custom"
+    result = subprocess.run(
+        [sys.executable, "generate_eval_data.py",
+         "--output", str(out), "--num_games", "6",
+         "--ruleset", "standard", "--ruleset_config", str(cfg_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+
+    # Evaluate WITHOUT --ruleset_config (uses canonical standard) → hash mismatch.
+    result2 = subprocess.run(
+        [sys.executable, "evaluate.py",
+         "--landlord", "random", "--landlord_up", "random",
+         "--landlord_down", "random",
+         "--eval_data", str(out) + ".pkl", "--num_workers", "1",
+         "--ruleset", "standard", "--eval_seed", "42"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result2.returncode != 0
+    assert "ruleset_hash" in result2.stderr or "do not match" in result2.stderr
 def test_worker_count_reproducibility(tmp_path):
     """num_workers=1 and num_workers>1 must produce identical results.
 
@@ -360,7 +496,7 @@ def test_mixed_legacy_and_standard_rejected(tmp_path):
     pkl = tmp_path / "mixed.pkl"
     with open(pkl, "wb") as f:
         pickle.dump(mixed, f)
-    with pytest.raises(ValueError, match="different format"):
+    with pytest.raises(ValueError, match="mixed"):
         load_eval_data(str(pkl), ruleset="standard")
 
 
