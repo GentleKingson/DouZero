@@ -323,38 +323,47 @@ def compute_game_result(
         )
 
     # Standard scoring.
-    base = ruleset.base_score
+    # The total multiplier = bid_component × event_multiplier.
+    # bid_component = bid_value (if bid_multiplier is enabled, else 1).
+    # event_multiplier = bomb × rocket × spring × anti_spring.
+    # max_multiplier caps the TOTAL multiplier (including bid), not just events.
+    bid_component = 1
     if ruleset.bid_multiplier and bid_value > 0:
-        base *= bid_value
+        bid_component = bid_value
         breakdown["bid"] = bid_value
 
-    multiplier = 1
+    event_multiplier = 1
     if bomb_count > 0:
         bomb_component = ruleset.bomb_multiplier ** bomb_count
         breakdown["bomb"] = bomb_component
-        multiplier *= bomb_component
+        event_multiplier *= bomb_component
     if rocket_count > 0:
         rocket_component = ruleset.rocket_multiplier
         breakdown["rocket"] = rocket_component
-        multiplier *= rocket_component
+        event_multiplier *= rocket_component
     if spring:
         spring_component = ruleset.spring_multiplier
         breakdown["spring"] = spring_component
-        multiplier *= spring_component
+        event_multiplier *= spring_component
     if anti_spring:
         anti_component = ruleset.anti_spring_multiplier
         breakdown["anti_spring"] = anti_component
-        multiplier *= anti_component
+        event_multiplier *= anti_component
 
-    breakdown["uncapped_multiplier"] = multiplier
+    breakdown["event_multiplier"] = event_multiplier
 
-    if ruleset.max_multiplier is not None and multiplier > ruleset.max_multiplier:
+    # Total multiplier = bid_component × event_multiplier.
+    uncapped_total_multiplier = bid_component * event_multiplier
+    breakdown["uncapped_total_multiplier"] = uncapped_total_multiplier
+
+    total_multiplier = uncapped_total_multiplier
+    if ruleset.max_multiplier is not None and total_multiplier > ruleset.max_multiplier:
         breakdown["max_multiplier_cap"] = ruleset.max_multiplier
-        multiplier = ruleset.max_multiplier
+        total_multiplier = ruleset.max_multiplier
 
-    breakdown["total_multiplier"] = multiplier
+    breakdown["total_multiplier"] = total_multiplier
 
-    total = base * multiplier
+    total = ruleset.base_score * total_multiplier
 
     # Standard: landlord wins/loses 2*total, each farmer wins/loses 1*total
     # (opposite sign). Score conservation: landlord + 2*farmer == 0.
@@ -374,7 +383,7 @@ def compute_game_result(
         spring=spring,
         anti_spring=anti_spring,
         multiplier_breakdown=breakdown,
-        total_multiplier=multiplier,
+        total_multiplier=total_multiplier,
         landlord_score=landlord_score,
         farmer_score=farmer_score,
         ruleset_id=ruleset.ruleset_id,
