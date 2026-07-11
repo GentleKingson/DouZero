@@ -97,6 +97,23 @@ pip install -e .
 CUDA_VISIBLE_DEVICES="" python -m pytest -q
 ```
 
+## P04 factorized forward verification
+
+The factorized forward (deployment-only, P04) is numerically equivalent to
+the legacy per-action forward under the same weights. To verify parity and
+the LSTM-call-count reduction:
+
+```bash
+# Parity + state_dict + LSTM-count + DeepAgent backend parity.
+CUDA_VISIBLE_DEVICES="" python -m pytest -q tests/test_factorized_parity.py
+
+# Latency + LSTM call count (writes artifacts/benchmark/bench_factorized.json).
+CUDA_VISIBLE_DEVICES="" python benchmarks/bench_factorized.py --rounds 30
+```
+
+See `docs/factorized_forward.md` for the equivalence derivation and the
+training-integration boundary.
+
 ## Capturing the baseline
 
 ```bash

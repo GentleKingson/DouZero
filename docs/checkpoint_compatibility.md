@@ -39,7 +39,7 @@ Two checkpoint formats coexist:
 | Field | Meaning |
 |---|---|
 | `schema_version` | manifest schema version (currently 1); bumped only on a breaking manifest-schema change |
-| `model_version` | model version (`legacy` in P01; `v2` arrives in P05) |
+| `model_version` | model version (`legacy` in P01; `factorized` in P04 as a deployment-only forward sharing the legacy state_dict; `v2` arrives in P05) |
 | `feature_version` | observation feature version (`legacy` in P01; `v2` in P03) |
 | `ruleset_id` | rule set (`legacy` in P01; `standard` in P02) |
 | `checkpoint_kind` | one of `training_checkpoint` / `position_weights` / `privileged_teacher` / `public_policy` |
@@ -65,6 +65,28 @@ Two checkpoint formats coexist:
   validation is possible because there is no manifest; callers assume the
   legacy feature/rule identity (acceptable in P01 because only `legacy`
   exists).
+
+## P04 factorized model — shared state_dict
+
+The P04 factorized models (`douzero/dmc/models_factorized.py`) declare the
+**same submodule names and shapes** as the legacy models
+(`lstm`, `dense1` … `dense6`), so a legacy per-position `.ckpt` loads into a
+factorized model with **no conversion** via the existing
+`load_legacy_position_ckpt` + key-filter path. `state_dict()` keys and shapes
+are byte-for-byte identical; only `forward` differs (the factorized forward
+encodes the shared history/state once per decision).
+
+Consequences:
+
+- A checkpoint produced by legacy training can be served with
+  `DeepAgent(..., backend='legacy_factorized')` and produces the **same**
+  selected action.
+- No migration tool or weight conversion is required.
+- The manifest `model_version` distinguishes a legacy-trained checkpoint
+  (`legacy`) from a factorized-trained one (`factorized`). In P04, training
+  is still legacy-only (the `dmc.py` gate rejects `model_version='factorized'`
+  for training), so no `factorized`-stamped training checkpoint is produced
+  yet. P05/P06 widen this.
 
 ## Security: weights_only by default
 

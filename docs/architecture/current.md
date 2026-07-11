@@ -271,7 +271,7 @@ The legacy baseline deliberately omits several things AGENTS.md requires:
 | Rule legality | `move_generator` / `move_detector` / `move_selector` | P02 `RuleSet` added (rules.py); move_generator/detector/selector NOT modified (TYPE_15 anomaly deferred) |
 | Bidding/scoring | `GameEnv` (ruleset=None=legacy) / `Env` / `scoring.py` | P02 resolved (standard mode); training integration → P05/P06 |
 | Observation schema | `get_obs` (role encoders) | P03 resolved: `douzero/observation/` adds versioned `PublicObservation`/`PrivilegedObservation` + schema + legacy adapter; `get_obs` unchanged (default `feature_version=legacy`) |
-| Model input/widths | `Landlord/FarmerLstmModel.forward(z,x)` | P04 factorized forward (parity); P05 Model V2 |
+| Model input/widths | `Landlord/FarmerLstmModel.forward(z,x)` | P04 resolved (deployment): `douzero/dmc/models_factorized.py` adds `LegacyFactorizedLandlord/FarmerModel` — same state_dict keys/shapes, encodes shared history/state once per decision, numerically equivalent to legacy; `DeepAgent` gains `backend='legacy_factorized'`. Training integration → P05/P06. P05 Model V2 |
 | Deployment selection | `DeepAgent.act(infoset)` | P05/P16 `DeepAgentV2` (public-only) |
 | Reward sign | `Env._get_reward` + actor negation | P06 centralised perspective |
 | Checkpoint manifest | `{pos}_weights_*.ckpt`, `model.tar` | P16 strict `ModelManifest` |
