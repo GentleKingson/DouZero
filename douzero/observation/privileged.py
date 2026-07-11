@@ -41,6 +41,64 @@ from typing import Any, Mapping
 PRIVILEGED_KIND: str = "privileged"
 
 
+def deep_freeze(value: Any) -> Any:
+    """Recursively produce an immutable deep copy of ``value``.
+
+    - mappings -> :class:`types.MappingProxyType` over a frozen dict
+    - list/tuple -> tuple of frozen items (list becomes tuple, so append/del
+      fail)
+    - set/frozenset -> frozenset of frozen items
+    - numpy ndarray -> read-only copy (``write=False``)
+    - everything else -> a deep copy (ints/strs/floats/None are returned as-is
+      by ``copy.deepcopy``)
+
+    This freezes nesting at every level, so
+    ``priv.hidden_hand_labels["counts"].append(9)`` raises ``AttributeError``
+    (a tuple has no ``append``) and
+    ``priv.hidden_hand_labels["meta"]["k"] = 0`` raises ``TypeError``
+    (a MappingProxyType is read-only).
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: deep_freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(deep_freeze(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(deep_freeze(item) for item in value)
+    try:
+        import numpy as np
+        if isinstance(value, np.ndarray):
+            result = value.copy()
+            result.setflags(write=False)
+            return result
+    except ImportError:  # pragma: no cover - numpy is a hard dependency
+        pass
+    return copy.deepcopy(value)
+
+
+def _to_plain(value: Any) -> Any:
+    """Recursively convert a frozen structure back to plain (mutable) Python.
+
+    The inverse of :func:`deep_freeze` for serialization: MappingProxyType ->
+    dict, tuple -> list, frozenset -> list, ndarray -> list. The container
+    itself stays immutable; only the serialization copy is mutable.
+    """
+    if isinstance(value, Mapping):
+        return {k: _to_plain(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return [_to_plain(v) for v in value]
+    if isinstance(value, frozenset):
+        return [_to_plain(v) for v in value]
+    try:
+        import numpy as np
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+    except ImportError:  # pragma: no cover
+        pass
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class PrivilegedObservation:
     """True hidden hands + training labels — NEVER passed to a deployment model.
@@ -55,7 +113,8 @@ class PrivilegedObservation:
     hidden_hand_labels
         Optional training-only labels for the belief model (e.g. the per-rank
         count allocation for a chosen opponent). ``None`` when not applicable.
-        Deep-frozen (recursively) at construction.
+        Recursively deep-frozen at construction (nested list/dict/set/ndarray
+        are all immutable).
     terminal_target_win
         Optional terminal win label (from the acting team's perspective) used
         for Monte-Carlo value training. ``None`` mid-episode.
@@ -67,10 +126,10 @@ class PrivilegedObservation:
         inspecting its contents.
 
     Deep immutability (item 5): ``frozen`` + ``slots``; caller-supplied
-    ``all_handcards`` is deep-copied and exposed as a read-only mapping;
-    ``hidden_hand_labels`` is deep-copied and frozen so nested list/dict/array
-    values cannot be mutated either. The container shares no ndarray with any
-    public container.
+    ``all_handcards`` is deep-frozen and exposed read-only;
+    ``hidden_hand_labels`` is recursively deep-frozen via :func:`deep_freeze`,
+    so nested list/dict/set/array values cannot be mutated in place either.
+    The container shares no ndarray with any public container.
     """
 
     all_handcards: Mapping[str, tuple[int, ...]]
@@ -81,21 +140,16 @@ class PrivilegedObservation:
     kind: str = field(default=PRIVILEGED_KIND, init=False)
 
     def __post_init__(self) -> None:
-        # Deep-copy caller-supplied mutable inputs, then expose them read-only.
-        # Tuples are immutable; we copy the outer dict, re-wrap each hand as a
-        # sorted tuple of ints, and wrap the result in a MappingProxyType so
-        # ``all_handcards[role] = ...`` raises TypeError (item 5).
-        copied_hands = {
-            str(role): tuple(sorted(int(c) for c in hand))
-            for role, hand in self.all_handcards.items()
-        }
-        object.__setattr__(self, "all_handcards", MappingProxyType(copied_hands))
+        # Deep-freeze caller-supplied mutable inputs at every nesting level
+        # (review round 4, blocker 1). MappingProxyType only freezes the top
+        # mapping; nested list/dict/set/ndarray stayed mutable until we
+        # recursed.
+        frozen_hands = deep_freeze(dict(self.all_handcards))
+        object.__setattr__(self, "all_handcards", frozen_hands)
         if self.hidden_hand_labels is not None:
-            # Deep-copy then freeze nested dicts (one level) so label values
-            # cannot be mutated in place. ``copy.deepcopy`` handles nested
-            # list/dict; we additionally wrap the top level read-only.
-            frozen = copy.deepcopy(dict(self.hidden_hand_labels))
-            object.__setattr__(self, "hidden_hand_labels", MappingProxyType(frozen))
+            object.__setattr__(
+                self, "hidden_hand_labels", deep_freeze(dict(self.hidden_hand_labels))
+            )
         if self.kind != PRIVILEGED_KIND:  # defensive; default already set
             object.__setattr__(self, "kind", PRIVILEGED_KIND)
 
@@ -108,7 +162,7 @@ class PrivilegedObservation:
         return {
             "kind": self.kind,
             "acting_role": self.acting_role,
-            "all_handcards": {k: list(v) for k, v in self.all_handcards.items()},
+            "all_handcards": {k: _to_plain(v) for k, v in self.all_handcards.items()},
             "hidden_hand_labels": (
                 None if self.hidden_hand_labels is None
                 else {k: _to_plain(v) for k, v in self.hidden_hand_labels.items()}
@@ -116,15 +170,6 @@ class PrivilegedObservation:
             "terminal_target_win": self.terminal_target_win,
             "terminal_target_score": self.terminal_target_score,
         }
-
-
-def _to_plain(value: Any) -> Any:
-    """Recursively convert a nested dict/list structure to plain Python."""
-    if isinstance(value, Mapping):
-        return {k: _to_plain(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_to_plain(v) for v in value]
-    return value
 
 
 def is_privileged(obj: Any) -> bool:
