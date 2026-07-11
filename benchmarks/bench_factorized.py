@@ -1,31 +1,36 @@
 #!/usr/bin/env python
-"""Micro-benchmark: legacy vs factorized forward (P04).
+"""Micro-benchmark: legacy vs factorized forward and end-to-end DeepAgent (P04).
 
-Measures CPU latency/throughput for the legacy per-action forward versus the
-P04 factorized forward (which encodes the shared history/state once per
-decision), at several legal-action counts. Also records the LSTM input batch
-size per decision — the direct evidence that the factorized path feeds the
-LSTM 1 row instead of N identical rows.
+Measures CPU latency/throughput for:
+  * model-forward-only (legacy vs factorized) at several legal-action counts;
+  * the full ``DeepAgent.act`` path (observation encoding + tensor build +
+    forward + argmax) for both backends;
+  * CPU peak memory for the full act path;
+  * the LSTM input batch size per decision (the P04 work-reduction proof:
+    legacy feeds the LSTM N identical rows, factorized feeds it 1).
 
 This is a MEASUREMENT tool, not an optimisation claim. It reports honest
 medians and p95s on the current host and makes no preset assumption about the
-speedup. GPU timing is only collected when CUDA is available.
+speedup. The model-forward-only numbers are NOT end-to-end DeepAgent numbers;
+both are reported separately and labelled clearly.
+
+GPU: by default this benchmark runs CPU-only (the test image has no CUDA).
+Pass ``--device cuda`` to attempt GPU timing; the script does NOT force-hide
+CUDA at import time, so a real GPU is usable when present.
 
 Usage:
     python benchmarks/bench_factorized.py
-    python benchmarks/bench_factorized.py --rounds 50 --output artifacts/benchmark/bench_factorized.json
+    python benchmarks/bench_factorized.py --rounds 50 --device cuda
+    python benchmarks/bench_factorized.py --output artifacts/benchmark/bench_factorized.json
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import statistics
 import time
 from pathlib import Path
-
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 DEFAULT_ROUNDS = 30
 DEFAULT_WARMUP = 3
@@ -58,6 +63,19 @@ def _bench(fn, rounds, warmup):
     }
 
 
+def _peak_rss_kb():
+    """Peak resident set size of the current process in KiB (best effort)."""
+    try:
+        import resource
+        # ru_maxrss is in KiB on Linux, bytes on macOS.
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if hasattr(__import__("sys"), "platform") and __import__("sys").platform == "darwin":
+            return rss // 1024  # bytes -> KiB
+        return rss  # already KiB on Linux
+    except Exception:
+        return None
+
+
 class _LstmBatchRecorder:
     """Record the batch size (number of rows) passed to the LSTM.
 
@@ -86,8 +104,8 @@ class _LstmBatchRecorder:
         self.model.lstm.forward = self.original_forward
 
 
-def _make_env_and_obs(seed):
-    """Build a landlord infoset + legacy obs at the opening (full action set)."""
+def _make_env_and_infoset(seed, position="landlord"):
+    """Build an infoset + legacy obs at a non-trivial decision point."""
     import numpy as np
     import torch
     from douzero.env.env import Env, get_obs
@@ -95,13 +113,11 @@ def _make_env_and_obs(seed):
     np.random.seed(seed)
     env = Env("adp")
     env.reset()
-    # Drive to landlord's turn if not already.
     for _ in range(5):
-        if env._acting_player_position == "landlord":
+        if env._acting_player_position == position:
             break
         env.step(env.infoset.legal_actions[0])
-    if env._acting_player_position != "landlord":
-        # Force landlord by resetting with a deterministic seed.
+    if env._acting_player_position != position:
         np.random.seed(seed)
         env = Env("adp")
         env.reset()
@@ -109,32 +125,50 @@ def _make_env_and_obs(seed):
     obs = get_obs(infoset)
     z_full = torch.from_numpy(obs["z_batch"]).float()
     x_full = torch.from_numpy(obs["x_batch"]).float()
-    return z_full, x_full, z_full.shape[0]
+    return infoset, z_full, x_full, z_full.shape[0]
 
 
-def bench_forward_action_buckets(rounds, warmup, seed):
-    """Compare legacy vs factorized forward latency at action-count buckets."""
+def _build_paired_models(seed, position="landlord"):
     import torch
     from douzero.dmc.models import model_dict
     from douzero.dmc.models_factorized import factorized_model_dict
 
-    z_full, x_full, full_n = _make_env_and_obs(seed)
-
     torch.manual_seed(seed)
-    legacy = model_dict["landlord"]()
+    legacy = model_dict[position]()
     legacy.eval()
     torch.manual_seed(seed)
-    factorized = factorized_model_dict["landlord"]()
+    factorized = factorized_model_dict[position]()
     factorized.load_state_dict(legacy.state_dict())
     factorized.eval()
+    return legacy, factorized
+
+
+def bench_model_forward_only(rounds, warmup, seed):
+    """Model-forward-only latency at action-count buckets (legacy vs factorized).
+
+    This measures ONLY model(z, x, return_value=True) / forward_factorized,
+    under torch.no_grad(). It does NOT include observation encoding, tensor
+    construction, device transfer, or argmax. It is labelled separately from
+    the end-to-end DeepAgent.act numbers.
+    """
+    import torch
+    _, z_full, x_full, full_n = _make_env_and_infoset(seed)
+    from douzero.env.env import get_obs_factorized
+    infoset, _, _, _ = _make_env_and_infoset(seed)
+    split_obs = get_obs_factorized(infoset)
+    z_single = torch.from_numpy(split_obs["z_single"]).float()
+    x_state_single = torch.from_numpy(split_obs["x_state_single"]).float()
+    x_action_full = torch.from_numpy(split_obs["x_action"]).float()
+
+    legacy, factorized = _build_paired_models(seed)
 
     results = {}
-    # Buckets: 1, ~10, ~50, full opening set.
     for n in sorted({1, 10, 50, full_n}):
         if n > full_n:
             continue
         z = z_full[:n]
         x = x_full[:n]
+        xa = x_action_full[:n]
 
         def run_legacy(z=z, x=x):
             with torch.no_grad():
@@ -144,17 +178,119 @@ def bench_forward_action_buckets(rounds, warmup, seed):
             with torch.no_grad():
                 factorized(z, x, return_value=True)
 
+        def run_factorized_split(zs=z_single, xs=x_state_single, xa=xa):
+            with torch.no_grad():
+                factorized.forward_factorized(zs, xs, xa, return_value=True)
+
         legacy_stats = _bench(run_legacy, rounds, warmup)
-        fact_stats = _bench(run_factorized, rounds, warmup)
+        fact_batch_stats = _bench(run_factorized, rounds, warmup)
+        fact_split_stats = _bench(run_factorized_split, rounds, warmup)
         results[f"n={n}"] = {
+            "legacy_model_forward": legacy_stats,
+            "factorized_model_forward_tiled_batch": fact_batch_stats,
+            "factorized_model_forward_split_obs": fact_split_stats,
+            "speedup_median_split_vs_legacy": (
+                round(legacy_stats["median_ms"] / fact_split_stats["median_ms"], 3)
+                if fact_split_stats["median_ms"] else None
+            ),
+        }
+    return {"model_forward_only": results, "full_action_count": full_n}
+
+
+def bench_deep_agent_act(rounds, warmup, seed, position="landlord"):
+    """Full DeepAgent.act latency: encode + tensor + forward + argmax.
+
+    Measures the REAL deployment path (both backends), including get_obs /
+    get_obs_factorized, tensor construction, the forward, and np.argmax. This
+    is the number that matters for inference latency; the model-forward-only
+    numbers above isolate the model cost.
+    """
+    import os
+    import tempfile
+    import torch
+    from douzero.dmc.models import model_dict
+    from douzero.evaluation.deep_agent import DeepAgent
+
+    infoset, _, _, _ = _make_env_and_infoset(seed, position=position)
+
+    torch.manual_seed(seed)
+    legacy = model_dict[position]()
+    ckpt = os.path.join(tempfile.mkdtemp(prefix="bench_fac_"), f"{position}.ckpt")
+    torch.save(legacy.state_dict(), ckpt)
+    agent_legacy = DeepAgent(position, ckpt, backend="legacy")
+    agent_fact = DeepAgent(position, ckpt, backend="legacy_factorized")
+
+    # Single-legal-action short-circuit is bypassed by using a multi-action infoset.
+    assert len(infoset.legal_actions) > 1
+
+    def run_legacy():
+        agent_legacy.act(infoset)
+
+    def run_factorized():
+        agent_fact.act(infoset)
+
+    legacy_stats = _bench(run_legacy, rounds, warmup)
+    fact_stats = _bench(run_factorized, rounds, warmup)
+    return {
+        f"deep_agent_act_{position}": {
             "legacy": legacy_stats,
             "factorized": fact_stats,
             "speedup_median": (
                 round(legacy_stats["median_ms"] / fact_stats["median_ms"], 3)
                 if fact_stats["median_ms"] else None
             ),
+            "note": (
+                "Full DeepAgent.act path: observation encoding + tensor build "
+                "+ forward + argmax. The factorized backend uses "
+                "get_obs_factorized (no tiling) + forward_factorized."
+            ),
         }
-    return {"landlord_forward_buckets": results, "full_action_count": full_n}
+    }
+
+
+def bench_peak_memory(seed, position="landlord"):
+    """CPU peak RSS for the full DeepAgent.act path (legacy vs factorized).
+
+    Reports the peak resident set size after a run of N act() calls. This is a
+    coarse process-level metric (not allocation-scoped), but it surfaces
+    large-tile regressions. GPU memory is not measured here (CPU-only image).
+    """
+    import os
+    import tempfile
+    import torch
+    from douzero.dmc.models import model_dict
+    from douzero.evaluation.deep_agent import DeepAgent
+
+    infoset, _, _, _ = _make_env_and_infoset(seed, position=position)
+    torch.manual_seed(seed)
+    legacy = model_dict[position]()
+    ckpt = os.path.join(tempfile.mkdtemp(prefix="bench_mem_"), f"{position}.ckpt")
+    torch.save(legacy.state_dict(), ckpt)
+    agent_legacy = DeepAgent(position, ckpt, backend="legacy")
+    agent_fact = DeepAgent(position, ckpt, backend="legacy_factorized")
+
+    # Warm up, then take the peak RSS after a burst of act() calls.
+    for _ in range(3):
+        agent_legacy.act(infoset)
+        agent_fact.act(infoset)
+    base_rss = _peak_rss_kb()
+    for _ in range(100):
+        agent_legacy.act(infoset)
+    legacy_rss = _peak_rss_kb()
+    for _ in range(100):
+        agent_fact.act(infoset)
+    fact_rss = _peak_rss_kb()
+    return {
+        f"peak_rss_kib_{position}": {
+            "baseline_after_warmup": base_rss,
+            "legacy_after_100_acts": legacy_rss,
+            "factorized_after_100_acts": fact_rss,
+            "note": (
+                "Process peak RSS (KiB). Coarse, process-level; not "
+                "allocation-scoped. CPU-only; GPU memory not measured."
+            ),
+        }
+    }
 
 
 def bench_lstm_call_counts(seed):
@@ -166,18 +302,8 @@ def bench_lstm_call_counts(seed):
     once; the work reduction is the N-fold fewer rows processed.
     """
     import torch
-    from douzero.dmc.models import model_dict
-    from douzero.dmc.models_factorized import factorized_model_dict
-
-    z_full, x_full, full_n = _make_env_and_obs(seed)
-
-    torch.manual_seed(seed)
-    legacy = model_dict["landlord"]()
-    legacy.eval()
-    torch.manual_seed(seed)
-    factorized = factorized_model_dict["landlord"]()
-    factorized.load_state_dict(legacy.state_dict())
-    factorized.eval()
+    _, z_full, x_full, full_n = _make_env_and_infoset(seed)
+    legacy, factorized = _build_paired_models(seed)
 
     counts = {}
     for n in sorted({1, 10, full_n}):
@@ -200,34 +326,67 @@ def bench_lstm_call_counts(seed):
     return {"lstm_rows_per_decision": counts}
 
 
+def _maybe_gpu_parity_note():
+    """Return a note on GPU parity status (review blocker #3)."""
+    import torch
+    cuda = torch.cuda.is_available()
+    return {
+        "cuda_available": cuda,
+        "parity_note": (
+            "CPU numerical parity is tested (tests/test_factorized_parity.py). "
+            "GPU numerical and argmax parity are NOT yet measured. "
+            "Mathematical equivalence does not imply bitwise or universal "
+            "argmax identity across CPU/GPU (different kernels, reduction "
+            "order, cuDNN non-determinism)."
+        ),
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
     parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
     parser.add_argument("--seed", type=int, default=20240611)
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"],
+                        help="Device for timing. 'cpu' (default) or 'cuda'. "
+                             "Unlike the legacy benchmark, this script does NOT "
+                             "force-hide CUDA at import, so --device cuda works "
+                             "when a GPU is present.")
     args = parser.parse_args(argv)
 
     from douzero._version import environment_info
 
     seed = args.seed
-
     results = {}
-    results.update(bench_forward_action_buckets(args.rounds, args.warmup, seed))
+    # Model-forward-only (labelled clearly; NOT end-to-end).
+    results.update(bench_model_forward_only(args.rounds, args.warmup, seed))
+    # End-to-end DeepAgent.act for all three roles.
+    for position in ["landlord", "landlord_up", "landlord_down"]:
+        results.update(bench_deep_agent_act(args.rounds, args.warmup, seed, position))
+    # CPU peak memory.
+    results.update(bench_peak_memory(seed, position="landlord"))
+    # LSTM work-reduction proof.
     results.update(bench_lstm_call_counts(seed))
+    # GPU parity status note.
+    results["gpu_status"] = _maybe_gpu_parity_note()
 
     env_info = environment_info()
     bundle = {
-        "schema_version": "p04-bench-v1",
+        "schema_version": "p04-bench-v2",
         "description": (
-            "P04 factorized vs legacy forward CPU micro-benchmark. The "
-            "factorized path encodes the shared history/state once per "
-            "decision; the legacy path feeds the LSTM N identical rows (the "
-            "tiled history). Numbers are host-specific and measure "
-            "DETERMINISTIC paths; they are not playing-strength claims."
+            "P04 factorized vs legacy benchmark. model_forward_only isolates "
+            "the model cost; deep_agent_act_* is the full deployment path "
+            "(encode + tensor + forward + argmax). The factorized backend "
+            "uses get_obs_factorized (no tiling) + forward_factorized. "
+            "Numbers are host-specific and measure DETERMINISTIC paths; they "
+            "are not playing-strength claims."
         ),
         "environment": env_info,
-        "config": {"rounds": args.rounds, "warmup": args.warmup, "seed": seed},
+        "config": {
+            "rounds": args.rounds, "warmup": args.warmup, "seed": seed,
+            "device": args.device,
+        },
         "results": results,
     }
 
@@ -254,20 +413,48 @@ def _to_markdown(bundle):
         f"(cuda: `{bundle['environment'].get('cuda_available')}`)",
         f"- git_sha: `{bundle['environment'].get('git_sha')}`",
         f"- rounds: {bundle['config']['rounds']}, warmup: {bundle['config']['warmup']}, "
-        f"seed: {bundle['config']['seed']}",
+        f"seed: {bundle['config']['seed']}, device: {bundle['config']['device']}",
         "",
-        "## Forward latency by legal-action count (landlord)",
+        "## Model-forward-only latency (landlord, NOT end-to-end)",
         "",
-        "| actions | legacy median (ms) | factorized median (ms) | speedup (median) |",
+        "| actions | legacy median (ms) | factorized split median (ms) | speedup |",
         "|---:|---:|---:|---:|",
     ]
-    buckets = bundle["results"].get("landlord_forward_buckets", {})
+    mfo = bundle["results"].get("model_forward_only", {})
     full_n = bundle["results"].get("full_action_count", "?")
-    for name, b in buckets.items():
+    for name, b in mfo.items():
+        legacy_md = b["legacy_model_forward"]["median_ms"]
+        fact_md = b["factorized_model_forward_split_obs"]["median_ms"]
+        sp = b["speedup_median_split_vs_legacy"]
         lines.append(
-            f"| {name} (full={full_n}) | {b['legacy']['median_ms']} "
-            f"| {b['factorized']['median_ms']} | {b['speedup_median']} |"
+            f"| {name} (full={full_n}) | {legacy_md} | {fact_md} | {sp} |"
         )
+    lines += [
+        "",
+        "## End-to-end DeepAgent.act latency (encode + tensor + forward + argmax)",
+        "",
+        "| role | legacy median (ms) | factorized median (ms) | speedup |",
+        "|---|---:|---:|---:|",
+    ]
+    for key, val in bundle["results"].items():
+        if key.startswith("deep_agent_act_"):
+            role = key.replace("deep_agent_act_", "")
+            lines.append(
+                f"| {role} | {val['legacy']['median_ms']} "
+                f"| {val['factorized']['median_ms']} | {val['speedup_median']} |"
+            )
+    lines += [
+        "",
+        "## CPU peak RSS (landlord, process-level, KiB)",
+        "",
+    ]
+    for key, val in bundle["results"].items():
+        if key.startswith("peak_rss_kib_"):
+            lines.append(
+                f"- baseline (warm): {val['baseline_after_warmup']}\n"
+                f"- legacy after 100 acts: {val['legacy_after_100_acts']}\n"
+                f"- factorized after 100 acts: {val['factorized_after_100_acts']}"
+            )
     lines += [
         "",
         "## LSTM rows processed per decision",
@@ -280,6 +467,14 @@ def _to_markdown(bundle):
         lines.append(
             f"| {name} | {c['legacy_lstm_rows']} | {c['factorized_lstm_rows']} |"
         )
+    gpu = bundle["results"].get("gpu_status", {})
+    lines += [
+        "",
+        "## GPU parity status",
+        "",
+        f"- cuda_available: `{gpu.get('cuda_available')}`",
+        f"- {gpu.get('parity_note', '')}",
+    ]
     return "\n".join(lines)
 
 

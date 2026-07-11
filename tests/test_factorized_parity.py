@@ -510,3 +510,311 @@ def test_split_legacy_batch_rejects_unknown_position():
     x = torch.zeros(3, 373)
     with pytest.raises(ValueError, match="position"):
         split_legacy_batch("bogus", z, x)
+
+
+# --------------------------------------------------------------------------- #
+# get_obs_factorized — the split observation encoder (no tiling)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("position", POSITIONS)
+def test_get_obs_factorized_state_matches_legacy_x_no_action(position, seed_factory):
+    """The split encoder's shared state must equal the legacy x_no_action."""
+    from douzero.env.env import get_obs_factorized
+
+    seed_factory(1000 + POSITIONS.index(position))
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+    legacy_obs = get_obs(infoset)
+    split_obs = get_obs_factorized(infoset)
+    np.testing.assert_array_equal(
+        split_obs["x_no_action"], legacy_obs["x_no_action"],
+        err_msg=f"x_no_action mismatch for {position}",
+    )
+    # x_state_single is the float32 singleton view of the same vector.
+    np.testing.assert_array_equal(
+        split_obs["x_state_single"][0].astype(np.int8),
+        legacy_obs["x_no_action"],
+        err_msg=f"x_state_single mismatch for {position}",
+    )
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+def test_get_obs_factorized_history_matches_legacy_z(position, seed_factory):
+    """The split encoder's singleton history must equal the legacy z."""
+    from douzero.env.env import get_obs_factorized
+
+    seed_factory(1010 + POSITIONS.index(position))
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+    legacy_obs = get_obs(infoset)
+    split_obs = get_obs_factorized(infoset)
+    np.testing.assert_array_equal(
+        split_obs["z"], legacy_obs["z"],
+        err_msg=f"z mismatch for {position}",
+    )
+    np.testing.assert_array_equal(
+        split_obs["z_single"][0].astype(np.int8), legacy_obs["z"],
+        err_msg=f"z_single mismatch for {position}",
+    )
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+def test_get_obs_factorized_action_matrix_matches_legacy(position, seed_factory):
+    """The split encoder's (N,54) action matrix must equal legacy x_batch[:,-54:]."""
+    from douzero.env.env import get_obs_factorized
+
+    seed_factory(1020 + POSITIONS.index(position))
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+    legacy_obs = get_obs(infoset)
+    split_obs = get_obs_factorized(infoset)
+    n = len(infoset.legal_actions)
+    assert split_obs["x_action"].shape == (n, 54)
+    np.testing.assert_array_equal(
+        split_obs["x_action"].astype(np.int8),
+        legacy_obs["x_batch"][:, -54:].astype(np.int8),
+        err_msg=f"action matrix mismatch for {position}",
+    )
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+def test_get_obs_factorized_shapes(position, seed_factory):
+    """The split encoder must produce singleton shared blocks + (N,54) actions."""
+    from douzero.env.env import get_obs_factorized
+
+    seed_factory(1030 + POSITIONS.index(position))
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+    split_obs = get_obs_factorized(infoset)
+    n = len(infoset.legal_actions)
+    assert split_obs["z_single"].shape == (1, 5, 162)
+    expected_state = 319 if position == "landlord" else 430
+    assert split_obs["x_state_single"].shape == (1, expected_state)
+    assert split_obs["x_action"].shape == (n, 54)
+    assert split_obs["legal_actions"] == infoset.legal_actions
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+def test_get_obs_factorized_forward_matches_legacy(position, seed_factory):
+    """End-to-end: split obs + forward_factorized == legacy forward."""
+    from douzero.env.env import get_obs_factorized
+
+    seed_factory(1040 + POSITIONS.index(position))
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+    legacy_obs = get_obs(infoset)
+    split_obs = get_obs_factorized(infoset)
+    z, x = _to_tensors(legacy_obs)
+
+    legacy, factorized = _build_paired_models(position)
+    z_single = torch.from_numpy(split_obs["z_single"]).float()
+    x_state_single = torch.from_numpy(split_obs["x_state_single"]).float()
+    x_action = torch.from_numpy(split_obs["x_action"]).float()
+    with torch.no_grad():
+        legacy_vals = legacy(z, x, return_value=True)["values"]
+        fact_vals = factorized.forward_factorized(
+            z_single, x_state_single, x_action, return_value=True
+        )["values"]
+    assert torch.allclose(legacy_vals, fact_vals, atol=ATOL, rtol=RTOL), (
+        f"split-obs parity mismatch for {position} (N={z.shape[0]}): "
+        f"max abs diff = {(legacy_vals - fact_vals).abs().max().item()}"
+    )
+
+
+def test_get_obs_factorized_never_tiles_state_into_n_rows(seed_factory):
+    """The split encoder must NOT allocate an (N, D_state) tiled block.
+
+    This is the core P04 observation-side de-duplication property. The shared
+    state is a singleton (1, D_state); only the per-action matrix carries N.
+    """
+    from douzero.env.env import get_obs_factorized
+
+    seed_factory(1050)
+    env = Env("adp")
+    infoset = _drive_to_position(env, "landlord")
+    split_obs = get_obs_factorized(infoset)
+    # The shared state has NO N dimension.
+    assert split_obs["x_state_single"].shape[0] == 1
+    assert split_obs["z_single"].shape[0] == 1
+    # Only the action matrix has the N dimension.
+    n = len(infoset.legal_actions)
+    assert split_obs["x_action"].shape[0] == n
+
+
+# --------------------------------------------------------------------------- #
+# Input invariant enforcement (review blocker #4)
+# --------------------------------------------------------------------------- #
+def _make_tiled_batch(position, n, seed=42):
+    """Build a correctly-tiled legacy batch (rows identical) for validation tests."""
+    seed_factory = None
+    np.random.seed(seed)
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+    obs = get_obs(infoset)
+    z = torch.from_numpy(obs["z_batch"]).float()
+    x = torch.from_numpy(obs["x_batch"]).float()
+    return z[:n], x[:n], infoset
+
+
+def test_forward_rejects_non_identical_z_rows():
+    """forward() must raise when z_batch rows are NOT identical (silent-failure guard)."""
+    z, x, _ = _make_tiled_batch("landlord", 4)
+    # Corrupt row 1 of z so rows are no longer identical.
+    z_bad = z.clone()
+    z_bad[1, 0, 0] = z_bad[1, 0, 0] + 1.0
+    _, factorized = _build_paired_models("landlord")
+    with pytest.raises(ValueError, match="rows are NOT identical"):
+        factorized(z_bad, x, return_value=True)
+
+
+def test_forward_rejects_non_identical_state_rows():
+    """forward() must raise when the x_batch state-block rows are NOT identical."""
+    z, x, _ = _make_tiled_batch("landlord", 4)
+    # Corrupt row 1's state block (not the action block) so state rows differ.
+    x_bad = x.clone()
+    x_bad[1, 0] = x_bad[1, 0] + 1.0  # state block starts at column 0
+    _, factorized = _build_paired_models("landlord")
+    with pytest.raises(ValueError, match="state block"):
+        factorized(z, x_bad, return_value=True)
+
+
+def test_forward_accepts_correctly_tiled_batch():
+    """forward() must accept a correctly-tiled legacy batch (the happy path)."""
+    z, x, _ = _make_tiled_batch("landlord", 5)
+    _, factorized = _build_paired_models("landlord")
+    with torch.no_grad():
+        vals = factorized(z, x, return_value=True)["values"]
+    assert vals.shape == (5, 1)
+
+
+def test_forward_rejects_wrong_z_ndim():
+    _, factorized = _build_paired_models("landlord")
+    z = torch.zeros(5, 162)  # 2D, not 3D
+    x = torch.zeros(5, 373)
+    with pytest.raises(ValueError, match="ndim"):
+        factorized(z, x, return_value=True)
+
+
+def test_forward_rejects_row_count_mismatch():
+    _, factorized = _build_paired_models("landlord")
+    z = torch.zeros(5, 5, 162)
+    x = torch.zeros(4, 373)  # N=4 != z's N=5
+    with pytest.raises(ValueError, match="row count"):
+        factorized(z, x, return_value=True)
+
+
+def test_forward_rejects_wrong_x_width():
+    _, factorized = _build_paired_models("landlord")
+    z = torch.zeros(3, 5, 162)
+    x = torch.zeros(3, 200)  # wrong width (expected 373)
+    with pytest.raises(ValueError, match="x_batch.shape"):
+        factorized(z, x, return_value=True)
+
+
+def test_forward_rejects_n_zero():
+    _, factorized = _build_paired_models("landlord")
+    z = torch.zeros(0, 5, 162)
+    x = torch.zeros(0, 373)
+    with pytest.raises(ValueError, match="N>=1"):
+        factorized(z, x, return_value=True)
+
+
+def test_forward_factorized_rejects_non_singleton_z():
+    _, factorized = _build_paired_models("landlord")
+    z = torch.zeros(3, 5, 162)  # not a singleton
+    x_state = torch.zeros(1, 319)
+    x_action = torch.zeros(3, 54)
+    with pytest.raises(ValueError, match="z_single"):
+        factorized.forward_factorized(z, x_state, x_action, return_value=True)
+
+
+def test_forward_factorized_rejects_wrong_state_width():
+    _, factorized = _build_paired_models("landlord")
+    z = torch.zeros(1, 5, 162)
+    x_state = torch.zeros(1, 100)  # expected 319
+    x_action = torch.zeros(3, 54)
+    with pytest.raises(ValueError, match="x_state_single"):
+        factorized.forward_factorized(z, x_state, x_action, return_value=True)
+
+
+def test_forward_factorized_rejects_wrong_action_width():
+    _, factorized = _build_paired_models("landlord")
+    z = torch.zeros(1, 5, 162)
+    x_state = torch.zeros(1, 319)
+    x_action = torch.zeros(3, 40)  # expected 54
+    with pytest.raises(ValueError, match="x_action"):
+        factorized.forward_factorized(z, x_state, x_action, return_value=True)
+
+
+# --------------------------------------------------------------------------- #
+# DeepAgent factorized backend uses the split path (no tiled batch)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("position", POSITIONS)
+def test_deepagent_factorized_uses_split_observation(position, seed_factory, tmp_path):
+    """The factorized DeepAgent must call forward_factorized, not the tiled forward.
+
+    Patches forward_factorized and the legacy forward to prove the split path
+    is taken and the tiled (N, ...) batch is never built for the model.
+    """
+    from douzero.evaluation.deep_agent import DeepAgent
+
+    seed_factory(1060 + POSITIONS.index(position))
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+
+    ckpt_legacy, ckpt_fact = _save_paired_ckpts(position, 888, tmp_path)
+    agent = DeepAgent(position, ckpt_fact, backend="legacy_factorized")
+
+    called_factorized = {"count": 0}
+    called_legacy = {"count": 0}
+    orig_factorized = agent.model.forward_factorized
+    orig_forward = agent.model.forward
+
+    def _spy_factorized(*args, **kwargs):
+        called_factorized["count"] += 1
+        return orig_factorized(*args, **kwargs)
+
+    def _spy_forward(*args, **kwargs):
+        called_legacy["count"] += 1
+        return orig_forward(*args, **kwargs)
+
+    agent.model.forward_factorized = _spy_factorized
+    agent.model.forward = _spy_forward
+    try:
+        action = agent.act(infoset)
+    finally:
+        agent.model.forward_factorized = orig_factorized
+        agent.model.forward = orig_forward
+
+    assert called_factorized["count"] == 1, "factorized backend must call forward_factorized"
+    assert called_legacy["count"] == 0, "factorized backend must not call the tiled forward"
+    assert action in infoset.legal_actions
+
+
+@pytest.mark.parametrize("position", POSITIONS)
+def test_deepagent_factorized_matches_legacy_split_path(position, seed_factory, tmp_path):
+    """DeepAgent factorized (split obs) selects the same action as legacy backend."""
+    from douzero.evaluation.deep_agent import DeepAgent
+
+    seed_factory(1070 + POSITIONS.index(position))
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+    ckpt_legacy, ckpt_fact = _save_paired_ckpts(position, 999, tmp_path)
+    agent_legacy = DeepAgent(position, ckpt_legacy, backend="legacy")
+    agent_fact = DeepAgent(position, ckpt_fact, backend="legacy_factorized")
+    assert agent_legacy.act(infoset) == agent_fact.act(infoset)
+
+
+def test_deepagent_legacy_uses_inference_mode(seed_factory, tmp_path):
+    """The legacy backend must run under torch.inference_mode (no autograd graph)."""
+    from douzero.evaluation.deep_agent import DeepAgent
+
+    seed_factory(1080)
+    env = Env("adp")
+    infoset = _drive_to_position(env, "landlord")
+    ckpt_legacy, _ = _save_paired_ckpts("landlord", 111, tmp_path)
+    agent = DeepAgent("landlord", ckpt_legacy, backend="legacy")
+    # Under inference_mode, requires_grad is False for new tensors.
+    with torch.inference_mode():
+        _ = agent.act(infoset)
+    # The call must not have left autograd tracking on the model's params.
+    assert all(not p.requires_grad or p.grad is None for p in agent.model.parameters())

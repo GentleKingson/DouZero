@@ -150,7 +150,7 @@ class _LegacyFactorizedBase(nn.Module):
             raise ValueError(
                 f"factorized forward expects x_batch.shape[1]=="
                 f"{expected_x_width} (state_width {self._state_width} + "
-                f"action {self._ACTION_WIDTH}), got {x_batch.shape[1]}."
+                f"action {_ACTION_WIDTH}), got {x_batch.shape[1]}."
             )
         # Shared-row invariant: all rows of z_batch must be identical, and all
         # rows of the state block of x_batch must be identical. This is cheap
