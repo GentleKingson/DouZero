@@ -76,7 +76,7 @@ First, clone the repo with (if you are in China and Github is slow, you can use 
 ```
 git clone https://github.com/kwai/DouZero.git
 ```
-Make sure you have python 3.6+ installed. Install dependencies:
+Make sure you have python 3.11+ installed. Install dependencies:
 ```
 cd douzero
 pip3 install -r requirements.txt
@@ -94,6 +94,16 @@ or install the up-to-date version (it could be not stable) with
 pip3 install -e .
 ```
 Note that Windows users can only use CPU as actors. See [Issues in Windows](README.md#issues-in-windows) about why GPUs are not supported. Nonetheless, Windows users can still [run the demo locally](https://github.com/datamllab/rlcard-showdown).  
+
+## Project documentation
+
+Engineering docs live under [`docs/`](docs/):
+
+- [Architecture (current)](docs/architecture/current.md) — the legacy baseline reference.
+- [Reproducibility](docs/reproducibility.md) — seeding, the determinism contract, and the CI Python matrix.
+- [Configuration](docs/configuration.md) — the typed config system and `--config` YAML support.
+- [Packaging](docs/packaging.md) — Python support policy and dependencies.
+- [Checkpoint compatibility](docs/checkpoint_compatibility.md) — the versioned checkpoint manifest.
 
 ## Training
 To use GPU for training, run

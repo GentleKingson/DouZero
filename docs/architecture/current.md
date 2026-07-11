@@ -241,10 +241,11 @@ The legacy baseline deliberately omits several things AGENTS.md requires:
   and the response-collapse test
   `test_quad_wing_wrong_move_collapses_response_to_bomb_or_pass`.
   (→ P02 rule engine should reconcile generator and detector.)
-- **`file_writer.py` imports `git` (GitPython) at module load.** `train.py`
-  imports `dmc` → `file_writer` → `git`, so the `git` *binary* must be on PATH
-  or `train.py --help` raises `ImportError`. This is why the P00 Docker image
-  installs `git`. (→ P01 may make this import lazy.)
+- ~~**`file_writer.py` imports `git` (GitPython) at module load.**~~ **Resolved
+  in P01:** the `import git` is now lazy (inside `gather_metadata`), GitPython
+  is declared in `install_requires`, and `import douzero.dmc` / `train.py
+  --help` work without GitPython. Actual training still needs the `git` binary
+  for run-metadata stamping (the P00 Docker image still installs it).
 
 ## 11. Interface boundaries later phases must respect
 

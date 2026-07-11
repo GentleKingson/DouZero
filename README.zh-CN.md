@@ -74,7 +74,7 @@ Zha, Daochen et al. “DouZero: Mastering DouDizhu with Self-Play Deep Reinforce
 git clone https://github.com/kwai/DouZero.git
 ```
 
-确保您已经安装好Python 3.6及以上版本，然后安装依赖：
+确保您已经安装好Python 3.11及以上版本，然后安装依赖：
 ```
 cd douzero
 pip3 install -r requirements.txt
