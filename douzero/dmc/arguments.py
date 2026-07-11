@@ -6,13 +6,18 @@ parser = argparse.ArgumentParser(description='DouZero: PyTorch DouDizhu AI')
 parser.add_argument('--xpid', default='douzero',
                     help='Experiment id (default: douzero)')
 parser.add_argument('--save_interval', default=30, type=int,
-                    help='Time interval (in minutes) at which to save the model')    
+                    help='Time interval (in minutes) at which to save the model')
 parser.add_argument('--objective', default='adp', type=str, choices=['adp', 'wp', 'logadp'],
-                    help='Use ADP or WP as reward (default: ADP)')    
+                    help='Use ADP or WP as reward (default: ADP)')
 
 # Training settings
-parser.add_argument('--actor_device_cpu', action='store_true',
-                    help='Use CPU as actor device')
+# Item 5: boolean flags use BooleanOptionalAction so that a YAML ``true`` can be
+# overridden to ``false`` from the CLI via ``--no-<flag>``. The positive form
+# ``--<flag>`` is unchanged from the legacy ``store_true`` behavior (sets True),
+# so existing scripts and docs keep working. Default remains False for all four.
+parser.add_argument('--actor_device_cpu', action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help='Use CPU as actor device (--no-actor_device_cpu forces False)')
 parser.add_argument('--gpu_devices', default='0', type=str,
                     help='Which GPUs to be used for training')
 parser.add_argument('--num_actor_devices', default=1, type=int,
@@ -21,10 +26,12 @@ parser.add_argument('--num_actors', default=5, type=int,
                     help='The number of actors for each simulation device')
 parser.add_argument('--training_device', default='0', type=str,
                     help='The index of the GPU used for training models. `cpu` means using cpu')
-parser.add_argument('--load_model', action='store_true',
-                    help='Load an existing model')
-parser.add_argument('--disable_checkpoint', action='store_true',
-                    help='Disable saving checkpoint')
+parser.add_argument('--load_model', action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help='Load an existing model (--no-load_model forces False)')
+parser.add_argument('--disable_checkpoint', action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help='Disable saving checkpoint (--no-disable_checkpoint forces False)')
 parser.add_argument('--savedir', default='douzero_checkpoints',
                     help='Root dir where experiment data will be saved')
 
@@ -60,8 +67,10 @@ parser.add_argument('--config', default='', type=str,
                     help='Optional path to a YAML config file (P01). CLI flags override the file.')
 parser.add_argument('--seed', default=0, type=int,
                     help='Base RNG seed (P01). 0 = legacy behavior (unseeded).')
-parser.add_argument('--deterministic', action='store_true',
-                    help='Force deterministic torch algorithms (P01). Off by default.')
+parser.add_argument('--deterministic', action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help='Force deterministic torch algorithms (P01). Off by default '
+                         '(--no-deterministic forces False).')
 parser.add_argument('--feature_version', default='legacy', type=str, choices=['legacy'],
                     help='Observation feature version (P01). Only "legacy" is supported in P01.')
 parser.add_argument('--ruleset', default='legacy', type=str, choices=['legacy'],
@@ -84,6 +93,15 @@ def _build_override_parser():
     for action in parser._actions:
         if action.dest == "help":
             continue
+        # BooleanOptionalAction: re-register as BooleanOptionalAction with
+        # default=SUPPRESS so both --flag (True) and --no-flag (False) appear
+        # only when the user typed them. This is what lets a CLI --no-<flag>
+        # override a YAML true (item 5).
+        if isinstance(action, _ap.BooleanOptionalAction):
+            op.add_argument(*action.option_strings,
+                            action=_ap.BooleanOptionalAction,
+                            dest=action.dest, default=_ap.SUPPRESS)
+            continue
         # Re-register each option string with default=SUPPRESS.
         kwargs = {"default": _ap.SUPPRESS}
         if action.type is not None:
@@ -93,7 +111,7 @@ def _build_override_parser():
         if action.const is not None and not action.option_strings:
             continue  # positional; skip (we have none)
         if action.nargs == 0:
-            # store_true / store_false
+            # store_true / store_false (legacy non-BooleanOptionalAction flags)
             op.add_argument(*action.option_strings, action="store_true",
                             dest=action.dest, default=_ap.SUPPRESS)
         else:
