@@ -208,7 +208,7 @@ def test_identity_returns_full_rule_identity():
     ident = rs.identity()
     assert ident["ruleset_id"] == "standard"
     assert ident["ruleset_version"] == "standard-v1"
-    assert len(ident["ruleset_hash"]) == 16  # first 16 hex chars
+    assert len(ident["ruleset_hash"]) == 64  # full SHA-256
 
 
 def test_identity_differs_for_different_params():
@@ -232,6 +232,73 @@ def test_from_dict_rejects_negative_max_redeals():
 def test_from_dict_custom_max_redeals():
     rs = RuleSet.from_dict({"ruleset_id": "standard", "max_redeals": 3})
     assert rs.max_redeals == 3
+
+
+# --------------------------------------------------------------------------- #
+# Strict validation (round 3 review)
+# --------------------------------------------------------------------------- #
+def test_bid_values_unsorted_rejected():
+    """Unsorted bid_values like (3,2,1,0) must be rejected."""
+    with pytest.raises(ValueError, match="exactly"):
+        RuleSet.from_dict({"ruleset_id": "standard", "bid_values": [3, 2, 1, 0]})
+
+
+def test_bid_values_with_duplicates_rejected():
+    """Duplicate bid_values like (0,1,2,2) must be rejected."""
+    with pytest.raises(ValueError, match="exactly"):
+        RuleSet.from_dict({"ruleset_id": "standard", "bid_values": [0, 1, 2, 2]})
+
+
+def test_bid_values_out_of_range_rejected():
+    """Out-of-range bid_values like (0,1,2,99) must be rejected."""
+    with pytest.raises(ValueError, match="exactly"):
+        RuleSet.from_dict({"ruleset_id": "standard", "bid_values": [0, 1, 2, 99]})
+
+
+def test_bid_values_string_rejected():
+    """String bid_values like '2' must be rejected (no implicit conversion)."""
+    with pytest.raises(TypeError, match="ints"):
+        RuleSet.from_dict({"ruleset_id": "standard", "bid_values": ["0", "1", "2", "3"]})
+
+
+def test_bid_values_float_rejected():
+    """Float bid_values like 2.8 must be rejected."""
+    with pytest.raises(TypeError, match="ints"):
+        RuleSet.from_dict({"ruleset_id": "standard", "bid_values": [0.0, 1.0, 2.8, 3.0]})
+
+
+def test_legacy_with_bid_values_rejected():
+    """Legacy ruleset must have empty bid_values."""
+    with pytest.raises(ValueError, match="empty bid_values"):
+        RuleSet.from_dict({
+            "ruleset_id": "legacy",
+            "bidding_mode": "none",
+            "bid_values": [0, 1, 2, 3],
+        })
+
+
+def test_standard_allow_rob_rejected():
+    """allow_rob=True must be rejected for standard ruleset (not implemented)."""
+    with pytest.raises(ValueError, match="allow_rob"):
+        RuleSet.from_dict({"ruleset_id": "standard", "allow_rob": True})
+
+
+def test_standard_allow_double_rejected():
+    """allow_double=True must be rejected for standard ruleset (not implemented)."""
+    with pytest.raises(ValueError, match="allow_double"):
+        RuleSet.from_dict({"ruleset_id": "standard", "allow_double": True})
+
+
+def test_bool_field_string_rejected():
+    """A truthy string 'false' for a bool field must be rejected."""
+    with pytest.raises(TypeError, match="bool"):
+        RuleSet.from_dict({"ruleset_id": "standard", "all_pass_redeal": "false"})
+
+
+def test_ruleset_version_must_be_nonempty():
+    """ruleset_version must be a non-empty string."""
+    with pytest.raises(ValueError, match="ruleset_version"):
+        RuleSet.from_dict({"ruleset_id": "standard", "ruleset_version": ""})
 
 
 # --------------------------------------------------------------------------- #

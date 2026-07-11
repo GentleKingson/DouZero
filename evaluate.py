@@ -31,15 +31,12 @@ if __name__ == '__main__':
     os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_device
 
-    # Build a custom RuleSet from YAML if requested.
+    # Build a custom RuleSet from YAML if requested (shared loader with generate_eval_data).
     ruleset_obj = None
     if args.ruleset == 'standard':
         if args.ruleset_config:
-            from douzero.env.rules import RuleSet
-            import yaml
-            with open(args.ruleset_config, 'r', encoding='utf-8') as fh:
-                raw = yaml.safe_load(fh) or {}
-            rules_obj = RuleSet.from_dict(raw.get('rules', raw))
+            from generate_eval_data import _load_ruleset_from_config
+            ruleset_obj = _load_ruleset_from_config(args.ruleset_config)
         else:
             from douzero.env.rules import RuleSet
             ruleset_obj = RuleSet.standard()

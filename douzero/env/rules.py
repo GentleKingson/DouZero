@@ -286,13 +286,14 @@ class RuleSet:
         """Return the full rule identity for compatibility checks.
 
         Contains ``ruleset_id``, ``ruleset_version``, and ``ruleset_hash``
-        (the first 16 hex chars of ``stable_hash``). All three must match for
-        two RuleSets to be considered compatible.
+        (the full 64-char SHA-256 of ``stable_hash``). All three must match
+        for two RuleSets to be considered compatible. For log display, use
+        ``stable_hash()[:16]``.
         """
         return {
             "ruleset_id": self.ruleset_id,
             "ruleset_version": self.ruleset_version,
-            "ruleset_hash": self.stable_hash()[:16],
+            "ruleset_hash": self.stable_hash(),
         }
 
 
@@ -331,14 +332,26 @@ def _validate_ruleset(cfg: RuleSet) -> None:
             raise ValueError(
                 "score_0_1_2_3 bidding_mode requires non-empty bid_values"
             )
-        # score_0_1_2_3 must use exactly (0, 1, 2, 3) — no duplicates,
-        # no out-of-range values, must be sorted.
+        # score_0_1_2_3 must use exactly (0, 1, 2, 3) — in order, no
+        # duplicates, no out-of-range values. Compare directly (not sorted).
         expected = (0, 1, 2, 3)
-        if tuple(sorted(cfg.bid_values)) != expected:
+        if cfg.bid_values != expected:
             raise ValueError(
                 f"score_0_1_2_3 bidding_mode requires bid_values to be "
-                f"exactly {expected}, got {cfg.bid_values!r}"
+                f"exactly {expected} (in order), got {cfg.bid_values!r}"
             )
+
+    # Legacy bid_values must be empty (no bidding in legacy).
+    if cfg.ruleset_id == RULESET_LEGACY and cfg.bid_values:
+        raise ValueError(
+            f"legacy ruleset must have empty bid_values, got {cfg.bid_values!r}"
+        )
+
+    # ruleset_version must be a non-empty string.
+    if not isinstance(cfg.ruleset_version, str) or not cfg.ruleset_version:
+        raise ValueError(
+            f"ruleset_version must be a non-empty string, got {cfg.ruleset_version!r}"
+        )
 
     # Multiplier fields: positive ints (spring/anti-spring may be 0 = disabled).
     for name in ("bomb_multiplier", "rocket_multiplier"):
@@ -373,3 +386,23 @@ def _validate_ruleset(cfg: RuleSet) -> None:
         raise ValueError(
             f"max_redeals must be a positive int, got {cfg.max_redeals!r}"
         )
+
+    # Boolean fields must be real bools (not truthy strings/ints from YAML).
+    for name in ("allow_rob", "all_pass_redeal", "bid_multiplier", "allow_double"):
+        val = getattr(cfg, name)
+        if not isinstance(val, bool):
+            raise TypeError(
+                f"{name} must be a bool, got {type(val).__name__}: {val!r}"
+            )
+
+    # Standard ruleset restrictions: allow_rob and allow_double are reserved
+    # for future bidding modes and must be False until implemented.
+    if cfg.ruleset_id == RULESET_STANDARD:
+        if cfg.allow_rob:
+            raise ValueError(
+                "allow_rob=True is not yet implemented for the standard ruleset"
+            )
+        if cfg.allow_double:
+            raise ValueError(
+                "allow_double=True is not yet implemented for the standard ruleset"
+            )
