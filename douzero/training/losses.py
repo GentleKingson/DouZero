@@ -431,18 +431,34 @@ class MultiObjectiveLoss(nn.Module):
         target_win = batch_labels["target_win"]
         target_score = self._resolve_score_target(batch_labels)
 
-        # Win loss (always computed; λ=0 disables its contribution).
-        win_term = bce_win_loss(win_logit, target_win)
-        # Conditional score loss with per-sample selection (P06 r1 fix).
+        # P06 r4: skip the computation entirely when the corresponding λ is
+        # 0. This avoids (a) wasted compute on disabled terms, and (b)
+        # ``0 * NaN = NaN`` propagation when a disabled term would have
+        # produced NaN. Each disabled term is a graph-bearing zero so the
+        # total stays differentiable when at least one term is active.
+        zero = win_logit.new_zeros(())
         clamp = self.config.score_clamp if self.config.score_target_transform == SCORE_TARGET_RAW else None
-        score_term, num_win, num_loss = conditional_score_huber_loss(
-            score_if_win,
-            score_if_loss,
-            target_score,
-            target_win,
-            delta=self.config.score_delta,
-            score_clamp=clamp,
-        )
+
+        if self.config.lambda_win > 0.0:
+            win_term = bce_win_loss(win_logit, target_win)
+        else:
+            win_term = zero
+
+        if self.config.lambda_score > 0.0:
+            score_term, num_win, num_loss = conditional_score_huber_loss(
+                score_if_win,
+                score_if_loss,
+                target_score,
+                target_win,
+                delta=self.config.score_delta,
+                score_clamp=clamp,
+            )
+        else:
+            score_term = zero
+            # Still compute diagnostics for the log even when disabled.
+            win_labels = target_win.reshape(-1)
+            num_win = int((win_labels >= 0.5).sum().item())
+            num_loss = int(win_labels.shape[0]) - num_win
 
         total = self.config.lambda_win * win_term + self.config.lambda_score * score_term
 
@@ -457,7 +473,7 @@ class MultiObjectiveLoss(nn.Module):
             )
             total = total + self.config.lambda_uncertainty * unc_term
         else:
-            unc_term = win_logit.new_zeros(())
+            unc_term = zero
 
         return LossComponents(
             total=total,

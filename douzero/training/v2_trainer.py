@@ -236,6 +236,27 @@ class V2Trainer:
         self.loss_fn = MultiObjectiveLoss(loss_cfg)
         self.decision_config = decision_config or DecisionConfig()
         self.config = config or TrainerConfig()
+        # P06 r4: reject a "valid but trains nothing" configuration.
+        # (a) optimizer_steps > 0 with all loss weights at 0 produces a
+        #     zero-gradient step that silently changes nothing.
+        # (b) optimizer_steps > 0 with buffer_capacity < batch_size means
+        #     step() can never sample a minibatch and silently skips.
+        active_loss = (
+            loss_cfg.lambda_win + loss_cfg.lambda_score + loss_cfg.lambda_uncertainty
+        )
+        if self.config.optimizer_steps > 0 and active_loss == 0:
+            raise ValueError(
+                f"optimizer_steps > 0 requires at least one non-zero loss "
+                f"weight (lambda_win/lambda_score/lambda_uncertainty); got "
+                f"all zeros. A zero-loss training run would silently produce "
+                f"no parameter change."
+            )
+        if self.config.optimizer_steps > 0 and self.config.buffer_capacity < self.config.batch_size:
+            raise ValueError(
+                f"buffer_capacity ({self.config.buffer_capacity}) must be >= "
+                f"batch_size ({self.config.batch_size}) when optimizer_steps > 0; "
+                f"otherwise step() can never sample a minibatch."
+            )
         self.optimizer = torch.optim.RMSprop(
             self.model.parameters(),
             lr=self.config.learning_rate,
@@ -360,90 +381,114 @@ class V2Trainer:
         if batch is None:
             return None
 
+        # P06 r4: use try/finally so model.eval() + gradient cleanup are
+        # guaranteed even when clip_grad_norm_(error_if_nonfinite=True) or
+        # the non-finite-loss guard raises. Without this, an exception
+        # leaves the model in training mode, and subsequent self-play
+        # collection would run with dropout active.
         self.model.train()
-        # Per-decision forward; gather the chosen action's heads and
-        # CONCATENATE (not stack) so the resulting tensors are (B, 1) — the
-        # loss module rejects (B, 1, 1) with a precise error.
-        gathered_win: list[torch.Tensor] = []
-        gathered_siw: list[torch.Tensor] = []
-        gathered_sil: list[torch.Tensor] = []
-        for i, obs in enumerate(batch.observations):
-            bundle = observation_to_model_inputs(obs)
-            out = self.model(
-                bundle.state_card_vectors,
-                bundle.state_context_flat,
-                bundle.context_card_vectors,
-                bundle.context_flat,
-                bundle.history_tokens,
-                bundle.history_key_padding_mask,
-                bundle.action_features,
-                bundle.action_mask,
-                bundle.acting_role,
+        try:
+            # Per-decision forward; gather the chosen action's heads and
+            # CONCATENATE (not stack) so the resulting tensors are (B, 1).
+            gathered_win: list[torch.Tensor] = []
+            gathered_siw: list[torch.Tensor] = []
+            gathered_sil: list[torch.Tensor] = []
+            for i, obs in enumerate(batch.observations):
+                bundle = observation_to_model_inputs(obs)
+                out = self.model(
+                    bundle.state_card_vectors,
+                    bundle.state_context_flat,
+                    bundle.context_card_vectors,
+                    bundle.context_flat,
+                    bundle.history_tokens,
+                    bundle.history_key_padding_mask,
+                    bundle.action_features,
+                    bundle.action_mask,
+                    bundle.acting_role,
+                )
+                idx = int(batch.action_indices[i].item())
+                gathered_win.append(out.win_logit[idx : idx + 1])
+                gathered_siw.append(out.score_if_win[idx : idx + 1])
+                gathered_sil.append(out.score_if_loss[idx : idx + 1])
+
+            win_logit = torch.cat(gathered_win, dim=0)        # (B, 1)
+            score_if_win = torch.cat(gathered_siw, dim=0)    # (B, 1)
+            score_if_loss = torch.cat(gathered_sil, dim=0)   # (B, 1)
+            batch_labels = {
+                "target_win": batch.target_win,
+                "target_score": batch.target_score,
+                "target_log_score": batch.target_log_score,
+            }
+            components = self.loss_fn.forward_gathered(
+                win_logit, score_if_win, score_if_loss, batch_labels
             )
-            idx = int(batch.action_indices[i].item())
-            gathered_win.append(out.win_logit[idx : idx + 1])
-            gathered_siw.append(out.score_if_win[idx : idx + 1])
-            gathered_sil.append(out.score_if_loss[idx : idx + 1])
 
-        win_logit = torch.cat(gathered_win, dim=0)        # (B, 1)
-        score_if_win = torch.cat(gathered_siw, dim=0)    # (B, 1)
-        score_if_loss = torch.cat(gathered_sil, dim=0)   # (B, 1)
-        batch_labels = {
-            "target_win": batch.target_win,
-            "target_score": batch.target_score,
-            "target_log_score": batch.target_log_score,
-        }
-        components = self.loss_fn.forward_gathered(
-            win_logit, score_if_win, score_if_loss, batch_labels
-        )
+            # Fail-closed: a non-finite loss means something is wrong.
+            if not torch.isfinite(components.total):
+                raise FloatingPointError(
+                    f"V2Trainer encountered a non-finite loss "
+                    f"({float(components.total.item())!r}); refusing to take an "
+                    f"optimizer step. Check the head clamp, the target clamp, "
+                    f"and the input encoding."
+                )
 
-        # Fail-closed: a non-finite loss means something is wrong (bad
-        # weights, bad inputs, a clamp gap). Do NOT let it poison the
-        # parameters.
-        if not torch.isfinite(components.total):
+            self.optimizer.zero_grad()
+            components.total.backward()
+            # error_if_nonfinite=True so a NaN/Inf gradient raises loudly
+            # here instead of silently corrupting the optimizer state.
+            grad_norm = nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.max_grad_norm,
+                error_if_nonfinite=True,
+            )
+            self.optimizer.step()
+            self.stats.optimizer_steps += 1
+            self.stats.last_loss = components.as_log_dict()
+            self.stats.grad_norm_last_step = float(grad_norm.detach().float().item())
+            # p_win distribution diagnostics.
+            with torch.no_grad():
+                p = torch.sigmoid(win_logit).reshape(-1)
+                self.stats.p_win_mean = float(p.mean().item())
+                self.stats.p_win_std = float(p.std().item()) if p.numel() > 1 else 0.0
+                sig = torch.sigmoid(win_logit.detach())
+                self.stats.score_mean_avg = float(
+                    (sig * score_if_win.detach() + (1 - sig) * score_if_loss.detach())
+                    .mean()
+                    .item()
+                )
+            return components
+        finally:
+            # Guarantee the model returns to eval mode and gradients are
+            # cleared even on exception, so subsequent self-play collection
+            # runs without dropout and without stale .grad accumulations.
             self.model.eval()
-            raise FloatingPointError(
-                f"V2Trainer encountered a non-finite loss "
-                f"({float(components.total.item())!r}); refusing to take an "
-                f"optimizer step. Check the head clamp, the target clamp, and "
-                f"the input encoding."
-            )
-
-        self.optimizer.zero_grad()
-        components.total.backward()
-        # error_if_nonfinite=True so a NaN/Inf gradient raises loudly here
-        # instead of silently corrupting the optimizer state. The clip
-        # itself still applies when the norm is finite.
-        grad_norm = nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            self.config.max_grad_norm,
-            error_if_nonfinite=True,
-        )
-        self.optimizer.step()
-        self.stats.optimizer_steps += 1
-        self.stats.last_loss = components.as_log_dict()
-        self.stats.grad_norm_last_step = float(grad_norm.detach().float().item())
-        # p_win distribution diagnostics.
-        with torch.no_grad():
-            p = torch.sigmoid(win_logit).reshape(-1)
-            self.stats.p_win_mean = float(p.mean().item())
-            self.stats.p_win_std = float(p.std().item()) if p.numel() > 1 else 0.0
-            sig = torch.sigmoid(win_logit.detach())
-            self.stats.score_mean_avg = float(
-                (sig * score_if_win.detach() + (1 - sig) * score_if_loss.detach())
-                .mean()
-                .item()
-            )
-        self.model.eval()
-        return components
+            self.optimizer.zero_grad(set_to_none=True)
 
     def train(self) -> TrainerStats:
-        """Run the configured number of episodes + optimizer steps."""
+        """Run the configured number of episodes + optimizer steps.
+
+        P06 r4: raises :class:`RuntimeError` if fewer optimizer steps were
+        taken than requested (e.g. not enough transitions collected to fill
+        a minibatch). The caller must either collect more episodes, reduce
+        ``batch_size``, or explicitly set ``optimizer_steps=0`` for a
+        collect-only run.
+        """
         # Snapshot one parameter for the "parameters changed" smoke check.
         before = next(self.model.parameters()).detach().clone()
         self.collect_episodes()
+        steps_taken = 0
         for _ in range(self.config.optimizer_steps):
-            self.step()
+            result = self.step()
+            if result is not None:
+                steps_taken += 1
         after = next(self.model.parameters()).detach().clone()
         self.stats_last_run_changed = not torch.equal(before, after)
+        if self.config.optimizer_steps > 0 and steps_taken < self.config.optimizer_steps:
+            raise RuntimeError(
+                f"requested {self.config.optimizer_steps} optimizer steps but "
+                f"only {steps_taken} were taken "
+                f"(collected {self.stats.transitions_collected} transitions, "
+                f"batch_size={self.config.batch_size}). "
+                f"Collect more episodes or reduce batch_size."
+            )
         return self.stats
