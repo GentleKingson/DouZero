@@ -39,6 +39,7 @@ from douzero.checkpoint.manifest import (
 from douzero.checkpoint.v2 import (
     build_v2_manifest,
     load_v2_checkpoint,
+    load_v2_position_weights,
     save_v2_checkpoint,
     save_v2_position_weights,
 )
@@ -57,6 +58,7 @@ __all__ = [
     # P05: Model V2 checkpoint helpers.
     "build_v2_manifest",
     "load_v2_checkpoint",
+    "load_v2_position_weights",
     "save_v2_checkpoint",
     "save_v2_position_weights",
 ]

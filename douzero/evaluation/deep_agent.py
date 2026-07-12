@@ -185,6 +185,11 @@ class DeepAgentV2:
         self.ruleset = ruleset
         self.decision_mode = decision_mode
         self.backend = "v2"
+        # Bug #3: bind the agent to the model's feature schema hash. Every
+        # observation forwarded through act_v2 must carry the SAME schema hash,
+        # so a model trained under schema A cannot silently consume an
+        # observation encoded under schema B (even if the shapes match).
+        self._feature_schema_hash = model.schema.stable_hash()
         if torch.cuda.is_available():
             self.model.cuda()
         self.model.eval()
@@ -216,11 +221,34 @@ class DeepAgentV2:
                 f"{type(obs).__name__}"
             )
 
+        # Bug #3: schema-hash binding. The observation's feature_schema_hash
+        # must equal the model's. A mismatch means the observation was encoded
+        # under a different schema (e.g. a field reordered/resized) than the
+        # model was trained against — same shapes are NOT enough. Reject before
+        # forwarding so a mis-encoded observation cannot produce a silent
+        # garbage action.
+        if obs.feature_schema_hash != self._feature_schema_hash:
+            raise ValueError(
+                f"DeepAgentV2 schema-hash mismatch: observation has "
+                f"{obs.feature_schema_hash!r}, model expects "
+                f"{self._feature_schema_hash!r}. The observation was encoded "
+                f"under a different feature schema than the model was trained "
+                f"against. Refusing to forward."
+            )
+
+        legal_actions = obs.public.legal_actions
+        # Bug #6: zero legal actions is a caller error. The model cannot select
+        # from an empty action set; returning an empty tuple would let a silent
+        # bug propagate downstream. Fail loudly.
+        if len(legal_actions) == 0:
+            raise ValueError(
+                "DeepAgentV2.act_v2 received an observation with zero legal "
+                "actions. A decision with no legal actions is undefined."
+            )
         # Single legal action: short-circuit without inference (matches the
         # legacy DeepAgent behaviour and avoids a degenerate forward).
-        legal_actions = obs.public.legal_actions
-        if len(legal_actions) <= 1:
-            return legal_actions[0] if legal_actions else ()
+        if len(legal_actions) == 1:
+            return legal_actions[0]
 
         return self._select_from_observation(obs)
 
@@ -300,23 +328,32 @@ class DeepAgentV2:
         return legal_actions[idx]
 
 
-def load_v2_model(model_path, schema, config=None):
-    """Load a :class:`~douzero.models_v2.model.ModelV2` from a state_dict file.
+def load_v2_model(model_path, schema, config=None, *, ruleset_id="legacy"):
+    """Load a :class:`~douzero.models_v2.model.ModelV2` from a V2 sidecar.
+
+    Bug #3 fix: the sidecar MUST be a manifest-bearing V2 bundle (written by
+    :func:`douzero.checkpoint.save_v2_position_weights`). The manifest's
+    model_version, schema hash, ruleset identity, and checkpoint_kind are
+    validated against RUNTIME expectations (the ``schema`` and ``ruleset_id``
+    the caller passes), and the state_dict is loaded with ``strict=True``.
+
+    A bare state_dict sidecar, a legacy/factorized ``.ckpt``, or a
+    same-shape different-schema sidecar is rejected with a precise error.
 
     Parameters
     ----------
     model_path:
-        Path to a ``.ckpt`` / ``.pt`` file holding a V2 ``state_dict``. The
-        state_dict MUST match the model constructed from ``schema`` + ``config``
-        exactly (strict load). Legacy / factorized weights are rejected here,
-        not silently partial-loaded.
+        Path to a V2 sidecar ``.ckpt`` (manifest-bearing).
     schema:
         The :class:`~douzero.observation.schema.FeatureSchemaManifest` the
-        saved model was trained against. The manifest check (P16) will bind
-        this to the checkpoint; for P05 the caller passes it explicitly.
+        runtime expects. The sidecar's schema hash must equal
+        ``schema.stable_hash()``.
     config:
         Optional :class:`~douzero.models_v2.config.ModelV2Config`. Defaults to
         ``ModelV2Config()``; must match the config the weights were saved under.
+    ruleset_id:
+        The rule-engine identity the runtime expects (``"legacy"`` or
+        ``"standard"``). Defaults to ``"legacy"``.
 
     Returns
     -------
@@ -325,45 +362,31 @@ def load_v2_model(model_path, schema, config=None):
     """
     from douzero.models_v2.config import ModelV2Config
     from douzero.models_v2.model import ModelV2
-    from douzero.checkpoint.compat import load_legacy_position_ckpt
+    from douzero.checkpoint import (
+        CheckpointCompatibilityError,
+        load_v2_position_weights,
+    )
 
     cfg = config or ModelV2Config()
     model = ModelV2(schema, cfg)
-    state_dict = model.state_dict()
-    # V2 weights are saved as a plain state_dict (P05). load_legacy_position_ckpt
-    # is weights_only=True and CPU-maps safely. P16 will wrap this with a
-    # manifest-bearing loader.
-    pretrained = load_legacy_position_ckpt(model_path)
-    # STRICT load: a key/shape mismatch means the wrong model family or a
-    # schema/config drift. We do NOT permissively filter, because V2 weights
-    # are incompatible with legacy/factorized weights and a partial load would
-    # silently mix architectures.
-    missing = [k for k in state_dict if k not in pretrained]
-    unexpected = [k for k in pretrained if k not in state_dict]
-    shape_mismatch = [
-        k for k in state_dict
-        if k in pretrained and state_dict[k].shape != pretrained[k].shape
-    ]
-    if missing or unexpected or shape_mismatch:
-        parts = []
-        if missing:
-            parts.append(f"missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
-        if unexpected:
-            parts.append(
-                f"unexpected keys: {unexpected[:5]}"
-                f"{'...' if len(unexpected) > 5 else ''}"
-            )
-        if shape_mismatch:
-            parts.append(
-                f"shape mismatches: {shape_mismatch[:5]}"
-                f"{'...' if len(shape_mismatch) > 5 else ''}"
-            )
-        raise ValueError(
-            f"V2 checkpoint at {model_path!r} does not match the constructed "
-            f"ModelV2 (schema/config). This usually means the checkpoint is a "
-            f"legacy/factorized model or was saved under a different "
-            f"schema/config. Details: " + "; ".join(parts)
+    expected_schema_hash = schema.stable_hash()
+
+    # Load + validate the manifest-bearing sidecar. weights_only=True is the
+    # default inside load_v2_position_weights. This rejects a bare state_dict,
+    # a legacy .ckpt, a wrong-schema sidecar, and a wrong-ruleset sidecar.
+    try:
+        pretrained, manifest = load_v2_position_weights(
+            model_path,
+            expected_schema_hash=expected_schema_hash,
+            expected_ruleset_id=ruleset_id,
         )
-    model.load_state_dict(pretrained)
+    except CheckpointCompatibilityError:
+        # Re-raise as-is: the message is already precise and actionable.
+        raise
+
+    # STRICT load (strict=True is the default for load_state_dict). A key/shape
+    # mismatch means the config the caller passed does not match the config the
+    # weights were saved under (e.g. a different hidden_size).
+    model.load_state_dict(pretrained, strict=True)
     model.eval()
     return model
