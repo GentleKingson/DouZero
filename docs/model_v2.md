@@ -67,19 +67,44 @@ acting role ──────────────────────�
 
 - **State/history encoded once per decision.** Only the action path and the
   final fusion run per legal action (the P04 factorized property, generalized).
+- **Action embeddings are consumed per-row.** The fusion concatenates each
+  action's own embedding with the shared trunk, so two different actions
+  produce different logits. Tested by action-sensitivity, permutation
+  equivariance, and action-encoder nonzero-gradient tests.
+- **State field identity is preserved.** The state encoder concatenates
+  per-field embeddings in a fixed schema order (it does NOT sum them).
+  Swapping two card fields (e.g. `my_hand` ↔ `other_hand`) changes the trunk.
+  Card fields are identified by their canonical schema name, not by a
+  width=54 guess.
 - **Variable legal-action counts.** The model takes `(N, action_width)` and
   broadcasts the shared trunk; no fixed maximum action count is assumed.
+- **Zero legal actions rejected.** `forward()`, `act_v2()`,
+  `observation_to_model_inputs()`, and `ModelOutput` all raise on zero action
+  rows (a decision with no legal actions is undefined).
 - **Padding masks are respected.** Padded history tokens never affect the
   output (tested by corrupting only padded slots and asserting the output is
   unchanged).
 - **No BatchNorm.** LayerNorm + residual MLPs throughout (actor inference
   batches are size-1; BatchNorm running stats would be unstable).
 - **Finite outputs.** Score heads are clamped to `[-score_clamp, score_clamp]`;
-  all heads are asserted finite on every test.
+  a runtime NaN/Inf guard (`nan_guard`, default on) checks the fused
+  representation and head outputs and raises `NumericalError` on any
+  non-finite value — catching both bad inputs and bad weights.
 - **Deterministic under `eval()`.** Same input → identical output.
 - **Imperfect-information boundary.** The model package imports only the
   public observation modules. Corrupting `infoset.all_handcards` (the true
   hidden hands) does not change the model output.
+
+### Batch scope (one decision per forward)
+
+P05 supports **one decision per forward pass** with a **variable number of
+legal actions** (the action path is `(N, action_width)` with no fixed max).
+It does NOT yet support a multi-decision training minibatch (padding +
+masking across decisions with different action counts). That padded
+decision/action batch representation belongs with the P06 multi-objective
+training loop, which is where the learner batches across actors. Constructing
+a `ModelV2` and calling `forward()` on one decision at a time is the complete,
+tested P05 contract; do not assume a `(B, N, ...)` batched forward is available.
 
 ### Output dictionary and sign convention
 
@@ -178,25 +203,52 @@ these two simple, fully-tested modes.
 
 ### Loading weights
 
-`load_v2_model(model_path, schema, config)` loads a V2 state_dict sidecar
-**strictly**: a key/shape mismatch (e.g. a legacy `.ckpt`) raises
-`ValueError`. There is no permissive partial load — V2 weights are
-incompatible with legacy/factorized weights.
+`load_v2_model(model_path, schema, config, ruleset_id=...)` loads a
+**manifest-bearing** V2 sidecar (written by `save_v2_position_weights`). The
+sidecar carries a minimal manifest (model_version, schema hash, ruleset
+identity, checkpoint_kind=`public_policy`); every identity field is validated
+against RUNTIME expectations (the `schema` and `ruleset_id` the caller passes),
+never against the checkpoint's self-reported values. The state_dict is loaded
+with `strict=True` and `weights_only=True` (the safe default).
+
+A bare state_dict sidecar, a legacy/factorized `.ckpt`, a same-shape
+different-schema sidecar, or a wrong-ruleset sidecar is rejected with a
+precise `CheckpointCompatibilityError`. There is no permissive partial load.
+
+`DeepAgentV2` additionally binds to the model's feature schema hash at
+construction and validates every observation's schema hash in `act_v2()`, so
+a model trained under schema A cannot silently consume an observation encoded
+under schema B.
 
 ## Checkpoints
 
-P05 adds V2-aware checkpoint helpers in `douzero/checkpoint/v2.py`:
+P05 adds V2-aware checkpoint helpers in `douzero/checkpoint/v2.py`. Every load
+validates FOUR identity axes against RUNTIME-SUPPLIED expectations (never the
+checkpoint's self-reported values):
 
-- `save_v2_checkpoint(path, model, schema_hash=..., frames=...)` — writes a
-  `model_v2.tar` bundle (state_dict + manifest + config + schema hash). The
-  manifest is stamped with `model_version="v2"` and `feature_version="v2"`.
-- `load_v2_checkpoint(path, expected_schema_hash=...)` — reads a V2 bundle,
-  validates the manifest, and optionally checks the schema hash. Raises
-  `CheckpointCompatibilityError` on any mismatch, including an attempt to load
-  a legacy/factorized `model.tar` here.
-- `save_v2_position_weights(path, model, schema_hash=...)` — writes a bare
-  `.ckpt` sidecar for `DeepAgentV2` deployment (mirrors the legacy per-position
-  sidecar; the strict manifest-bearing sidecar arrives in P16).
+1. `model_version == "v2"` — rejects a legacy / factorized bundle.
+2. `feature_schema_hash` — must equal the runtime schema's `stable_hash()`.
+   Catches a same-shape-different-schema drift.
+3. `ruleset_id` / `ruleset_version` / `ruleset_hash` — a model trained under
+   one ruleset must not be served under another.
+4. `checkpoint_kind` — `training_checkpoint` vs `public_policy`.
+
+Helpers:
+
+- `save_v2_checkpoint(path, model, schema_hash=..., frames=...)` — writes the
+  full `model_v2.tar` bundle (state_dict + manifest + config + schema hash).
+- `load_v2_checkpoint(path, expected_schema_hash=..., expected_ruleset_id=...,
+  expected_checkpoint_kind=...)` — reads + validates the full bundle. All
+  expected values are required runtime arguments (no defaults that skip the
+  check).
+- `save_v2_position_weights(path, model, schema_hash=..., ruleset_id=...)` —
+  writes the **manifest-bearing** deployment sidecar (`.ckpt`). NOT a bare
+  state_dict: it carries a `public_policy` manifest so the identity check
+  applies at deployment too.
+- `load_v2_position_weights(path, expected_schema_hash=...,
+  expected_ruleset_id=...)` — reads + validates the sidecar. Rejects a bare
+  state_dict, a legacy `.ckpt`, a wrong-schema sidecar, and a wrong-ruleset
+  sidecar.
 
 The existing `load_checkpoint` (legacy/factorized `model.tar`) already rejects
 a `model_version` mismatch via the manifest validator, so a V2 bundle cannot
