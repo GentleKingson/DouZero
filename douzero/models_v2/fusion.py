@@ -94,12 +94,20 @@ class StateActionFusion(nn.Module):
         self.num_roles = num_roles
         self.num_layers = num_layers
 
+        # The fused input is [state_trunk, history_summary, action_embedding]
+        # (three hidden-wide vectors) plus the role embedding. The action
+        # embedding MUST be a per-row input: every legal action has its own
+        # embedding, so two different actions produce two different fused rows
+        # and therefore two different logits. (A prior version concatenated
+        # only state + history + role and silently broadcast the result across
+        # actions, which made every action's logit identical — a correctness
+        # bug caught by the action-sensitivity test.)
         if role_embedding_dim > 0:
             self.role_embed = nn.Embedding(num_roles, role_embedding_dim)
-            fused_width = hidden_size * 2 + role_embedding_dim
+            fused_width = hidden_size * 3 + role_embedding_dim
         else:
             self.role_embed = None
-            fused_width = hidden_size * 2
+            fused_width = hidden_size * 3
 
         self.input_proj = nn.Linear(fused_width, hidden_size)
         self.blocks = nn.ModuleList(
@@ -138,7 +146,30 @@ class StateActionFusion(nn.Module):
         if n == 0:
             raise ValueError("action_embeddings has zero rows (no legal actions)")
 
-        # Broadcast the shared trunk to every action. expand is a view (no copy).
+        # Validate the shared trunk + history shapes (defensive — a shape bug
+        # here would silently broadcast the wrong vector).
+        if state_trunk.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"state_trunk trailing dim {state_trunk.shape[-1]} != "
+                f"hidden_size {self.hidden_size}"
+            )
+        if history_summary.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"history_summary trailing dim {history_summary.shape[-1]} != "
+                f"hidden_size {self.hidden_size}"
+            )
+        if action_embeddings.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"action_embeddings trailing dim {action_embeddings.shape[-1]} != "
+                f"hidden_size {self.hidden_size}"
+            )
+
+        # Broadcast the shared trunk + history to every action row. expand is a
+        # view (no copy). The action embedding is ALREADY per-row, so each
+        # fused row carries its own action — this is what makes different
+        # actions produce different logits (and what makes the fusion
+        # permutation-equivariant: permuting the action rows permutes the
+        # output rows by the same permutation).
         state_b = state_trunk.unsqueeze(0).expand(n, -1)
         history_b = history_summary.unsqueeze(0).expand(n, -1)
 
@@ -149,9 +180,9 @@ class StateActionFusion(nn.Module):
                 )
             role_vec = self.role_embed.weight[role_index]  # (role_embedding_dim,)
             role_b = role_vec.unsqueeze(0).expand(n, -1)
-            fused = torch.cat([state_b, history_b, role_b], dim=-1)
+            fused = torch.cat([state_b, history_b, action_embeddings, role_b], dim=-1)
         else:
-            fused = torch.cat([state_b, history_b], dim=-1)
+            fused = torch.cat([state_b, history_b, action_embeddings], dim=-1)
 
         h = self.input_proj(fused)
         for block in self.blocks:

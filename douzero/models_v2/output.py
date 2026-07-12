@@ -43,6 +43,14 @@ class ModelOutput:
 
     def __post_init__(self) -> None:
         n = self.win_logit.shape[0]
+        # Bug #6: a ModelOutput with zero action rows is invalid. The model
+        # must never produce one (forward rejects zero actions), and a caller
+        # must never construct one (there is nothing to select from).
+        if n == 0:
+            raise ValueError(
+                "ModelOutput cannot have zero action rows; a decision with no "
+                "legal actions is undefined."
+            )
         for name in ("score_if_win", "score_if_loss", "p_win", "score_mean"):
             t = getattr(self, name)
             if t.shape[0] != n or t.shape[-1] != 1:

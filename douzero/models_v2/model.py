@@ -139,9 +139,17 @@ class ModelV2(nn.Module):
         flat_context_width = non_card_state_width + non_card_context_width
 
         # --- Build the sub-modules. ---
+        # The state encoder receives BOTH the state card fields and the
+        # context card fields (bottom revealed + bottom unplayed), in a fixed
+        # order: [state card fields..., context card fields...]. The total
+        # count is passed so the encoder can size its per-field projection and
+        # enforce the count at forward time (a wrong count is a caller bug, not
+        # a silent misconfiguration).
+        total_card_fields = _NUM_STATE_CARD_FIELDS + _NUM_CONTEXT_CARD_FIELDS
         self.state_encoder = StateEncoder(
             card_vector_dim=self._card_vector_dim,
-            context_width=flat_context_width,
+            num_card_fields=total_card_fields,
+            flat_context_width=flat_context_width,
             hidden_size=cfg.hidden_size,
         )
         self.history_encoder = build_history_encoder(
@@ -240,7 +248,26 @@ class ModelV2(nn.Module):
         -------
         ModelOutput
             The multi-head output over the N actions.
+
+        Raises
+        ------
+        ValueError
+            If there are zero legal actions (the model cannot select from an
+            empty action set).
+        NumericalError
+            If ``nan_guard`` is enabled and any fused/head tensor contains NaN
+            or Inf (catches both bad inputs and bad weights).
         """
+        # Bug #6: zero legal actions is a caller error. The model must not
+        # return an empty output (downstream argmax/selection would silently
+        # pick index 0 of an empty tensor). Fail loudly here.
+        if action_features.shape[0] == 0:
+            raise ValueError(
+                "ModelV2.forward received zero legal actions (action_features "
+                "has zero rows). A decision with no legal actions is undefined; "
+                "the caller must short-circuit before calling the model."
+            )
+
         # --- Encode the shared state once. ---
         all_card_vectors = state_card_vectors + context_card_vectors
         full_context_flat = torch.cat([state_context_flat, context_flat], dim=-1)
@@ -256,8 +283,25 @@ class ModelV2(nn.Module):
         role_idx = self.role_index(acting_role)
         fused = self.fusion(state_trunk, history_summary, action_embeddings, role_idx)
 
+        # Bug #5: runtime NaN/Inf guard on the fused representation. This
+        # catches BOTH bad inputs (a NaN in the state/history/action tensors
+        # propagates to fused) AND bad weights (a NaN weight produces a NaN
+        # fused output regardless of the input). Checking only inputs would
+        # miss weight corruption; checking fused catches both upstream causes.
+        if self.config.nan_guard:
+            from .numerical import assert_finite
+            assert_finite(fused, "fused")
+
         # --- Heads. ---
         head_out = self.heads(fused)
+
+        if self.config.nan_guard:
+            # The heads apply a clamp to the score outputs, so they should be
+            # finite by construction; this guard catches a regression (e.g. a
+            # head that bypasses the clamp) rather than a normal case.
+            assert_finite(head_out["win_logit"], "win_logit")
+            assert_finite(head_out["p_win"], "p_win")
+
         return ModelOutput(
             win_logit=head_out["win_logit"],
             score_if_win=head_out["score_if_win"],

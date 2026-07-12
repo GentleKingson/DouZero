@@ -39,7 +39,7 @@ from douzero.models_v2.action_encoder import ActionEncoder
 from douzero.models_v2.batch import ModelInputBundle, observation_to_model_inputs
 from douzero.models_v2.card_encoder import CardSetEncoder, MultiCardSetEncoder
 from douzero.models_v2.config import (
-    HISTORY_ENCODER_LSTM_CANONICAL,
+    HISTORY_ENCODER_LSTM,
     HISTORY_ENCODER_TRANSFORMER,
     ModelV2Config,
     SUPPORTED_ROLES,
@@ -52,6 +52,7 @@ from douzero.models_v2.history_encoder import (
     build_history_encoder,
 )
 from douzero.models_v2.model import ModelV2
+from douzero.models_v2.numerical import NumericalError, assert_finite
 from douzero.models_v2.output import ModelOutput
 from douzero.models_v2.state_encoder import StateEncoder
 
@@ -62,7 +63,7 @@ __all__ = [
     "ModelOutput",
     "SUPPORTED_ROLES",
     "HISTORY_ENCODER_TRANSFORMER",
-    "HISTORY_ENCODER_LSTM_CANONICAL",
+    "HISTORY_ENCODER_LSTM",
     # batch bridge
     "ModelInputBundle",
     "observation_to_model_inputs",
@@ -76,4 +77,7 @@ __all__ = [
     "TransformerHistoryEncoder",
     "LSTMHistoryEncoder",
     "build_history_encoder",
+    # numerical safety
+    "NumericalError",
+    "assert_finite",
 ]
