@@ -41,7 +41,14 @@ from douzero.training.calibration import (
 def test_trainer_rng_seed_0_uses_system_entropy():
     """When rng_seed=0, the trainer's local RNG should NOT be seeded to 0;
     it should use system entropy so two trainers with seed=0 behave
-    differently (matching the unseeded deal shuffle)."""
+    differently (matching the unseeded deal shuffle and model init).
+
+    P06 r4: the r3 version of this test had ``or True`` which made it a
+    tautology. This version checks the construction path directly via the
+    RNG's internal state: a random.Random(0) has a deterministic internal
+    state, while random.Random() (system entropy) does not."""
+    import random as _random
+
     from douzero.models_v2.config import ModelV2Config
     from douzero.models_v2.model import ModelV2
     from douzero.observation.schema import build_v2_schema
@@ -50,24 +57,19 @@ def test_trainer_rng_seed_0_uses_system_entropy():
     torch.manual_seed(999)
     model = ModelV2(build_v2_schema(), ModelV2Config())
     trainer = V2Trainer(model, config=TrainerConfig(rng_seed=0, max_episodes=0))
-    # A random.Random(0) produces a known first value; system entropy does not.
-    seeded_first = __import__("random").Random(0).random()
-    # The probability that two independent random.Random() instances produce
-    # the exact same first value is negligible; if rng_seed=0 produced
-    # random.Random(0) this would ALWAYS equal seeded_first.
-    assert trainer.rng.random() != seeded_first or True  # weak check
-    # Stronger: the trainer should NOT have internal state identical to
-    # Random(0). Check the first few values differ from the seeded sequence.
-    seeded_rng = __import__("random").Random(0)
-    seeded_vals = [seeded_rng.random() for _ in range(5)]
-    trainer_vals = [trainer.rng.random() for _ in range(5)]
-    # If trainer used Random(0) AFTER the check above consumed one value,
-    # the remaining sequence would still match. So verify the trainer's
-    # state is NOT Random(0) by checking against a fresh Random(0).
-    fresh = __import__("random").Random(0)
-    fresh_vals = [fresh.random() for _ in range(5)]
-    # With system entropy, the sequences are (overwhelmingly likely) different.
-    assert trainer_vals != fresh_vals or trainer_vals != seeded_vals
+
+    # random.Random(0) has a specific internal state tuple; system entropy
+    # does not. Compare against a fresh Random(0).
+    seeded_state = _random.Random(0).getstate()
+    trainer_state = trainer.rng.getstate()
+    # The state tuples differ in the third element (the shuffled internal
+    # array) when the RNG was initialized differently. The first two
+    # elements (version, gusano) may coincidentally match, so compare the
+    # full tuple.
+    assert trainer_state != seeded_state, (
+        "trainer RNG with rng_seed=0 has the same state as random.Random(0); "
+        "it should use system entropy (random.Random() with no argument)."
+    )
 
 
 def test_trainer_rng_seed_nonzero_is_reproducible():
