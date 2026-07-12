@@ -148,13 +148,15 @@ opponents into `other_hand_cards`, which is swap-invariant).
   'landlord' else -env_output['episode_return']`. There is **no** discounting;
   the Monte-Carlo return is broadcast across the episode's timesteps.
 
-> Sign-convention landmine resolved in P06: reward sign was historically
-> flipped in two places (`Env._get_reward` and the actor loop). P06
+> Sign-convention landmine addressed in P06: reward sign was historically
+> flipped in two places (`Env._get_reward` and the actor loop). The legacy
+> path retains its historical sign conversion verbatim so the legacy
+> single-target training path stays byte-for-byte identical; P06's V2 path
 > centralises perspective conversion in `douzero/training/labels.py`
 > (`team_targets()`) and exposes the team-perspective labels at terminal
-> via `Env.step`'s `info['team_targets']`. The legacy `reward` path is
-> unchanged; the new labels are additive. See
-> `docs/multi_objective_training.md`.
+> via `Env.step`'s `info['team_targets']`. The V2 trainer, loss module,
+> and evaluation read these labels directly and never flip signs in more
+> than one place. See `docs/multi_objective_training.md`.
 
 ## 7. Training loop (actor/learner)
 

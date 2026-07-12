@@ -24,9 +24,7 @@ The deployment path gains a configurable **decision policy**
 
 AGENTS.md mandates that every value be expressed from the **current acting
 player's team** perspective: a farmer win is positive for both farmer
-roles. P06 removes the scattered farmer negation that existed in the legacy
-actor loop (`douzero/dmc/utils.py` negated `episode_return` for farmer
-positions) by centralizing the conversion in
+roles. P06 centralizes the conversion in
 `douzero/training/labels.py`:
 
 ```python
@@ -46,6 +44,16 @@ game_result.farmer_score` (per farmer, same sign and magnitude by
 construction). Score conservation `landlord_score + 2*farmer_score == 0`
 holds.
 
+> **Legacy path is unchanged.** The historical farmer negation in the
+> legacy actor loop (`douzero/dmc/utils.py: episode_return =
+> env_output['episode_return'] if p == 'landlord' else
+> -env_output['episode_return']`) is preserved verbatim so the legacy
+> single-target training path stays byte-for-byte identical. P06's V2
+> path simply **does not rely on** that scattered negation: it derives
+> team-perspective labels directly from the public `GameResult` via
+> `team_targets()`, so the V2 trainer, loss module, and evaluation never
+> flip signs in more than one place.
+
 ## Team-perspective terminal labels
 
 `Env.step` now populates two additive keys in the terminal `info` dict
@@ -63,36 +71,53 @@ opt in to the new labels.
 ## Loss module
 
 `douzero/training/losses.py` exposes `MultiObjectiveLoss`, an `nn.Module`
-combining the four loss terms with configurable weights:
+combining the loss terms with configurable weights:
 
 ```python
 from douzero.training import LossConfig, MultiObjectiveLoss
 
 loss_fn = MultiObjectiveLoss(LossConfig(
-    lambda_win=1.0,         # BCEWithLogitsLoss on win_logit
-    lambda_score=0.5,       # masked Huber on score_if_win / score_if_loss
-    lambda_log=0.0,         # optional log-score auxiliary
-    lambda_uncertainty=0.0, # optional NLL (default off)
-    score_delta=1.0,        # Huber delta for the score loss
+    lambda_win=1.0,            # BCEWithLogitsLoss on win_logit
+    lambda_score=0.5,          # per-sample Huber on the conditional heads
+    lambda_uncertainty=0.0,    # optional heteroscedastic NLL (default off)
+    score_delta=1.0,           # Huber delta for the score loss
+    score_target_transform="raw",  # "raw" | "signed_log" (mutually exclusive)
+    score_clamp=32.0,          # raw target is clamped to match the head clamp
 ))
 components = loss_fn.forward_gathered(win_logit, score_if_win, score_if_loss, batch_labels)
 components.total.backward()
 ```
 
-### Conditional masking (the critical correctness property)
+### Per-sample conditional score loss (the critical correctness property)
 
-`score_if_win` is supervised **only** on samples whose team won
-(`target_win == 1`); `score_if_loss` only where the team lost
-(`target_win == 0`). When a minibatch is all-win or all-loss, the
-un-supervised term is exactly zero and produces no NaN/Inf. The unit tests
-cover both empty-mask cases (`test_p06_losses.py`).
+Each sample's prediction is taken from the head matching its actual
+terminal outcome (`score_if_win` for won samples, `score_if_loss` for
+lost samples), then a single mean Huber is computed over the whole batch.
+This keeps the per-sample loss weight **identical regardless of the
+batch's win/loss composition** — the r0 `0.5 * (win_term + loss_term)`
+halved the only active term on a pure-win or pure-loss batch. P06 r1
+switches to per-sample selection so the same per-sample error produces
+the same loss whether the batch is all-win, all-loss, or mixed.
 
 ### Tail stability
 
-The score heads are clamped at `±score_clamp` (default 32.0) inside the
-model. The Huber delta further bounds the gradient contribution of large
-bomb/rocket residuals, so a 32× multiplier game does not dominate the
-gradient.
+Two complementary mechanisms:
+
+1. The score heads are clamped at `±score_clamp` (default 32.0) inside the
+   model. When `score_target_transform="raw"`, the **raw target is clamped
+   to the same range** so it matches what the heads can represent (a 5-bomb
+   legacy ADP landlord game has `landlord_score = 64`, which would otherwise
+   saturate the head and zero its gradient).
+2. Setting `score_target_transform="signed_log"` trains the heads on
+   `sign(s)·log1p(|s|)` instead, which compresses the bomb/rocket tail
+   (`log1p(32) ≈ 3.5`, `log1p(64) ≈ 4.17`) well inside the head clamp. The
+   decision policy then reads `score_mean` on the signed-log scale.
+
+These two transforms are **mutually exclusive**. The r0 additive
+`lambda_log` term supervised the same head toward both raw=32 and
+signed_log≈3.5 simultaneously — an impossible target. P06 r1 removes the
+additive log term and makes the transform a single config choice so a head
+always has one consistent supervision target.
 
 ## Decision policy
 
