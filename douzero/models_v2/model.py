@@ -1,0 +1,289 @@
+"""Model V2: shared state-action model with multi-head outputs (P05).
+
+This is the unified model that replaces the three role-specific legacy MLPs with
+one shared backbone plus role conditioning. It is selected by
+``model_version=v2`` and consumes an :class:`~douzero.observation.encode_v2.ObservationV2`
+(public inputs only).
+
+Architecture (mirrors the spec in ``docs/model_v2.md``)::
+
+    state block (once) ──┐
+    public context ──────┼── StateEncoder ──► state_trunk ──────────────┐
+                         │                                                ├──►
+    history tokens+mask ── HistoryEncoder ──► history_summary ───────────┤    StateActionFusion
+                                                                        ├──► (per action) ──► ValueHeads ──► ModelOutput
+    action feature rows ── ActionEncoder ──► action_embeddings (N) ──────┤      (+ role embed)
+                                                                        │
+    acting role ───────────────────────────────────────────────────────────┘
+
+Contract
+--------
+- The state and history are encoded **once per decision** (not per legal
+  action). Only the action path and the final fusion run per candidate. This
+  is the P04 factorized property, generalized to the V2 inputs.
+- Variable legal-action counts are handled natively: the action encoder takes
+  ``(N, action_width)`` and the fusion broadcasts the shared trunk across N.
+  No fixed maximum action count is assumed.
+- Masks are respected: the history encoder takes a padding mask so padded
+  history slots never affect the output; padded action rows are excluded from
+  selection via :meth:`ModelOutput.argmax_win`.
+- The model is deterministic under ``eval()`` (no BatchNorm; dropout is a
+  configured no-op at the default 0.0).
+
+Checkpoint compatibility
+------------------------
+V2 weights are NOT compatible with the legacy / factorized models (different
+parameter names and shapes). The checkpoint manifest records
+``model_version="v2"``; the loader (P16, with a P05 guard added here) rejects a
+schema/model mismatch rather than permissively partial-loading. Legacy model
+files are untouched.
+
+Imperfect-information boundary
+------------------------------
+This module imports ONLY from :mod:`douzero.observation` (public) and the
+sibling V2 modules. It MUST NOT import :mod:`douzero.observation.privileged`
+or accept a :class:`PrivilegedObservation`. The deployment guard
+(:class:`~douzero.evaluation.deep_agent.DeepAgentV2`) enforces this by type at
+the boundary; this model itself consumes only the tensor blocks of
+``ObservationV2``.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+from douzero.observation.schema import (
+    FeatureSchemaManifest,
+    action_width as schema_action_width,
+    context_width as schema_context_width,
+    history_token_width as schema_history_token_width,
+    state_width as schema_state_width,
+)
+
+from .action_encoder import ActionEncoder
+from .config import HISTORY_ENCODER_TRANSFORMER, ModelV2Config, SUPPORTED_ROLES
+from .fusion import StateActionFusion
+from .heads import ValueHeads
+from .history_encoder import build_history_encoder
+from .output import ModelOutput
+from .state_encoder import StateEncoder
+
+#: The number of card-set sub-blocks the state encoder consumes from the state
+#: block. Must match the schema's card-vector state fields (see
+#: ``build_v2_schema``). Asserted at construction.
+_NUM_STATE_CARD_FIELDS = 6  # my, other, landlord/landlord_down/landlord_up played, last_move
+#: The number of card-set sub-blocks in the public context block.
+_NUM_CONTEXT_CARD_FIELDS = 2  # bottom_cards_revealed, bottom_cards_unplayed
+
+
+class ModelV2(nn.Module):
+    """Shared state-action value model (P05).
+
+    Parameters
+    ----------
+    schema:
+        The :class:`FeatureSchemaManifest` the model is constructed against.
+        Every input width is derived from it, so a schema change surfaces as a
+        shape mismatch at construction (or at forward) rather than a silent
+        misconfiguration. Bind this to the checkpoint manifest for loading.
+    config:
+        Architecture hyperparameters. Defaults match ``ModelV2Config()`` and
+        ``configs/enhanced.yaml``.
+    """
+
+    def __init__(
+        self,
+        schema: FeatureSchemaManifest,
+        config: ModelV2Config | None = None,
+    ) -> None:
+        super().__init__()
+        self.schema = schema
+        self.config = config or ModelV2Config()
+        cfg = self.config
+
+        # --- Derive every input width from the schema (no magic numbers). ---
+        self._state_width = schema_state_width(schema)
+        self._action_width = schema_action_width(schema)
+        self._history_token_width = schema_history_token_width(schema)
+        self._context_width = schema_context_width(schema)
+        self._card_vector_dim = schema.card_vector_dim
+        self._max_history_len = schema.max_history_len
+
+        # The non-card portion of the state block (one-hots + counts) feeds the
+        # state encoder's flat-context path. Its width is the state width minus
+        # the card-vector fields' total width.
+        state_card_total = self._card_vector_dim * _NUM_STATE_CARD_FIELDS
+        if state_card_total > self._state_width:
+            raise ValueError(
+                f"schema state_width {self._state_width} is smaller than the "
+                f" {_NUM_STATE_CARD_FIELDS} card-vector fields "
+                f"({state_card_total}); the schema layout is unexpected"
+            )
+        # The flat context passed to the state encoder is: the non-card state
+        # fields + the ENTIRE public-context block (both its card fields and
+        # its small fields). The state encoder embeds the state card fields and
+        # the context card fields through the shared card projection, so only
+        # the non-card state + non-card context go into context_flat. We pass
+        # the context block's non-card fields as context too, to keep the input
+        # width stable when a future public field is added.
+        context_card_total = self._card_vector_dim * _NUM_CONTEXT_CARD_FIELDS
+        non_card_state_width = self._state_width - state_card_total
+        non_card_context_width = self._context_width - context_card_total
+        if non_card_context_width < 0:
+            raise ValueError(
+                f"schema context_width {self._context_width} is smaller than "
+                f"the {_NUM_CONTEXT_CARD_FIELDS} context card-vector fields "
+                f"({context_card_total}); the schema layout is unexpected"
+            )
+        flat_context_width = non_card_state_width + non_card_context_width
+
+        # --- Build the sub-modules. ---
+        self.state_encoder = StateEncoder(
+            card_vector_dim=self._card_vector_dim,
+            context_width=flat_context_width,
+            hidden_size=cfg.hidden_size,
+        )
+        self.history_encoder = build_history_encoder(
+            token_width=self._history_token_width,
+            hidden_size=cfg.hidden_size,
+            max_history_len=self._max_history_len,
+            backend=cfg.history_encoder,
+            num_layers=cfg.history_layers,
+            num_heads=cfg.history_heads,
+            dropout=cfg.history_dropout,
+        )
+        self.action_encoder = ActionEncoder(
+            action_width=self._action_width,
+            hidden_size=cfg.hidden_size,
+        )
+        self.fusion = StateActionFusion(
+            hidden_size=cfg.hidden_size,
+            role_embedding_dim=cfg.role_embedding_dim,
+            num_roles=len(SUPPORTED_ROLES),
+            num_layers=cfg.mlp_layers,
+            dropout=cfg.mlp_dropout,
+        )
+        self.heads = ValueHeads(
+            hidden_size=cfg.hidden_size,
+            score_clamp=cfg.score_clamp,
+        )
+
+        # Cache the role-name -> index map so forward() does no dict lookup.
+        self._role_to_index = {role: i for i, role in enumerate(SUPPORTED_ROLES)}
+
+    # ------------------------------------------------------------------ #
+    # Public API
+    # ------------------------------------------------------------------ #
+    def role_index(self, role: str) -> int:
+        """Return the integer index of ``role`` for the role embedding table.
+
+        Raises ``ValueError`` for an unknown role so a malformed observation
+        fails at the boundary rather than producing a silent default.
+        """
+        try:
+            return self._role_to_index[role]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown acting role {role!r}. Supported roles: {SUPPORTED_ROLES}"
+            ) from exc
+
+    def forward(
+        self,
+        state_card_vectors: tuple[torch.Tensor, ...],
+        state_context_flat: torch.Tensor,
+        context_card_vectors: tuple[torch.Tensor, ...],
+        context_flat: torch.Tensor,
+        history_tokens: torch.Tensor,
+        history_key_padding_mask: torch.Tensor,
+        action_features: torch.Tensor,
+        action_mask: torch.Tensor,
+        acting_role: str,
+    ) -> ModelOutput:
+        """Run a full forward pass for one decision.
+
+        All inputs come from an :class:`ObservationV2`; the caller (or
+        :class:`~douzero.models_v2.batch.observation_to_model_inputs`) is
+        responsible for splitting the state/context blocks into their
+        card-vector and flat-field portions. This explicit split keeps the
+        model's tensor contract inspectable and testable.
+
+        Parameters
+        ----------
+        state_card_vectors:
+            The card-vector fields of the state block, in schema order (my,
+            other, landlord/landlord_down/landlord_up played, last_move). Each
+            ``(card_vector_dim,)`` float.
+        state_context_flat:
+            The non-card state fields, flattened in schema order.
+        context_card_vectors:
+            The card-vector fields of the public-context block (bottom revealed
+            + bottom unplayed). Each ``(card_vector_dim,)`` float.
+        context_flat:
+            The non-card context fields (bid, phase, rocket, multiplier,
+            ruleset), flattened in schema order.
+        history_tokens:
+            Shape ``(max_history_len, history_token_width)`` float. Padded
+            slots should be zero.
+        history_key_padding_mask:
+            Shape ``(max_history_len,)`` bool, ``True`` for PADDING.
+        action_features:
+            Shape ``(N, action_width)`` float, one row per legal action (N >= 1).
+        action_mask:
+            Shape ``(N,)`` bool, ``True`` for a valid action. For the common
+            case of no padding, pass all-True.
+        acting_role:
+            The acting role name (``"landlord"`` / ``"landlord_up"`` /
+            ``"landlord_down"``).
+
+        Returns
+        -------
+        ModelOutput
+            The multi-head output over the N actions.
+        """
+        # --- Encode the shared state once. ---
+        all_card_vectors = state_card_vectors + context_card_vectors
+        full_context_flat = torch.cat([state_context_flat, context_flat], dim=-1)
+        state_trunk = self.state_encoder(all_card_vectors, full_context_flat)
+
+        # --- Encode the history once. ---
+        history_summary = self.history_encoder(history_tokens, history_key_padding_mask)
+
+        # --- Encode each action. ---
+        action_embeddings = self.action_encoder(action_features)
+
+        # --- Fuse shared trunk + history + per-action + role. ---
+        role_idx = self.role_index(acting_role)
+        fused = self.fusion(state_trunk, history_summary, action_embeddings, role_idx)
+
+        # --- Heads. ---
+        head_out = self.heads(fused)
+        return ModelOutput(
+            win_logit=head_out["win_logit"],
+            score_if_win=head_out["score_if_win"],
+            score_if_loss=head_out["score_if_loss"],
+            p_win=head_out["p_win"],
+            score_mean=head_out["score_mean"],
+            action_mask=action_mask,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Introspection / reporting helpers
+    # ------------------------------------------------------------------ #
+    def parameter_count(self) -> dict[str, int]:
+        """Return per-submodule and total parameter counts.
+
+        Useful for the model-card / architecture report. Counts trainable
+        parameters only (buffers like LayerNorm running stats are excluded).
+        """
+        counts: dict[str, int] = {}
+        for name, module in (
+            ("state_encoder", self.state_encoder),
+            ("history_encoder", self.history_encoder),
+            ("action_encoder", self.action_encoder),
+            ("fusion", self.fusion),
+            ("heads", self.heads),
+        ):
+            counts[name] = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        counts["total"] = sum(counts.values())
+        return counts
