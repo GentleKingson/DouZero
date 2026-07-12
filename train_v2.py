@@ -122,6 +122,15 @@ def _assert_v2_identity(cfg) -> None:
         raise ValueError(
             f"train_v2.py requires model_version='v2', got {cfg.model_version!r}."
         )
+    # P06 r6: defense-in-depth. The loader already cross-validates
+    # model_version == model.version, but this gate is the last line of
+    # defense before a V2 model is constructed.
+    if cfg.model.version != "v2":
+        raise ValueError(
+            f"train_v2.py requires model.version='v2', got "
+            f"{cfg.model.version!r}. The nested model.version must match "
+            f"model_version (enforced by the loader)."
+        )
     if cfg.ruleset != "legacy":
         raise NotImplementedError(
             f"train_v2.py (P06) only supports ruleset='legacy' (the card-play-"
@@ -140,6 +149,9 @@ def _assert_v2_identity(cfg) -> None:
 #: YAML config triggers a visible warning (P06 r3 fix: these were silently
 #: ignored in r0-r2). P14's high-throughput trainer will consume them.
 _UNSUPPORTED_LEGACY_FIELDS: dict[str, object] = {
+    "xpid": "douzero",
+    "save_interval": 30,
+    "savedir": "douzero_checkpoints",
     "actor_device_cpu": False,
     "gpu_devices": "0",
     "num_actor_devices": 1,
