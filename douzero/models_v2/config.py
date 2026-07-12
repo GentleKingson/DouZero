@@ -27,7 +27,9 @@ Design notes
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import dataclass, fields
 
 HISTORY_ENCODER_TRANSFORMER = "transformer"
 HISTORY_ENCODER_LSTM = "lstm"
@@ -101,6 +103,52 @@ class ModelV2Config:
             raise ValueError(f"mlp_dropout must be in [0, 1), got {self.mlp_dropout}")
         if self.score_clamp <= 0.0:
             raise ValueError(f"score_clamp must be positive, got {self.score_clamp}")
+
+    # ------------------------------------------------------------------ #
+    # Canonical identity (blocker #2 fix)
+    # ------------------------------------------------------------------ #
+    def compatibility_dict(self) -> dict:
+        """Return the architecture-identity subset of this config.
+
+        Two configs with the same :meth:`compatibility_dict` produce models
+        with the same architecture (same parameter shapes AND the same
+        runtime behavior). This is the contract a checkpoint binds to: a
+        weights sidecar saved under one config must not be loaded into a model
+        built under a different config, even if the parameter SHAPES happen to
+        match (e.g. ``history_heads`` 8→4 keeps the projection shapes but
+        changes how the Transformer splits the hidden dim; ``score_clamp``
+        32→8 changes the output clamp; ``nan_guard`` true→false changes
+        whether the forward validates finiteness).
+
+        ``strict=True`` state_dict loading only checks parameter KEYS exist —
+        it cannot detect these same-shape-different-semantics drifts, so the
+        config hash is the missing second identity axis alongside the feature
+        schema hash.
+        """
+        return {
+            "hidden_size": self.hidden_size,
+            "history_encoder": self.history_encoder,
+            "history_layers": self.history_layers,
+            "history_heads": self.history_heads,
+            "history_dropout": self.history_dropout,
+            "role_embedding_dim": self.role_embedding_dim,
+            "mlp_layers": self.mlp_layers,
+            "mlp_dropout": self.mlp_dropout,
+            "belief_enabled": self.belief_enabled,
+            "human_prior_enabled": self.human_prior_enabled,
+            "score_clamp": self.score_clamp,
+            "nan_guard": self.nan_guard,
+        }
+
+    def stable_hash(self) -> str:
+        """A SHA-256 hex digest of :meth:`compatibility_dict`.
+
+        Stable across runs (deterministic JSON serialization with sorted
+        keys). Stamp this into a checkpoint so a loader can reject a
+        same-shape-different-config drift.
+        """
+        payload = json.dumps(self.compatibility_dict(), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @classmethod
     def from_model_config(cls, model_config) -> "ModelV2Config":
