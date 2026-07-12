@@ -15,7 +15,12 @@ from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any, Mapping
 
-from douzero.config.schemas import OptimizerConfig, TrainingConfig
+from douzero.config.schemas import (
+    DecisionPolicyConfig,
+    LossConfig,
+    OptimizerConfig,
+    TrainingConfig,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -78,11 +83,14 @@ def load_legacy_config() -> TrainingConfig:
 # --------------------------------------------------------------------------- #
 def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     """Construct a TrainingConfig from a raw mapping, validating keys."""
-    valid_top = {f.name for f in fields(TrainingConfig) if f.name != "optimizer"}
+    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy")}
     valid_opt_names = {f.name for f in fields(OptimizerConfig)}
+    valid_loss_names = {f.name for f in fields(LossConfig)}
+    valid_decision_names = {f.name for f in fields(DecisionPolicyConfig)}
 
-    # 'optimizer' and 'rules' are valid top-level keys (handled separately).
-    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "rules"}
+    # 'optimizer', 'loss', 'decision_policy', and 'rules' are valid top-level
+    # keys (handled separately).
+    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "rules"}
     if unknown_top:
         raise ValueError(f"Unknown config keys: {sorted(unknown_top)}")
 
@@ -92,6 +100,22 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     unknown_opt = set(optimizer_raw.keys()) - valid_opt_names
     if unknown_opt:
         raise ValueError(f"Unknown optimizer config keys: {sorted(unknown_opt)}")
+
+    loss_raw = raw.get("loss", {})
+    if not isinstance(loss_raw, Mapping):
+        raise TypeError("'loss' must be a mapping")
+    unknown_loss = set(loss_raw.keys()) - valid_loss_names
+    if unknown_loss:
+        raise ValueError(f"Unknown loss config keys: {sorted(unknown_loss)}")
+
+    decision_raw = raw.get("decision_policy", {})
+    if not isinstance(decision_raw, Mapping):
+        raise TypeError("'decision_policy' must be a mapping")
+    unknown_decision = set(decision_raw.keys()) - valid_decision_names
+    if unknown_decision:
+        raise ValueError(
+            f"Unknown decision_policy config keys: {sorted(unknown_decision)}"
+        )
 
     # P02: a 'rules' block is accepted but not stored on TrainingConfig (which
     # only carries the version string). We validate it here so a malformed
@@ -108,6 +132,10 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
             kwargs[name] = raw[name]
     if optimizer_raw:
         kwargs["optimizer"] = OptimizerConfig(**dict(optimizer_raw))
+    if loss_raw:
+        kwargs["loss"] = LossConfig(**dict(loss_raw))
+    if decision_raw:
+        kwargs["decision_policy"] = DecisionPolicyConfig(**dict(decision_raw))
     cfg = TrainingConfig(**kwargs)
     _validate_types(cfg)
     _validate_legacy_only_versions(cfg)
@@ -128,6 +156,10 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "seed": int, "deterministic": bool, "config": str,
     "feature_version": str, "ruleset": str, "model_version": str,
     "learning_rate": float, "alpha": float, "momentum": float, "epsilon": float,
+    # P06 multi-objective loss + decision-policy nested fields.
+    "lambda_win": float, "lambda_score": float, "lambda_log": float,
+    "lambda_uncertainty": float, "score_delta": float, "log_score_delta": float,
+    "mode": str, "abs_tol": float, "rel_tol": float, "risk_penalty": float,
 }
 
 
@@ -167,6 +199,13 @@ def _validate_types(cfg: TrainingConfig) -> None:
     for name in _FIELD_TYPES:
         if name in {"learning_rate", "alpha", "momentum", "epsilon"}:
             _check_field(name, getattr(cfg.optimizer, name), "optimizer")
+        elif name in {
+            "lambda_win", "lambda_score", "lambda_log", "lambda_uncertainty",
+            "score_delta", "log_score_delta",
+        }:
+            _check_field(name, getattr(cfg.loss, name), "loss")
+        elif name in {"mode", "abs_tol", "rel_tol", "risk_penalty"}:
+            _check_field(name, getattr(cfg.decision_policy, name), "decision_policy")
         elif hasattr(cfg, name):
             _check_field(name, getattr(cfg, name), "training")
 

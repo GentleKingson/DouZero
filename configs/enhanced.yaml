@@ -1,0 +1,75 @@
+# Enhanced DouZero configuration (P06).
+#
+# This is the V2 multi-objective training configuration: shared state/action
+# model with multi-head outputs (win probability + conditional scores),
+# team-perspective labels, BCE + Huber multi-objective loss, and the
+# configurable decision policy. Loaded via the V2 trainer entry point
+# (train_v2.py --config configs/enhanced.yaml).
+#
+# The legacy train.py path does NOT read this file. Enabling any of these
+# knobs through the legacy entry point has no effect (the legacy loop uses
+# the single-target MSE in douzero.dmc.compute_loss regardless).
+
+# General
+xpid: douzero_v2
+save_interval: 30
+objective: adp
+
+# Training settings
+actor_device_cpu: false
+gpu_devices: "0"
+num_actor_devices: 1
+num_actors: 5
+training_device: "0"
+load_model: false
+disable_checkpoint: false
+savedir: douzero_v2_checkpoints
+
+# Hyperparameters
+total_frames: 600000
+exp_epsilon: 0.05
+batch_size: 32
+unroll_length: 100
+num_buffers: 50
+num_threads: 4
+max_grad_norm: 40.0
+
+# Reproducibility
+seed: 0
+deterministic: false
+
+# Version identifiers. V2 model + V2 observation schema. The default ruleset
+# is still legacy (card-play-only) so the P06 smoke can run without bidding;
+# switch to `standard` once the trainer drives bidding (P11 league work).
+feature_version: v2
+ruleset: legacy
+model_version: v2
+
+# Optimizer (RMSProp)
+optimizer:
+  learning_rate: 0.0001
+  alpha: 0.99
+  momentum: 0
+  epsilon: 1.0e-5
+
+# P06 multi-objective loss. These are the V2 trainer defaults: BCE win head
+# (weight 1.0) + masked Huber conditional score heads (weight 0.5). The
+# log-score auxiliary and uncertainty-NLL terms are available for ablation
+# but default OFF.
+loss:
+  lambda_win: 1.0
+  lambda_score: 0.5
+  lambda_log: 0.0
+  lambda_uncertainty: 0.0
+  score_delta: 1.0
+  log_score_delta: 1.0
+
+# Decision policy. `pure_win` is the deployment default (matches the P05
+# DeepAgentV2). Switch to `win_then_score` / `score_then_win` for
+# lexicographic selection, or `risk_aware` (default off via risk_penalty 0)
+# for the uncertainty-penalized mode.
+decision_policy:
+  mode: pure_win
+  abs_tol: 0.0
+  rel_tol: 0.0
+  risk_penalty: 0.0

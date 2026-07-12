@@ -122,10 +122,16 @@ def test_serialize_round_trip():
 
     cfg = load_config(str(LEGACY_YAML))
     d = serialize(cfg)
-    # Rebuild from the serialized dict.
+    # Rebuild from the serialized dict, reconstructing the nested dataclasses
+    # (optimizer, loss, decision_policy) just like the loader does.
+    from douzero.config.schemas import DecisionPolicyConfig, LossConfig
+
+    drop = {"optimizer", "loss", "decision_policy"}
     rebuilt = TrainingConfig(
-        **{k: v for k, v in d.items() if k != "optimizer"},
+        **{k: v for k, v in d.items() if k not in drop},
         optimizer=OptimizerConfig(**d["optimizer"]),
+        loss=LossConfig(**d["loss"]),
+        decision_policy=DecisionPolicyConfig(**d["decision_policy"]),
     )
     assert rebuilt == cfg
 
