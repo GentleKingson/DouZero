@@ -59,14 +59,21 @@ class LossConfig:
     config is absent. The V2 trainer (:mod:`douzero.training.v2_trainer`)
     constructs its own :class:`~douzero.training.losses.LossConfig` from
     these fields and runs the multi-objective combination.
+
+    P06 r1: ``score_target_transform`` selects whether the conditional
+    score heads are supervised against the raw team score or its
+    ``sign(s)·log1p(|s|)`` transform. The two are mutually exclusive (a
+    single head cannot fit both scales at once). ``score_clamp`` must match
+    the model's head clamp so the raw target stays inside what the heads
+    can represent.
     """
 
     lambda_win: float = 0.0
     lambda_score: float = 0.0
-    lambda_log: float = 0.0
     lambda_uncertainty: float = 0.0
     score_delta: float = 1.0
-    log_score_delta: float = 1.0
+    score_target_transform: str = "raw"  # "raw" | "signed_log"
+    score_clamp: float = 32.0
 
 
 # --------------------------------------------------------------------------- #
