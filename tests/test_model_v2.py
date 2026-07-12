@@ -503,18 +503,25 @@ class TestSaveLoad:
         out_before = _forward(model, obs)
 
         bundle_path = str(tmp_path / "model_v2.tar")
-        schema_hash = model.schema.stable_hash()
+        # Omit schema_hash / model_config on purpose: the save must DERIVE them
+        # from the model (blocker #1 — the default call produces a LOADABLE file,
+        # not one stamped with an empty config hash that the loader rejects).
         manifest = save_v2_checkpoint(
-            bundle_path, model, schema_hash=schema_hash,
-            model_config=model.config, frames=123,
+            bundle_path, model, ruleset=RuleSet.legacy(), frames=123,
             position_frames={"landlord": 41, "landlord_up": 41, "landlord_down": 41},
         )
         assert manifest.model_version == "v2"
         assert manifest.feature_version == "v2"
+        # Blocker #2: the full ruleset identity is stamped from the caller's
+        # RuleSet, not derived from flags.
+        legacy = RuleSet.legacy()
+        assert (manifest.ruleset_id, manifest.ruleset_version, manifest.ruleset_hash) == (
+            legacy.ruleset_id, legacy.ruleset_version, legacy.stable_hash(),
+        )
 
         state_dict, loaded_manifest = load_v2_checkpoint(
             bundle_path,
-            expected_schema_hash=schema_hash,
+            expected_schema_hash=model.schema.stable_hash(),
             expected_model_config_hash=model.config.stable_hash(),
             expected_ruleset=RuleSet.legacy(),
         )
@@ -538,7 +545,8 @@ class TestSaveLoad:
         model = _build_model()
         bundle_path = str(tmp_path / "model_v2.tar")
         save_v2_checkpoint(
-            bundle_path, model, schema_hash=model.schema.stable_hash(),
+            bundle_path, model, ruleset=RuleSet.legacy(),
+            schema_hash=model.schema.stable_hash(),
             model_config=model.config,
         )
         with pytest.raises(CheckpointCompatibilityError, match="schema_hash"):
@@ -560,7 +568,8 @@ class TestSaveLoad:
         model = _build_model()
         bundle_path = str(tmp_path / "model_v2.tar")
         save_v2_checkpoint(
-            bundle_path, model, schema_hash=model.schema.stable_hash(),
+            bundle_path, model, ruleset=RuleSet.legacy(),
+            schema_hash=model.schema.stable_hash(),
             model_config=model.config,
         )
         # A different config (history_heads 8 -> 4 keeps projection shapes but
@@ -586,7 +595,8 @@ class TestSaveLoad:
         model = _build_model()
         bundle_path = str(tmp_path / "model_v2.tar")
         save_v2_checkpoint(
-            bundle_path, model, schema_hash=model.schema.stable_hash(),
+            bundle_path, model, ruleset=RuleSet.legacy(),
+            schema_hash=model.schema.stable_hash(),
             model_config=model.config,
         )
         with pytest.raises(CheckpointCompatibilityError, match="ruleset"):
@@ -608,7 +618,8 @@ class TestSaveLoad:
         model = _build_model()
         bundle_path = str(tmp_path / "model_v2.tar")
         save_v2_checkpoint(
-            bundle_path, model, schema_hash=model.schema.stable_hash(),
+            bundle_path, model, ruleset=RuleSet.legacy(),
+            schema_hash=model.schema.stable_hash(),
             model_config=model.config,
         )
         with pytest.raises(CheckpointCompatibilityError, match="checkpoint_kind"):
@@ -619,6 +630,131 @@ class TestSaveLoad:
                 expected_ruleset=RuleSet.legacy(),
                 expected_checkpoint_kind="public_policy",
             )
+
+    # ------------------------------------------------------------------ #
+    # Save-side identity closure (blockers #1 and #2): the save DERIVES the
+    # model identity from the model itself and REQUIRES the full RuleSet, so a
+    # bundle can never be stamped with an identity that does not match the
+    # actual weights, and the default call always produces a loadable file.
+    # ------------------------------------------------------------------ #
+    def test_v2_checkpoint_save_requires_ruleset(self, tmp_path):
+        """Blocker #2: ruleset is required — omitting it is a TypeError."""
+        from douzero.checkpoint import save_v2_checkpoint
+
+        model = _build_model()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        with pytest.raises(TypeError, match="ruleset"):
+            save_v2_checkpoint(
+                bundle_path, model,
+                schema_hash=model.schema.stable_hash(),
+                model_config=model.config,
+            )
+
+    def test_v2_checkpoint_save_rejects_non_ruleset(self, tmp_path):
+        """Blocker #2: a non-RuleSet ruleset (e.g. a bare id string) is rejected."""
+        from douzero.checkpoint import save_v2_checkpoint
+
+        model = _build_model()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        with pytest.raises(TypeError, match="RuleSet"):
+            save_v2_checkpoint(bundle_path, model, ruleset="legacy")
+
+    def test_v2_checkpoint_save_rejects_wrong_schema_hash(self, tmp_path):
+        """Blocker #2: a caller-supplied schema_hash that differs from the
+        model's own is rejected — a bundle cannot be mislabelled."""
+        from douzero.checkpoint import save_v2_checkpoint
+
+        model = _build_model()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        with pytest.raises(ValueError, match="schema_hash mismatch"):
+            save_v2_checkpoint(
+                bundle_path, model, ruleset=RuleSet.legacy(),
+                schema_hash="0" * 64,  # a SHA-256-shaped hash that cannot match
+                model_config=model.config,
+            )
+
+    def test_v2_checkpoint_save_rejects_wrong_model_config(self, tmp_path):
+        """Blocker #2: a caller-supplied ModelV2Config whose hash differs from
+        the model's is rejected (the same-shape relabelling attack is closed)."""
+        from douzero.checkpoint import save_v2_checkpoint
+
+        model = _build_model()
+        # history_heads 8 -> 4 keeps projection shapes but changes the config
+        # hash — the exact same-shape-different-semantics case.
+        wrong_cfg = ModelV2Config(history_heads=4)
+        assert wrong_cfg.stable_hash() != model.config.stable_hash()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        with pytest.raises(ValueError, match="model_config mismatch"):
+            save_v2_checkpoint(
+                bundle_path, model, ruleset=RuleSet.legacy(),
+                schema_hash=model.schema.stable_hash(),
+                model_config=wrong_cfg,
+            )
+
+    def test_v2_checkpoint_save_standard_ruleset_round_trip(self, tmp_path):
+        """Blocker #2: a full bundle stamped with the standard ruleset
+        round-trips, and its manifest carries the standard identity (the
+        flags-only path could not express this)."""
+        from douzero.checkpoint import load_v2_checkpoint, save_v2_checkpoint
+
+        model = _build_model()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        standard = RuleSet.standard()
+        manifest = save_v2_checkpoint(bundle_path, model, ruleset=standard, frames=7)
+        assert manifest.ruleset_id == standard.ruleset_id
+        assert manifest.ruleset_version == standard.ruleset_version
+        assert manifest.ruleset_hash == standard.stable_hash()
+
+        # Loading under the SAME standard ruleset succeeds and round-trips.
+        state_dict, loaded = load_v2_checkpoint(
+            bundle_path,
+            expected_schema_hash=model.schema.stable_hash(),
+            expected_model_config_hash=model.config.stable_hash(),
+            expected_ruleset=standard,
+        )
+        assert loaded.frames == 7
+        model2 = ModelV2(model.schema, model.config)
+        model2.load_state_dict(state_dict, strict=True)
+
+    def test_v2_checkpoint_save_custom_ruleset_hash_distinct(self, tmp_path):
+        """Blocker #2: two legacy-id rulesets with different parameters produce
+        different hashes, and the full bundle stamps the COMPLETE hash — so a
+        bundle saved under a custom legacy ruleset is REJECTED when loaded under
+        canonical ``RuleSet.legacy()`` (same id, different hash), and accepted
+        only under the matching custom ruleset."""
+        from dataclasses import replace
+        from douzero.checkpoint import (
+            CheckpointCompatibilityError,
+            load_v2_checkpoint,
+            save_v2_checkpoint,
+        )
+
+        model = _build_model()
+        # A legacy-id ruleset with a non-canonical bomb_multiplier: same id
+        # ("legacy"), different stable_hash — a custom rule family.
+        custom = replace(RuleSet.legacy(), bomb_multiplier=3)
+        assert custom.ruleset_id == "legacy"
+        assert custom.stable_hash() != RuleSet.legacy().stable_hash()
+
+        bundle_path = str(tmp_path / "model_v2.tar")
+        save_v2_checkpoint(bundle_path, model, ruleset=custom)
+
+        # Same id, canonical hash -> REJECTED (the full hash must match).
+        with pytest.raises(CheckpointCompatibilityError, match="ruleset"):
+            load_v2_checkpoint(
+                bundle_path,
+                expected_schema_hash=model.schema.stable_hash(),
+                expected_model_config_hash=model.config.stable_hash(),
+                expected_ruleset=RuleSet.legacy(),
+            )
+        # Loading under the matching custom ruleset succeeds.
+        state_dict, _ = load_v2_checkpoint(
+            bundle_path,
+            expected_schema_hash=model.schema.stable_hash(),
+            expected_model_config_hash=model.config.stable_hash(),
+            expected_ruleset=custom,
+        )
+        assert isinstance(state_dict, dict)
 
     def test_load_v2_model_rejects_bare_state_dict(self, tmp_path):
         """load_v2_model must reject a bare state_dict sidecar (no manifest)."""
