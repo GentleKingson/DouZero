@@ -116,11 +116,12 @@ model_config_hash, ruleset id/version/hash, checkpoint_kind):
   values). Every expected value is a required argument. Raises
   `CheckpointCompatibilityError` on any mismatch, including an attempt to load a
   legacy/factorized `model.tar` here.
-- `save_v2_position_weights(path, model, *, schema_hash, model_config, ruleset)`
-  — writes the **manifest-bearing** deployment sidecar (`.ckpt`) for
-  `DeepAgentV2`. It is NOT a bare state_dict: it carries the schema hash,
-  model-config hash, and full ruleset identity so the strict identity check
-  applies at deployment too.
+- `save_v2_position_weights(path, model, *, ruleset, schema_hash=None,
+  model_config=None)` — writes the **manifest-bearing** deployment sidecar
+  (`.ckpt`) for `DeepAgentV2`. It is NOT a bare state_dict: it carries the
+  schema hash, model-config hash, and full ruleset identity so the strict
+  identity check applies at deployment too. Like `save_v2_checkpoint`, the
+  schema/config identity is derived from the model (overrides verified).
 
 The strict V2 loader (`load_v2_model` in `deep_agent.py`) performs a full
 key-set + shape match and raises `ValueError` on any mismatch — there is no
