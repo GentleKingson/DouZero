@@ -34,9 +34,12 @@ Checkpoint compatibility
 ------------------------
 V2 weights are NOT compatible with the legacy / factorized models (different
 parameter names and shapes). The checkpoint manifest records
-``model_version="v2"``; the loader (P16, with a P05 guard added here) rejects a
-schema/model mismatch rather than permissively partial-loading. Legacy model
-files are untouched.
+``model_version="v2"``; the strict V2 loader (P05: ``load_v2_checkpoint`` /
+``load_v2_position_weights`` / ``load_v2_model``) validates the manifest's
+schema/config/ruleset identity against runtime expectations and rejects a
+mismatch rather than permissively partial-loading. Only the legacy
+per-position loader remains permissive until P16. Legacy model files are
+untouched.
 
 Imperfect-information boundary
 ------------------------------

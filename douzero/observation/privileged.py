@@ -24,9 +24,9 @@ The imperfect-information boundary for the V2 path is currently enforced by:
 - the public encoder not importing this ``privileged`` module;
 - ``PublicObservation`` serialization containing no hidden-hand field.
 
-A canonical type guard (a ``DeepAgentV2`` rejecting ``PrivilegedObservation``
-by type) is **not implemented in P03**. It remains a P05/P16 acceptance
-requirement and will be added together with ``DeepAgentV2`` itself.
+A canonical type guard (a ``DeepAgentV2`` rejecting ``PrivilegedObservation`` by
+type) ships in P05: ``DeepAgentV2.act_v2`` raises ``TypeError`` on a
+``PrivilegedObservation`` before any model call.
 """
 
 from __future__ import annotations
