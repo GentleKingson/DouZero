@@ -170,6 +170,14 @@ class Env:
             # Standard mode: return structured terminal info.
             if self.ruleset is not None and self._env.game_result is not None:
                 info = self._env.game_result.to_dict()
+            # P06: attach team-perspective multi-objective labels to the
+            # terminal info dict in BOTH legacy and standard modes. These
+            # labels are derived from the public terminal result (winner +
+            # bomb count + bid value), never from hidden hands, and are
+            # consumed by the V2 trainer and the calibration harness. The
+            # legacy ``reward`` field above is unchanged; the new keys are
+            # purely additive.
+            info = self._attach_team_perspective_labels(info)
         else:
             obs = get_obs(self.infoset)
         return obs, reward, done, info
@@ -248,6 +256,87 @@ class Env:
                 return -bomb_num - 1.0
             else:
                 return -1.0
+
+    def _legacy_terminal_result_dict(self):
+        """Build a GameResult-compatible dict for a legacy-mode terminal state.
+
+        P02's :class:`GameResult` is only produced in standard mode. For the
+        legacy path (still the default) we construct the minimal
+        team-perspective terminal dict the P06 label helpers consume. The
+        convention matches ``douzero/env/scoring.py``'s documented legacy
+        scoring (``landlord_score = ±2 * 2**bomb_num``,
+        ``farmer_score = ∓1 * 2**bomb_num``, bomb_num includes the rocket),
+        so score conservation (``landlord_score + 2*farmer_score == 0``)
+        holds.
+
+        For ``objective='wp'`` we use base 2 / 1 (landlord plays for two);
+        for ``objective='logadp'`` we use ``±2*(bomb_num+1)`` /
+        ``∓(bomb_num+1)`` mirroring the legacy reward magnitude.
+        """
+        winner = self._game_winner
+        bomb_num = self._game_bomb_num
+        landlord_won = winner == 'landlord'
+        sign = 1 if landlord_won else -1
+        if self.objective == 'adp':
+            magnitude = float(2 ** bomb_num)
+        elif self.objective == 'logadp':
+            magnitude = float(bomb_num + 1)
+        else:  # 'wp'
+            magnitude = 1.0
+        return {
+            "winner_team": winner,
+            "winner_position": winner if landlord_won else (
+                # The legacy game engine does not record which farmer emptied
+                # first here; the team-perspective label does not depend on
+                # it. We record the winning team only.
+                "farmer"
+            ),
+            "bid_value": 0,
+            "bomb_count": int(bomb_num),
+            "rocket_count": 0,  # legacy bomb_num already includes the rocket
+            "spring": False,
+            "anti_spring": False,
+            "multiplier_breakdown": {"bombs_and_rocket": int(bomb_num)},
+            "total_multiplier": int(2 ** bomb_num) if self.objective == "adp" else 1,
+            # Landlord plays for two (sign × 2 × magnitude); each farmer plays
+            # for one (sign-flipped × magnitude). Conservation holds.
+            "landlord_score": int(sign * 2 * magnitude),
+            "farmer_score": int(-sign * magnitude),
+            "ruleset_id": "legacy",
+            "ruleset_version": "legacy-v1",
+            "ruleset_hash": "",
+        }
+
+    def _attach_team_perspective_labels(self, info):
+        """Attach P06 team-perspective multi-objective labels to terminal info.
+
+        Additive only: the existing ``info`` (which is the full GameResult
+        dict in standard mode, or an empty dict in legacy mode) is preserved.
+        The new ``team_targets`` key maps each position to its
+        ``target_win`` / ``target_score`` / ``target_log_score`` triple, and
+        ``terminal_result`` carries the GameResult-like dict the labels were
+        derived from (so the trainer/calibration harness can re-derive
+        per-position metrics without re-running the env).
+        """
+        from douzero.training.labels import team_targets
+
+        if not isinstance(info, dict):
+            info = {} if info is None else dict(info)
+        if "winner_team" not in info:
+            # Legacy mode: synthesize the minimal terminal result dict.
+            info.update(self._legacy_terminal_result_dict())
+        result_dict = {
+            k: info[k] for k in (
+                "winner_team", "landlord_score", "farmer_score"
+            ) if k in info
+        }
+        per_position = {
+            pos: team_targets(result_dict, pos)
+            for pos in ("landlord", "landlord_up", "landlord_down")
+        }
+        info["team_targets"] = per_position
+        info["terminal_result"] = result_dict
+        return info
 
     @property
     def _game_infoset(self):

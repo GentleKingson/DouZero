@@ -53,7 +53,13 @@ def test_rollout_terminates_and_returns_terminal_reward(objective, seed_factory)
     env = Env(objective)
     result = _rollout_to_terminal(env)
     assert result["winner"] in {"landlord", "farmer"}
-    assert result["info"] == {}
+    # P06 attaches team-perspective labels to terminal info; the legacy
+    # ``reward`` path itself is unchanged. Assert the keys P06 added.
+    assert "team_targets" in result["info"]
+    assert "terminal_result" in result["info"]
+    for pos in ("landlord", "landlord_up", "landlord_down"):
+        labels = result["info"]["team_targets"][pos]
+        assert labels["target_win"] in (0.0, 1.0)
     # Terminal reward is non-zero and from the landlord's perspective.
     bomb = result["bomb_num"]
     if result["winner"] == "landlord":
