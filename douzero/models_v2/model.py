@@ -180,6 +180,22 @@ class ModelV2(nn.Module):
             score_clamp=cfg.score_clamp,
         )
 
+        # P07: optional belief fusion. When ``belief_enabled`` the model gains
+        # a projection that maps the (frozen, externally-computed) belief
+        # posterior features into the trunk and adds them to the state
+        # representation before fusion. The belief FEATURES are produced by a
+        # separate :class:`~douzero.belief.model.BeliefModel` (pretrained then
+        # frozen); this model never owns or reads true hidden hands. The
+        # architecture delta is exactly ``belief_enabled`` (already an identity
+        # axis in :meth:`ModelV2Config.compatibility_dict`), so no checkpoint
+        # identity-version bump is required and existing belief-disabled
+        # checkpoints remain loadable unchanged.
+        self.belief_proj: nn.Module | None = None
+        if cfg.belief_enabled:
+            from douzero.belief.model import BELIEF_FEATURE_DIM
+
+            self.belief_proj = nn.Linear(BELIEF_FEATURE_DIM, cfg.hidden_size)
+
         # Cache the role-name -> index map so forward() does no dict lookup.
         self._role_to_index = {role: i for i, role in enumerate(SUPPORTED_ROLES)}
 
@@ -210,6 +226,8 @@ class ModelV2(nn.Module):
         action_features: torch.Tensor,
         action_mask: torch.Tensor,
         acting_role: str,
+        belief_features: torch.Tensor | None = None,
+        belief_stop_gradient: bool = True,
     ) -> ModelOutput:
         """Run a full forward pass for one decision.
 
@@ -246,6 +264,17 @@ class ModelV2(nn.Module):
         acting_role:
             The acting role name (``"landlord"`` / ``"landlord_up"`` /
             ``"landlord_down"``).
+        belief_features:
+            Optional ``(BELIEF_FEATURE_DIM,)`` float tensor — the belief
+            posterior features from a frozen
+            :class:`~douzero.belief.model.BeliefModel`. Only consumed when
+            ``config.belief_enabled``; passing it to a belief-disabled model
+            raises ``ValueError``. When ``belief_enabled`` and ``None``, a zero
+            vector is used (belief signal absent).
+        belief_stop_gradient:
+            If True (default), detach ``belief_features`` so the value loss
+            cannot update the (frozen) belief model — the "pretrain then freeze"
+            path. Pass False for joint training.
 
         Returns
         -------
@@ -275,6 +304,38 @@ class ModelV2(nn.Module):
         all_card_vectors = state_card_vectors + context_card_vectors
         full_context_flat = torch.cat([state_context_flat, context_flat], dim=-1)
         state_trunk = self.state_encoder(all_card_vectors, full_context_flat)
+
+        # P07: optional belief fusion. The belief features (posterior expected
+        # counts, entropy, key-card probabilities) are produced by a separate,
+        # pretrained-and-frozen BeliefModel from the PUBLIC observation only;
+        # they are projected into the trunk and added. ``belief_stop_gradient``
+        # (default True) detaches the features so value loss never updates the
+        # frozen belief weights — the "pretrain belief then freeze" path. A
+        # caller doing joint training passes ``belief_stop_gradient=False``.
+        # When ``belief_enabled`` but no features are supplied, a zero vector is
+        # used so the model still runs (the belief signal is absent, not an
+        # error) — useful for ablations and the masked-zero baseline.
+        if self.belief_proj is not None:
+            from douzero.belief.model import BELIEF_FEATURE_DIM
+
+            if belief_features is None:
+                belief_features = state_trunk.new_zeros(BELIEF_FEATURE_DIM)
+            else:
+                if belief_features.shape[-1] != BELIEF_FEATURE_DIM:
+                    raise ValueError(
+                        f"belief_features trailing dim "
+                        f"{belief_features.shape[-1]} != BELIEF_FEATURE_DIM "
+                        f"{BELIEF_FEATURE_DIM}"
+                    )
+                if belief_stop_gradient:
+                    belief_features = belief_features.detach()
+            state_trunk = state_trunk + self.belief_proj(belief_features)
+        elif belief_features is not None:
+            raise ValueError(
+                "belief_features were passed to a belief-DISABLED ModelV2 "
+                "(config.belief_enabled is False). Drop belief_features or "
+                "rebuild the model with belief_enabled=True."
+            )
 
         # --- Encode the history once. ---
         history_summary = self.history_encoder(history_tokens, history_key_padding_mask)
