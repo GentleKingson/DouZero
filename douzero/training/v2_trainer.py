@@ -211,25 +211,22 @@ class V2Trainer:
     ) -> None:
         _legacy_only(ruleset)
         loss_cfg = loss_config or LossConfig()
-        # P06 r2: when the score heads are supervised against the RAW team
-        # score, the loss target is clamped to loss_cfg.score_clamp. If that
-        # clamp does not match the model's head clamp, the target range and
-        # the representable output range disagree (a head clamped to ±8
+        # P06 r2/r7: the loss target is clamped to loss_cfg.score_clamp in
+        # BOTH raw and signed_log modes (r5 made the clamp universal). If
+        # that clamp does not match the model's head clamp, the target range
+        # and the representable output range disagree (a head clamped to ±8
         # cannot fit a target clamped to ±32), producing a systematic fit
         # gap. Reject this at construction rather than letting it poison
         # every gradient step.
-        if (
-            loss_cfg.score_target_transform == "raw"
-            and abs(loss_cfg.score_clamp - model.config.score_clamp) > 1e-9
-        ):
+        if abs(loss_cfg.score_clamp - model.config.score_clamp) > 1e-9:
             raise ValueError(
                 f"LossConfig.score_clamp ({loss_cfg.score_clamp}) does not match "
-                f"model.config.score_clamp ({model.config.score_clamp}). In raw "
-                f"score mode the loss target is clamped to score_clamp, so it "
-                f"must equal the model's head clamp or the target range and the "
-                f"representable output range disagree. Either align both values, "
-                f"pass score_target_transform='signed_log', or construct the "
-                f"model with ModelV2Config(score_clamp=loss_cfg.score_clamp)."
+                f"model.config.score_clamp ({model.config.score_clamp}). The "
+                f"loss target is clamped to score_clamp in both raw and "
+                f"signed_log modes, so it must equal the model's head clamp "
+                f"or the target range and the representable output range "
+                f"disagree. Either align both values, or construct the model "
+                f"with ModelV2Config(score_clamp=loss_cfg.score_clamp)."
             )
         # P06 r5: the score_target_transform must also agree between the
         # loss config and the model config, so a model trained with "raw"

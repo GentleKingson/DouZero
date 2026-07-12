@@ -590,12 +590,21 @@ def _gather_action(
     ``action_indices`` are absolute row indices into the head tensors'
     leading dim. If ``None``, the first valid action of the (single)
     decision is selected — a deterministic fallback for synthetic tests.
+
+    P06 r7: validates the indices before gathering:
+    - dtype must be integer (bool is rejected because ``True``/``False``
+      are silently cast to 1/0);
+    - negative indices are rejected (PyTorch wraps them to the tail,
+      silently selecting the wrong row);
+    - out-of-bounds indices are rejected;
+    - indices pointing at padded rows (``action_mask=False``) are rejected.
     """
     head = output.win_logit
     if head.dim() != 2 or head.shape[-1] != 1:
         raise ValueError(
             "expected head tensor of shape (B*N, 1), got " f"{tuple(head.shape)}"
         )
+    num_rows = head.shape[0]
     if action_indices is None:
         # Single-decision fallback: take the first valid action.
         mask = output.action_mask
@@ -606,7 +615,53 @@ def _gather_action(
             output.score_if_loss[idx : idx + 1],
         )
 
+    # P06 r7: reject bool and non-integer dtypes before the implicit
+    # .to(torch.long) cast silently converts them.
+    if isinstance(action_indices, torch.Tensor):
+        if action_indices.dtype == torch.bool:
+            raise TypeError(
+                "action_indices must have an integer dtype, got torch.bool. "
+                "True/False would be silently cast to 1/0."
+            )
+        if action_indices.dtype not in (
+            torch.int8, torch.int16, torch.int32, torch.int64,
+            torch.uint8,
+        ):
+            raise TypeError(
+                f"action_indices must have an integer dtype, got "
+                f"{action_indices.dtype}. Float indices would be silently "
+                f"truncated."
+            )
+
     rows = action_indices.reshape(-1).to(torch.long)
+
+    if rows.numel() == 0:
+        raise ValueError(
+            "action_indices is empty; at least one action must be selected."
+        )
+    if bool((rows < 0).any()):
+        raise ValueError(
+            f"action_indices contains negative values "
+            f"({rows[rows < 0].tolist()}); negative indices would wrap to "
+            f"the tail and silently select the wrong row."
+        )
+    if bool((rows >= num_rows).any()):
+        raise ValueError(
+            f"action_indices contains out-of-bounds values "
+            f"(max {int(rows.max().item())} for {num_rows} action rows)."
+        )
+    # Reject indices pointing at padded (action_mask=False) rows. The
+    # ModelOutput contract requires consumers to honour the mask.
+    mask = output.action_mask
+    if mask is not None and mask.shape[0] == num_rows:
+        selected_mask = mask[rows]
+        if not bool(selected_mask.all()):
+            bad = rows[~selected_mask].tolist()
+            raise ValueError(
+                f"action_indices select padded/invalid action rows: {bad}. "
+                f"The action_mask is False for these rows (padding)."
+            )
+
     return (
         output.win_logit[rows],
         output.score_if_win[rows],
