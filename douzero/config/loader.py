@@ -126,6 +126,32 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     if unknown_model:
         raise ValueError(f"Unknown model config keys: {sorted(unknown_model)}")
 
+    # P06 r6: unify top-level ``model_version`` and nested ``model.version``
+    # into a single source of truth. Without this, a YAML like
+    # ``model_version: v2`` + ``model: {version: legacy}`` would be accepted,
+    # with the identity gate reading ``model_version`` while the model
+    # constructor reads ``model.*``.
+    top_version = raw.get("model_version", TrainingConfig.__dataclass_fields__["model_version"].default)
+    has_explicit_nested = "version" in model_raw
+    nested_version = model_raw.get("version", top_version)
+    if nested_version != top_version:
+        raise ValueError(
+            f"model.version ({nested_version!r}) must match model_version "
+            f"({top_version!r}). The top-level and nested model identity "
+            f"fields must agree; set only one or ensure both are the same."
+        )
+    # Validate an EXPLICITLY provided nested version against the supported
+    # set. When no model: block is present, the top-level version validation
+    # is handled by _validate_legacy_only_versions downstream.
+    if has_explicit_nested and nested_version not in _LEGACY_ONLY_VERSIONS["model_version"]:
+        raise ValueError(
+            f"model.version has unsupported value {nested_version!r}. "
+            f"Supported values are {sorted(_LEGACY_ONLY_VERSIONS['model_version'])}."
+        )
+    # Ensure model_raw carries the resolved version so ModelConfig picks it up.
+    model_raw = dict(model_raw)
+    model_raw["version"] = nested_version
+
     # P02: a 'rules' block is accepted but not stored on TrainingConfig (which
     # only carries the version string). We validate it here so a malformed
     # rules block fails loudly, and so the ruleset version string is
