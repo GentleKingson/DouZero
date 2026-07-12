@@ -85,6 +85,11 @@ _SCHEMA_HASH_KEY = "feature_schema_hash"
 #: same-shape-different-semantics config drift (e.g. history_heads 8→4) is
 #: rejected, not silently loaded.
 _MODEL_CONFIG_HASH_KEY = "model_config_hash"
+#: P06 r6: the identity-version key. Version 1 = P05 compatibility dict
+#: (no ``score_target_transform``); version 2 = P06 r5+ (adds it). Absent
+#: on P05 checkpoints; the loader treats absence as version 1 and applies
+#: the P05 migration path (v1 hash + raw transform check).
+_MODEL_CONFIG_IDENTITY_VERSION_KEY = "model_config_identity_version"
 
 #: A small sentinel schema hash stamped into a manifest-less bundle so a loader
 #: can distinguish "no schema hash present" from "schema hash is the empty
@@ -95,6 +100,78 @@ _NO_SCHEMA_HASH = ""
 #: deployment sidecar (DeepAgentV2); ``training_checkpoint`` is the full
 #: bundle. Both are in the global CHECKPOINT_KINDS set.
 _V2_CHECKPOINT_KINDS = frozenset({"training_checkpoint", "public_policy"})
+
+
+def _validate_model_config_hash(
+    bundle: dict,
+    expected_model_config_hash: str,
+    runtime_model_config: "ModelV2Config | None",
+    path: str,
+) -> None:
+    """Validate the model-config hash, with P05 migration (P06 r6).
+
+    A V2 bundle carries ``model_config_hash`` and, since P06 r6,
+    ``model_config_identity_version``. The validation logic is:
+
+    - **Identity version 2** (current): the bundle's hash must match the
+      runtime's ``stable_hash()`` exactly. No migration.
+    - **Identity version 1 or absent** (P05 checkpoint): the bundle was saved
+      before ``score_target_transform`` entered the compatibility dict. The
+      loader computes the runtime's ``stable_hash_v1()`` (the P05 field set)
+      and allows loading ONLY when:
+
+      1. the v1 hash matches the bundle's hash, AND
+      2. the runtime ``score_target_transform == "raw"`` (the P05 default).
+
+      A runtime using ``signed_log`` cannot accept a P05 checkpoint because
+      the P05 model's score heads were implicitly on the raw scale.
+
+    ``runtime_model_config`` is the ModelV2Config the loader is about to
+    construct the model with. It is required (not ``None``) so the v1 hash
+    can be computed.
+    """
+    actual_cfg_hash = bundle.get(_MODEL_CONFIG_HASH_KEY, _NO_SCHEMA_HASH)
+    identity_version = bundle.get(_MODEL_CONFIG_IDENTITY_VERSION_KEY, 1)
+
+    if identity_version == 2:
+        if actual_cfg_hash != expected_model_config_hash:
+            raise CheckpointCompatibilityError(
+                f"V2 checkpoint at {path!r} model_config_hash mismatch: "
+                f"checkpoint has {actual_cfg_hash!r}, runtime expects "
+                f"{expected_model_config_hash!r}. The model was saved under a "
+                f"different ModelV2Config (e.g. history_heads, score_clamp, "
+                f"nan_guard, score_target_transform). Same-shape weights are "
+                f"not enough."
+            )
+        return
+
+    # Identity version 1 (or absent): P05 migration path.
+    if runtime_model_config is None:
+        raise CheckpointCompatibilityError(
+            f"V2 checkpoint at {path!r} carries model_config_identity_version="
+            f"{identity_version!r} (P05 format) but no runtime_model_config "
+            f"was supplied for the v1 hash computation. P05-format checkpoints "
+            f"require the runtime ModelV2Config to validate the legacy hash."
+        )
+    runtime_transform = runtime_model_config.score_target_transform
+    if runtime_transform != "raw":
+        raise CheckpointCompatibilityError(
+            f"V2 checkpoint at {path!r} is a P05-format checkpoint (identity "
+            f"version {identity_version!r}) whose score heads were trained on "
+            f"the 'raw' scale, but the runtime requests "
+            f"score_target_transform={runtime_transform!r}. A P05 checkpoint "
+            f"is only loadable under the 'raw' transform. Retrain under the "
+            f"desired transform or switch the runtime to 'raw'."
+        )
+    v1_hash = runtime_model_config.stable_hash_v1()
+    if actual_cfg_hash != v1_hash:
+        raise CheckpointCompatibilityError(
+            f"V2 checkpoint at {path!r} model_config_hash mismatch (P05 "
+            f"migration): checkpoint has {actual_cfg_hash!r}, runtime P05 v1 "
+            f"hash is {v1_hash!r}. The model was saved under a different "
+            f"ModelV2Config even under the P05 identity. Same-shape weights "
+            f"are not enough."
+        )
 
 
 def _coerce_flags(flags: Any) -> argparse.Namespace | dict[str, Any] | None:
@@ -318,6 +395,9 @@ def save_v2_checkpoint(
         _CONFIG_KEY: dict(config_dict) if config_dict else {},
         _SCHEMA_HASH_KEY: str(schema_hash),
         _MODEL_CONFIG_HASH_KEY: str(model_config_hash),
+        # P06 r6: stamp the identity version so a future loader knows which
+        # compatibility-dict field set produced this hash.
+        _MODEL_CONFIG_IDENTITY_VERSION_KEY: 2,
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, path)
@@ -333,6 +413,7 @@ def load_v2_checkpoint(
     expected_checkpoint_kind: str = "training_checkpoint",
     training_device: str | None = None,
     allow_unsafe_pickle: bool = False,
+    runtime_model_config: "ModelV2Config | None" = None,
 ) -> tuple[dict, CheckpointManifest]:
     """Load a V2 bundle, validating its manifest against RUNTIME expectations.
 
@@ -364,6 +445,11 @@ def load_v2_checkpoint(
     allow_unsafe_pickle:
         Switches to ``weights_only=False`` (permits arbitrary code execution
         via pickle). Default is ``False`` (safe — ``weights_only=True``).
+    runtime_model_config:
+        P06 r6: the runtime :class:`ModelV2Config`. Required for loading a
+        P05-format checkpoint (one that lacks ``model_config_identity_version``
+        or carries version 1) so the v1 hash can be computed. When ``None``
+        and the checkpoint is P05-format, loading is rejected.
 
     Returns
     -------
@@ -445,20 +531,16 @@ def load_v2_checkpoint(
             f"field reorder/resize changes the hash)."
         )
 
-    # Model-config hash check (blocker #2): the bundle's config hash must equal
-    # the runtime's. This catches a same-shape-different-semantics config drift
-    # (e.g. history_heads 8->4 keeps projection shapes but changes the
-    # Transformer split; score_clamp / nan_guard change runtime behavior) that
-    # strict state_dict loading cannot detect.
-    actual_cfg_hash = bundle.get(_MODEL_CONFIG_HASH_KEY, _NO_SCHEMA_HASH)
-    if actual_cfg_hash != expected_model_config_hash:
-        raise CheckpointCompatibilityError(
-            f"V2 checkpoint at {path!r} model_config_hash mismatch: "
-            f"checkpoint has {actual_cfg_hash!r}, runtime expects "
-            f"{expected_model_config_hash!r}. The model was saved under a "
-            f"different ModelV2Config (e.g. history_heads, score_clamp, "
-            f"nan_guard). Same-shape weights are not enough."
-        )
+    # Model-config hash check (blocker #2 + P06 r6 migration): delegates to
+    # _validate_model_config_hash which handles both identity-version-2
+    # (strict) and identity-version-1/absent (P05 migration with v1 hash +
+    # raw-transform check).
+    _validate_model_config_hash(
+        bundle,
+        expected_model_config_hash=expected_model_config_hash,
+        runtime_model_config=runtime_model_config,
+        path=path,
+    )
 
     state_dict = bundle[_V2_STATE_DICT_KEY]
     if not isinstance(state_dict, dict):
@@ -549,6 +631,8 @@ def save_v2_position_weights(
         _MANIFEST_KEY: manifest.to_dict(),
         _SCHEMA_HASH_KEY: str(schema_hash),
         _MODEL_CONFIG_HASH_KEY: str(model_config_hash),
+        # P06 r6: stamp the identity version (mirrors save_v2_checkpoint).
+        _MODEL_CONFIG_IDENTITY_VERSION_KEY: 2,
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, path)
@@ -563,6 +647,7 @@ def load_v2_position_weights(
     expected_ruleset: "RuleSet",
     training_device: str | None = None,
     allow_unsafe_pickle: bool = False,
+    runtime_model_config: "ModelV2Config | None" = None,
 ) -> tuple[dict, CheckpointManifest]:
     """Load a manifest-bearing V2 deployment sidecar.
 
@@ -579,6 +664,10 @@ def load_v2_position_weights(
     - a wrong ruleset, including a custom rule family with the same id but
       different parameters (ruleset hash mismatch);
     - an unknown ruleset id (the caller's RuleSet provides the expected id).
+
+    ``runtime_model_config`` (P06 r6) is required for loading a P05-format
+    sidecar so the v1 hash can be computed; see
+    :func:`load_v2_checkpoint` for the full migration description.
     """
     if not expected_schema_hash:
         raise ValueError(
@@ -642,13 +731,13 @@ def load_v2_position_weights(
             f"checkpoint has {actual_hash!r}, runtime expects "
             f"{expected_schema_hash!r}."
         )
-    if actual_cfg_hash != expected_model_config_hash:
-        raise CheckpointCompatibilityError(
-            f"V2 sidecar at {path!r} model_config_hash mismatch: "
-            f"checkpoint has {actual_cfg_hash!r}, runtime expects "
-            f"{expected_model_config_hash!r}. The model was saved under a "
-            f"different ModelV2Config."
-        )
+    # P06 r6: model-config hash with P05 migration (mirrors the full bundle).
+    _validate_model_config_hash(
+        bundle,
+        expected_model_config_hash=expected_model_config_hash,
+        runtime_model_config=runtime_model_config,
+        path=path,
+    )
     if not isinstance(state_dict, dict):
         raise CheckpointCompatibilityError(
             f"V2 sidecar at {path!r} state_dict is not a dict (got "
