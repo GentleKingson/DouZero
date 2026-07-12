@@ -135,6 +135,54 @@ def _assert_v2_identity(cfg) -> None:
         )
 
 
+#: Legacy multiprocess fields the P06 V2 trainer does NOT consume. Each entry
+#: maps the field name to its TrainingConfig default; a non-default value in a
+#: YAML config triggers a visible warning (P06 r3 fix: these were silently
+#: ignored in r0-r2). P14's high-throughput trainer will consume them.
+_UNSUPPORTED_LEGACY_FIELDS: dict[str, object] = {
+    "actor_device_cpu": False,
+    "gpu_devices": "0",
+    "num_actor_devices": 1,
+    "num_actors": 5,
+    "training_device": "0",
+    "load_model": False,
+    "disable_checkpoint": False,
+    "total_frames": 100000000000,
+    "unroll_length": 100,
+    "num_buffers": 50,
+    "num_threads": 4,
+}
+
+
+def _warn_unsupported_legacy_fields(cfg) -> None:
+    """Print a visible warning when a YAML config sets a legacy multiprocess
+    field to a non-default value the P06 V2 trainer will silently ignore.
+
+    P06 r3 fix: the enhanced.yaml carries these fields for TrainingConfig
+    schema compatibility, but the single-process trainer does not consume
+    them. Rather than silently accepting a user's tuned ``num_actors: 16``
+    (which would have NO effect), we print a stderr warning naming each
+    ignored field so the user knows the V2 trainer path does not use it.
+    """
+    if cfg is None:
+        return
+    ignored = []
+    for field_name, default_val in _UNSUPPORTED_LEGACY_FIELDS.items():
+        actual = getattr(cfg, field_name, default_val)
+        if actual != default_val:
+            ignored.append(f"  {field_name}: {actual!r} (default {default_val!r})")
+    if ignored:
+        import sys
+
+        print(
+            "[train_v2] WARNING: the following legacy multiprocess fields are "
+            "set in the config but NOT consumed by the P06 single-process V2 "
+            "trainer. They will be consumed by P14's high-throughput trainer.\n"
+            + "\n".join(ignored),
+            file=sys.stderr,
+        )
+
+
 def _resolve_ruleset(cfg):
     """Resolve the ruleset for the trainer.
 
@@ -220,6 +268,11 @@ def main() -> None:
     # silently pair them with the wrong observation path.
     _assert_v2_identity(yaml_cfg)
 
+    # P06 r3: warn about legacy multiprocess fields the V2 trainer does not
+    # consume, so a user who tunes num_actors / gpu_devices / etc. in the
+    # YAML is alerted that the single-process trainer ignores them.
+    _warn_unsupported_legacy_fields(yaml_cfg)
+
     # Build the seed/deterministic resolver. ``resolve(cli_dest, yaml_value,
     # default_value)`` implements CLI > YAML > built-in-default precedence.
     # argparse SUPPRESS defaults mean absent CLI flags do NOT appear in
@@ -252,7 +305,13 @@ def main() -> None:
     from douzero.models_v2.model import ModelV2
     from douzero.observation.schema import build_v2_schema
 
-    torch.manual_seed(seed)
+    # P06 r3: respect the project's seed=0 → no-op contract. set_global_seed(0)
+    # is a no-op (Python/NumPy/Torch all unseeded); we must NOT separately
+    # torch.manual_seed(0) or the model init would be seeded while the deal
+    # shuffle is not — a mixed, contradictory reproducibility state. Only
+    # seed Torch when the user explicitly requested a non-zero seed.
+    if seed != 0:
+        torch.manual_seed(seed)
     schema = build_v2_schema()
     model_cfg = _build_model_cfg(yaml_cfg)
     model = ModelV2(schema, model_cfg)

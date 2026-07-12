@@ -128,6 +128,21 @@ class TrainerConfig:
             )
         if self.max_episodes < 0:
             raise ValueError(f"max_episodes must be >= 0, got {self.max_episodes}")
+        # P06 r3: RMSprop parameter ranges. alpha is the squared-gradient
+        # running-average decay (0 <= alpha < 1); momentum is non-negative;
+        # epsilon is the denominator stability term (must be positive).
+        if not (_math.isfinite(self.rmsprop_alpha) and 0.0 <= self.rmsprop_alpha < 1.0):
+            raise ValueError(
+                f"rmsprop_alpha must be finite and in [0, 1), got {self.rmsprop_alpha}"
+            )
+        if not (_math.isfinite(self.rmsprop_momentum) and self.rmsprop_momentum >= 0.0):
+            raise ValueError(
+                f"rmsprop_momentum must be finite and >= 0, got {self.rmsprop_momentum}"
+            )
+        if not (_math.isfinite(self.rmsprop_epsilon) and self.rmsprop_epsilon > 0.0):
+            raise ValueError(
+                f"rmsprop_epsilon must be finite and > 0, got {self.rmsprop_epsilon}"
+            )
 
 
 @dataclass
@@ -229,10 +244,26 @@ class V2Trainer:
             eps=self.config.rmsprop_epsilon,
         )
         self.buffer = V2ReplayBuffer(capacity_transitions=self.config.buffer_capacity)
-        self.rng = random.Random(self.config.rng_seed)
+        # P06 r3: respect the project's seed=0 → no-op contract. When
+        # rng_seed is 0, use system entropy (random.Random() with no arg)
+        # so the trainer's action sampling is unseeded — matching the
+        # unseeded deal shuffle and model init. Only seed the local RNG
+        # when the user explicitly requested a non-zero seed.
+        if self.config.rng_seed == 0:
+            self.rng = random.Random()
+        else:
+            self.rng = random.Random(self.config.rng_seed)
         self.stats = TrainerStats(
             episodes_per_team={"landlord": 0, "farmer": 0}
         )
+        # P06 r3: put the model in eval mode for self-play collection.
+        # ``inference_mode`` in _choose_action_index only disables autograd;
+        # it does NOT switch Dropout / BatchNorm behaviour, so without
+        # eval() a model with non-zero history_dropout or mlp_dropout would
+        # produce non-deterministic action selection even with exp_epsilon=0.
+        # step() toggles to train() for the optimizer step, then back to
+        # eval() after.
+        self.model.eval()
 
     # ------------------------------------------------------------------ #
     # Self-play episode collection
