@@ -67,6 +67,11 @@ _MANIFEST_KEY = "manifest"
 _CONFIG_KEY = "model_v2_config"
 #: The bundle key holding the feature schema hash the model was built against.
 _SCHEMA_HASH_KEY = "feature_schema_hash"
+#: The bundle key holding the ModelV2Config compatibility hash (blocker #2).
+#: A loader binds the checkpoint to the exact architecture config, so a
+#: same-shape-different-semantics config drift (e.g. history_heads 8→4) is
+#: rejected, not silently loaded.
+_MODEL_CONFIG_HASH_KEY = "model_config_hash"
 
 #: A small sentinel schema hash stamped into a manifest-less bundle so a loader
 #: can distinguish "no schema hash present" from "schema hash is the empty
@@ -138,6 +143,7 @@ def save_v2_checkpoint(
     model: "torch.nn.Module",
     *,
     schema_hash: str,
+    model_config: "ModelV2Config | None" = None,
     config_dict: dict[str, Any] | None = None,
     flags: argparse.Namespace | dict[str, Any] | None = None,
     frames: int = 0,
@@ -155,6 +161,14 @@ def save_v2_checkpoint(
         The :attr:`FeatureSchemaManifest.stable_hash` the model was constructed
         against (i.e. ``model.schema.stable_hash()``). Stamped into the bundle
         so a loader can reject a schema drift.
+    model_config:
+        The :class:`~douzero.models_v2.config.ModelV2Config` the model was
+        constructed with. Its :meth:`~ModelV2Config.stable_hash` is stamped
+        into the bundle (blocker #2) so a loader can reject a
+        same-shape-different-semantics config drift that strict state_dict
+        loading cannot detect. Recommended; pass ``None`` only for tests that
+        intentionally skip the config-hash identity (the loader then requires
+        ``expected_model_config_hash=None`` too).
     config_dict:
         Optional serializable dict of the :class:`ModelV2Config`. Auditability
         only; the loader does not reconstruct the config from it (the caller
@@ -170,6 +184,12 @@ def save_v2_checkpoint(
             "schema_hash is required (an empty hash cannot bind the checkpoint "
             "to a feature schema)."
         )
+    # Blocker #2: compute the model-config compatibility hash. A loader binds
+    # the checkpoint to this hash so a same-shape-different-config drift
+    # (e.g. history_heads 8->4) is rejected, not silently loaded.
+    model_config_hash = (
+        model_config.stable_hash() if model_config is not None else _NO_SCHEMA_HASH
+    )
     manifest = build_v2_manifest(
         flags=flags,
         schema_hash=schema_hash,
@@ -182,6 +202,7 @@ def save_v2_checkpoint(
         _MANIFEST_KEY: manifest.to_dict(),
         _CONFIG_KEY: dict(config_dict) if config_dict else {},
         _SCHEMA_HASH_KEY: str(schema_hash),
+        _MODEL_CONFIG_HASH_KEY: str(model_config_hash),
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, path)
@@ -192,7 +213,8 @@ def load_v2_checkpoint(
     path: str,
     *,
     expected_schema_hash: str,
-    expected_ruleset_id: str = "legacy",
+    expected_model_config_hash: str,
+    expected_ruleset: "RuleSet",
     expected_checkpoint_kind: str = "training_checkpoint",
     training_device: str | None = None,
     allow_unsafe_pickle: bool = False,
@@ -208,17 +230,25 @@ def load_v2_checkpoint(
         was constructed against). The bundle's schema hash must match exactly.
         Required (no default) — binding a checkpoint to a schema must be
         explicit, not skipped.
-    expected_ruleset_id:
-        The rule-engine identity the runtime expects (``"legacy"`` or
-        ``"standard"``). Defaults to ``"legacy"``. A V2 model trained under one
-        ruleset must not be served under another.
+    expected_model_config_hash:
+        The :meth:`ModelV2Config.stable_hash` the runtime expects. The bundle's
+        model-config hash must match exactly. Required — this closes the
+        same-shape-different-semantics loophole (e.g. ``history_heads`` 8→4)
+        that strict state_dict loading cannot detect.
+    expected_ruleset:
+        The :class:`~douzero.env.rules.RuleSet` the runtime expects. The
+        bundle's ruleset_id / ruleset_version / ruleset_hash must all match.
+        Passing a full RuleSet (not just an id string) supports custom rule
+        families and rejects an unknown id that would otherwise be silently
+        downgraded to legacy.
     expected_checkpoint_kind:
         Defaults to ``"training_checkpoint"``. Pass ``"public_policy"`` when
         loading a deployment sidecar via this loader.
     training_device:
         Device to map tensors to (``"cpu"`` / ``"cuda:N"`` / None).
     allow_unsafe_pickle:
-        Switches to ``weights_only=False``. Default is ``True`` (safe).
+        Switches to ``weights_only=False`` (permits arbitrary code execution
+        via pickle). Default is ``False`` (safe — ``weights_only=True``).
 
     Returns
     -------
@@ -229,15 +259,30 @@ def load_v2_checkpoint(
     Raises
     ------
     CheckpointCompatibilityError
-        On ANY identity mismatch (model_version, schema hash, ruleset, kind).
-        The expected values come from the RUNTIME, not the checkpoint, so a
-        forged/corrupted checkpoint cannot self-attest compatibility.
+        On ANY identity mismatch (model_version, schema hash, model-config
+        hash, ruleset id/version/hash, kind). The expected values come from
+        the RUNTIME, not the checkpoint, so a forged/corrupted checkpoint
+        cannot self-attest compatibility.
     """
     if not expected_schema_hash:
         raise ValueError(
             "expected_schema_hash is required: a checkpoint must be explicitly "
             "bound to a feature schema, never loaded without the check."
         )
+    if not expected_model_config_hash:
+        raise ValueError(
+            "expected_model_config_hash is required: a checkpoint must be "
+            "explicitly bound to its ModelV2Config, never loaded without the "
+            "check (a same-shape-different-config drift is otherwise silent)."
+        )
+    from douzero.env.rules import RuleSet as _RuleSet
+    if not isinstance(expected_ruleset, _RuleSet):
+        raise TypeError(
+            f"expected_ruleset must be a RuleSet instance, got "
+            f"{type(expected_ruleset).__name__}. Pass the full RuleSet so the "
+            f"complete ruleset_hash is validated, not just an id string."
+        )
+
     weights_only = not allow_unsafe_pickle
     bundle = torch.load(
         path,
@@ -252,31 +297,20 @@ def load_v2_checkpoint(
         )
     manifest = CheckpointManifest.from_dict(bundle[_MANIFEST_KEY])
 
-    # Compute the EXPECTED rule identity from the runtime-supplied ruleset id
-    # (NOT from the manifest's self-reported value). This is the bug #3 fix: a
-    # forged manifest cannot self-attest a different ruleset.
-    from douzero.env.rules import RuleSet
-    if expected_ruleset_id == "standard":
-        expected_rs = RuleSet.standard()
-    else:
-        expected_rs = RuleSet.legacy()
-
     # Validate EVERY identity field. The expected values come from the runtime
-    # (this function's arguments), except feature_version which is always "v2"
-    # for a V2 bundle (and the manifest's own ruleset_version/hash, which must
-    # match the canonical identity for the ruleset_id the manifest carries —
-    # this catches a bundle that claims ruleset_id=legacy but stamps a standard
-    # ruleset hash).
+    # (this function's arguments — the caller's RuleSet and schema/config
+    # hashes), NOT from the manifest's self-reported values. A forged manifest
+    # cannot self-attest a different identity.
     _validate_manifest(
         manifest,
         expected_schema_version=CURRENT_SCHEMA_VERSION,
         expected_model_version="v2",
         expected_feature_version="v2",
-        expected_ruleset_id=expected_ruleset_id,
+        expected_ruleset_id=expected_ruleset.ruleset_id,
         expected_checkpoint_kind=expected_checkpoint_kind,
         path=path,
-        expected_ruleset_version=expected_rs.ruleset_version,
-        expected_ruleset_hash=expected_rs.stable_hash(),
+        expected_ruleset_version=expected_ruleset.ruleset_version,
+        expected_ruleset_hash=expected_ruleset.stable_hash(),
     )
     if manifest.model_version != "v2":
         raise CheckpointCompatibilityError(
@@ -296,6 +330,21 @@ def load_v2_checkpoint(
             f"field reorder/resize changes the hash)."
         )
 
+    # Model-config hash check (blocker #2): the bundle's config hash must equal
+    # the runtime's. This catches a same-shape-different-semantics config drift
+    # (e.g. history_heads 8->4 keeps projection shapes but changes the
+    # Transformer split; score_clamp / nan_guard change runtime behavior) that
+    # strict state_dict loading cannot detect.
+    actual_cfg_hash = bundle.get(_MODEL_CONFIG_HASH_KEY, _NO_SCHEMA_HASH)
+    if actual_cfg_hash != expected_model_config_hash:
+        raise CheckpointCompatibilityError(
+            f"V2 checkpoint at {path!r} model_config_hash mismatch: "
+            f"checkpoint has {actual_cfg_hash!r}, runtime expects "
+            f"{expected_model_config_hash!r}. The model was saved under a "
+            f"different ModelV2Config (e.g. history_heads, score_clamp, "
+            f"nan_guard). Same-shape weights are not enough."
+        )
+
     state_dict = bundle[_V2_STATE_DICT_KEY]
     if not isinstance(state_dict, dict):
         raise CheckpointCompatibilityError(
@@ -313,15 +362,16 @@ def save_v2_position_weights(
     model: "torch.nn.Module",
     *,
     schema_hash: str,
-    ruleset_id: str = "legacy",
+    model_config: "ModelV2Config | None",
+    ruleset: "RuleSet",
     flags: argparse.Namespace | dict[str, Any] | None = None,
 ) -> CheckpointManifest:
     """Save a manifest-bearing V2 deployment sidecar (``.ckpt``).
 
-    Bug #3 fix: the sidecar is NOT a bare state_dict. It is a small bundle
-    (state_dict + manifest + schema hash) so the strict identity check applies
-    at deployment too. A same-shape legacy/wrong-schema sidecar is rejected on
-    load, not silently accepted.
+    The sidecar is NOT a bare state_dict. It is a small bundle
+    (state_dict + manifest + schema hash + model-config hash) so the strict
+    identity check applies at deployment too. A same-shape legacy/wrong-schema/
+    wrong-config sidecar is rejected on load, not silently accepted.
 
     Parameters
     ----------
@@ -331,10 +381,16 @@ def save_v2_position_weights(
         The :class:`~douzero.models_v2.model.ModelV2` to save.
     schema_hash:
         The feature schema hash the model was constructed against. Required.
-    ruleset_id:
-        The rule-engine identity (``"legacy"`` or ``"standard"``). Defaults to
-        ``"legacy"``. Stamped into the manifest so a deployment loader can
-        reject a ruleset mismatch.
+    model_config:
+        The :class:`~douzero.models_v2.config.ModelV2Config` the model was
+        constructed with. Its :meth:`~ModelV2Config.stable_hash` is stamped
+        into the sidecar (blocker #2). Required.
+    ruleset:
+        The :class:`~douzero.env.rules.RuleSet` the model was trained under.
+        Its full identity (id + version + hash) is stamped into the manifest so
+        a deployment loader can reject a ruleset mismatch — including a custom
+        rule family (blocker #3). Passing the full RuleSet (not just an id
+        string) avoids the silent-downgrade-to-legacy loophole.
     flags:
         Optional runtime flags for the manifest's effective_config.
     """
@@ -342,24 +398,33 @@ def save_v2_position_weights(
         raise ValueError(
             "save_v2_position_weights requires a non-empty schema_hash."
         )
+    if model_config is None:
+        raise ValueError(
+            "save_v2_position_weights requires the ModelV2Config (to stamp its "
+            "compatibility hash)."
+        )
+    from douzero.env.rules import RuleSet as _RuleSet
+    if not isinstance(ruleset, _RuleSet):
+        raise TypeError(
+            f"ruleset must be a RuleSet instance, got {type(ruleset).__name__}."
+        )
     manifest = build_v2_manifest(
         flags=flags,
         schema_hash=schema_hash,
         checkpoint_kind="public_policy",
     )
-    # Force the ruleset identity onto the manifest so the deployment loader
-    # can reject a ruleset mismatch. build_manifest reads ruleset off flags;
-    # we override here so the caller's explicit ruleset_id wins.
-    from douzero.env.rules import RuleSet
-    rs = RuleSet.standard() if ruleset_id == "standard" else RuleSet.legacy()
-    object.__setattr__(manifest, "ruleset_id", ruleset_id)
-    object.__setattr__(manifest, "ruleset_version", rs.ruleset_version)
-    object.__setattr__(manifest, "ruleset_hash", rs.stable_hash())
+    # Stamp the FULL ruleset identity (id + version + hash) from the caller's
+    # RuleSet. This supports custom rule families: the complete hash
+    # distinguishes same-id/different-parameters rulesets.
+    object.__setattr__(manifest, "ruleset_id", ruleset.ruleset_id)
+    object.__setattr__(manifest, "ruleset_version", ruleset.ruleset_version)
+    object.__setattr__(manifest, "ruleset_hash", ruleset.stable_hash())
 
     bundle = {
         _V2_STATE_DICT_KEY: model.state_dict(),
         _MANIFEST_KEY: manifest.to_dict(),
         _SCHEMA_HASH_KEY: str(schema_hash),
+        _MODEL_CONFIG_HASH_KEY: str(model_config.stable_hash()),
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, path)
@@ -370,25 +435,40 @@ def load_v2_position_weights(
     path: str,
     *,
     expected_schema_hash: str,
-    expected_ruleset_id: str = "legacy",
+    expected_model_config_hash: str,
+    expected_ruleset: "RuleSet",
     training_device: str | None = None,
     allow_unsafe_pickle: bool = False,
 ) -> tuple[dict, CheckpointManifest]:
     """Load a manifest-bearing V2 deployment sidecar.
 
-    Validates the manifest's model_version, schema hash, ruleset identity, and
-    checkpoint_kind (must be ``public_policy``) against RUNTIME expectations.
-    Returns ``(state_dict, manifest)`` for a strict ``load_state_dict``.
+    Validates the manifest's model_version, schema hash, model-config hash,
+    ruleset identity (id + version + hash), and checkpoint_kind (must be
+    ``public_policy``) against RUNTIME expectations. Returns
+    ``(state_dict, manifest)`` for a strict ``load_state_dict``.
 
     Raises ``CheckpointCompatibilityError`` on any mismatch, including:
     - a bare state_dict sidecar (no manifest) — the sidecar must carry identity;
     - a legacy/factorized ``.ckpt`` (wrong model_version or no manifest);
     - a same-shape different-schema sidecar (schema hash mismatch);
-    - a wrong ruleset (ruleset_id/version/hash mismatch).
+    - a same-shape different-config sidecar (model-config hash mismatch);
+    - a wrong ruleset, including a custom rule family with the same id but
+      different parameters (ruleset hash mismatch);
+    - an unknown ruleset id (the caller's RuleSet provides the expected id).
     """
     if not expected_schema_hash:
         raise ValueError(
             "expected_schema_hash is required for load_v2_position_weights."
+        )
+    if not expected_model_config_hash:
+        raise ValueError(
+            "expected_model_config_hash is required for load_v2_position_weights."
+        )
+    from douzero.env.rules import RuleSet as _RuleSet
+    if not isinstance(expected_ruleset, _RuleSet):
+        raise TypeError(
+            f"expected_ruleset must be a RuleSet instance, got "
+            f"{type(expected_ruleset).__name__}."
         )
     weights_only = not allow_unsafe_pickle
     bundle = torch.load(
@@ -402,6 +482,7 @@ def load_v2_position_weights(
     if isinstance(bundle, dict) and _MANIFEST_KEY in bundle:
         manifest = CheckpointManifest.from_dict(bundle[_MANIFEST_KEY])
         actual_hash = bundle.get(_SCHEMA_HASH_KEY, _NO_SCHEMA_HASH)
+        actual_cfg_hash = bundle.get(_MODEL_CONFIG_HASH_KEY, _NO_SCHEMA_HASH)
         state_dict = bundle[_V2_STATE_DICT_KEY]
     elif isinstance(bundle, dict) and all(
         isinstance(v, torch.Tensor) for v in bundle.values()
@@ -410,8 +491,9 @@ def load_v2_position_weights(
         raise CheckpointCompatibilityError(
             f"V2 sidecar at {path!r} is a bare state_dict with no manifest. A "
             f"V2 deployment sidecar MUST carry a manifest (model_version, "
-            f"schema hash, ruleset). A bare state_dict cannot be verified and "
-            f"may be a legacy/factorized checkpoint. Refusing to load."
+            f"schema hash, model-config hash, ruleset). A bare state_dict "
+            f"cannot be verified and may be a legacy/factorized checkpoint. "
+            f"Refusing to load."
         )
     else:
         raise CheckpointCompatibilityError(
@@ -419,28 +501,29 @@ def load_v2_position_weights(
             f"key and not a bare state_dict). The file is malformed."
         )
 
-    from douzero.env.rules import RuleSet
-    if expected_ruleset_id == "standard":
-        expected_rs = RuleSet.standard()
-    else:
-        expected_rs = RuleSet.legacy()
-
     _validate_manifest(
         manifest,
         expected_schema_version=CURRENT_SCHEMA_VERSION,
         expected_model_version="v2",
         expected_feature_version="v2",
-        expected_ruleset_id=expected_ruleset_id,
+        expected_ruleset_id=expected_ruleset.ruleset_id,
         expected_checkpoint_kind="public_policy",
         path=path,
-        expected_ruleset_version=expected_rs.ruleset_version,
-        expected_ruleset_hash=expected_rs.stable_hash(),
+        expected_ruleset_version=expected_ruleset.ruleset_version,
+        expected_ruleset_hash=expected_ruleset.stable_hash(),
     )
     if actual_hash != expected_schema_hash:
         raise CheckpointCompatibilityError(
             f"V2 sidecar at {path!r} feature_schema_hash mismatch: "
             f"checkpoint has {actual_hash!r}, runtime expects "
             f"{expected_schema_hash!r}."
+        )
+    if actual_cfg_hash != expected_model_config_hash:
+        raise CheckpointCompatibilityError(
+            f"V2 sidecar at {path!r} model_config_hash mismatch: "
+            f"checkpoint has {actual_cfg_hash!r}, runtime expects "
+            f"{expected_model_config_hash!r}. The model was saved under a "
+            f"different ModelV2Config."
         )
     if not isinstance(state_dict, dict):
         raise CheckpointCompatibilityError(

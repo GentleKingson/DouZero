@@ -138,6 +138,16 @@ class DeepAgentV2:
     - The model itself only ever sees the tensor blocks of the observation; it
       has no field for hidden hands.
 
+    Identity closure (blocker #3): the agent binds to the model's verified
+    ruleset identity (attached by :func:`load_v2_model`) and requires an
+    explicit :class:`~douzero.env.rules.RuleSet` at construction. The agent's
+    RuleSet MUST match the model's checkpoint identity (id + version + hash),
+    and every observation's ruleset identity must match too. This closes the
+    loophole where a standard-policy model could be served under a legacy
+    observation context (the ruleset family/bid/multiplier are observation
+    data values that do not necessarily change the schema layout, so the
+    schema-hash check alone cannot catch the mismatch).
+
     The legacy ``act(infoset)`` method is also provided so this agent can drop
     into the existing :mod:`douzero.evaluation.simulation` harness, which passes
     a ``GameEnv`` infoset. It builds an :class:`ObservationV2` internally via
@@ -150,11 +160,15 @@ class DeepAgentV2:
         The acting role (``"landlord"`` / ``"landlord_up"`` /
         ``"landlord_down"``). Used to build the V2 observation from an infoset.
     model:
-        A constructed :class:`~douzero.models_v2.model.ModelV2`. The caller is
-        responsible for loading weights (see :func:`load_v2_model`).
+        A constructed :class:`~douzero.models_v2.model.ModelV2`. If loaded via
+        :func:`load_v2_model`, it carries ``expected_ruleset_identity`` which
+        the agent validates against ``ruleset``.
     ruleset:
-        Optional :class:`~douzero.env.rules.RuleSet` used when building the V2
-        observation from an infoset. Defaults to the legacy ruleset.
+        REQUIRED :class:`~douzero.env.rules.RuleSet`. Used to build the V2
+        observation from an infoset AND validated against the model's
+        checkpoint ruleset identity (if present). Passing ``None`` is rejected
+        so a standard-policy model can never silently run under a legacy
+        observation context.
     decision_mode:
         How to convert the multi-head output to a single action. ``"win"``
         (default) picks the highest-``p_win`` valid action. ``"score"`` picks
@@ -166,20 +180,49 @@ class DeepAgentV2:
         self,
         position,
         model,
-        ruleset=None,
+        ruleset,
         decision_mode="win",
     ):
         from douzero.models_v2.model import ModelV2  # local import: keep the
         # production import graph (evaluation.simulation) free of a hard torch
         # model dependency at module load, mirroring the lazy imports above.
+        from douzero.env.rules import RuleSet
         if not isinstance(model, ModelV2):
             raise TypeError(
                 f"DeepAgentV2 requires a ModelV2 instance, got {type(model).__name__}"
+            )
+        if ruleset is None:
+            raise ValueError(
+                "DeepAgentV2 requires an explicit RuleSet. Passing ruleset=None "
+                "is rejected so a standard-policy model cannot silently run "
+                "under a legacy observation context. Pass RuleSet.legacy() or "
+                "RuleSet.standard() explicitly."
+            )
+        if not isinstance(ruleset, RuleSet):
+            raise TypeError(
+                f"ruleset must be a RuleSet instance, got {type(ruleset).__name__}"
             )
         if decision_mode not in ("win", "score"):
             raise ValueError(
                 f"decision_mode must be 'win' or 'score', got {decision_mode!r}"
             )
+        # Blocker #3: if the model carries a verified checkpoint ruleset
+        # identity (attached by load_v2_model), the agent's RuleSet MUST match
+        # it exactly (id + version + hash). This prevents serving a
+        # standard-policy model under a legacy agent context.
+        model_identity = getattr(model, "expected_ruleset_identity", None)
+        if model_identity is not None:
+            mid, mver, mhash = model_identity
+            if (ruleset.ruleset_id, ruleset.ruleset_version, ruleset.stable_hash()) != (mid, mver, mhash):
+                raise ValueError(
+                    f"DeepAgentV2 ruleset identity mismatch: the model's "
+                    f"checkpoint was verified under ruleset "
+                    f"(id={mid!r}, version={mver!r}, hash={mhash!r}), but the "
+                    f"agent's RuleSet is "
+                    f"(id={ruleset.ruleset_id!r}, version={ruleset.ruleset_version!r}, "
+                    f"hash={ruleset.stable_hash()!r}). A model trained under one "
+                    f"ruleset must not be served under another."
+                )
         self.position = position
         self.model = model
         self.ruleset = ruleset
@@ -190,6 +233,13 @@ class DeepAgentV2:
         # so a model trained under schema A cannot silently consume an
         # observation encoded under schema B (even if the shapes match).
         self._feature_schema_hash = model.schema.stable_hash()
+        # Blocker #3: cache the agent's ruleset identity triple for the
+        # per-observation check in act_v2.
+        self._ruleset_identity = (
+            ruleset.ruleset_id,
+            ruleset.ruleset_version,
+            ruleset.stable_hash(),
+        )
         if torch.cuda.is_available():
             self.model.cuda()
         self.model.eval()
@@ -234,6 +284,27 @@ class DeepAgentV2:
                 f"{self._feature_schema_hash!r}. The observation was encoded "
                 f"under a different feature schema than the model was trained "
                 f"against. Refusing to forward."
+            )
+
+        # Blocker #3: per-observation ruleset identity check. The observation's
+        # ruleset identity (carried in obs.public) must match the agent's
+        # (and therefore the model's checkpoint) identity. The schema-hash
+        # check above does NOT catch this: the ruleset family/bid/multiplier
+        # are observation data values that do not necessarily change the schema
+        # layout, so a standard-policy model could otherwise run under a legacy
+        # observation context. Compare the full triple (id + version + hash).
+        obs_ruleset_identity = (
+            obs.public.ruleset_id,
+            obs.public.ruleset_version,
+            obs.public.ruleset_hash,
+        )
+        if obs_ruleset_identity != self._ruleset_identity:
+            raise ValueError(
+                f"DeepAgentV2 ruleset identity mismatch: observation carries "
+                f"(id={obs.public.ruleset_id!r}, version={obs.public.ruleset_version!r}, "
+                f"hash={obs.public.ruleset_hash!r}), but the agent/model "
+                f"expects {self._ruleset_identity}. A model trained under one "
+                f"ruleset must not consume an observation encoded under another."
             )
 
         legal_actions = obs.public.legal_actions
@@ -328,17 +399,23 @@ class DeepAgentV2:
         return legal_actions[idx]
 
 
-def load_v2_model(model_path, schema, config=None, *, ruleset_id="legacy"):
+def load_v2_model(model_path, schema, ruleset, config=None):
     """Load a :class:`~douzero.models_v2.model.ModelV2` from a V2 sidecar.
 
-    Bug #3 fix: the sidecar MUST be a manifest-bearing V2 bundle (written by
+    The sidecar MUST be a manifest-bearing V2 bundle (written by
     :func:`douzero.checkpoint.save_v2_position_weights`). The manifest's
-    model_version, schema hash, ruleset identity, and checkpoint_kind are
-    validated against RUNTIME expectations (the ``schema`` and ``ruleset_id``
-    the caller passes), and the state_dict is loaded with ``strict=True``.
+    model_version, schema hash, model-config hash, ruleset identity, and
+    checkpoint_kind are validated against RUNTIME expectations, and the
+    state_dict is loaded with ``strict=True``.
 
-    A bare state_dict sidecar, a legacy/factorized ``.ckpt``, or a
-    same-shape different-schema sidecar is rejected with a precise error.
+    Blocker #3 fix: the verified ruleset identity is ATTACHED to the returned
+    model (``model.expected_ruleset_identity``) so a downstream
+    :class:`DeepAgentV2` can enforce that the agent's RuleSet matches the
+    checkpoint's, and that every observation's ruleset identity matches too.
+
+    A bare state_dict sidecar, a legacy/factorized ``.ckpt``, a same-shape
+    different-schema sidecar, a same-shape different-config sidecar, or a
+    wrong-ruleset sidecar is rejected with a precise error.
 
     Parameters
     ----------
@@ -348,45 +425,57 @@ def load_v2_model(model_path, schema, config=None, *, ruleset_id="legacy"):
         The :class:`~douzero.observation.schema.FeatureSchemaManifest` the
         runtime expects. The sidecar's schema hash must equal
         ``schema.stable_hash()``.
+    ruleset:
+        The :class:`~douzero.env.rules.RuleSet` the runtime expects. The full
+        identity (id + version + hash) is validated, supporting custom rule
+        families and rejecting an unknown id.
     config:
         Optional :class:`~douzero.models_v2.config.ModelV2Config`. Defaults to
-        ``ModelV2Config()``; must match the config the weights were saved under.
-    ruleset_id:
-        The rule-engine identity the runtime expects (``"legacy"`` or
-        ``"standard"``). Defaults to ``"legacy"``.
+        ``ModelV2Config()``; must match the config the weights were saved under
+        (the model-config hash is validated).
 
     Returns
     -------
     ModelV2
-        The loaded model in eval mode.
+        The loaded model in eval mode, with ``expected_ruleset_identity`` and
+        ``expected_model_config_hash`` attached as attributes for DeepAgentV2.
     """
     from douzero.models_v2.config import ModelV2Config
     from douzero.models_v2.model import ModelV2
-    from douzero.checkpoint import (
-        CheckpointCompatibilityError,
-        load_v2_position_weights,
-    )
+    from douzero.checkpoint import load_v2_position_weights
 
     cfg = config or ModelV2Config()
     model = ModelV2(schema, cfg)
     expected_schema_hash = schema.stable_hash()
+    expected_cfg_hash = cfg.stable_hash()
 
     # Load + validate the manifest-bearing sidecar. weights_only=True is the
     # default inside load_v2_position_weights. This rejects a bare state_dict,
-    # a legacy .ckpt, a wrong-schema sidecar, and a wrong-ruleset sidecar.
-    try:
-        pretrained, manifest = load_v2_position_weights(
-            model_path,
-            expected_schema_hash=expected_schema_hash,
-            expected_ruleset_id=ruleset_id,
-        )
-    except CheckpointCompatibilityError:
-        # Re-raise as-is: the message is already precise and actionable.
-        raise
+    # a legacy .ckpt, a wrong-schema sidecar, a wrong-config sidecar, and a
+    # wrong-ruleset sidecar (including a custom rule family with a mismatched
+    # hash).
+    pretrained, manifest = load_v2_position_weights(
+        model_path,
+        expected_schema_hash=expected_schema_hash,
+        expected_model_config_hash=expected_cfg_hash,
+        expected_ruleset=ruleset,
+    )
 
     # STRICT load (strict=True is the default for load_state_dict). A key/shape
     # mismatch means the config the caller passed does not match the config the
     # weights were saved under (e.g. a different hidden_size).
     model.load_state_dict(pretrained, strict=True)
     model.eval()
+
+    # Blocker #3: attach the VERIFIED ruleset identity to the model so a
+    # downstream DeepAgentV2 can enforce agent-vs-model and obs-vs-model
+    # ruleset consistency without re-deriving it. The identity triple is the
+    # full (id, version, hash) from the manifest, which was just validated
+    # against the caller's RuleSet.
+    model.expected_ruleset_identity = (
+        manifest.ruleset_id,
+        manifest.ruleset_version,
+        manifest.ruleset_hash,
+    )
+    model.expected_model_config_hash = expected_cfg_hash
     return model

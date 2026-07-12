@@ -283,11 +283,11 @@ class ModelV2(nn.Module):
         role_idx = self.role_index(acting_role)
         fused = self.fusion(state_trunk, history_summary, action_embeddings, role_idx)
 
-        # Bug #5: runtime NaN/Inf guard on the fused representation. This
-        # catches BOTH bad inputs (a NaN in the state/history/action tensors
-        # propagates to fused) AND bad weights (a NaN weight produces a NaN
-        # fused output regardless of the input). Checking only inputs would
-        # miss weight corruption; checking fused catches both upstream causes.
+        # Bug #5: runtime NaN/Inf guard. Imported once and applied to the fused
+        # representation AND every head output. The fused check catches bad
+        # inputs and bad fusion/encoder weights; the head-output checks catch a
+        # NaN/Inf originating in a head (e.g. a NaN weight in a score head,
+        # which the score clamp cannot remove — torch.clamp(nan) is nan).
         if self.config.nan_guard:
             from .numerical import assert_finite
             assert_finite(fused, "fused")
@@ -296,11 +296,20 @@ class ModelV2(nn.Module):
         head_out = self.heads(fused)
 
         if self.config.nan_guard:
-            # The heads apply a clamp to the score outputs, so they should be
-            # finite by construction; this guard catches a regression (e.g. a
-            # head that bypasses the clamp) rather than a normal case.
+            # Guard EVERY head output, including the conditional score heads
+            # and the derived score_mean. The heads apply a clamp to the score
+            # outputs, but clamp only bounds finite values — it does NOT catch
+            # NaN (torch.clamp(nan, -c, c) is nan), and a NaN weight in
+            # score_win_head / score_loss_head produces a NaN score output that
+            # the clamp cannot remove. Checking all five outputs catches a NaN
+            # or Inf wherever it originates (win head, either score head, or
+            # the derived mean), so a corrupted score head cannot silently
+            # propagate into the decision policy / loss.
             assert_finite(head_out["win_logit"], "win_logit")
+            assert_finite(head_out["score_if_win"], "score_if_win")
+            assert_finite(head_out["score_if_loss"], "score_if_loss")
             assert_finite(head_out["p_win"], "p_win")
+            assert_finite(head_out["score_mean"], "score_mean")
 
         return ModelOutput(
             win_logit=head_out["win_logit"],
