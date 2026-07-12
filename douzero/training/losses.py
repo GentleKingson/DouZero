@@ -412,14 +412,94 @@ class MultiObjectiveLoss(nn.Module):
         When ``score_target_transform == "signed_log"`` the target is
         ``sign(s)·log1p(|s|)`` (computed from ``target_score`` if a
         pre-transformed ``target_log_score`` is not supplied). Otherwise
-        the raw ``target_score`` is returned (the head clamp bounds it).
+        the raw ``target_score`` is returned.
+
+        P06 r5: in BOTH modes the resolved target is clamped to
+        ``[-score_clamp, score_clamp]`` so it stays inside what the heads
+        can represent. For ``raw`` mode this bounds large bomb/rocket
+        scores; for ``signed_log`` mode it bounds the edge case where a
+        very small ``score_clamp`` (e.g. 0.5) is still smaller than
+        ``log1p(1.0)≈0.693`` — the smallest common non-zero score.
         """
         if self.config.score_target_transform == SCORE_TARGET_SIGNED_LOG:
             pre = batch_labels.get("target_log_score")
             if pre is not None:
-                return pre
-            return _signed_log(batch_labels["target_score"])
-        return batch_labels["target_score"]
+                resolved = pre.float()
+            else:
+                resolved = _signed_log(batch_labels["target_score"])
+        else:
+            resolved = batch_labels["target_score"].float()
+        # Clamp to the representable range in both modes.
+        sc = float(self.config.score_clamp)
+        return resolved.clamp(-sc, sc)
+
+    def _validate_loss_labels(
+        self,
+        win_logit: torch.Tensor,
+        batch_labels: dict[str, torch.Tensor],
+    ) -> None:
+        """Validate batch labels at the public loss boundary (P06 r5).
+
+        Checks:
+        - ``target_win`` has the same leading dim as ``win_logit``, is
+          finite, and strictly binary ``{0.0, 1.0}`` (a NaN outcome label
+          would silently route to ``score_if_loss`` via
+          ``NaN >= 0.5 → False`` in per-sample selection).
+        - ``target_score`` has the right length and is finite when any
+          score-related loss is active (``lambda_score > 0`` or
+          ``lambda_uncertainty > 0``).
+        - ``target_log_score`` (when provided and signed_log mode is
+          active) has the right length and is finite.
+        """
+        b = win_logit.shape[0]
+        target_win = batch_labels["target_win"]
+        tw = target_win.float().reshape(-1)
+        if tw.shape[0] != b:
+            raise ValueError(
+                f"target_win length {tw.shape[0]} != win_logit batch {b}"
+            )
+        if not bool(torch.isfinite(tw).all()):
+            raise ValueError(
+                "target_win contains non-finite values (NaN/Inf); the loss "
+                "module rejects invalid outcome labels at its boundary."
+            )
+        # Binary check with tiny tolerance for float serialization.
+        dist = (tw - tw.round().clamp(0.0, 1.0)).abs()
+        if bool((dist > 1e-6).any()):
+            raise ValueError(
+                f"target_win must be binary {{0, 1}}, got non-binary values "
+                f"(max distance to nearest of {{0,1}} = "
+                f"{float(dist.max().item()):.6g})."
+            )
+
+        active_score = (
+            self.config.lambda_score > 0.0 or self.config.lambda_uncertainty > 0.0
+        )
+        target_score = batch_labels["target_score"].float().reshape(-1)
+        if target_score.shape[0] != b:
+            raise ValueError(
+                f"target_score length {target_score.shape[0]} != batch {b}"
+            )
+        if active_score and not bool(torch.isfinite(target_score).all()):
+            raise ValueError(
+                "target_score contains non-finite values while a score-"
+                "related loss is active; the loss module rejects invalid "
+                "score labels at its boundary."
+            )
+
+        if self.config.score_target_transform == SCORE_TARGET_SIGNED_LOG:
+            target_log = batch_labels.get("target_log_score")
+            if target_log is not None:
+                tl = target_log.float().reshape(-1)
+                if tl.shape[0] != b:
+                    raise ValueError(
+                        f"target_log_score length {tl.shape[0]} != batch {b}"
+                    )
+                if not bool(torch.isfinite(tl).all()):
+                    raise ValueError(
+                        "target_log_score contains non-finite values; the "
+                        "loss module rejects invalid log-score labels."
+                    )
 
     def _from_gathered_heads(
         self,
@@ -428,6 +508,13 @@ class MultiObjectiveLoss(nn.Module):
         score_if_loss: torch.Tensor,
         batch_labels: dict[str, torch.Tensor],
     ) -> LossComponents:
+        # P06 r5: validate labels at the public loss boundary. The replay
+        # buffer's Transition.validate() protects the trainer path, but
+        # forward_gathered() is a public API that P14 or external callers
+        # can invoke directly. A NaN target_win would silently route to
+        # score_if_loss via ``NaN >= 0.5 → False`` in _select_per_sample,
+        # turning an invalid label into a "loss sample" instead of raising.
+        self._validate_loss_labels(win_logit, batch_labels)
         target_win = batch_labels["target_win"]
         target_score = self._resolve_score_target(batch_labels)
 

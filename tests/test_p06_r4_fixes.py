@@ -197,28 +197,75 @@ def test_train_raises_when_insufficient_transitions():
 # --------------------------------------------------------------------------- #
 # Blocker 2c: λ=0 skips computation (no 0*NaN propagation)
 # --------------------------------------------------------------------------- #
-def test_loss_skips_disabled_terms_avoiding_zero_times_nan():
-    """When lambda_win=0, the win term is not computed, so a NaN target_win
-    in the BCE does not propagate via 0*NaN=NaN."""
+def test_loss_rejects_nan_target_win_at_boundary():
+    """P06 r5: the public loss API must reject target_win=NaN at its
+    boundary. The r4 version of this test asserted the loss was finite —
+    which codified the bug where NaN silently routed to score_if_loss via
+    ``NaN >= 0.5 → False`` in _select_per_sample. Now the loss module
+    validates labels before any computation."""
     from douzero.training import MultiObjectiveLoss
 
     win_logit = torch.tensor([[0.5]], requires_grad=True)
     score_if_win = torch.tensor([[1.0]], requires_grad=True)
     score_if_loss = torch.tensor([[-1.0]], requires_grad=True)
     labels = {
-        "target_win": torch.tensor([float("nan")]),  # would poison BCE
+        "target_win": torch.tensor([float("nan")]),  # invalid outcome label
         "target_score": torch.tensor([1.0]),
     }
     fn = MultiObjectiveLoss(
-        LossConfig(lambda_win=0.0, lambda_score=1.0)  # win disabled
+        LossConfig(lambda_win=0.0, lambda_score=1.0)  # score active
     )
+    with pytest.raises(ValueError, match="target_win contains non-finite"):
+        fn.forward_gathered(win_logit, score_if_win, score_if_loss, labels)
+
+
+def test_loss_rejects_non_binary_target_win():
+    """target_win=2.0 is not in {0, 1} and must be rejected."""
+    from douzero.training import MultiObjectiveLoss
+
+    win_logit = torch.tensor([[0.5]], requires_grad=True)
+    score_if_win = torch.tensor([[1.0]], requires_grad=True)
+    score_if_loss = torch.tensor([[-1.0]], requires_grad=True)
+    labels = {
+        "target_win": torch.tensor([2.0]),
+        "target_score": torch.tensor([1.0]),
+    }
+    fn = MultiObjectiveLoss(LossConfig(lambda_win=1.0, lambda_score=0.5))
+    with pytest.raises(ValueError, match="target_win must be binary"):
+        fn.forward_gathered(win_logit, score_if_win, score_if_loss, labels)
+
+
+def test_loss_rejects_non_finite_target_score_when_score_active():
+    """target_score=Inf must be rejected when lambda_score > 0."""
+    from douzero.training import MultiObjectiveLoss
+
+    win_logit = torch.tensor([[0.5]], requires_grad=True)
+    score_if_win = torch.tensor([[1.0]], requires_grad=True)
+    score_if_loss = torch.tensor([[-1.0]], requires_grad=True)
+    labels = {
+        "target_win": torch.tensor([1.0]),
+        "target_score": torch.tensor([float("inf")]),
+    }
+    fn = MultiObjectiveLoss(LossConfig(lambda_win=1.0, lambda_score=0.5))
+    with pytest.raises(ValueError, match="target_score contains non-finite"):
+        fn.forward_gathered(win_logit, score_if_win, score_if_loss, labels)
+
+
+def test_loss_accepts_nan_target_score_when_score_inactive():
+    """When lambda_score=0 AND lambda_uncertainty=0, a non-finite
+    target_score is acceptable because no score loss is computed."""
+    from douzero.training import MultiObjectiveLoss
+
+    win_logit = torch.tensor([[0.5]], requires_grad=True)
+    score_if_win = torch.tensor([[1.0]], requires_grad=True)
+    score_if_loss = torch.tensor([[-1.0]], requires_grad=True)
+    labels = {
+        "target_win": torch.tensor([1.0]),
+        "target_score": torch.tensor([float("inf")]),  # OK: score disabled
+    }
+    fn = MultiObjectiveLoss(LossConfig(lambda_win=1.0, lambda_score=0.0))
     comps = fn.forward_gathered(win_logit, score_if_win, score_if_loss, labels)
-    # Total must be finite (the NaN target_win was never used).
     assert torch.isfinite(comps.total)
-    comps.total.backward()
-    # win_logit may have no grad (the win term was skipped, and the score
-    # term flows through score_if_win/score_if_loss, not win_logit).
-    assert win_logit.grad is None or torch.isfinite(win_logit.grad).all()
 
 
 # --------------------------------------------------------------------------- #
