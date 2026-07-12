@@ -221,9 +221,13 @@ def test_trainer_accepts_mismatched_clamp_in_signed_log_mode():
     from douzero.training import LossConfig, TrainerConfig, V2Trainer
 
     torch.manual_seed(42)
-    # In signed_log mode the target is NOT clamped to score_clamp (log1p
-    # compresses it well inside the head clamp), so a mismatch is acceptable.
-    model = ModelV2(build_v2_schema(), ModelV2Config(score_clamp=8.0))
+    # In signed_log mode the target is NOT clamped to score_clamp in raw
+    # mode's sense, so a raw-clamp mismatch is acceptable. Both model and
+    # loss must agree on score_target_transform="signed_log" (P06 r5).
+    model = ModelV2(
+        build_v2_schema(),
+        ModelV2Config(score_clamp=8.0, score_target_transform="signed_log"),
+    )
     loss_cfg = LossConfig(score_clamp=32.0, score_target_transform="signed_log")
     trainer = V2Trainer(model, loss_config=loss_cfg, config=TrainerConfig(max_episodes=0))
     assert trainer is not None

@@ -231,6 +231,18 @@ class V2Trainer:
                 f"pass score_target_transform='signed_log', or construct the "
                 f"model with ModelV2Config(score_clamp=loss_cfg.score_clamp)."
             )
+        # P06 r5: the score_target_transform must also agree between the
+        # loss config and the model config, so a model trained with "raw"
+        # is not accidentally paired with a "signed_log" loss (the model's
+        # checkpoint identity records which transform its outputs were
+        # trained against).
+        if loss_cfg.score_target_transform != model.config.score_target_transform:
+            raise ValueError(
+                f"LossConfig.score_target_transform ({loss_cfg.score_target_transform!r}) "
+                f"does not match model.config.score_target_transform "
+                f"({model.config.score_target_transform!r}). A model trained "
+                f"under one score semantics must not be optimized under another."
+            )
         self.model = model
         self.ruleset = ruleset
         self.loss_fn = MultiObjectiveLoss(loss_cfg)

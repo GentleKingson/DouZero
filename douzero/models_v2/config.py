@@ -64,6 +64,15 @@ class ModelV2Config:
     # Score-head stability: outputs are clamped to a finite range so a wild
     # initialization cannot produce Inf that poisons the multi-objective loss.
     score_clamp: float = 32.0
+    # P06 r5: score-output semantics identity. This records which target
+    # transform the model's score heads were trained against, so a model
+    # trained with ``"raw"`` scores cannot be loaded as if its ``score_mean``
+    # were on the ``"signed_log"`` scale (or vice versa). It enters
+    # :meth:`compatibility_dict` and therefore the model-config hash the
+    # checkpoint loader validates, making cross-semantics loading fail with
+    # a precise error. ``"raw"`` is the default (matches the P05 architecture
+    # contract).
+    score_target_transform: str = "raw"
     # Runtime NaN/Inf guard (bug #5). When True (default), the model forward
     # asserts its fused representation and head outputs are finite and raises
     # NumericalError otherwise. This catches both bad inputs and bad weights
@@ -103,6 +112,11 @@ class ModelV2Config:
             raise ValueError(f"mlp_dropout must be in [0, 1), got {self.mlp_dropout}")
         if self.score_clamp <= 0.0:
             raise ValueError(f"score_clamp must be positive, got {self.score_clamp}")
+        if self.score_target_transform not in ("raw", "signed_log"):
+            raise ValueError(
+                f"score_target_transform must be 'raw' or 'signed_log', "
+                f"got {self.score_target_transform!r}"
+            )
 
     # ------------------------------------------------------------------ #
     # Canonical identity (blocker #2 fix)
@@ -137,6 +151,7 @@ class ModelV2Config:
             "belief_enabled": self.belief_enabled,
             "human_prior_enabled": self.human_prior_enabled,
             "score_clamp": self.score_clamp,
+            "score_target_transform": self.score_target_transform,
             "nan_guard": self.nan_guard,
         }
 
