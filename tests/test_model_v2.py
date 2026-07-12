@@ -505,14 +505,18 @@ class TestSaveLoad:
         bundle_path = str(tmp_path / "model_v2.tar")
         schema_hash = model.schema.stable_hash()
         manifest = save_v2_checkpoint(
-            bundle_path, model, schema_hash=schema_hash, frames=123,
+            bundle_path, model, schema_hash=schema_hash,
+            model_config=model.config, frames=123,
             position_frames={"landlord": 41, "landlord_up": 41, "landlord_down": 41},
         )
         assert manifest.model_version == "v2"
         assert manifest.feature_version == "v2"
 
         state_dict, loaded_manifest = load_v2_checkpoint(
-            bundle_path, expected_schema_hash=schema_hash
+            bundle_path,
+            expected_schema_hash=schema_hash,
+            expected_model_config_hash=model.config.stable_hash(),
+            expected_ruleset=RuleSet.legacy(),
         )
         assert loaded_manifest.model_version == "v2"
         assert loaded_manifest.frames == 123
@@ -533,12 +537,20 @@ class TestSaveLoad:
 
         model = _build_model()
         bundle_path = str(tmp_path / "model_v2.tar")
-        save_v2_checkpoint(bundle_path, model, schema_hash=model.schema.stable_hash())
+        save_v2_checkpoint(
+            bundle_path, model, schema_hash=model.schema.stable_hash(),
+            model_config=model.config,
+        )
         with pytest.raises(CheckpointCompatibilityError, match="schema_hash"):
-            load_v2_checkpoint(bundle_path, expected_schema_hash="bogus_hash")
+            load_v2_checkpoint(
+                bundle_path,
+                expected_schema_hash="bogus_hash",
+                expected_model_config_hash=model.config.stable_hash(),
+                expected_ruleset=RuleSet.legacy(),
+            )
 
-    def test_v2_checkpoint_rejects_wrong_ruleset(self, tmp_path):
-        """A ruleset mismatch (legacy sidecar loaded as standard) is rejected."""
+    def test_v2_checkpoint_rejects_config_mismatch(self, tmp_path):
+        """Blocker #2: a model-config-hash mismatch (history_heads diff) is rejected."""
         from douzero.checkpoint import (
             CheckpointCompatibilityError,
             load_v2_checkpoint,
@@ -547,12 +559,42 @@ class TestSaveLoad:
 
         model = _build_model()
         bundle_path = str(tmp_path / "model_v2.tar")
-        save_v2_checkpoint(bundle_path, model, schema_hash=model.schema.stable_hash())
+        save_v2_checkpoint(
+            bundle_path, model, schema_hash=model.schema.stable_hash(),
+            model_config=model.config,
+        )
+        # A different config (history_heads 8 -> 4 keeps projection shapes but
+        # changes the config hash).
+        different_cfg = ModelV2Config(history_heads=4)
+        assert different_cfg.stable_hash() != model.config.stable_hash()
+        with pytest.raises(CheckpointCompatibilityError, match="model_config_hash"):
+            load_v2_checkpoint(
+                bundle_path,
+                expected_schema_hash=model.schema.stable_hash(),
+                expected_model_config_hash=different_cfg.stable_hash(),
+                expected_ruleset=RuleSet.legacy(),
+            )
+
+    def test_v2_checkpoint_rejects_wrong_ruleset(self, tmp_path):
+        """A ruleset mismatch (legacy bundle loaded as standard) is rejected."""
+        from douzero.checkpoint import (
+            CheckpointCompatibilityError,
+            load_v2_checkpoint,
+            save_v2_checkpoint,
+        )
+
+        model = _build_model()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        save_v2_checkpoint(
+            bundle_path, model, schema_hash=model.schema.stable_hash(),
+            model_config=model.config,
+        )
         with pytest.raises(CheckpointCompatibilityError, match="ruleset"):
             load_v2_checkpoint(
                 bundle_path,
                 expected_schema_hash=model.schema.stable_hash(),
-                expected_ruleset_id="standard",
+                expected_model_config_hash=model.config.stable_hash(),
+                expected_ruleset=RuleSet.standard(),
             )
 
     def test_v2_checkpoint_rejects_wrong_kind(self, tmp_path):
@@ -565,20 +607,21 @@ class TestSaveLoad:
 
         model = _build_model()
         bundle_path = str(tmp_path / "model_v2.tar")
-        save_v2_checkpoint(bundle_path, model, schema_hash=model.schema.stable_hash())
+        save_v2_checkpoint(
+            bundle_path, model, schema_hash=model.schema.stable_hash(),
+            model_config=model.config,
+        )
         with pytest.raises(CheckpointCompatibilityError, match="checkpoint_kind"):
             load_v2_checkpoint(
                 bundle_path,
                 expected_schema_hash=model.schema.stable_hash(),
+                expected_model_config_hash=model.config.stable_hash(),
+                expected_ruleset=RuleSet.legacy(),
                 expected_checkpoint_kind="public_policy",
             )
 
     def test_load_v2_model_rejects_bare_state_dict(self, tmp_path):
-        """load_v2_model must reject a bare state_dict sidecar (no manifest).
-
-        Bug #3: a bare state_dict has no identity, so a same-shape wrong-schema
-        sidecar would load silently. The sidecar MUST carry a manifest.
-        """
+        """load_v2_model must reject a bare state_dict sidecar (no manifest)."""
         from douzero.evaluation.deep_agent import load_v2_model
 
         model = _build_model()
@@ -587,7 +630,7 @@ class TestSaveLoad:
 
         schema = build_v2_schema()
         with pytest.raises(Exception, match="bare state_dict|manifest"):
-            load_v2_model(str(bare_ckpt), schema)
+            load_v2_model(str(bare_ckpt), schema, RuleSet.legacy())
 
     def test_load_v2_model_rejects_legacy_ckpt(self, tmp_path):
         """load_v2_model must reject a legacy/factorized state_dict."""
@@ -601,7 +644,7 @@ class TestSaveLoad:
 
         schema = build_v2_schema()
         with pytest.raises(Exception, match="bare state_dict|manifest"):
-            load_v2_model(str(legacy_ckpt), schema)
+            load_v2_model(str(legacy_ckpt), schema, RuleSet.legacy())
 
     def test_load_v2_model_loads_manifest_sidecar(self, tmp_path):
         """load_v2_model loads a manifest-bearing V2 sidecar strictly."""
@@ -611,21 +654,39 @@ class TestSaveLoad:
         model = _build_model()
         ckpt = str(tmp_path / "v2.ckpt")
         save_v2_position_weights(
-            ckpt, model, schema_hash=model.schema.stable_hash()
+            ckpt, model,
+            schema_hash=model.schema.stable_hash(),
+            model_config=model.config,
+            ruleset=RuleSet.legacy(),
         )
-        loaded = load_v2_model(ckpt, model.schema, model.config)
+        loaded = load_v2_model(ckpt, model.schema, RuleSet.legacy(), model.config)
         loaded.eval()
         obs, _ = _build_v2_obs(seed=122, position="landlord")
         out_before = _forward(model, obs)
         out_after = _forward(loaded, obs)
         assert torch.allclose(out_before.win_logit, out_after.win_logit, atol=1e-6)
 
-    def test_load_v2_model_rejects_schema_mismatch_sidecar(self, tmp_path):
-        """A sidecar with a different schema hash is rejected.
+    def test_load_v2_model_attaches_ruleset_identity(self, tmp_path):
+        """Blocker #3: load_v2_model attaches the verified ruleset identity."""
+        from douzero.checkpoint import save_v2_position_weights
+        from douzero.evaluation.deep_agent import load_v2_model
 
-        Build a sidecar under the default schema, then try to load it under a
-        schema with a different max_history_len (which changes the stable hash).
-        """
+        model = _build_model()
+        ckpt = str(tmp_path / "v2.ckpt")
+        save_v2_position_weights(
+            ckpt, model,
+            schema_hash=model.schema.stable_hash(),
+            model_config=model.config,
+            ruleset=RuleSet.standard(),
+        )
+        loaded = load_v2_model(ckpt, model.schema, RuleSet.standard(), model.config)
+        rs = RuleSet.standard()
+        assert loaded.expected_ruleset_identity == (
+            rs.ruleset_id, rs.ruleset_version, rs.stable_hash(),
+        )
+
+    def test_load_v2_model_rejects_schema_mismatch_sidecar(self, tmp_path):
+        """A sidecar with a different schema hash is rejected."""
         from douzero.checkpoint import (
             CheckpointCompatibilityError,
             save_v2_position_weights,
@@ -634,12 +695,37 @@ class TestSaveLoad:
 
         model = _build_model()
         ckpt = str(tmp_path / "v2.ckpt")
-        save_v2_position_weights(ckpt, model, schema_hash=model.schema.stable_hash())
-        # A different schema (max_history_len changes the hash).
+        save_v2_position_weights(
+            ckpt, model,
+            schema_hash=model.schema.stable_hash(),
+            model_config=model.config,
+            ruleset=RuleSet.legacy(),
+        )
         different_schema = build_v2_schema(max_history_len=50)
         assert different_schema.stable_hash() != model.schema.stable_hash()
         with pytest.raises(CheckpointCompatibilityError, match="schema_hash"):
-            load_v2_model(ckpt, different_schema)
+            load_v2_model(ckpt, different_schema, RuleSet.legacy())
+
+    def test_load_v2_model_rejects_config_mismatch_sidecar(self, tmp_path):
+        """Blocker #2: a sidecar with a different config hash is rejected."""
+        from douzero.checkpoint import (
+            CheckpointCompatibilityError,
+            save_v2_position_weights,
+        )
+        from douzero.evaluation.deep_agent import load_v2_model
+
+        model = _build_model()
+        ckpt = str(tmp_path / "v2.ckpt")
+        save_v2_position_weights(
+            ckpt, model,
+            schema_hash=model.schema.stable_hash(),
+            model_config=model.config,
+            ruleset=RuleSet.legacy(),
+        )
+        # Load with a different config (score_clamp 32 -> 8 changes behavior).
+        different_cfg = ModelV2Config(score_clamp=8.0)
+        with pytest.raises(CheckpointCompatibilityError, match="model_config_hash"):
+            load_v2_model(ckpt, model.schema, RuleSet.legacy(), different_cfg)
 
     def test_load_v2_model_rejects_wrong_ruleset_sidecar(self, tmp_path):
         """A sidecar saved as legacy but loaded as standard is rejected."""
@@ -652,10 +738,13 @@ class TestSaveLoad:
         model = _build_model()
         ckpt = str(tmp_path / "v2.ckpt")
         save_v2_position_weights(
-            ckpt, model, schema_hash=model.schema.stable_hash(), ruleset_id="legacy"
+            ckpt, model,
+            schema_hash=model.schema.stable_hash(),
+            model_config=model.config,
+            ruleset=RuleSet.legacy(),
         )
         with pytest.raises(CheckpointCompatibilityError, match="ruleset"):
-            load_v2_model(ckpt, model.schema, ruleset_id="standard")
+            load_v2_model(ckpt, model.schema, RuleSet.standard(), model.config)
 
 
 # --------------------------------------------------------------------------- #
@@ -671,7 +760,7 @@ class TestDeepAgentV2:
         from douzero.evaluation.deep_agent import DeepAgentV2
 
         model = _build_model()
-        agent = DeepAgentV2("landlord", model)
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
         priv = PrivilegedObservation(
             all_handcards={"landlord": (3,), "landlord_up": (4,), "landlord_down": (5,)},
             acting_role="landlord",
@@ -683,7 +772,7 @@ class TestDeepAgentV2:
         from douzero.evaluation.deep_agent import DeepAgentV2
 
         model = _build_model()
-        agent = DeepAgentV2("landlord", model)
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
         with pytest.raises(TypeError, match="ObservationV2"):
             agent.act_v2({"not": "an observation"})
 
@@ -692,7 +781,7 @@ class TestDeepAgentV2:
 
         model = _build_model()
         model.eval()
-        agent = DeepAgentV2("landlord", model)
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
         obs, _ = _build_v2_obs(seed=130, position="landlord")
         chosen = agent.act_v2(obs)
         assert chosen in obs.public.legal_actions
@@ -702,7 +791,7 @@ class TestDeepAgentV2:
 
         model = _build_model()
         model.eval()
-        agent = DeepAgentV2("landlord", model)
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
         obs, _ = _build_v2_obs(seed=131, position="landlord")
         # Build a fake obs with a single legal action by slicing (the model
         # must NOT be called for N=1).
@@ -724,7 +813,7 @@ class TestDeepAgentV2:
 
         model = _build_model()
         model.eval()
-        agent = DeepAgentV2("landlord", model)
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
         np.random.seed(133)
         env = Env("adp")
         env.reset()
@@ -737,7 +826,7 @@ class TestDeepAgentV2:
 
         model = _build_model()
         model.eval()
-        agent = DeepAgentV2("landlord", model, decision_mode="score")
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy(), decision_mode="score")
         obs, _ = _build_v2_obs(seed=134, position="landlord")
         chosen = agent.act_v2(obs)
         assert chosen in obs.public.legal_actions
@@ -747,13 +836,21 @@ class TestDeepAgentV2:
 
         model = _build_model()
         with pytest.raises(ValueError, match="decision_mode"):
-            DeepAgentV2("landlord", model, decision_mode="bogus")
+            DeepAgentV2("landlord", model, RuleSet.legacy(), decision_mode="bogus")
 
     def test_requires_model_v2_instance(self):
         from douzero.evaluation.deep_agent import DeepAgentV2
 
         with pytest.raises(TypeError, match="ModelV2"):
-            DeepAgentV2("landlord", "not_a_model")
+            DeepAgentV2("landlord", "not_a_model", RuleSet.legacy())
+
+    def test_requires_explicit_ruleset(self):
+        """Blocker #3: ruleset=None is rejected (no silent legacy default)."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        with pytest.raises(ValueError, match="explicit RuleSet"):
+            DeepAgentV2("landlord", model, ruleset=None)
 
 
 class _DeepAgentV2Helper:
@@ -1100,7 +1197,7 @@ class TestDeepAgentV2SchemaBinding:
 
         model = _build_model()
         model.eval()
-        agent = DeepAgentV2("landlord", model)
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
         obs, _ = _build_v2_obs(seed=220, position="landlord")
         # Corrupt the schema hash on the observation.
         from douzero.observation.encode_v2 import ObservationV2
@@ -1115,8 +1212,71 @@ class TestDeepAgentV2SchemaBinding:
         from douzero.evaluation.deep_agent import DeepAgentV2
 
         model = _build_model()
-        agent = DeepAgentV2("landlord", model)
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
         assert agent._feature_schema_hash == model.schema.stable_hash()
+
+    def test_standard_model_with_legacy_agent_rejected(self):
+        """Blocker #3: a standard-checkpoint model cannot be served by a legacy agent."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        # Attach a standard ruleset identity to the model (as load_v2_model would).
+        rs = RuleSet.standard()
+        model.expected_ruleset_identity = (
+            rs.ruleset_id, rs.ruleset_version, rs.stable_hash(),
+        )
+        with pytest.raises(ValueError, match="ruleset identity mismatch"):
+            DeepAgentV2("landlord", model, RuleSet.legacy())
+
+    def test_standard_model_with_standard_agent_accepted(self):
+        """Blocker #3: matching identities construct successfully."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        rs = RuleSet.standard()
+        model.expected_ruleset_identity = (
+            rs.ruleset_id, rs.ruleset_version, rs.stable_hash(),
+        )
+        agent = DeepAgentV2("landlord", model, RuleSet.standard())
+        assert agent._ruleset_identity == model.expected_ruleset_identity
+
+    def test_act_v2_rejects_ruleset_mismatch(self):
+        """Blocker #3: an observation encoded under a different ruleset is rejected.
+
+        The agent is bound to legacy; an observation carrying a standard
+        ruleset identity must be rejected before forwarding (the schema-hash
+        check alone cannot catch this).
+        """
+        import dataclasses
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        model.eval()
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
+        obs, _ = _build_v2_obs(seed=221, position="landlord")
+        # Corrupt the ruleset identity on the observation's public block.
+        rs = RuleSet.standard()
+        bad_public = dataclasses.replace(
+            obs.public,
+            ruleset_id=rs.ruleset_id,
+            ruleset_version=rs.ruleset_version,
+            ruleset_hash=rs.stable_hash(),
+        )
+        bad_obs = dataclasses.replace(obs, public=bad_public)
+        with pytest.raises(ValueError, match="ruleset identity mismatch"):
+            agent.act_v2(bad_obs)
+
+    def test_act_v2_accepts_matching_ruleset(self):
+        """Blocker #3: a legacy observation under a legacy agent forwards fine."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        model.eval()
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
+        obs, _ = _build_v2_obs(seed=222, position="landlord")
+        # The obs is legacy by default (matches the agent).
+        chosen = agent.act_v2(obs)
+        assert chosen in obs.public.legal_actions
 
 
 # --------------------------------------------------------------------------- #
@@ -1178,6 +1338,44 @@ class TestNaNGuard:
         with pytest.raises(NumericalError, match="non-finite"):
             assert_finite(torch.tensor([float("inf")]), "inf")
 
+    def test_nan_in_score_win_head_rejected(self):
+        """Blocker #1: NaN in score_win_head is caught (score clamp can't remove NaN)."""
+        from douzero.models_v2 import NumericalError
+
+        model = _build_model()
+        model.eval()
+        with torch.no_grad():
+            model.heads.score_win_head.weight[0, 0] = float("nan")
+        obs, _ = _build_v2_obs(seed=233, position="landlord")
+        # The fused + win_logit may be finite, but score_if_win / score_mean
+        # carry NaN. The guard must catch them.
+        with pytest.raises(NumericalError, match="score_if_win|score_mean"):
+            _forward(model, obs)
+
+    def test_nan_in_score_loss_head_rejected(self):
+        """Blocker #1: NaN in score_loss_head bias is caught."""
+        from douzero.models_v2 import NumericalError
+
+        model = _build_model()
+        model.eval()
+        with torch.no_grad():
+            model.heads.score_loss_head.bias[0] = float("nan")
+        obs, _ = _build_v2_obs(seed=234, position="landlord")
+        with pytest.raises(NumericalError, match="score_if_loss|score_mean"):
+            _forward(model, obs)
+
+    def test_inf_in_win_head_rejected(self):
+        """Blocker #1: Inf in the win head is caught (p_win = sigmoid(inf) is finite, but win_logit is inf)."""
+        from douzero.models_v2 import NumericalError
+
+        model = _build_model()
+        model.eval()
+        with torch.no_grad():
+            model.heads.win_head.weight[0, 0] = float("inf")
+        obs, _ = _build_v2_obs(seed=235, position="landlord")
+        with pytest.raises(NumericalError, match="win_logit"):
+            _forward(model, obs)
+
 
 # --------------------------------------------------------------------------- #
 # Bug #6: zero legal actions must raise everywhere
@@ -1205,7 +1403,7 @@ class TestZeroActionsRejection:
 
         model = _build_model()
         model.eval()
-        agent = DeepAgentV2("landlord", model)
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
         obs, _ = _build_v2_obs(seed=241, position="landlord")
         # Build an observation with zero legal actions by replacing the public
         # legal_actions and the action block. Use dataclasses.replace on the
