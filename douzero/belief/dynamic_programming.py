@@ -160,6 +160,143 @@ def _check_feasible(
         )
 
 
+def _backward_filter_table(logp: np.ndarray, total: int) -> np.ndarray:
+    """Backward log-partition table for constrained-marginal computation.
+
+    ``beta[r, s] = log sum over (c_r..c_{R-1}) with sum s of prod_{i>=r}
+    exp(logp[i, c_i])``. Computed by the same recurrence as
+    :func:`_forward_filter_table` but walked from the last rank backwards.
+
+    ``beta[R, 0] = 0``; ``beta[R, s>0] = -inf``.
+    """
+    n_ranks = NUM_BELIEF_RANKS
+    lp = np.where(np.isneginf(logp), _NEG_INF, logp).astype(np.float64)
+    beta = np.full((n_ranks + 1, total + 1), _NEG_INF, dtype=np.float64)
+    beta[n_ranks, 0] = 0.0
+    for r in range(n_ranks - 1, -1, -1):
+        row = lp[r]
+        nxt = beta[r + 1]
+        cur = beta[r]
+        for s in range(total + 1):
+            for k in range(NUM_COUNT_SLOTS):
+                lpk = row[k]
+                if lpk <= _NEG_INF:
+                    continue
+                ns = s - k
+                if ns < 0:
+                    continue
+                base = nxt[ns]
+                if base <= _NEG_INF:
+                    continue
+                combined = base + lpk
+                if cur[s] <= _NEG_INF:
+                    cur[s] = combined
+                else:
+                    m = max(cur[s], combined)
+                    cur[s] = m + np.log(
+                        np.exp(cur[s] - m) + np.exp(combined - m)
+                    )
+    return beta
+
+
+def constrained_marginals(
+    logp: np.ndarray,
+    total: int,
+    *,
+    summary: str | None = None,
+) -> np.ndarray:
+    """Return the per-rank marginal of the constrained posterior.
+
+    For each rank ``r`` and count ``k`` this returns the exact conditional
+    probability that opponent A holds ``k`` copies of rank ``r``, **given** that
+    the full allocation sums to ``total``::
+
+        P(c_r = k | sum_i c_i = total)
+
+    computed by forward-backward (log-sum-exp) dynamic programming. Unlike the
+    independent per-rank softmax, these marginals are mutually consistent with
+    the total-count constraint: ``sum_r sum_k k * marg[r, k] == total``
+    exactly (the constrained expected total equals the target).
+
+    Parameters
+    ----------
+    logp:
+        ``(15, 5)`` masked log-probabilities (illegal slots ``-inf``). Only the
+        relative ordering matters.
+    total:
+        Exact total ``sum(c)`` (opponent A's hidden remaining-card count).
+    summary:
+        Optional observation summary attached to the infeasibility error.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(15, 5)`` float64 marginals; each row sums to 1 (over legal slots);
+        illegal slots are exactly 0.
+
+    Raises
+    ------
+    BeliefDPError
+        If no legal allocation sums to ``total``.
+    """
+    if not isinstance(total, (int, np.integer)) or isinstance(total, bool):
+        raise TypeError(f"total must be an int, got {type(total).__name__}")
+    total = int(total)
+    if total < 0:
+        raise ValueError(f"total must be non-negative, got {total}")
+    logp_arr = np.asarray(logp, dtype=np.float64)
+    if logp_arr.shape != (NUM_BELIEF_RANKS, NUM_COUNT_SLOTS):
+        raise ValueError(
+            f"logp must have shape ({NUM_BELIEF_RANKS}, {NUM_COUNT_SLOTS}), "
+            f"got {logp_arr.shape}"
+        )
+    # Trivial case: total 0 forces every rank to count 0 (where legal).
+    if total == 0:
+        out = np.zeros((NUM_BELIEF_RANKS, NUM_COUNT_SLOTS), dtype=np.float64)
+        for r in range(NUM_BELIEF_RANKS):
+            if not np.isneginf(logp_arr[r, 0]):
+                out[r, 0] = 1.0
+        return out
+
+    alpha = _forward_filter_table(logp_arr, total)
+    _check_feasible(alpha, total, summary)
+    beta = _backward_filter_table(logp_arr, total)
+
+    marg = np.zeros((NUM_BELIEF_RANKS, NUM_COUNT_SLOTS), dtype=np.float64)
+    for r in range(NUM_BELIEF_RANKS):
+        # combined[k] = log sum_{s_a} exp(alpha[r, s_a] + beta[r+1, total-k-s_a])
+        # = log-partition of all OTHER ranks (given c_r = k) summing to total-k.
+        log_combined = np.full(NUM_COUNT_SLOTS, _NEG_INF, dtype=np.float64)
+        for k in range(NUM_COUNT_SLOTS):
+            if np.isneginf(logp_arr[r, k]):
+                continue
+            remaining = total - k
+            if remaining < 0:
+                continue
+            # Convolve alpha[r][.] and beta[r+1][.] at sum `remaining`.
+            terms = []
+            for s_a in range(remaining + 1):
+                a = alpha[r, s_a]
+                b = beta[r + 1, remaining - s_a]
+                if a <= _NEG_INF or b <= _NEG_INF:
+                    continue
+                terms.append(a + b)
+            if terms:
+                m = max(terms)
+                log_combined[k] = m + float(np.log(sum(np.exp(t - m) for t in terms)))
+        log_marg = logp_arr[r] + log_combined
+        # Normalize each rank's marginal over k (softmax); rows with all -inf
+        # (should not happen given feasibility) stay all-zero.
+        finite = log_marg[log_marg > _NEG_INF]
+        if finite.size > 0:
+            m = finite.max()
+            exps = np.where(log_marg > _NEG_INF, np.exp(log_marg - m), 0.0)
+            denom = exps.sum()
+            if denom > 0.0:
+                marg[r] = exps / denom
+    return marg
+
+
 # --------------------------------------------------------------------------- #
 # MAP decode
 # --------------------------------------------------------------------------- #

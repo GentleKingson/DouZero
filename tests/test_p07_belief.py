@@ -269,6 +269,82 @@ class TestDynamicProgramming:
 
 
 # --------------------------------------------------------------------------- #
+# Constrained marginals (Blocker #3): the per-rank posterior conditioned on
+# the total-count constraint, used by the value-fusion features.
+# --------------------------------------------------------------------------- #
+class TestConstrainedMarginals:
+    def _logp(self):
+        # Two ranks share the total; others forced to 0.
+        logp = np.full((NUM_BELIEF_RANKS, NUM_COUNT_SLOTS), -np.inf)
+        for r in range(2, NUM_BELIEF_RANKS):
+            logp[r, 0] = 0.0
+        logp[0, 0] = np.log(0.4)
+        logp[0, 1] = np.log(0.6)
+        logp[1, 0] = np.log(0.5)
+        logp[1, 1] = np.log(0.5)
+        return logp
+
+    def test_expected_total_equals_target_exactly(self):
+        from douzero.belief import constrained_marginals
+
+        for total in (0, 1, 2):
+            marg = constrained_marginals(self._logp(), total=total)
+            counts = np.arange(NUM_COUNT_SLOTS, dtype=np.float64)
+            expected_total = float((marg * counts).sum())
+            assert abs(expected_total - total) < 1e-9, (total, expected_total)
+
+    def test_different_total_produces_different_posterior(self):
+        """Same logits/unseen, different total => different marginals."""
+        from douzero.belief import constrained_marginals
+
+        logp = self._logp()
+        m1 = constrained_marginals(logp, total=1)
+        m2 = constrained_marginals(logp, total=2)
+        assert not np.allclose(m1, m2)
+        # Both must have expected totals matching their targets.
+        counts = np.arange(NUM_COUNT_SLOTS, dtype=np.float64)
+        assert abs((m1 * counts).sum() - 1) < 1e-9
+        assert abs((m2 * counts).sum() - 2) < 1e-9
+
+    def test_rows_sum_to_one_over_legal_slots(self):
+        from douzero.belief import constrained_marginals
+
+        marg = constrained_marginals(self._logp(), total=1)
+        assert marg.shape == (NUM_BELIEF_RANKS, NUM_COUNT_SLOTS)
+        for r in range(NUM_BELIEF_RANKS):
+            assert abs(marg[r].sum() - 1.0) < 1e-9
+
+    def test_total_zero_forces_all_zero_counts(self):
+        from douzero.belief import constrained_marginals
+
+        marg = constrained_marginals(self._logp(), total=0)
+        # Every rank's mass is on count 0 (the only feasible per-rank value).
+        assert np.allclose(marg[:, 0], 1.0)
+
+    def test_belief_features_reject_unconstrained_factor_probs(self):
+        """belief_features_from_probs must reject an independent softmax."""
+        # Independent per-rank softmax: expected total generally != target.
+        factor = np.full((1, NUM_BELIEF_RANKS, NUM_COUNT_SLOTS), 0.5)
+        factor[0, 0, :2] = 0.5  # only slots 0,1 legal for rank 0
+        factor[0, 0, 2:] = 0.0
+        unseen = np.zeros((1, NUM_BELIEF_RANKS), dtype=np.int64)
+        unseen[0, 0] = 1
+        with pytest.raises(ValueError):
+            belief_features_from_probs(
+                factor, np.array([1]), unseen, assert_constrained=True,
+            )
+
+    def test_belief_features_accept_constrained_marginals(self):
+        from douzero.belief import constrained_marginals
+
+        marg = constrained_marginals(self._logp(), total=1)[None, ...]
+        unseen = np.ones((1, NUM_BELIEF_RANKS), dtype=np.int64)
+        feat = belief_features_from_probs(marg, np.array([1]), unseen)
+        assert feat.shape == (1, BELIEF_FEATURE_DIM)
+        assert np.all(np.isfinite(feat))
+
+
+# --------------------------------------------------------------------------- #
 # Headline: 1000-state conservation sweep on real game states
 # --------------------------------------------------------------------------- #
 class TestConservationSweep:
@@ -305,6 +381,12 @@ class TestConservationSweep:
                 # A + B must reconstruct the full unseen pool.
                 recon = s + b
                 np.testing.assert_array_equal(recon, binput.unseen_counts)
+            # Constrained-marginal expected total must equal the target exactly
+            # (Blocker #3): the value-fusion features are conservation-safe.
+            exp_total = float(out.expected_counts[0].sum())
+            assert abs(exp_total - binput.opponent_a_total) < 1e-6, (
+                exp_total, binput.opponent_a_total
+            )
             checked += 1
             if checked >= 1000:
                 break

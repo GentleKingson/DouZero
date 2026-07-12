@@ -60,6 +60,7 @@ from .constraints import (
 )
 from .dynamic_programming import (
     BeliefDPError,
+    constrained_marginals,
     decode_map,
     sample_allocation,
 )
@@ -105,6 +106,7 @@ __all__ = [
     "total_entropy_from_probs",
     "unseen_counts_per_rank",
     "BeliefDPError",
+    "constrained_marginals",
     "decode_map",
     "sample_allocation",
     "BELIEF_INPUT_DIM",

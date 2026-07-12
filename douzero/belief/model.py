@@ -104,18 +104,37 @@ class BeliefOutput:
     """The forward output of :class:`BeliefModel` for one batch.
 
     ``logits`` is the raw ``[B, 15, 5]`` tensor; ``legal`` the mask;
-    ``probs`` the masked softmax; ``opponent_a_total`` the per-sample target
-    total. ``expected_counts`` and ``entropy`` are posterior summaries (numpy)
-    for downstream consumers.
+    ``factor_probs`` the **independent** per-rank masked softmax (the model's
+    per-rank factor distribution, NOT conditioned on the total-count
+    constraint); ``constrained_probs`` the per-rank **marginals of the
+    constrained posterior** ``P(c_r=k | sum=total)`` — these are what the value
+    model should consume, because their expected total equals
+    ``opponent_a_total`` exactly. ``opponent_a_total`` is the per-sample target
+    total. ``expected_counts`` / ``entropy`` are derived from the constrained
+    marginals.
     """
 
     logits: torch.Tensor  # (B, 15, 5)
     legal: torch.Tensor  # (B, 15, 5) bool
-    probs: torch.Tensor  # (B, 15, 5) masked softmax
+    factor_probs: torch.Tensor  # (B, 15, 5) independent per-rank softmax
+    constrained_probs: np.ndarray  # (B, 15, 5) constrained marginals
     opponent_a_total: np.ndarray  # (B,) int64
     opponent_a_role: list[str]
-    expected_counts: np.ndarray  # (B, 15) float64
-    entropy: np.ndarray  # (B,) float64
+    expected_counts: np.ndarray  # (B, 15) float64 — from constrained marginals
+    entropy: np.ndarray  # (B,) float64 — from constrained marginals
+
+    @property
+    def probs(self) -> torch.Tensor:
+        """Constrained-marginal probabilities as a torch tensor.
+
+        Returned on CPU; callers that need a different device should recompute
+        from :meth:`detach_logits` via
+        :func:`~douzero.belief.dynamic_programming.constrained_marginals`.
+        Kept as a property named ``probs`` so existing callers that read the
+        constrained posterior get it; the independent factor distribution is
+        ``factor_probs``.
+        """
+        return torch.from_numpy(self.constrained_probs.astype(np.float32))
 
     def detach_logits(self) -> np.ndarray:
         """Return the logits as a detached ``(B, 15, 5)`` numpy array."""
@@ -179,16 +198,33 @@ class BeliefModel(nn.Module):
     def forward(self, inputs: list[BeliefInput] | BeliefInput) -> BeliefOutput:
         """Run a forward pass for one (or a batch of) :class:`BeliefInput`.
 
-        Returns a :class:`BeliefOutput` carrying the masked logits/probs and
-        the per-sample constraint totals. Single-input callers may pass one
-        :class:`BeliefInput`; it is internally promoted to a length-1 batch.
+        Returns a :class:`BeliefOutput` carrying the masked logits, the
+        independent per-rank factor distribution (``factor_probs``), and the
+        **constrained marginals** (``constrained_probs``) — the per-rank
+        posterior conditioned on the total-count constraint, whose expected
+        total equals ``opponent_a_total`` exactly. The value model should
+        consume the constrained marginals.
+
+        Single-input callers may pass one :class:`BeliefInput`; it is
+        internally promoted to a length-1 batch. Device and dtype are derived
+        from the model parameters so ``model.cuda()`` / ``model.double()``
+        work (the input feature vectors are cast to match).
         """
+        from .dynamic_programming import constrained_marginals
+
         if isinstance(inputs, BeliefInput):
             inputs = [inputs]
         if len(inputs) == 0:
             raise ValueError("BeliefModel.forward received an empty input list")
-        feature_matrix = torch.from_numpy(
-            np.stack([inp.feature_vector for inp in inputs], axis=0).astype(np.float32)
+        # Derive device/dtype from the model parameters so a caller that moved
+        # the model to CUDA or cast to double gets matching input tensors
+        # (Medium #6 fix).
+        param = next(self.parameters())
+        feats_np = np.stack(
+            [inp.feature_vector for inp in inputs], axis=0
+        ).astype(np.float32)
+        feature_matrix = torch.as_tensor(
+            feats_np, device=param.device, dtype=param.dtype
         )
         unseen = np.stack(
             [inp.unseen_counts for inp in inputs], axis=0
@@ -202,18 +238,33 @@ class BeliefModel(nn.Module):
         roles = [inp.opponent_a_role for inp in inputs]
 
         logits = self._forward_logits(feature_matrix)
-        legal = torch.from_numpy(legal_np).to(logits.device).bool()
+        legal = torch.as_tensor(legal_np, device=logits.device).bool()
         masked = logits.masked_fill(~legal, _MASK_LOGIT)
-        probs = torch.softmax(masked, dim=-1)
-        probs_np = probs.detach().cpu().float().numpy()
+        factor_probs = torch.softmax(masked, dim=-1)
+
+        # Constrained per-rank marginals P(c_r=k | sum=total). These are the
+        # joint-posterior marginals (not the independent factor softmax); their
+        # expected total equals opponent_a_total exactly, which is the property
+        # the value-fusion features require (Blocker #3 fix).
+        logp_np = logits.detach().cpu().float().numpy()
+        logp_np = np.where(legal_np, logp_np, -np.inf)
+        constrained = np.zeros(
+            (len(inputs), NUM_BELIEF_RANKS, NUM_COUNT_SLOTS), dtype=np.float64
+        )
+        for i in range(len(inputs)):
+            constrained[i] = constrained_marginals(
+                logp_np[i], int(totals[i]),
+                summary=f"role={roles[i]} total={int(totals[i])}",
+            )
         return BeliefOutput(
             logits=logits,
             legal=legal,
-            probs=probs,
+            factor_probs=factor_probs,
+            constrained_probs=constrained,
             opponent_a_total=totals,
             opponent_a_role=roles,
-            expected_counts=expected_counts_from_probs(probs_np),
-            entropy=total_entropy_from_probs(probs_np),
+            expected_counts=expected_counts_from_probs(constrained),
+            entropy=total_entropy_from_probs(constrained),
         )
 
     # ------------------------------------------------------------------ #
@@ -271,14 +322,26 @@ def belief_features_from_probs(
     probs: np.ndarray,
     opponent_a_total: np.ndarray,
     unseen_counts: np.ndarray,
+    *,
+    assert_constrained: bool = True,
 ) -> np.ndarray:
-    """Project a belief posterior into the value-model feature vector.
+    """Project the CONSTRAINED belief posterior into the value-model features.
+
+    ``probs`` MUST be the constrained per-rank marginals
+    (``P(c_r=k | sum=total)``, e.g. from
+    :func:`~douzero.belief.dynamic_programming.constrained_marginals` or
+    :attr:`BeliefOutput.constrained_probs`) — NOT the independent per-rank
+    softmax. Only the constrained marginals have an expected total equal to
+    ``opponent_a_total`` exactly, which is the conservation property the value
+    fusion requires. When ``assert_constrained`` is True (default) the function
+    asserts ``sum_r E[c_A_r] == opponent_a_total`` per sample and raises if the
+    caller passed an unconstrained distribution.
 
     Returns a ``(B, BELIEF_FEATURE_DIM)`` float32 matrix the value model
     consumes when ``belief_enabled=True``:
 
     - per-rank expected count for opponent A (15),
-    - per-rank normalized entropy (15),
+    - per-rank entropy in nats (15),
     - per-rank max probability (15),
     - opponent-A expected total (1),
     - opponent-B expected total (1),
@@ -298,6 +361,20 @@ def belief_features_from_probs(
     flat = p.reshape(-1, NUM_BELIEF_RANKS, NUM_COUNT_SLOTS)
     counts = np.arange(NUM_COUNT_SLOTS, dtype=np.float64)
     expected_a = (flat * counts).sum(axis=-1)  # (B, 15)
+    # Conservation: the constrained marginal's expected total must equal the
+    # target. Reject an unconstrained (factor-softmax) input loudly.
+    if assert_constrained:
+        totals = np.asarray(opponent_a_total, dtype=np.float64).reshape(-1)
+        got = expected_a.sum(axis=-1)
+        if not np.allclose(got, totals, atol=1e-4):
+            worst = float(np.abs(got - totals).max())
+            raise ValueError(
+                "belief_features_from_probs received an UNCONSTRAINED "
+                "probability tensor: sum_r E[c_A_r] does not match "
+                f"opponent_a_total (max abs diff {worst:.4g}). Pass the "
+                "constrained marginals (BeliefOutput.constrained_probs), not "
+                "the independent per-rank softmax (factor_probs)."
+            )
     with np.errstate(divide="ignore", invalid="ignore"):
         entropy = -np.where(flat > 0, flat * np.log(flat), 0.0).sum(axis=-1)  # (B,15)
     max_prob = flat.max(axis=-1)  # (B, 15)
