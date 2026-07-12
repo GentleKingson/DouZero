@@ -24,7 +24,7 @@ from douzero.training.losses import (
     MultiObjectiveLoss,
     bce_win_loss,
     conditional_score_huber_loss,
-    log_score_aux_loss,
+    uncertainty_nll,
 )
 
 
@@ -128,28 +128,62 @@ def test_conditional_loss_large_multiplier_tail_stays_finite():
     assert math.isfinite(loss.item())
 
 
-def test_log_score_aux_loss_zero_when_lambda_zero_via_combiner():
-    output = _make_output([0.5], [2.0], [-2.0])
+def test_log_score_transform_zero_is_zero():
+    """score_target_transform='signed_log' maps a 0 target to 0."""
+    output = _make_output([0.5], [0.0], [0.0])
     labels = {
         "target_win": torch.tensor([1.0]),
-        "target_score": torch.tensor([2.0]),
-        "target_log_score": torch.tensor([math.log1p(2.0)]),
+        "target_score": torch.tensor([0.0]),
+        "target_log_score": torch.tensor([0.0]),
     }
-    fn = MultiObjectiveLoss(LossConfig(lambda_win=1.0, lambda_score=0.0, lambda_log=0.0))
+    fn = MultiObjectiveLoss(
+        LossConfig(lambda_win=0.0, lambda_score=1.0, score_target_transform="signed_log")
+    )
     comps = fn(output, labels)
-    assert comps.log == 0.0
+    assert comps.score == pytest.approx(0.0, abs=1e-6)
 
 
-def test_log_score_aux_loss_active_when_lambda_positive():
-    output = _make_output([0.5], [2.0], [-2.0])
+def test_score_target_transform_signed_log_supervises_log_scale():
+    """When score_target_transform='signed_log', the heads are supervised
+    against sign(s)·log1p(|s|), NOT the raw score. A head value of 3.5
+    should be a near-perfect fit for a raw target of 32 (log1p(32)≈3.5),
+    while it would be a terrible fit for a raw target of 32."""
+    output = _make_output([0.5], [3.5], [3.5])
     labels = {
         "target_win": torch.tensor([1.0]),
-        "target_score": torch.tensor([2.0]),
-        "target_log_score": torch.tensor([10.0]),  # deliberately off
+        "target_score": torch.tensor([32.0]),  # raw
+        # No target_log_score: the loss derives it from target_score.
     }
-    fn = MultiObjectiveLoss(LossConfig(lambda_win=0.0, lambda_score=0.0, lambda_log=1.0))
+    fn_log = MultiObjectiveLoss(
+        LossConfig(lambda_win=0.0, lambda_score=1.0, score_target_transform="signed_log")
+    )
+    fn_raw = MultiObjectiveLoss(
+        LossConfig(lambda_win=0.0, lambda_score=1.0, score_target_transform="raw")
+    )
+    log_loss = fn_log(output, labels).score
+    raw_loss = fn_raw(output, labels).score
+    # The signed-log fit is near-perfect (head=3.5, target≈3.466).
+    assert log_loss < 0.05
+    # The raw fit is wildly off (head=3.5, target=32).
+    assert raw_loss > 10.0
+
+
+def test_raw_target_clamped_to_score_clamp():
+    """A raw target above score_clamp is clamped so it stays inside what the
+    heads can represent (a head clamp of 32 cannot represent a target of
+    64). The P06 r1 fix prevents the head's gradient from zeroing on
+    saturated tail targets."""
+    output = _make_output([0.5], [32.0], [32.0])
+    labels = {
+        "target_win": torch.tensor([1.0]),
+        "target_score": torch.tensor([64.0]),  # exceeds score_clamp
+    }
+    fn = MultiObjectiveLoss(
+        LossConfig(lambda_win=0.0, lambda_score=1.0, score_clamp=32.0)
+    )
     comps = fn(output, labels)
-    assert comps.log > 0.0
+    # Head=32, clamped target=32 -> near-perfect fit (Huber at 0 is 0).
+    assert comps.score == pytest.approx(0.0, abs=1e-5)
 
 
 # --------------------------------------------------------------------------- #
@@ -177,7 +211,7 @@ def test_combined_loss_finite_and_grad():
         "target_log_score": torch.tensor([0.7, -1.1, 1.4]),
     }
     fn = MultiObjectiveLoss(
-        LossConfig(lambda_win=1.0, lambda_score=0.5, lambda_log=0.1)
+        LossConfig(lambda_win=1.0, lambda_score=0.5, lambda_uncertainty=0.1)
     )
     comps = fn.forward_gathered(win_logit, score_if_win, score_if_loss, labels)
     assert isinstance(comps, LossComponents)
@@ -234,9 +268,21 @@ def test_loss_config_rejects_negative_weight():
 
 
 def test_loss_config_to_dict_roundtrip_keys():
-    cfg = LossConfig(lambda_win=1.0, lambda_score=0.5, lambda_log=0.1)
+    cfg = LossConfig(lambda_win=1.0, lambda_score=0.5, lambda_uncertainty=0.1)
     d = cfg.to_dict()
     assert set(d.keys()) == {
-        "lambda_win", "lambda_score", "lambda_log", "lambda_uncertainty",
-        "score_delta", "log_score_delta",
+        "lambda_win", "lambda_score", "lambda_uncertainty",
+        "score_delta", "score_target_transform", "score_clamp",
     }
+
+
+def test_loss_config_rejects_bad_score_target_transform():
+    with pytest.raises(ValueError):
+        LossConfig(score_target_transform="bogus")
+
+
+def test_loss_config_rejects_bad_score_clamp():
+    with pytest.raises(ValueError):
+        LossConfig(score_clamp=0.0)
+    with pytest.raises(ValueError):
+        LossConfig(score_clamp=-1.0)

@@ -54,15 +54,20 @@ optimizer:
 
 # P06 multi-objective loss. These are the V2 trainer defaults: BCE win head
 # (weight 1.0) + masked Huber conditional score heads (weight 0.5). The
-# log-score auxiliary and uncertainty-NLL terms are available for ablation
-# but default OFF.
+# uncertainty-NLL term is available for ablation but defaults OFF.
+#
+# score_target_transform selects which target the conditional heads are
+# supervised against (mutually exclusive — a single head cannot fit both
+# scales at once):
+#   raw        — fit the raw team score (clamped to score_clamp).
+#   signed_log — fit sign(s)·log1p(|s|) (compresses the bomb/rocket tail).
 loss:
   lambda_win: 1.0
   lambda_score: 0.5
-  lambda_log: 0.0
   lambda_uncertainty: 0.0
   score_delta: 1.0
-  log_score_delta: 1.0
+  score_target_transform: raw
+  score_clamp: 32.0
 
 # Decision policy. `pure_win` is the deployment default (matches the P05
 # DeepAgentV2). Switch to `win_then_score` / `score_then_win` for

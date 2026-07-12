@@ -55,10 +55,10 @@ optimizer:
 loss:
   lambda_win: 0.0
   lambda_score: 0.0
-  lambda_log: 0.0
   lambda_uncertainty: 0.0
   score_delta: 1.0
-  log_score_delta: 1.0
+  score_target_transform: raw
+  score_clamp: 32.0
 
 decision_policy:
   mode: pure_win

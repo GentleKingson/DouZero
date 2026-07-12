@@ -157,8 +157,9 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "feature_version": str, "ruleset": str, "model_version": str,
     "learning_rate": float, "alpha": float, "momentum": float, "epsilon": float,
     # P06 multi-objective loss + decision-policy nested fields.
-    "lambda_win": float, "lambda_score": float, "lambda_log": float,
-    "lambda_uncertainty": float, "score_delta": float, "log_score_delta": float,
+    "lambda_win": float, "lambda_score": float,
+    "lambda_uncertainty": float, "score_delta": float,
+    "score_target_transform": str, "score_clamp": float,
     "mode": str, "abs_tol": float, "rel_tol": float, "risk_penalty": float,
 }
 
@@ -200,9 +201,11 @@ def _validate_types(cfg: TrainingConfig) -> None:
         if name in {"learning_rate", "alpha", "momentum", "epsilon"}:
             _check_field(name, getattr(cfg.optimizer, name), "optimizer")
         elif name in {
-            "lambda_win", "lambda_score", "lambda_log", "lambda_uncertainty",
-            "score_delta", "log_score_delta",
+            "lambda_win", "lambda_score", "lambda_uncertainty",
+            "score_delta", "score_clamp",
         }:
+            _check_field(name, getattr(cfg.loss, name), "loss")
+        elif name == "score_target_transform":
             _check_field(name, getattr(cfg.loss, name), "loss")
         elif name in {"mode", "abs_tol", "rel_tol", "risk_penalty"}:
             _check_field(name, getattr(cfg.decision_policy, name), "decision_policy")
