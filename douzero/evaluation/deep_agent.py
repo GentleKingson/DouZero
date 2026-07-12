@@ -172,8 +172,20 @@ class DeepAgentV2:
     decision_mode:
         How to convert the multi-head output to a single action. ``"win"``
         (default) picks the highest-``p_win`` valid action. ``"score"`` picks
-        the highest expected score. P06 adds lexicographic modes; P05 keeps
-        these two simple, fully-tested modes.
+        the highest expected score. P06 adds the full multi-objective policy
+        set (``pure_win``, ``pure_score``, ``win_then_score``,
+        ``score_then_win``, ``risk_aware``); ``win`` and ``score`` are kept
+        as aliases for ``pure_win`` / ``pure_score``.
+    decision_config:
+        Optional :class:`~douzero.training.decision_policy.DecisionConfig`
+        carrying the mode AND the tolerance/risk-penalty knobs (P06 r1 fix:
+        ``decision_mode`` alone drops ``abs_tol`` / ``rel_tol`` /
+        ``risk_penalty`` to their defaults, which silently disables the
+        lexicographic and risk-aware modes). When supplied, this takes
+        precedence over ``decision_mode``; when omitted, a
+        :class:`DecisionConfig` is built from ``decision_mode`` with default
+        tolerances (preserving the P05 contract for callers that only pass
+        ``decision_mode``).
     """
 
     def __init__(
@@ -181,13 +193,15 @@ class DeepAgentV2:
         position,
         model,
         ruleset,
-        decision_mode="win",
+        decision_mode=None,
+        decision_config=None,
     ):
         from douzero.models_v2.model import ModelV2  # local import: keep the
         # production import graph (evaluation.simulation) free of a hard torch
         # model dependency at module load, mirroring the lazy imports above.
         from douzero.env.rules import RuleSet
         from douzero.training.decision_policy import (
+            DecisionConfig,
             SUPPORTED_DECISION_MODES,
             canonical_mode,
         )
@@ -206,15 +220,40 @@ class DeepAgentV2:
             raise TypeError(
                 f"ruleset must be a RuleSet instance, got {type(ruleset).__name__}"
             )
-        # P06 widens decision_mode to the full multi-objective policy set.
-        # ``win`` and ``score`` are kept as aliases for ``pure_win`` /
-        # ``pure_score`` so the P05 contract is unchanged.
-        if decision_mode not in SUPPORTED_DECISION_MODES:
-            raise ValueError(
-                f"decision_mode must be one of {SUPPORTED_DECISION_MODES}, "
-                f"got {decision_mode!r}"
-            )
-        self.decision_mode = canonical_mode(decision_mode)
+        # P06 r1: accept a full DecisionConfig so the tolerance and
+        # risk-penalty knobs actually reach selection. Precedence:
+        #   1. decision_config (if supplied) — carries mode + tolerances.
+        #   2. decision_mode (if supplied) — build a DecisionConfig with
+        #      default tolerances (preserves the P05 caller contract).
+        #   3. Neither — default to pure_win with default tolerances.
+        if decision_config is not None:
+            if not isinstance(decision_config, DecisionConfig):
+                raise TypeError(
+                    "decision_config must be a DecisionConfig instance, got "
+                    f"{type(decision_config).__name__}"
+                )
+            # If the caller ALSO passed a non-None decision_mode, require it
+            # to agree with the config's canonical mode — silent disagreement
+            # is a caller bug. A None decision_mode (the default) is inferred
+            # from the config so callers don't have to repeat the mode.
+            if decision_mode is not None:
+                if canonical_mode(decision_mode) != decision_config.mode:
+                    raise ValueError(
+                        f"decision_mode {decision_mode!r} disagrees with "
+                        f"decision_config.mode {decision_config.mode!r}; pass only "
+                        f"one or make them agree."
+                    )
+            self.decision_config = decision_config
+        else:
+            # No DecisionConfig supplied; build one from decision_mode.
+            mode = decision_mode if decision_mode is not None else "win"
+            if mode not in SUPPORTED_DECISION_MODES:
+                raise ValueError(
+                    f"decision_mode must be one of {SUPPORTED_DECISION_MODES}, "
+                    f"got {mode!r}"
+                )
+            self.decision_config = DecisionConfig(mode=canonical_mode(mode))
+        self.decision_mode = self.decision_config.mode
         # Blocker #3: if the model carries a verified checkpoint ruleset
         # identity (attached by load_v2_model), the agent's RuleSet MUST match
         # it exactly (id + version + hash). This prevents serving a
@@ -235,7 +274,6 @@ class DeepAgentV2:
         self.position = position
         self.model = model
         self.ruleset = ruleset
-        self.decision_mode = decision_mode
         self.backend = "v2"
         # Bug #3: bind the agent to the model's feature schema hash. Every
         # observation forwarded through act_v2 must carry the SAME schema hash,
@@ -391,7 +429,6 @@ class DeepAgentV2:
     # --- Internal selection ------------------------------------------------- #
     def _select_from_observation(self, obs):
         from douzero.models_v2.batch import observation_to_model_inputs
-        from douzero.training.decision_policy import DecisionConfig, select_action
 
         bundle = observation_to_model_inputs(obs)
         if torch.cuda.is_available():
@@ -408,12 +445,14 @@ class DeepAgentV2:
                 bundle.action_mask,
                 bundle.acting_role,
             )
-        # P06: route through the unified decision policy. The agent's
-        # ``decision_mode`` was canonicalized at construction time, so we
-        # build a DecisionConfig with the same mode and the default
-        # tolerances (evaluation must be deterministic; lexicographic
-        # tolerance bands are for deployment configuration, not default).
-        idx = select_action(out, DecisionConfig(mode=self.decision_mode))
+        # P06 r1: route through the unified decision policy using the FULL
+        # DecisionConfig (carrying abs_tol / rel_tol / risk_penalty), not a
+        # freshly-constructed one with default tolerances. The agent's
+        # decision_config was built once at construction and carries the
+        # caller's tolerance / risk-penalty choices into deployment.
+        from douzero.training.decision_policy import select_action
+
+        idx = select_action(out, self.decision_config)
         legal_actions = obs.actions.legal_actions
         # The action_mask may include padding rows beyond the real actions;
         # the decision policy respects the mask, so the index is a

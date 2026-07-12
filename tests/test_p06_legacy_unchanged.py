@@ -40,8 +40,10 @@ def test_legacy_config_defaults_have_zero_loss_weights():
     cfg = SchemaLossConfig()
     assert cfg.lambda_win == 0.0
     assert cfg.lambda_score == 0.0
-    assert cfg.lambda_log == 0.0
     assert cfg.lambda_uncertainty == 0.0
+    # score_target_transform defaults to "raw" (the heads fit the raw team
+    # score; this is the conservative default for legacy-equivalent scoring).
+    assert cfg.score_target_transform == "raw"
 
 
 def test_legacy_yaml_loads_with_new_blocks(tmp_path):
@@ -57,21 +59,38 @@ def test_legacy_yaml_loads_with_new_blocks(tmp_path):
 
 
 def test_legacy_dmc_imports_avoid_training_v2_modules():
-    """Importing douzero.dmc.dmc must NOT pull in the P06 training package."""
+    """Importing douzero.dmc.dmc must NOT pull in the P06 training package.
+
+    Uses a subprocess so the test's sys.modules manipulation does not
+    corrupt the module identity for subsequent tests in the same session
+    (deleting douzero.training.* from sys.modules would cause later tests
+    to see a fresh, duplicate DecisionConfig class).
+    """
+    import subprocess
     import sys
 
-    # Drop any cached imports we want to test.
-    for mod_name in list(sys.modules):
-        if mod_name.startswith("douzero.training"):
-            del sys.modules[mod_name]
-    # Re-import the legacy dmc entrypoint.
-    importlib.import_module("douzero.dmc.dmc")
-    # After importing the legacy path, the training package must NOT be in
-    # sys.modules — the legacy path does not depend on the V2 trainer.
-    assert "douzero.training" not in sys.modules, (
-        "douzero.dmc.dmc transitively imports douzero.training, which would "
-        "couple the legacy training path to the V2 multi-objective modules."
+    code = (
+        "import sys\n"
+        "import importlib\n"
+        "# Ensure the training package is not loaded before the check.\n"
+        "for m in list(sys.modules):\n"
+        "    if m.startswith('douzero.training'):\n"
+        "        del sys.modules[m]\n"
+        "importlib.import_module('douzero.dmc.dmc')\n"
+        "assert 'douzero.training' not in sys.modules, "
+        "'douzero.dmc.dmc transitively imports douzero.training'\n"
+        "print('OK')\n"
     )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=__import__("os").path.dirname(__import__("os").path.dirname(__file__)),
+    )
+    assert result.returncode == 0, (
+        f"subprocess check failed:\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert "OK" in result.stdout
 
 
 def test_dmc_train_gate_still_rejects_v2():

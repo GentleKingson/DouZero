@@ -6,12 +6,13 @@ completes one optimizer step and changes the parameters).
 
 Design
 ------
-- Single process. No shared memory, no actor subprocesses. The legacy
-  multiprocessing path (:mod:`douzero.dmc`) is untouched.
-- Self-play: a single :class:`~douzero.env.env.Env` (legacy mode by default)
-  plays games to terminal. Each decision is made by an epsilon-greedy policy
-  over the current :class:`~douzero.models_v2.model.ModelV2` outputs (random
-  for the first few episodes when the buffer is empty).
+- Single process, CPU-only. No shared memory, no actor subprocesses, no
+  GPU handling. The legacy multiprocessing path (:mod:`douzero.dmc`) is
+  untouched. GPU + multi-process is P14.
+- Self-play: a single :class:`~douzero.env.env.Env` (legacy mode) plays
+  games to terminal. Each decision is made by an epsilon-greedy policy
+  over the current :class:`~douzero.models_v2.model.ModelV2` outputs
+  (random for the first few episodes when the buffer is empty).
 - Transition recording: every decision's :class:`ObservationV2` + chosen
   action index + acting position is appended to the current
   :class:`~douzero.training.v2_buffer.Episode`.
@@ -19,22 +20,31 @@ Design
   :meth:`~douzero.env.env.Env._attach_team_perspective_labels`) is read and
   the episode's transitions receive team-perspective Monte-Carlo labels.
 - Optimizer step: the trainer samples a minibatch, forwards each decision,
-  gathers the chosen action's head values, and calls
+  gathers the chosen action's head values, concatenates them, and calls
   :meth:`MultiObjectiveLoss.forward_gathered`.
 
-This trainer is intentionally NOT high-throughput. It is the bounded test
-the P06 acceptance criteria require; P14 introduces the multiprocessing
-actor/learner.
+P06 r1 hardening
+----------------
+- The trainer rejects a non-legacy ruleset at construction (standard mode
+  requires a bidding driver that is not part of P06).
+- The per-decision heads are concatenated with :func:`torch.cat` (not
+  :func:`torch.stack`), so the gathered heads have shape ``(B, 1)`` as the
+  loss module requires.
+- The optimizer step is fail-closed: a non-finite loss or gradient raises
+  :class:`FloatingPointError` BEFORE the optimizer is allowed to mutate
+  parameters (PyTorch's ``clip_grad_norm_`` defaults to
+  ``error_if_nonfinite=False`` which silently lets NaN/Inf through).
+- The unsupported ``checkpoint_dir`` / ``save_every_steps`` options that
+  were advertised in r0 are removed; they will be wired up alongside the
+  P14 high-throughput trainer where save/resume actually matters.
 """
 
 from __future__ import annotations
 
 import math
-import os
 import random
 from dataclasses import dataclass, field
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -45,18 +55,21 @@ from douzero.models_v2.model import ModelV2
 from douzero.observation.encode_v2 import get_obs_v2
 
 from douzero.training.decision_policy import DecisionConfig, select_action
-from douzero.training.labels import ALL_POSITIONS
 from douzero.training.losses import LossComponents, LossConfig, MultiObjectiveLoss
-from douzero.training.v2_buffer import Episode, V2ReplayBuffer
+from douzero.training.v2_buffer import Episode, Transition, V2ReplayBuffer
 
 
 @dataclass
 class TrainerConfig:
     """Knobs for :class:`V2Trainer`.
 
-    Defaults are tuned for a CPU smoke test (a handful of short episodes and
-    a single optimizer step). Production-scale tuning belongs in
+    Defaults are tuned for a CPU smoke test (a handful of short episodes
+    and a single optimizer step). Production-scale tuning belongs in
     ``configs/enhanced.yaml``, not here.
+
+    P06 r1 removed ``checkpoint_dir`` and ``save_every_steps``: they were
+    advertised but never implemented. They will be reintroduced alongside
+    the P14 high-throughput trainer where checkpoint/resume is exercised.
     """
 
     seed: int = 0
@@ -69,13 +82,13 @@ class TrainerConfig:
     # Minibatch / optimization.
     batch_size: int = 16
     learning_rate: float = 1e-4
+    rmsprop_alpha: float = 0.99
+    rmsprop_momentum: float = 0.0
+    rmsprop_epsilon: float = 1e-5
     max_grad_norm: float = 40.0
     optimizer_steps: int = 1
     # Replay buffer.
     buffer_capacity: int = 4096
-    # Where to save V2 checkpoints (empty string = no saving).
-    checkpoint_dir: str = ""
-    save_every_steps: int = 0
     # RNG for action sampling / minibatch sampling.
     rng_seed: int = 0
 
@@ -95,6 +108,25 @@ class TrainerStats:
     score_mean_avg: float = float("nan")
 
 
+def _legacy_only(ruleset: RuleSet | None) -> None:
+    """Reject any non-None ruleset (P06 has no bidding driver).
+
+    ``Env`` treats ANY non-None ``RuleSet`` as standard mode (it enters the
+    bidding phase), even ``RuleSet.legacy()``. The P06 trainer has no
+    bidding driver, so the only valid value is ``ruleset=None`` (which
+    gives the legacy card-play-only env). This is a P06 limitation; P11's
+    league work adds the bidding driver.
+    """
+    if ruleset is None:
+        return
+    raise NotImplementedError(
+        f"V2Trainer only supports ruleset=None (the legacy card-play-only "
+        f"env) in P06. Env treats any non-None RuleSet as standard mode and "
+        f"enters the bidding phase, which requires a bidding driver that is "
+        f"part of P11's league work. Got ruleset={ruleset!r}."
+    )
+
+
 class V2Trainer:
     """Single-process V2 multi-objective trainer.
 
@@ -102,18 +134,16 @@ class V2Trainer:
     ----------
     model:
         The :class:`ModelV2` to optimize. The trainer takes ownership of
-        gradient updates but does NOT move the model to a device; the
-        caller constructs the model on the desired device.
+        gradient updates. CPU-only — the model is NOT moved to a device
+        (GPU is P14).
     ruleset:
         :class:`RuleSet` for the env. ``None`` (default) keeps the legacy
-        card-play-only env (no bidding). Standard mode requires the trainer
-        to drive bidding, which is deferred to P11's league work; the P06
-        smoke uses legacy mode.
+        card-play-only env (no bidding). Non-legacy rulesets are rejected
+        at construction (P06 has no bidding driver).
     loss_config:
         :class:`LossConfig` for the multi-objective loss.
     decision_config:
-        :class:`DecisionConfig` for action selection during self-play. The
-        default ``pure_win`` matches the deployment default.
+        :class:`DecisionConfig` for action selection during self-play.
     config:
         :class:`TrainerConfig` for episode/optimization knobs.
     """
@@ -127,6 +157,7 @@ class V2Trainer:
         decision_config: DecisionConfig | None = None,
         config: TrainerConfig | None = None,
     ) -> None:
+        _legacy_only(ruleset)
         self.model = model
         self.ruleset = ruleset
         self.loss_fn = MultiObjectiveLoss(loss_config or LossConfig())
@@ -135,6 +166,9 @@ class V2Trainer:
         self.optimizer = torch.optim.RMSprop(
             self.model.parameters(),
             lr=self.config.learning_rate,
+            alpha=self.config.rmsprop_alpha,
+            momentum=self.config.rmsprop_momentum,
+            eps=self.config.rmsprop_epsilon,
         )
         self.buffer = V2ReplayBuffer(capacity_transitions=self.config.buffer_capacity)
         self.rng = random.Random(self.config.rng_seed)
@@ -183,9 +217,9 @@ class V2Trainer:
                 # Record the decision (single-legal-action steps are not
                 # trained on — there is nothing to learn).
                 episode.transitions.append(
-                    _make_transition(obs, action_index, position)
+                    Transition(obs=obs, action_index=action_index, position=position)
                 )
-            obs_out, reward, done, info = env.step(action)
+            _obs_out, _reward, done, info = env.step(action)
             if done:
                 episode.terminal_result = info or {}
                 break
@@ -213,21 +247,29 @@ class V2Trainer:
         return select_action(out, self.decision_config)
 
     # ------------------------------------------------------------------ #
-    # Optimization
+    # Optimization (fail-closed on non-finite loss / gradient)
     # ------------------------------------------------------------------ #
     def step(self) -> LossComponents | None:
         """Run one optimizer step on a sampled minibatch.
 
         Returns the :class:`LossComponents` if a step was taken, or ``None``
         if the buffer did not have enough labelled transitions yet.
+
+        Fail-closed (P06 r1): if the total loss is non-finite OR the
+        gradient norm is non-finite, raise :class:`FloatingPointError`
+        BEFORE the optimizer mutates parameters. PyTorch's
+        :func:`torch.nn.utils.clip_grad_norm_` defaults to
+        ``error_if_nonfinite=False`` which silently lets NaN/Inf through;
+        we pass ``error_if_nonfinite=True`` to make the failure loud.
         """
-        batch = self.buffer.sample_minibatch(
-            self.config.batch_size, rng=self.rng
-        )
+        batch = self.buffer.sample_minibatch(self.config.batch_size, rng=self.rng)
         if batch is None:
             return None
 
         self.model.train()
+        # Per-decision forward; gather the chosen action's heads and
+        # CONCATENATE (not stack) so the resulting tensors are (B, 1) — the
+        # loss module rejects (B, 1, 1) with a precise error.
         gathered_win: list[torch.Tensor] = []
         gathered_siw: list[torch.Tensor] = []
         gathered_sil: list[torch.Tensor] = []
@@ -249,9 +291,9 @@ class V2Trainer:
             gathered_siw.append(out.score_if_win[idx : idx + 1])
             gathered_sil.append(out.score_if_loss[idx : idx + 1])
 
-        win_logit = torch.stack(gathered_win)  # (B, 1)
-        score_if_win = torch.stack(gathered_siw)
-        score_if_loss = torch.stack(gathered_sil)
+        win_logit = torch.cat(gathered_win, dim=0)        # (B, 1)
+        score_if_win = torch.cat(gathered_siw, dim=0)    # (B, 1)
+        score_if_loss = torch.cat(gathered_sil, dim=0)   # (B, 1)
         batch_labels = {
             "target_win": batch.target_win,
             "target_score": batch.target_score,
@@ -261,10 +303,27 @@ class V2Trainer:
             win_logit, score_if_win, score_if_loss, batch_labels
         )
 
+        # Fail-closed: a non-finite loss means something is wrong (bad
+        # weights, bad inputs, a clamp gap). Do NOT let it poison the
+        # parameters.
+        if not torch.isfinite(components.total):
+            self.model.eval()
+            raise FloatingPointError(
+                f"V2Trainer encountered a non-finite loss "
+                f"({float(components.total.item())!r}); refusing to take an "
+                f"optimizer step. Check the head clamp, the target clamp, and "
+                f"the input encoding."
+            )
+
         self.optimizer.zero_grad()
         components.total.backward()
+        # error_if_nonfinite=True so a NaN/Inf gradient raises loudly here
+        # instead of silently corrupting the optimizer state. The clip
+        # itself still applies when the norm is finite.
         grad_norm = nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.config.max_grad_norm
+            self.model.parameters(),
+            self.config.max_grad_norm,
+            error_if_nonfinite=True,
         )
         self.optimizer.step()
         self.stats.optimizer_steps += 1
@@ -275,9 +334,9 @@ class V2Trainer:
             p = torch.sigmoid(win_logit).reshape(-1)
             self.stats.p_win_mean = float(p.mean().item())
             self.stats.p_win_std = float(p.std().item()) if p.numel() > 1 else 0.0
+            sig = torch.sigmoid(win_logit.detach())
             self.stats.score_mean_avg = float(
-                (torch.sigmoid(win_logit.detach()) * score_if_win.detach()
-                 + (1 - torch.sigmoid(win_logit.detach())) * score_if_loss.detach())
+                (sig * score_if_win.detach() + (1 - sig) * score_if_loss.detach())
                 .mean()
                 .item()
             )
@@ -294,10 +353,3 @@ class V2Trainer:
         after = next(self.model.parameters()).detach().clone()
         self.stats_last_run_changed = not torch.equal(before, after)
         return self.stats
-
-
-def _make_transition(obs, action_index: int, position: str):
-    """Build a Transition; imported lazily to keep the top-level import light."""
-    from douzero.training.v2_buffer import Transition
-
-    return Transition(obs=obs, action_index=action_index, position=position)
