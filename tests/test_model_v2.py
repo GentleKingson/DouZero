@@ -40,7 +40,7 @@ from douzero.observation import (
     get_obs_v2,
 )
 from douzero.models_v2 import (
-    HISTORY_ENCODER_LSTM_CANONICAL,
+    HISTORY_ENCODER_LSTM,
     HISTORY_ENCODER_TRANSFORMER,
     ModelInputBundle,
     ModelOutput,
@@ -165,7 +165,7 @@ class TestConstruction:
         assert model._context_width == context_width(schema)
 
     def test_lstm_backend_constructs(self):
-        cfg = ModelV2Config(history_encoder=HISTORY_ENCODER_LSTM_CANONICAL)
+        cfg = ModelV2Config(history_encoder=HISTORY_ENCODER_LSTM)
         model = _build_model(cfg)
         from douzero.models_v2 import LSTMHistoryEncoder
         assert isinstance(model.history_encoder, LSTMHistoryEncoder)
@@ -355,7 +355,7 @@ class TestHistoryMasking:
 
     def test_lstm_backend_respects_padding(self):
         """The LSTM history backend must also ignore padded tokens."""
-        cfg = ModelV2Config(history_encoder=HISTORY_ENCODER_LSTM_CANONICAL)
+        cfg = ModelV2Config(history_encoder=HISTORY_ENCODER_LSTM)
         model = _build_model(cfg)
         model.eval()
         obs, _ = _build_v2_obs(seed=83, position="landlord", steps_into_game=5)
@@ -488,7 +488,7 @@ class TestSaveLoad:
         # Load into a fresh model with the same config + schema.
         model2 = ModelV2(model.schema, model.config)
         state = torch.load(ckpt, weights_only=True)
-        model2.load_state_dict(state)
+        model2.load_state_dict(state, strict=True)
         model2.eval()
         out_after = _forward(model2, obs)
         assert torch.allclose(out_before.win_logit, out_after.win_logit, atol=1e-6)
@@ -518,7 +518,7 @@ class TestSaveLoad:
         assert loaded_manifest.frames == 123
 
         model2 = ModelV2(model.schema, model.config)
-        model2.load_state_dict(state_dict)
+        model2.load_state_dict(state_dict, strict=True)
         model2.eval()
         out_after = _forward(model2, obs)
         assert torch.allclose(out_before.win_logit, out_after.win_logit, atol=1e-6)
@@ -537,34 +537,125 @@ class TestSaveLoad:
         with pytest.raises(CheckpointCompatibilityError, match="schema_hash"):
             load_v2_checkpoint(bundle_path, expected_schema_hash="bogus_hash")
 
+    def test_v2_checkpoint_rejects_wrong_ruleset(self, tmp_path):
+        """A ruleset mismatch (legacy sidecar loaded as standard) is rejected."""
+        from douzero.checkpoint import (
+            CheckpointCompatibilityError,
+            load_v2_checkpoint,
+            save_v2_checkpoint,
+        )
+
+        model = _build_model()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        save_v2_checkpoint(bundle_path, model, schema_hash=model.schema.stable_hash())
+        with pytest.raises(CheckpointCompatibilityError, match="ruleset"):
+            load_v2_checkpoint(
+                bundle_path,
+                expected_schema_hash=model.schema.stable_hash(),
+                expected_ruleset_id="standard",
+            )
+
+    def test_v2_checkpoint_rejects_wrong_kind(self, tmp_path):
+        """A training bundle loaded as public_policy is rejected."""
+        from douzero.checkpoint import (
+            CheckpointCompatibilityError,
+            load_v2_checkpoint,
+            save_v2_checkpoint,
+        )
+
+        model = _build_model()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        save_v2_checkpoint(bundle_path, model, schema_hash=model.schema.stable_hash())
+        with pytest.raises(CheckpointCompatibilityError, match="checkpoint_kind"):
+            load_v2_checkpoint(
+                bundle_path,
+                expected_schema_hash=model.schema.stable_hash(),
+                expected_checkpoint_kind="public_policy",
+            )
+
+    def test_load_v2_model_rejects_bare_state_dict(self, tmp_path):
+        """load_v2_model must reject a bare state_dict sidecar (no manifest).
+
+        Bug #3: a bare state_dict has no identity, so a same-shape wrong-schema
+        sidecar would load silently. The sidecar MUST carry a manifest.
+        """
+        from douzero.evaluation.deep_agent import load_v2_model
+
+        model = _build_model()
+        bare_ckpt = tmp_path / "bare.ckpt"
+        torch.save(model.state_dict(), bare_ckpt)  # bare, no manifest
+
+        schema = build_v2_schema()
+        with pytest.raises(Exception, match="bare state_dict|manifest"):
+            load_v2_model(str(bare_ckpt), schema)
+
     def test_load_v2_model_rejects_legacy_ckpt(self, tmp_path):
-        """load_v2_model must reject a legacy/factorized state_dict (strict)."""
+        """load_v2_model must reject a legacy/factorized state_dict."""
         from douzero.dmc.models import model_dict
         from douzero.evaluation.deep_agent import load_v2_model
 
-        # Save a LEGACY landlord state_dict.
         torch.manual_seed(0)
         legacy_model = model_dict["landlord"]()
         legacy_ckpt = tmp_path / "legacy.ckpt"
         torch.save(legacy_model.state_dict(), legacy_ckpt)
 
         schema = build_v2_schema()
-        with pytest.raises(ValueError, match="does not match"):
+        with pytest.raises(Exception, match="bare state_dict|manifest"):
             load_v2_model(str(legacy_ckpt), schema)
 
-    def test_load_v2_model_loads_v2_state_dict(self, tmp_path):
-        """load_v2_model loads a V2 state_dict sidecar strictly."""
+    def test_load_v2_model_loads_manifest_sidecar(self, tmp_path):
+        """load_v2_model loads a manifest-bearing V2 sidecar strictly."""
+        from douzero.checkpoint import save_v2_position_weights
         from douzero.evaluation.deep_agent import load_v2_model
 
         model = _build_model()
-        ckpt = tmp_path / "v2.ckpt"
-        torch.save(model.state_dict(), ckpt)
-        loaded = load_v2_model(str(ckpt), model.schema, model.config)
+        ckpt = str(tmp_path / "v2.ckpt")
+        save_v2_position_weights(
+            ckpt, model, schema_hash=model.schema.stable_hash()
+        )
+        loaded = load_v2_model(ckpt, model.schema, model.config)
         loaded.eval()
         obs, _ = _build_v2_obs(seed=122, position="landlord")
         out_before = _forward(model, obs)
         out_after = _forward(loaded, obs)
         assert torch.allclose(out_before.win_logit, out_after.win_logit, atol=1e-6)
+
+    def test_load_v2_model_rejects_schema_mismatch_sidecar(self, tmp_path):
+        """A sidecar with a different schema hash is rejected.
+
+        Build a sidecar under the default schema, then try to load it under a
+        schema with a different max_history_len (which changes the stable hash).
+        """
+        from douzero.checkpoint import (
+            CheckpointCompatibilityError,
+            save_v2_position_weights,
+        )
+        from douzero.evaluation.deep_agent import load_v2_model
+
+        model = _build_model()
+        ckpt = str(tmp_path / "v2.ckpt")
+        save_v2_position_weights(ckpt, model, schema_hash=model.schema.stable_hash())
+        # A different schema (max_history_len changes the hash).
+        different_schema = build_v2_schema(max_history_len=50)
+        assert different_schema.stable_hash() != model.schema.stable_hash()
+        with pytest.raises(CheckpointCompatibilityError, match="schema_hash"):
+            load_v2_model(ckpt, different_schema)
+
+    def test_load_v2_model_rejects_wrong_ruleset_sidecar(self, tmp_path):
+        """A sidecar saved as legacy but loaded as standard is rejected."""
+        from douzero.checkpoint import (
+            CheckpointCompatibilityError,
+            save_v2_position_weights,
+        )
+        from douzero.evaluation.deep_agent import load_v2_model
+
+        model = _build_model()
+        ckpt = str(tmp_path / "v2.ckpt")
+        save_v2_position_weights(
+            ckpt, model, schema_hash=model.schema.stable_hash(), ruleset_id="legacy"
+        )
+        with pytest.raises(CheckpointCompatibilityError, match="ruleset"):
+            load_v2_model(ckpt, model.schema, ruleset_id="standard")
 
 
 # --------------------------------------------------------------------------- #
@@ -774,3 +865,375 @@ class TestModelOutputValidation:
         bad_mask = torch.ones(3, dtype=torch.float32)
         with pytest.raises(ValueError, match="bool"):
             ModelOutput(win, sw, sl, pw, sm, bad_mask)
+
+    def test_zero_action_rows_rejected(self):
+        """Bug #6: a ModelOutput with zero action rows is invalid."""
+        win = torch.zeros(0, 1)
+        sw = torch.zeros(0, 1)
+        sl = torch.zeros(0, 1)
+        pw = torch.zeros(0, 1)
+        sm = torch.zeros(0, 1)
+        mask = torch.zeros(0, dtype=torch.bool)
+        with pytest.raises(ValueError, match="zero action rows"):
+            ModelOutput(win, sw, sl, pw, sm, mask)
+
+
+# --------------------------------------------------------------------------- #
+# Bug #1: action embeddings are actually consumed (action sensitivity +
+# permutation equivariance + action_encoder nonzero gradients)
+# --------------------------------------------------------------------------- #
+class TestActionSensitivity:
+    """The fusion MUST consume each action's own embedding.
+
+    A prior version concatenated only state+history+role and silently broadcast
+    the result across actions, making every action's logit identical. These
+    tests would have caught that bug.
+    """
+
+    def test_different_actions_produce_different_logits(self):
+        """Two different action feature rows must yield different win_logits."""
+        model = _build_model()
+        model.eval()
+        obs, _ = _build_v2_obs(seed=200, position="landlord")
+        out = _forward(model, obs)
+        n = out.num_actions
+        if n < 2:
+            pytest.skip("need >= 2 actions")
+        # At least one pair of actions must differ in win_logit. If every pair
+        # were equal, the fusion is ignoring the action embedding.
+        logits = out.win_logit.squeeze(-1)
+        diffs = (logits.unsqueeze(0) - logits.unsqueeze(1)).abs()
+        assert diffs.max().item() > 1e-5, (
+            f"all {n} actions produced near-identical win_logits (max diff "
+            f"{diffs.max().item():.2e}); the fusion is likely ignoring the "
+            f"action embedding"
+        )
+
+    def test_action_row_permutation_permutes_output_rows(self):
+        """Permuting the action rows permutes the output rows by the same perm.
+
+        This is permutation equivariance: the fusion is a per-row function of
+        (shared trunk, per-action embedding), so reordering the inputs must
+        reorder the outputs identically.
+        """
+        model = _build_model()
+        model.eval()
+        obs, _ = _build_v2_obs(seed=201, position="landlord")
+        bundle = observation_to_model_inputs(obs)
+        n = bundle.action_features.shape[0]
+        if n < 3:
+            pytest.skip("need >= 3 actions for a non-trivial permutation")
+        out_orig = _forward(model, obs)
+
+        # Apply a fixed permutation to the action rows (and the mask).
+        perm = torch.tensor([2, 0, 1] + list(range(3, n)))
+        permuted_actions = bundle.action_features[perm]
+        permuted_mask = bundle.action_mask[perm]
+        out_perm = model(
+            bundle.state_card_vectors, bundle.state_context_flat,
+            bundle.context_card_vectors, bundle.context_flat,
+            bundle.history_tokens, bundle.history_key_padding_mask,
+            permuted_actions, permuted_mask, bundle.acting_role,
+        )
+        # The permuted output rows must equal the original rows at the same
+        # permutation indices.
+        orig_logits = out_orig.win_logit.squeeze(-1)
+        perm_logits = out_perm.win_logit.squeeze(-1)
+        assert torch.allclose(orig_logits[perm], perm_logits, atol=1e-5), (
+            "permuting action rows did not permute output rows identically; "
+            "the fusion is not permutation-equivariant"
+        )
+
+    def test_action_encoder_receives_nonzero_gradient(self):
+        """Every key parameter in action_encoder must get a nonzero gradient.
+
+        This proves the action embedding flows into the loss (and therefore
+        into the selected action). A disconnected action_encoder would have
+        all-zero gradients.
+        """
+        model = _build_model()
+        model.train()
+        obs, _ = _build_v2_obs(seed=202, position="landlord")
+        out = _forward(model, obs)
+        # A loss that depends on the win_logits (sum), so gradients flow back
+        # through the heads -> fusion -> action_embeddings -> action_encoder.
+        loss = out.win_logit.sum()
+        loss.backward()
+        for name, param in model.action_encoder.named_parameters():
+            assert param.grad is not None, f"{name} has no gradient"
+            assert param.grad.abs().sum().item() > 0, (
+                f"action_encoder.{name} got an all-zero gradient; the action "
+                f"embedding is disconnected from the loss"
+            )
+
+
+# --------------------------------------------------------------------------- #
+# Bug #2: state encoder preserves field identity (no summing)
+# --------------------------------------------------------------------------- #
+class TestStateFieldIdentity:
+    """The state encoder MUST preserve which card set is which.
+
+    A prior version summed all card-set embeddings, which discarded field
+    identity (the sum is invariant under any permutation of the summed fields).
+    These tests would have caught that bug.
+    """
+
+    def test_swapping_my_hand_and_other_hand_changes_trunk(self):
+        """Swapping two card fields must change the state trunk.
+
+        my_hand (cards I hold) and other_hand (unseen pool) are semantically
+        different; the model must distinguish them.
+        """
+        model = _build_model()
+        model.eval()
+        obs, _ = _build_v2_obs(seed=210, position="landlord")
+        bundle = observation_to_model_inputs(obs)
+        # state_card_vectors[0] = my_handcards, [1] = other_handcards.
+        my_hand = bundle.state_card_vectors[0]
+        other_hand = bundle.state_card_vectors[1]
+        if torch.equal(my_hand, other_hand):
+            pytest.skip("my_hand and other_hand happen to be equal")
+        # Forward with the original order.
+        out_orig = _forward(model, obs)
+        # Swap the first two card vectors.
+        swapped = (
+            (other_hand, my_hand) + bundle.state_card_vectors[2:]
+        )
+        out_swapped = model(
+            swapped, bundle.state_context_flat,
+            bundle.context_card_vectors, bundle.context_flat,
+            bundle.history_tokens, bundle.history_key_padding_mask,
+            bundle.action_features, bundle.action_mask, bundle.acting_role,
+        )
+        assert not torch.allclose(out_orig.win_logit, out_swapped.win_logit, atol=1e-5), (
+            "swapping my_hand and other_hand did not change the output; the "
+            "state encoder is discarding field identity (summing embeddings)"
+        )
+
+    def test_same_card_sum_different_field_allocation_differs(self):
+        """Two states with the same total card counts but different field
+        allocation must produce different outputs.
+
+        Construct two synthetic bundles where the SUM of all card fields is
+        identical, but the per-field allocation differs. A summing encoder
+        would produce identical trunks; a field-identity-preserving encoder
+        must differ.
+        """
+        import numpy as np
+        from douzero.observation.schema import build_v2_schema
+
+        schema = build_v2_schema()
+        model = _build_model(schema=schema)
+        model.eval()
+        cvd = schema.card_vector_dim
+
+        def _make_bundle(field_vals):
+            """field_vals: list of 8 np arrays (6 state + 2 context card fields)."""
+            state_cards = tuple(torch.from_numpy(v.astype(np.float32)) for v in field_vals[:6])
+            context_cards = tuple(torch.from_numpy(v.astype(np.float32)) for v in field_vals[6:8])
+            state_flat = torch.zeros(1, dtype=torch.float32)  # minimal flat context
+            # Pad state_flat to the expected non-card state width.
+            from douzero.observation.schema import state_width, context_width
+            non_card_state = state_width(schema) - cvd * 6
+            non_card_ctx = context_width(schema) - cvd * 2
+            state_flat = torch.zeros(non_card_state, dtype=torch.float32)
+            ctx_flat = torch.zeros(non_card_ctx, dtype=torch.float32)
+            hist_tokens = torch.zeros(schema.max_history_len, schema.history_token_fields and sum(int(np.prod(f.shape)) for f in schema.history_token_fields), dtype=torch.float32)
+            hist_kpm = torch.ones(schema.max_history_len, dtype=torch.bool)  # all padding
+            act_feat = torch.zeros(1, sum(int(np.prod(f.shape)) for f in schema.action_fields), dtype=torch.float32)
+            act_feat[0, 0] = 1.0  # one card, to differentiate from zero
+            act_mask = torch.ones(1, dtype=torch.bool)
+            return state_cards, state_flat, context_cards, ctx_flat, hist_tokens, hist_kpm, act_feat, act_mask
+
+        # Two allocations with the SAME total per-rank sum but DIFFERENT fields.
+        base = np.zeros(cvd, dtype=np.float32)
+        base[0] = 4  # four 3s total across all fields
+        # Allocation A: all four in field 0.
+        vals_a = [np.zeros(cvd, dtype=np.float32) for _ in range(8)]
+        vals_a[0][0] = 4
+        # Allocation B: two in field 0, two in field 1.
+        vals_b = [np.zeros(cvd, dtype=np.float32) for _ in range(8)]
+        vals_b[0][0] = 2
+        vals_b[1][0] = 2
+        # Sanity: the sums are identical.
+        assert sum(v.sum() for v in vals_a) == sum(v.sum() for v in vals_b)
+
+        sa, sfa, ca, cfa, ht, hk, af, am = _make_bundle(vals_a)
+        sb, sfb, cb, cfb, _, _, _, _ = _make_bundle(vals_b)
+        out_a = model(sa, sfa, ca, cfa, ht, hk, af, am, "landlord")
+        out_b = model(sb, sfb, cb, cfb, ht, hk, af, am, "landlord")
+        assert not torch.allclose(out_a.win_logit, out_b.win_logit, atol=1e-5), (
+            "two states with the same card sum but different field allocation "
+            "produced identical outputs; the state encoder is summing fields "
+            "rather than preserving field identity"
+        )
+
+    def test_state_encoder_concatenates_not_sums(self):
+        """Direct unit test: the StateEncoder output depends on field order.
+
+        Build a StateEncoder with 2 card fields; swapping the two inputs must
+        change the output (a sum would be invariant).
+        """
+        from douzero.models_v2.state_encoder import StateEncoder
+
+        torch.manual_seed(0)
+        enc = StateEncoder(card_vector_dim=54, num_card_fields=2, flat_context_width=4, hidden_size=16)
+        enc.eval()
+        a = torch.zeros(54); a[0] = 1.0
+        b = torch.zeros(54); b[1] = 1.0
+        ctx = torch.zeros(4)
+        out_ab = enc((a, b), ctx)
+        out_ba = enc((b, a), ctx)
+        assert not torch.allclose(out_ab, out_ba, atol=1e-6), (
+            "swapping two card fields did not change the StateEncoder output; "
+            "it is summing rather than concatenating"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Bug #3: DeepAgentV2 schema-hash binding
+# --------------------------------------------------------------------------- #
+class TestDeepAgentV2SchemaBinding:
+    def test_act_v2_rejects_schema_hash_mismatch(self):
+        """An observation with a different schema hash is rejected."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        model.eval()
+        agent = DeepAgentV2("landlord", model)
+        obs, _ = _build_v2_obs(seed=220, position="landlord")
+        # Corrupt the schema hash on the observation.
+        from douzero.observation.encode_v2 import ObservationV2
+        # ObservationV2 is frozen; reconstruct with a bogus hash via __replace__.
+        import dataclasses
+        bad_obs = dataclasses.replace(obs, feature_schema_hash="bogus_hash")
+        with pytest.raises(ValueError, match="schema-hash mismatch"):
+            agent.act_v2(bad_obs)
+
+    def test_agent_binds_to_model_schema_hash(self):
+        """The agent stores the model's schema hash at construction."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        agent = DeepAgentV2("landlord", model)
+        assert agent._feature_schema_hash == model.schema.stable_hash()
+
+
+# --------------------------------------------------------------------------- #
+# Bug #5: NaN/Inf runtime guard
+# --------------------------------------------------------------------------- #
+class TestNaNGuard:
+    def test_nan_input_rejected(self):
+        """A NaN in the action features is caught by the guard."""
+        from douzero.models_v2 import NumericalError
+
+        model = _build_model()
+        model.eval()
+        obs, _ = _build_v2_obs(seed=230, position="landlord")
+        bundle = observation_to_model_inputs(obs)
+        # Inject a NaN into the action features.
+        bad_actions = bundle.action_features.clone()
+        bad_actions[0, 0] = float("nan")
+        with pytest.raises(NumericalError, match="fused"):
+            model(
+                bundle.state_card_vectors, bundle.state_context_flat,
+                bundle.context_card_vectors, bundle.context_flat,
+                bundle.history_tokens, bundle.history_key_padding_mask,
+                bad_actions, bundle.action_mask, bundle.acting_role,
+            )
+
+    def test_nan_weight_rejected(self):
+        """A NaN in a model weight is caught by the guard (output is NaN)."""
+        from douzero.models_v2 import NumericalError
+
+        model = _build_model()
+        model.eval()
+        # Inject a NaN into the fusion input_proj weight.
+        with torch.no_grad():
+            model.fusion.input_proj.weight[0, 0] = float("nan")
+        obs, _ = _build_v2_obs(seed=231, position="landlord")
+        with pytest.raises(NumericalError, match="fused"):
+            _forward(model, obs)
+
+    def test_nan_guard_disabled_skips_check(self):
+        """With nan_guard=False, the guard is skipped (output may be NaN)."""
+        cfg = ModelV2Config(nan_guard=False)
+        model = _build_model(cfg)
+        model.eval()
+        with torch.no_grad():
+            model.fusion.input_proj.weight[0, 0] = float("nan")
+        obs, _ = _build_v2_obs(seed=232, position="landlord")
+        # No exception; the output may contain NaN but the guard is off.
+        out = _forward(model, obs)
+        # The forward completed (no raise); we do NOT assert finiteness here.
+        assert out.num_actions == obs.actions.features.shape[0]
+
+    def test_assert_finite_helper(self):
+        """The assert_finite helper raises on NaN and passes on finite."""
+        from douzero.models_v2 import NumericalError, assert_finite
+
+        assert_finite(torch.zeros(3), "ok")  # no raise
+        with pytest.raises(NumericalError, match="non-finite"):
+            assert_finite(torch.tensor([1.0, float("nan"), 2.0]), "bad")
+        with pytest.raises(NumericalError, match="non-finite"):
+            assert_finite(torch.tensor([float("inf")]), "inf")
+
+
+# --------------------------------------------------------------------------- #
+# Bug #6: zero legal actions must raise everywhere
+# --------------------------------------------------------------------------- #
+class TestZeroActionsRejection:
+    def test_model_forward_rejects_zero_actions(self):
+        """ModelV2.forward raises on zero action rows."""
+        model = _build_model()
+        model.eval()
+        obs, _ = _build_v2_obs(seed=240, position="landlord")
+        bundle = observation_to_model_inputs(obs)
+        empty_actions = bundle.action_features[:0]
+        empty_mask = bundle.action_mask[:0]
+        with pytest.raises(ValueError, match="zero legal actions"):
+            model(
+                bundle.state_card_vectors, bundle.state_context_flat,
+                bundle.context_card_vectors, bundle.context_flat,
+                bundle.history_tokens, bundle.history_key_padding_mask,
+                empty_actions, empty_mask, bundle.acting_role,
+            )
+
+    def test_deep_agent_v2_rejects_zero_legal_actions(self):
+        """DeepAgentV2.act_v2 raises on an observation with no legal actions."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        model.eval()
+        agent = DeepAgentV2("landlord", model)
+        obs, _ = _build_v2_obs(seed=241, position="landlord")
+        # Build an observation with zero legal actions by replacing the public
+        # legal_actions and the action block. Use dataclasses.replace on the
+        # inner public obs + actions.
+        import dataclasses
+        from douzero.observation.encode_v2 import LegalActionBatch
+        empty_actions = LegalActionBatch(
+            features=np.zeros((0, obs.actions.features.shape[1]), dtype=np.int8),
+            action_mask=np.zeros((0,), dtype=np.int8),
+            legal_actions=(),
+        )
+        bad_public = dataclasses.replace(obs.public, legal_actions=())
+        bad_obs = dataclasses.replace(obs, public=bad_public, actions=empty_actions)
+        with pytest.raises(ValueError, match="zero legal actions"):
+            agent.act_v2(bad_obs)
+
+    def test_observation_to_model_inputs_rejects_zero_actions(self):
+        """The batch bridge raises on zero actions before the model sees them."""
+        model = _build_model()
+        model.eval()
+        obs, _ = _build_v2_obs(seed=242, position="landlord")
+        import dataclasses
+        from douzero.observation.encode_v2 import LegalActionBatch
+        empty_actions = LegalActionBatch(
+            features=np.zeros((0, obs.actions.features.shape[1]), dtype=np.int8),
+            action_mask=np.zeros((0,), dtype=np.int8),
+            legal_actions=(),
+        )
+        bad_obs = dataclasses.replace(obs, actions=empty_actions)
+        with pytest.raises(ValueError, match="zero legal actions"):
+            observation_to_model_inputs(bad_obs)
