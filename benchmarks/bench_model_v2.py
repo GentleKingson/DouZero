@@ -7,15 +7,14 @@ Measures CPU latency for the V2 shared state-action model:
   * model-forward-only latency at several legal-action counts (1, 10, 50,
     full action set) — the per-decision cost as the candidate set grows;
   * full ``DeepAgentV2.act`` latency (observation encoding + tensor build +
-    forward + selection) for the default config;
-  * a comparison row against the legacy factorized forward at the same action
-    counts, so the V2 cost is contextualised (NOT a parity claim — the
-    architectures differ).
+    forward + selection) for the default config, measured with the
+    environment prepared ONCE outside the timed loop.
 
 This is a MEASUREMENT tool, not a strength or speedup claim. It reports honest
 medians and p95s on the current host and makes no preset assumption about the
 relative cost. The model-forward-only numbers are NOT end-to-end act numbers;
-both are reported separately and labelled clearly.
+both are reported separately and labelled clearly. A legacy-factorized
+comparison is NOT included here; it lives in ``bench_factorized.py``.
 
 This benchmark is **CPU-only**, mirroring ``bench_factorized.py``. CUDA is
 force-hidden at import. GPU timing, GPU memory, and AMP/DDP comparison are out
