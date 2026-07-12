@@ -118,20 +118,22 @@ def test_cli_overrides_optimizer():
 # serialize round-trip
 # --------------------------------------------------------------------------- #
 def test_serialize_round_trip():
-    import copy
-
     cfg = load_config(str(LEGACY_YAML))
     d = serialize(cfg)
-    # Rebuild from the serialized dict, reconstructing the nested dataclasses
-    # (optimizer, loss, decision_policy) just like the loader does.
-    from douzero.config.schemas import DecisionPolicyConfig, LossConfig
+    # Rebuild from the serialized dict, reconstructing the nested dataclasses.
+    from douzero.config.schemas import (
+        DecisionPolicyConfig,
+        LossConfig,
+        ModelConfig,
+    )
 
-    drop = {"optimizer", "loss", "decision_policy"}
+    drop = {"optimizer", "loss", "decision_policy", "model"}
     rebuilt = TrainingConfig(
         **{k: v for k, v in d.items() if k not in drop},
         optimizer=OptimizerConfig(**d["optimizer"]),
         loss=LossConfig(**d["loss"]),
         decision_policy=DecisionPolicyConfig(**d["decision_policy"]),
+        model=ModelConfig(**d["model"]),
     )
     assert rebuilt == cfg
 

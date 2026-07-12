@@ -242,16 +242,30 @@ def _build_decision_config(cfg):
 
 
 def _build_model_cfg(cfg):
-    """Build a ModelV2Config from the YAML model_version block (P06 r1)."""
+    """Build a ModelV2Config from the YAML config (P06 r2/r5).
+
+    The score_clamp and score_target_transform come from the ``loss:``
+    block (not a ``model:`` block) because they are training-identity
+    fields that bind the model's output semantics to what the loss
+    supervised. The remaining architecture knobs come from the ``model:``
+    block when present (P06 r5).
+    """
     from douzero.models_v2.config import ModelV2Config
 
     if cfg is None:
         return ModelV2Config()
-    # The legacy TrainingConfig does not carry the full ModelConfig
-    # architecture block (only the version strings); use the V2 defaults
-    # but honour score_clamp so the head clamp matches the loss target
-    # clamp exactly.
-    return ModelV2Config(score_clamp=cfg.loss.score_clamp)
+    # If a model: block is present, bridge it through from_model_config
+    # so YAML architecture knobs (hidden_size, history_encoder, etc.)
+    # actually drive model construction. Then overlay the loss-identity
+    # fields (score_clamp, score_target_transform).
+    base = ModelV2Config.from_model_config(cfg.model)
+    return ModelV2Config(
+        **{
+            **base.compatibility_dict(),
+            "score_clamp": cfg.loss.score_clamp,
+            "score_target_transform": cfg.loss.score_target_transform,
+        }
+    )
 
 
 def main() -> None:

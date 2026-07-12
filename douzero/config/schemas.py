@@ -95,6 +95,46 @@ class DecisionPolicyConfig:
 
 
 # --------------------------------------------------------------------------- #
+# Model architecture (P05 widens to ``v2``; referenced by TrainingConfig)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ModelConfig:
+    """Model architecture selection (P05 widens to ``v2``).
+
+    ``version`` selects the model family:
+
+    - ``"legacy"`` (default): the original role-specific LSTM+MLP value
+      models. Preserved unchanged for backward compatibility.
+    - ``"factorized"`` (P04): a deployment-only, checkpoint-compatible
+      forward that is numerically equivalent to ``legacy`` under the same
+      weights (encodes the shared state/history once per decision).
+    - ``"v2"`` (P05): the shared state/action model with role embeddings,
+      a Transformer (or LSTM) history encoder, and multi-head outputs
+      (win probability + conditional scores). Enabled by
+      ``model_version=v2`` + ``feature_version=v2``.
+
+    The remaining fields configure the V2 architecture only; they are
+    ignored by the legacy and factorized paths. Defaults match
+    ``configs/enhanced.yaml`` and the V2 model constructor defaults.
+    """
+
+    version: str = "legacy"
+
+    # --- V2 architecture knobs (P05). Defaults keep the model small enough
+    # to run a forward/backward smoke test on CPU while still representing a
+    # credible shared backbone. Tuned values belong in configs/, not here.
+    hidden_size: int = 256
+    history_encoder: str = "transformer"  # transformer | lstm
+    history_layers: int = 4
+    history_heads: int = 8
+    role_embedding_dim: int = 32
+    # Auxiliary heads are gated by config so ablations can disable them
+    # (P09 attaches more; P05 keeps the structural skeleton).
+    belief_enabled: bool = False
+    human_prior_enabled: bool = False
+
+
+# --------------------------------------------------------------------------- #
 # Training -- mirrors douzero/dmc/arguments.py exactly (all 23 args)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -143,49 +183,15 @@ class TrainingConfig:
     # LossConfig / DecisionConfig.
     loss: LossConfig = field(default_factory=LossConfig)
     decision_policy: DecisionPolicyConfig = field(default_factory=DecisionPolicyConfig)
+    # P06 r5: V2 model architecture block. The legacy train.py path ignores
+    # this; train_v2.py reads it via ModelV2Config.from_model_config().
+    model: ModelConfig = field(default_factory=ModelConfig)
 
 
 # --------------------------------------------------------------------------- #
 # Placeholder sub-configs (model/rule/feature versions are addressed in later
 # phases; P01 only carries the version strings).
 # --------------------------------------------------------------------------- #
-@dataclass(frozen=True)
-class ModelConfig:
-    """Model architecture selection (P05 widens to ``v2``).
-
-    ``version`` selects the model family:
-
-    - ``"legacy"`` (default): the original role-specific LSTM+MLP value
-      models. Preserved unchanged for backward compatibility.
-    - ``"factorized"`` (P04): a deployment-only, checkpoint-compatible
-      forward that is numerically equivalent to ``legacy`` under the same
-      weights (encodes the shared state/history once per decision).
-    - ``"v2"`` (P05): the shared state/action model with role embeddings,
-      a Transformer (or LSTM) history encoder, and multi-head outputs
-      (win probability + conditional scores). Enabled by
-      ``model_version=v2`` + ``feature_version=v2``.
-
-    The remaining fields configure the V2 architecture only; they are
-    ignored by the legacy and factorized paths. Defaults match
-    ``configs/enhanced.yaml`` and the V2 model constructor defaults.
-    """
-
-    version: str = "legacy"
-
-    # --- V2 architecture knobs (P05). Defaults keep the model small enough
-    # to run a forward/backward smoke test on CPU while still representing a
-    # credible shared backbone. Tuned values belong in configs/, not here.
-    hidden_size: int = 256
-    history_encoder: str = "transformer"  # transformer | lstm
-    history_layers: int = 4
-    history_heads: int = 8
-    role_embedding_dim: int = 32
-    # Auxiliary heads are gated by config so ablations can disable them
-    # (P09 attaches more; P05 keeps the structural skeleton).
-    belief_enabled: bool = False
-    human_prior_enabled: bool = False
-
-
 @dataclass(frozen=True)
 class RuleConfig:
     """Rule configuration (P02).

@@ -63,6 +63,20 @@ optimizer:
   momentum: 0
   epsilon: 1.0e-5
 
+# V2 model architecture (P06 r5). Consumed by train_v2.py via
+# ModelV2Config.from_model_config(). The score_clamp and
+# score_target_transform are overlaid from the loss: block below because
+# they are training-identity fields, not pure architecture.
+model:
+  version: v2
+  hidden_size: 256
+  history_encoder: transformer
+  history_layers: 4
+  history_heads: 8
+  role_embedding_dim: 32
+  belief_enabled: false
+  human_prior_enabled: false
+
 # P06 multi-objective loss. These are the V2 trainer defaults: BCE win head
 # (weight 1.0) + masked Huber conditional score heads (weight 0.5). The
 # uncertainty-NLL term is available for ablation but defaults OFF.
