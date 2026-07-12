@@ -195,17 +195,39 @@ def bench_forward_only(model, obs, rounds, warmup):
 def bench_deep_agent_act(agent, env_seed, rounds, warmup, steps_into_game=0):
     """Full DeepAgentV2.act(infoset) latency (encode + forward + select).
 
-    Pre-rolled to a landlord turn with a REAL history (``steps_into_game``),
-    matching :func:`_make_v2_obs`, so the end-to-end number is measured at the
-    same non-degenerate decision point as the forward-only rows — not at an
-    opening move whose empty history understates the act() cost.
+    The environment is prepared ONCE, outside the timed loop, so the reported
+    per-decision number covers ONLY what ``DeepAgentV2.act`` does on each call:
+    ``get_obs_v2`` (observation encode, including ``ObservationV2.__post_init__``
+    schema/alignment validation) + tensor build + forward + argmax. Env
+    reset/deal/pre-roll cost is reported separately as ``environment_setup_ms``
+    so a reader cannot mistake an env-construction cost for an agent latency.
+
+    Fail-closed: if the pre-rolled decision point has fewer than 2 legal
+    actions, ``act`` would short-circuit on a single action and skip inference,
+    so the measurement would NOT reflect a model decision — raise loudly
+    rather than report a degenerate (single-action) timing.
     """
+    import time as _time
+
+    t_setup0 = _time.perf_counter()
+    env = _landlord_env(env_seed, steps_into_game)
+    infoset = env.infoset
+    environment_setup_ms = (_time.perf_counter() - t_setup0) * 1000.0
+
+    if len(infoset.legal_actions) <= 1:
+        raise ValueError(
+            f"benchmark decision point has {len(infoset.legal_actions)} legal "
+            f"action(s); need >= 2 so act() exercises model inference rather "
+            f"than the single-action short-circuit. Try a different env_seed "
+            f"or steps_into_game."
+        )
 
     def _fn():
-        env = _landlord_env(env_seed, steps_into_game)
-        agent.act(env.infoset)
+        agent.act(infoset)
 
-    return _bench(_fn, rounds, warmup)
+    result = _bench(_fn, rounds, warmup)
+    result["environment_setup_ms"] = round(environment_setup_ms, 4)
+    return result
 
 
 def main():
@@ -249,12 +271,14 @@ def main():
     from douzero.evaluation.deep_agent import DeepAgentV2
     agent = DeepAgentV2("landlord", model, RuleSet.legacy())
     report["deep_agent_act_ms"] = bench_deep_agent_act(
-        agent, env_seed=42, rounds=max(args.rounds // 3, 5),
+        agent, env_seed=42, rounds=args.rounds,
         warmup=max(args.warmup, 1), steps_into_game=args.steps_into_game,
     )
     report["deep_agent_act_ms"]["note"] = (
-        "Full act(infoset) path: get_obs_v2 + tensor build + forward + "
-        "argmax. Fewer rounds because each iteration rebuilds the env."
+        "Per-decision act(infoset) path ONLY: get_obs_v2 + tensor build + "
+        "forward + argmax. The env is prepared ONCE outside the timed loop "
+        "(see environment_setup_ms); each iteration re-invokes act() on the "
+        "same infoset."
     )
 
     # Write JSON + Markdown summary.
@@ -291,6 +315,8 @@ def main():
             da = report["deep_agent_act_ms"]
             fh.write(f"- median: {da['median_ms']} ms, mean: {da['mean_ms']} ms, "
                      f"p95: {da['p95_ms']} ms\n")
+            fh.write(f"- environment setup (one-time, outside timed loop): "
+                     f"{da.get('environment_setup_ms', 'n/a')} ms\n")
 
     print(f"V2 benchmark written to {out_path} and {md_path}")
     print(f"Total parameters: {report['parameter_count']['total']:,}")

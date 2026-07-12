@@ -72,6 +72,10 @@ def test_bench_model_v2_deep_agent_path_runs(tmp_path):
     # future silent-zero stub (e.g. a short-circuit returning {median_ms: 0.0})
     # that would pass a mere key-presence check.
     assert da["median_ms"] > 0, f"deep-agent median_ms is non-positive:\n{da}"
+    # The env-setup cost must be reported separately so a reader cannot mistake
+    # an env-construction cost for an agent latency.
+    assert "environment_setup_ms" in da, (
+        f"deep-agent result missing environment_setup_ms:\n{da}")
 
     # The Markdown summary must have rendered the end-to-end section — it only
     # renders when deep_agent_act_ms has a median_ms, so this confirms the path
@@ -119,3 +123,93 @@ def test_bench_model_v2_constructs_agent_with_explicit_ruleset():
             "by DeepAgentV2 and would silently break the benchmark's deep-agent "
             "path."
         )
+
+
+# --------------------------------------------------------------------------- #
+# Round 3: the per-decision timing must cover ONLY act() work. The env
+# (reset + deal + pre-roll) is prepared ONCE outside the timed loop; each timed
+# round re-invokes act() on the same infoset. Otherwise env-construction cost
+# inflates the reported agent latency.
+# --------------------------------------------------------------------------- #
+def _build_agent():
+    import torch
+    from douzero.models_v2 import ModelV2, ModelV2Config
+    from douzero.observation import build_v2_schema
+    from douzero.evaluation.deep_agent import DeepAgentV2
+    from douzero.env.rules import RuleSet
+
+    torch.manual_seed(1234)
+    model = ModelV2(build_v2_schema(), ModelV2Config())
+    model.eval()
+    return DeepAgentV2("landlord", model, RuleSet.legacy()), model
+
+
+def test_bench_deep_agent_env_prepared_outside_timed_loop(monkeypatch):
+    """_landlord_env is called exactly ONCE per bench_deep_agent_act call (not
+    once per timed round); otherwise the reported latency would include env
+    construction."""
+    from benchmarks import bench_model_v2 as bm
+
+    calls = {"n": 0}
+    real = bm._landlord_env
+
+    def counting(seed, steps):
+        calls["n"] += 1
+        return real(seed, steps)
+
+    monkeypatch.setattr(bm, "_landlord_env", counting)
+    agent, _ = _build_agent()
+
+    result = bm.bench_deep_agent_act(
+        agent, env_seed=42, rounds=3, warmup=1, steps_into_game=4)
+    assert calls["n"] == 1, (
+        f"_landlord_env called {calls['n']} times; expected exactly 1 (the "
+        f"env must be prepared OUTSIDE the timed loop)")
+    assert "environment_setup_ms" in result
+
+
+def test_bench_deep_agent_forward_called_once_per_round(monkeypatch):
+    """model.forward is invoked exactly warmup + rounds times (one inference per
+    act() call, no single-action short-circuit)."""
+    from benchmarks.bench_model_v2 import bench_deep_agent_act
+
+    agent, model = _build_agent()
+
+    calls = {"n": 0}
+    original_forward = model.forward
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model, "forward", counting)
+
+    warmup, rounds = 2, 4
+    bench_deep_agent_act(
+        agent, env_seed=42, rounds=rounds, warmup=warmup, steps_into_game=4)
+    assert calls["n"] == warmup + rounds, (
+        f"forward called {calls['n']} times; expected warmup+rounds="
+        f"{warmup + rounds} (one inference per act() call)")
+
+
+def test_bench_deep_agent_rejects_single_action_decision(monkeypatch):
+    """A decision point with a single legal action would let act() short-circuit
+    and skip inference; the benchmark must refuse to time such a degenerate
+    point rather than report a misleading latency."""
+    from benchmarks import bench_model_v2 as bm
+
+    agent, _ = _build_agent()
+
+    real_env = bm._landlord_env(42, 4)
+
+    class _SingleInfoset:
+        legal_actions = [list(real_env.infoset.legal_actions[0])]
+
+    class _SingleEnv:
+        infoset = _SingleInfoset()
+
+    monkeypatch.setattr(bm, "_landlord_env", lambda seed, steps: _SingleEnv())
+
+    with pytest.raises(ValueError, match="need >= 2"):
+        bm.bench_deep_agent_act(
+            agent, env_seed=42, rounds=2, warmup=1, steps_into_game=4)
