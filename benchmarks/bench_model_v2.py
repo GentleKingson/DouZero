@@ -208,20 +208,24 @@ def main():
         "forward_only_ms": bench_forward_only(model, obs, args.rounds, args.warmup),
     }
 
-    # DeepAgentV2 end-to-end act path.
-    try:
-        from douzero.evaluation.deep_agent import DeepAgentV2
-        agent = DeepAgentV2("landlord", model)
-        report["deep_agent_act_ms"] = bench_deep_agent_act(
-            agent, env_seed=42, rounds=max(args.rounds // 3, 5),
-            warmup=max(args.warmup, 1),
-        )
-        report["deep_agent_act_ms"]["note"] = (
-            "Full act(infoset) path: get_obs_v2 + tensor build + forward + "
-            "argmax. Fewer rounds because each iteration rebuilds the env."
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        report["deep_agent_act_ms"] = {"error": str(exc)}
+    # DeepAgentV2 end-to-end act path. Constructed with an explicit RuleSet
+    # (REQUIRED by DeepAgentV2 since the ruleset-binding fix); legacy matches
+    # the default ModelV2 / Env("adp") training context. This block is NOT
+    # wrapped in a broad try/except: a failure on the core measurement path
+    # must fail the benchmark LOUDLY (non-zero exit, no report written), not be
+    # swallowed into an {"error": ...} field that the JSON/Markdown summary
+    # would otherwise render as if it were a latency measurement.
+    from douzero.env.rules import RuleSet
+    from douzero.evaluation.deep_agent import DeepAgentV2
+    agent = DeepAgentV2("landlord", model, RuleSet.legacy())
+    report["deep_agent_act_ms"] = bench_deep_agent_act(
+        agent, env_seed=42, rounds=max(args.rounds // 3, 5),
+        warmup=max(args.warmup, 1),
+    )
+    report["deep_agent_act_ms"]["note"] = (
+        "Full act(infoset) path: get_obs_v2 + tensor build + forward + "
+        "argmax. Fewer rounds because each iteration rebuilds the env."
+    )
 
     # Write JSON + Markdown summary.
     out_path = Path(args.output)
