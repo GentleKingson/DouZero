@@ -36,7 +36,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .config import HISTORY_ENCODER_LSTM_CANONICAL, HISTORY_ENCODER_TRANSFORMER
+from .config import HISTORY_ENCODER_LSTM, HISTORY_ENCODER_TRANSFORMER
 
 
 class _HistoryBase(nn.Module):
@@ -259,7 +259,7 @@ def build_history_encoder(
             num_heads=num_heads,
             dropout=dropout,
         )
-    if backend == HISTORY_ENCODER_LSTM_CANONICAL:
+    if backend == HISTORY_ENCODER_LSTM:
         return LSTMHistoryEncoder(
             token_width=token_width,
             hidden_size=hidden_size,
@@ -269,5 +269,5 @@ def build_history_encoder(
         )
     raise ValueError(
         f"Unknown history encoder backend {backend!r}. "
-        f"Supported: {sorted([HISTORY_ENCODER_TRANSFORMER, HISTORY_ENCODER_LSTM_CANONICAL])}"
+        f"Supported: {sorted([HISTORY_ENCODER_TRANSFORMER, HISTORY_ENCODER_LSTM])}"
     )

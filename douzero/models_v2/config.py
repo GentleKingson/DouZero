@@ -30,9 +30,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 HISTORY_ENCODER_TRANSFORMER = "transformer"
-HISTORY_ENCODER_LSTM = "lsm"
-HISTORY_ENCODER_LSTM_CANONICAL = "lstm"
-_VALID_HISTORY_ENCODERS = frozenset({HISTORY_ENCODER_TRANSFORMER, HISTORY_ENCODER_LSTM, HISTORY_ENCODER_LSTM_CANONICAL})
+HISTORY_ENCODER_LSTM = "lstm"
+_VALID_HISTORY_ENCODERS = frozenset({HISTORY_ENCODER_TRANSFORMER, HISTORY_ENCODER_LSTM})
 
 #: Roles the V2 model supports (mirrors ``douzero.observation.seats.ALL_ROLES``).
 #: Kept here to avoid importing the observation package at config-construction
@@ -63,6 +62,12 @@ class ModelV2Config:
     # Score-head stability: outputs are clamped to a finite range so a wild
     # initialization cannot produce Inf that poisons the multi-objective loss.
     score_clamp: float = 32.0
+    # Runtime NaN/Inf guard (bug #5). When True (default), the model forward
+    # asserts its fused representation and head outputs are finite and raises
+    # NumericalError otherwise. This catches both bad inputs and bad weights
+    # (a NaN weight produces a NaN output regardless of the input). A caller
+    # that has already validated inputs may disable it for speed.
+    nan_guard: bool = True
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:

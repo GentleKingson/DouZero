@@ -14,10 +14,23 @@ Inputs (all from :class:`~douzero.observation.encode_v2.ObservationV2`):
   identity, the final bid one-hot, the phase one-hot, the rocket count, the
   total multiplier (int32), and the ruleset-id one-hot.
 
-The encoder embeds the card-set sub-blocks through the shared
-:class:`~douzero.models_v2.card_encoder.MultiCardSetEncoder`, flattens the
-small one-hot/count sub-blocks, and projects the concatenation into the trunk
-width via a small MLP with residual + LayerNorm.
+Field-identity preservation (the key correctness property)
+----------------------------------------------------------
+The encoder MUST preserve which card set is which. Swapping ``my_hand`` and
+``other_hand`` (or any two card fields) must change the state trunk — otherwise
+the model cannot distinguish "cards I hold" from "cards the opponents hold",
+which is a catastrophic imperfect-information error. A prior version summed
+all card-set embeddings into one vector, which discarded field identity
+entirely (the sum is invariant under any permutation of the summed fields).
+
+This implementation keeps field identity by concatenating the per-field
+embeddings in a FIXED schema order before projecting. The schema order is
+fixed at construction time (the caller passes the field names in order), so
+swapping two callers' inputs changes which embedding lands in which
+concatenation slot, which changes the trunk.
+
+The non-card state fields (one-hots, counts) are likewise kept in their fixed
+schema order and concatenated, never summed.
 
 Role conditioning
 -----------------
@@ -34,42 +47,59 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .card_encoder import MultiCardSetEncoder
+from .card_encoder import CardSetEncoder
 
 
 class StateEncoder(nn.Module):
-    """Encode the V2 state block + public context into one trunk vector.
+    """Encode the V2 state card fields + flat context into one trunk vector.
 
     Parameters
     ----------
     card_vector_dim:
-        Width of each card-count vector (54). The card-set sub-blocks each have
+        Width of each card-count vector (54). The card-set fields each have
         this trailing width.
-    context_width:
-        Total width of the *non-card* state fields (the one-hot/count sub-blocks
-        of :class:`StateBlock` and :class:`PublicContextBlock`). This is derived
-        from the schema so a field-width change surfaces as a shape mismatch.
+    num_card_fields:
+        The EXACT number of card-set fields the encoder will receive, in a
+        fixed order. Used to size the per-field projection. Must match the
+        number of card vectors passed at construction / forward time.
+    flat_context_width:
+        Total width of the *non-card* state + public-context fields (the
+        one-hot/count sub-blocks). Derived from the schema so a field-width
+        change surfaces as a shape mismatch.
     hidden_size:
         Trunk width.
     """
 
-    def __init__(self, card_vector_dim: int, context_width: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        card_vector_dim: int,
+        num_card_fields: int,
+        flat_context_width: int,
+        hidden_size: int,
+    ) -> None:
         super().__init__()
         if card_vector_dim <= 0:
             raise ValueError(f"card_vector_dim must be positive, got {card_vector_dim}")
-        if context_width <= 0:
-            raise ValueError(f"context_width must be positive, got {context_width}")
+        if num_card_fields <= 0:
+            raise ValueError(f"num_card_fields must be positive, got {num_card_fields}")
+        if flat_context_width <= 0:
+            raise ValueError(f"flat_context_width must be positive, got {flat_context_width}")
         if hidden_size <= 0:
             raise ValueError(f"hidden_size must be positive, got {hidden_size}")
         self.card_vector_dim = card_vector_dim
-        self.context_width = context_width
+        self.num_card_fields = num_card_fields
+        self.flat_context_width = flat_context_width
         self.hidden_size = hidden_size
 
-        self.card_encoder = MultiCardSetEncoder(card_vector_dim, hidden_size)
-        # Project the concatenation of (card-set embeddings + flat context)
-        # into the trunk. There is no residual shortcut here because the input
-        # width differs from hidden_size; the fusion stack carries residuals.
-        self.input_width = hidden_size + context_width
+        # One shared card-set projection (shared weights = "share general card
+        # knowledge"), applied independently to each card field. Sharing does
+        # NOT discard field identity: the outputs are CONCATENATED in fixed
+        # field order, not summed.
+        self.card_encoder = CardSetEncoder(card_vector_dim, hidden_size)
+        # Concatenate: [card_field_0_emb, card_field_1_emb, ..., flat_context].
+        # num_card_fields * hidden_size (preserves which field is which) +
+        # flat_context_width (the non-card fields, also order-preserving).
+        self.input_width = num_card_fields * hidden_size + flat_context_width
         self.proj = nn.Linear(self.input_width, hidden_size)
         self.norm = nn.LayerNorm(hidden_size)
 
@@ -83,31 +113,33 @@ class StateEncoder(nn.Module):
         Parameters
         ----------
         card_vectors:
-            Tuple of card-count tensors, each shape ``(card_vector_dim,)`` float.
-            Order is fixed by the caller (the model) and must match the order
-            used to compute ``context_width`` at construction. All are embedded
-            through the shared card projection and summed.
+            Tuple of card-count tensors, each shape ``(card_vector_dim,)``
+            float. Order is FIXED (the caller / model.py passes them in schema
+            order). Swapping two entries changes the concatenation order and
+            therefore changes the trunk — field identity is preserved.
         context_flat:
-            Shape ``(context_width,)`` float — the flattened non-card state +
-            public-context fields.
+            Shape ``(flat_context_width,)`` float — the flattened non-card
+            state + public-context fields, in their fixed schema order.
 
         Returns
         -------
         torch.Tensor
             Shape ``(hidden_size,)`` — the role-agnostic state trunk.
         """
-        if context_flat.shape[-1] != self.context_width:
+        if context_flat.shape[-1] != self.flat_context_width:
             raise ValueError(
                 f"context_flat trailing dim {context_flat.shape[-1]} != "
-                f"context_width {self.context_width}"
+                f"flat_context_width {self.flat_context_width}"
             )
-        if not card_vectors:
-            raise ValueError("StateEncoder.forward requires at least one card vector")
-        embeddings = self.card_encoder(*card_vectors)
-        # Sum the card-set embeddings into one hidden-wide vector. Summing (vs
-        # concatenating) keeps the trunk width fixed regardless of how many
-        # card sets the schema carries, so adding a future public field does
-        # not change the head input width.
-        card_summary = torch.stack(embeddings, dim=0).sum(dim=0)
-        merged = torch.cat([card_summary, context_flat.float()], dim=-1)
+        if len(card_vectors) != self.num_card_fields:
+            raise ValueError(
+                f"expected {self.num_card_fields} card vectors, got "
+                f"{len(card_vectors)}"
+            )
+        # Embed each card field with the SHARED projection. Each result keeps
+        # its position in the list, so concatenation preserves field identity.
+        embeddings = [self.card_encoder(cv) for cv in card_vectors]
+        # Concatenate per-field embeddings + flat context. NOT a sum: a sum
+        # would be invariant under field permutation and lose field identity.
+        merged = torch.cat([*embeddings, context_flat.float()], dim=-1)
         return self.norm(self.proj(merged))
