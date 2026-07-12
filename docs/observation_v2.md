@@ -242,19 +242,19 @@ are byte-for-byte unchanged. **Training does not yet consume V2 observations**:
 actor initialisation) until P05 (Model V2) and P06 (multi-objective training)
 wire the V2 schema into the actor/learner and buffers.
 
-## 11. Deployment boundary note (no DeepAgentV2 yet)
+## 11. Deployment boundary note
 
-There is **no `DeepAgentV2` yet** — it arrives in P05/P16. Until then the
-imperfect-information boundary for the V2 path is enforced by:
+The imperfect-information boundary for the V2 path is enforced at multiple
+layers:
 
 - the public encoder recomputing the unseen pool from public info and ignoring
   `infoset.all_handcards` (the leakage test replaces `all_handcards` with an
   access-throws sentinel and asserts `get_obs_v2` still succeeds);
 - the public encoder not importing the `privileged` module;
-- `PublicObservation` serialization containing no hidden-hand field.
-
-A canonical type guard (`DeepAgentV2` rejecting `PrivilegedObservation` by
-type) will be added together with `DeepAgentV2` itself in P05/P16.
+- `PublicObservation` serialization containing no hidden-hand field;
+- **P05**: `DeepAgentV2` (`douzero/evaluation/deep_agent.py`) provides the
+  canonical type guard — `act_v2(obs)` rejects a `PrivilegedObservation` by
+  type **before any model call**. See `docs/model_v2.md`.
 
 ## 12. Tests
 

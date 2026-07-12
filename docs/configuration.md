@@ -58,15 +58,18 @@ identifiers are enforced by the config loader:
 | `--deterministic` | off | bool | Force deterministic torch algorithms |
 | `--feature_version` | `legacy` | `legacy`, `v2` | Observation feature version (P03 widens to include `v2`) |
 | `--ruleset` | `legacy` | `legacy`, `standard` | Rule set identifier (P02 widens to include `standard`) |
-| `--model_version` | `legacy` | `legacy` | Model version (P05 introduces `v2`) |
+| `--model_version` | `legacy` | `legacy`, `factorized`, `v2` | Model version (P04 adds `factorized`; P05 adds `v2`) |
 
 P02 widens `--ruleset` to accept `standard` (in addition to `legacy`).
 P03 widens `--feature_version` to accept `v2` (the versioned observation schema
 in `douzero/observation/`; the legacy encoder remains the default and is
-byte-for-byte unchanged — see `docs/observation_v2.md`). `--model_version`
-remains `legacy`-only until P05. All version identifiers are recorded in the
-checkpoint manifest (see `docs/checkpoint_compatibility.md`) so incompatible
-loads are rejected.
+byte-for-byte unchanged — see `docs/observation_v2.md`). P04 widens
+`--model_version` to accept `factorized` (a deployment-only,
+checkpoint-compatible forward). P05 widens it further to `v2` (the shared
+state-action model with multi-head outputs — see `docs/model_v2.md`). The
+default stays `legacy`. All version identifiers are recorded in the checkpoint
+manifest (see `docs/checkpoint_compatibility.md`) so incompatible loads are
+rejected.
 
 ### Standard ruleset
 
