@@ -88,6 +88,14 @@ def _validate_predictions(
             f"bug. min={float(p.min().item()):.6g}, "
             f"max={float(p.max().item()):.6g}."
         )
+    # P06 r3: target_win must also be finite. NaN labels would silently pass
+    # the range / binary checks below (any comparison with NaN is False) and
+    # poison Brier / NLL / ECE.
+    if not bool(torch.isfinite(t).all()):
+        raise ValueError(
+            f"target_win contains non-finite values (NaN/Inf); calibration "
+            f"metrics require binary labels in {{0, 1}}."
+        )
     # target_win must be binary {0, 1}. Allow a tiny float tolerance.
     t_min = float(t.min().item())
     t_max = float(t.max().item())
@@ -108,9 +116,10 @@ def _validate_predictions(
 def brier_score(p_win: torch.Tensor, target_win: torch.Tensor) -> float:
     """Return the mean Brier score (lower is better; 0 is perfect).
 
-    Uses the validated but UNCLAMPED ``p_win`` so an illegal probability
-    (e.g. 2.0) produces a large Brier score rather than being masked to a
-    near-perfect 1.0.
+    Illegal probabilities (``p_win`` outside ``[0, 1]``, NaN, Inf) and
+    non-binary or non-finite ``target_win`` are rejected by
+    :func:`_validate_predictions` with a :class:`ValueError` rather than
+    being silently clamped (P06 r2/r3 fix).
     """
     p, t = _validate_predictions(p_win, target_win)
     return float(((p - t) ** 2).mean().item())

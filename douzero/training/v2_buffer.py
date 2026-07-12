@@ -57,9 +57,17 @@ class Transition:
     target_log_score: float = float("nan")
 
     def has_labels(self) -> bool:
-        return not (
-            isinstance(self.target_win, float) and math_isnan(self.target_win)
-        )
+        """Return True iff all three team-perspective labels are finite.
+
+        P06 r3: previously checked only ``target_win``; now also checks
+        ``target_score`` and ``target_log_score`` so a partially-labelled
+        transition (e.g. a bug in ``label_from_terminal`` that left one
+        field NaN) is caught at buffer-entry time.
+        """
+        for value in (self.target_win, self.target_score, self.target_log_score):
+            if isinstance(value, float) and math_isnan(value):
+                return False
+        return True
 
 
 def math_isnan(x: float) -> bool:
