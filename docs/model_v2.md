@@ -247,17 +247,20 @@ checkpoint's self-reported values):
    unknown id (no silent downgrade to legacy).
 5. `checkpoint_kind` — `training_checkpoint` vs `public_policy`.
 
-Helpers (all accept the full `RuleSet` object, not an id string):
+Helpers (all accept the full `RuleSet` object, not an id string; both save
+helpers derive the schema/config identity from the model and reject a caller
+override that disagrees):
 
-- `save_v2_checkpoint(path, model, schema_hash=..., model_config=...,
-  ruleset=..., frames=...)` — writes the full `model_v2.tar` bundle.
+- `save_v2_checkpoint(path, model, *, ruleset, schema_hash=None,
+  model_config=None, frames=...)` — writes the full `model_v2.tar` bundle.
 - `load_v2_checkpoint(path, expected_schema_hash=...,
   expected_model_config_hash=..., expected_ruleset=...,
   expected_checkpoint_kind=...)` — reads + validates the full bundle. All
   expected values are required runtime arguments.
-- `save_v2_position_weights(path, model, schema_hash=...,
-  model_config=..., ruleset=...)` — writes the **manifest-bearing** deployment
-  sidecar (`.ckpt`). NOT a bare state_dict.
+- `save_v2_position_weights(path, model, *, ruleset, schema_hash=None,
+  model_config=None)` — writes the **manifest-bearing** deployment sidecar
+  (`.ckpt`). NOT a bare state_dict; same model-derived identity closure as the
+  full bundle.
 - `load_v2_position_weights(path, expected_schema_hash=...,
   expected_model_config_hash=..., expected_ruleset=...)` — reads + validates
   the sidecar.
@@ -342,4 +345,3 @@ deferred to P14.
 - Human prior / auxiliary heads (P08/P09): `human_prior_enabled` is carried but
   no prior head is attached yet.
 - AMP / DDP / `torch.compile` (P14).
-- Strict manifest-bearing deployment loader (P16).
