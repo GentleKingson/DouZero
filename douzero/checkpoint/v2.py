@@ -8,7 +8,7 @@ sidecar format.
 
 Identity contract (bug #3 fix — the critical correctness property)
 ------------------------------------------------------------------
-A V2 checkpoint is bound to FOUR identity axes, and every load validates ALL
+A V2 checkpoint is bound to FIVE identity axes, and every load validates ALL
 of them against RUNTIME-SUPPLIED expectations (never against the checkpoint's
 own self-reported values — a forged or corrupted checkpoint could otherwise
 self-attest compatibility):
@@ -18,13 +18,26 @@ self-attest compatibility):
    against. Must equal the runtime schema's ``stable_hash()``. This catches a
    same-shape-different-schema drift (e.g. a field reordered) that a pure
    shape check would miss.
-3. ``ruleset_id`` / ``ruleset_version`` / ``ruleset_hash`` — the rule engine
+3. ``model_config_hash`` — the :meth:`ModelV2Config.stable_hash` the model was
+   constructed with. Must equal the runtime config's hash. This catches a
+   same-shape-different-semantics config drift (e.g. ``history_heads`` 8→4
+   keeps projection shapes but changes the Transformer split; ``score_clamp``
+   / ``nan_guard`` change runtime behavior) that strict state_dict loading
+   cannot detect.
+4. ``ruleset_id`` / ``ruleset_version`` / ``ruleset_hash`` — the rule engine
    the model expects. A V2 model trained under the legacy ruleset must not be
    silently served under the standard ruleset (the bidding/scoring context
    fields differ).
-4. ``checkpoint_kind`` — ``training_checkpoint`` vs ``public_policy``. A
+5. ``checkpoint_kind`` — ``training_checkpoint`` vs ``public_policy``. A
    training bundle is not directly deployable as a public-policy sidecar and
    vice versa.
+
+Save-side closure: :func:`save_v2_checkpoint` does NOT accept a self-reported
+identity. It derives the schema/config hash from the model itself, requires
+the full :class:`~douzero.env.rules.RuleSet`, and rejects any caller-supplied
+``schema_hash`` / ``model_config`` that disagrees with the model's own. So a
+bundle cannot be labelled with an identity that does not match the actual
+weights, and the default call (no overrides) always produces a loadable file.
 
 Security: every load defaults to ``weights_only=True`` (safe unpickling). The
 position sidecar carries its own manifest so the strict identity check applies
@@ -140,9 +153,10 @@ def build_v2_manifest(
 # --------------------------------------------------------------------------- #
 def save_v2_checkpoint(
     path: str,
-    model: "torch.nn.Module",
+    model: "ModelV2",
     *,
-    schema_hash: str,
+    ruleset: "RuleSet",
+    schema_hash: str | None = None,
     model_config: "ModelV2Config | None" = None,
     config_dict: dict[str, Any] | None = None,
     flags: argparse.Namespace | dict[str, Any] | None = None,
@@ -151,45 +165,100 @@ def save_v2_checkpoint(
 ) -> CheckpointManifest:
     """Save a Model V2 ``state_dict`` + manifest to a ``model_v2.tar`` bundle.
 
+    The bundle's identity is DERIVED FROM THE MODEL, never self-reported by the
+    caller. This closes the save-side loopholes (blockers #1 and #2):
+
+    - The feature schema hash and model-config hash default to the model's own
+      ``model.schema.stable_hash()`` / ``model.config.stable_hash()``. A caller
+      may pass ``schema_hash`` / ``model_config`` for belt-and-braces, but if
+      either disagrees with the model's own identity the save is REJECTED — a
+      bundle can never be labelled with an identity that does not match the
+      actual weights (e.g. stamping config-A weights with config-B's hash when
+      the two happen to share parameter shapes).
+    - The default call (no overrides) therefore always produces a LOADABLE
+      file. Previously ``model_config=None`` wrote an empty config hash that
+      the loader always rejects, so the default save produced an un-loadable
+      bundle.
+    - The full :class:`~douzero.env.rules.RuleSet` is REQUIRED and its complete
+      identity (id + version + hash) is stamped onto the manifest. This mirrors
+      :func:`save_v2_position_weights` and supports custom rule families: the
+      flags-only path could only express the canonical ``legacy`` / ``standard``
+      strings, never a same-id-different-parameters ruleset.
+
     Parameters
     ----------
     path:
         Output path (typically ``<savedir>/<xpid>/model_v2.tar``).
     model:
-        The :class:`~douzero.models_v2.model.ModelV2` to save.
+        The :class:`~douzero.models_v2.model.ModelV2` to save. Must carry
+        ``.schema`` and ``.config`` (always present on a ``ModelV2``).
+    ruleset:
+        REQUIRED :class:`~douzero.env.rules.RuleSet` the model was trained
+        under. Its full identity (id + version + hash) is stamped into the
+        manifest. Passing ``None`` is a ``TypeError``; an unknown id is
+        rejected on construction by :class:`RuleSet` itself.
     schema_hash:
-        The :attr:`FeatureSchemaManifest.stable_hash` the model was constructed
-        against (i.e. ``model.schema.stable_hash()``). Stamped into the bundle
-        so a loader can reject a schema drift.
+        Optional override for the feature schema hash. Defaults to
+        ``model.schema.stable_hash()``. If provided, it MUST equal the model's
+        schema hash or the save raises ``ValueError``.
     model_config:
-        The :class:`~douzero.models_v2.config.ModelV2Config` the model was
-        constructed with. Its :meth:`~ModelV2Config.stable_hash` is stamped
-        into the bundle (blocker #2) so a loader can reject a
-        same-shape-different-semantics config drift that strict state_dict
-        loading cannot detect. Recommended; pass ``None`` only for tests that
-        intentionally skip the config-hash identity (the loader then requires
-        ``expected_model_config_hash=None`` too).
+        Optional override :class:`~douzero.models_v2.config.ModelV2Config`.
+        Defaults to ``model.config``. If provided, its :meth:`stable_hash` MUST
+        equal the model's config hash or the save raises ``ValueError``.
     config_dict:
         Optional serializable dict of the :class:`ModelV2Config`. Auditability
-        only; the loader does not reconstruct the config from it (the caller
-        passes the config explicitly so construction is explicit).
+        only; the loader does not reconstruct the config from it.
     flags:
         Optional runtime flags (Namespace or dict). The manifest's
-        ``model_version`` is forced to ``"v2"`` regardless.
+        ``model_version`` is forced to ``"v2"`` regardless. Note the ruleset
+        identity is stamped from ``ruleset``, NOT derived from ``flags``.
     frames, position_frames:
         Training progress counters (0 for a fresh / untrained model).
     """
-    if not schema_hash:
-        raise ValueError(
-            "schema_hash is required (an empty hash cannot bind the checkpoint "
-            "to a feature schema)."
+    from douzero.env.rules import RuleSet as _RuleSet
+
+    if not isinstance(ruleset, _RuleSet):
+        raise TypeError(
+            f"ruleset must be a RuleSet instance, got {type(ruleset).__name__}. "
+            f"Pass the full RuleSet so the complete ruleset_hash is stamped "
+            f"into the manifest, not just an id string."
         )
-    # Blocker #2: compute the model-config compatibility hash. A loader binds
-    # the checkpoint to this hash so a same-shape-different-config drift
-    # (e.g. history_heads 8->4) is rejected, not silently loaded.
-    model_config_hash = (
-        model_config.stable_hash() if model_config is not None else _NO_SCHEMA_HASH
-    )
+    # Derive the model identity from the model itself. A ModelV2 always carries
+    # .schema and .config; a non-ModelV2 (or a bare nn.Module) is a caller bug.
+    try:
+        actual_schema_hash = model.schema.stable_hash()
+        actual_config_hash = model.config.stable_hash()
+    except AttributeError as exc:
+        raise TypeError(
+            f"save_v2_checkpoint requires a ModelV2 with .schema and .config, "
+            f"got {type(model).__name__}."
+        ) from exc
+
+    # If the caller supplied an override, it MUST match the model's own
+    # identity — otherwise the bundle would be mislabelled (the attack surface
+    # blocker #2 calls out: stamping one model's weights with another's hash).
+    if schema_hash is None:
+        schema_hash = actual_schema_hash
+    elif schema_hash != actual_schema_hash:
+        raise ValueError(
+            f"save_v2_checkpoint schema_hash mismatch: passed {schema_hash!r} "
+            f"but the model's schema hash is {actual_schema_hash!r}. A bundle's "
+            f"identity must match the actual model; pass schema_hash=None (the "
+            f"default) to derive it from the model."
+        )
+    if model_config is None:
+        model_config_hash = actual_config_hash
+    else:
+        model_config_hash = model_config.stable_hash()
+        if model_config_hash != actual_config_hash:
+            raise ValueError(
+                f"save_v2_checkpoint model_config mismatch: the passed "
+                f"ModelV2Config hash {model_config_hash!r} differs from the "
+                f"model's config hash {actual_config_hash!r}. A bundle's "
+                f"identity must match the actual model; same-shape weights are "
+                f"not enough to relabel a model under a different config."
+            )
+
     manifest = build_v2_manifest(
         flags=flags,
         schema_hash=schema_hash,
@@ -197,6 +266,15 @@ def save_v2_checkpoint(
         position_frames=position_frames,
         checkpoint_kind="training_checkpoint",
     )
+    # Stamp the FULL ruleset identity (id + version + hash) from the caller's
+    # RuleSet, mirroring save_v2_position_weights. The flags path could only
+    # express canonical legacy/standard; this supports custom rule families
+    # (same id, different parameters -> different hash) and keeps the full
+    # bundle and the deployment sidecar on ONE rule-identity API.
+    object.__setattr__(manifest, "ruleset_id", ruleset.ruleset_id)
+    object.__setattr__(manifest, "ruleset_version", ruleset.ruleset_version)
+    object.__setattr__(manifest, "ruleset_hash", ruleset.stable_hash())
+
     bundle = {
         _V2_STATE_DICT_KEY: model.state_dict(),
         _MANIFEST_KEY: manifest.to_dict(),

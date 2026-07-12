@@ -96,18 +96,31 @@ Transformer/LSTM history encoder, and multi-head outputs. Its `state_dict`
 keys and shapes do **not** match the legacy models, so a legacy `.ckpt`
 **cannot** be loaded into a V2 model and vice versa.
 
-P05 adds V2-aware checkpoint helpers in `douzero/checkpoint/v2.py`:
+P05 adds V2-aware checkpoint helpers in `douzero/checkpoint/v2.py`. Both the
+full bundle and the deployment sidecar are **manifest-bearing** and bound to
+the same FIVE identity axes (model_version, feature_schema_hash,
+model_config_hash, ruleset id/version/hash, checkpoint_kind):
 
-- `save_v2_checkpoint(path, model, schema_hash=...)` — writes a `model_v2.tar`
-  bundle (state_dict + manifest + config + feature schema hash). The manifest
-  is stamped with `model_version="v2"` and `feature_version="v2"`.
-- `load_v2_checkpoint(path, expected_schema_hash=...)` — reads a V2 bundle,
-  validates the manifest, and optionally binds the feature schema hash so a
-  schema drift is rejected. Raises `CheckpointCompatibilityError` on any
-  mismatch, including an attempt to load a legacy/factorized `model.tar` here.
-- `save_v2_position_weights(path, model, schema_hash=...)` — writes a bare
-  `.ckpt` sidecar for `DeepAgentV2` deployment (the strict manifest-bearing
-  sidecar arrives in P16).
+- `save_v2_checkpoint(path, model, *, ruleset, ...)` — writes the full
+  `model_v2.tar` bundle. The model identity (feature schema hash +
+  `ModelV2Config` hash) is **derived from the model itself**, not self-reported
+  by the caller — a caller-supplied `schema_hash` / `model_config` that
+  disagrees with the model's own is rejected, so a bundle can never be labelled
+  with an identity that does not match the actual weights. The full `RuleSet`
+  is **required** and its complete identity (id + version + hash) is stamped
+  onto the manifest, supporting custom rule families. The default call (no
+  overrides) always produces a loadable file.
+- `load_v2_checkpoint(path, *, expected_schema_hash, expected_model_config_hash,
+  expected_ruleset, ...)` — reads a V2 bundle and validates ALL FIVE identity
+  axes against RUNTIME-supplied expectations (never the manifest's self-reported
+  values). Every expected value is a required argument. Raises
+  `CheckpointCompatibilityError` on any mismatch, including an attempt to load a
+  legacy/factorized `model.tar` here.
+- `save_v2_position_weights(path, model, *, schema_hash, model_config, ruleset)`
+  — writes the **manifest-bearing** deployment sidecar (`.ckpt`) for
+  `DeepAgentV2`. It is NOT a bare state_dict: it carries the schema hash,
+  model-config hash, and full ruleset identity so the strict identity check
+  applies at deployment too.
 
 The strict V2 loader (`load_v2_model` in `deep_agent.py`) performs a full
 key-set + shape match and raises `ValueError` on any mismatch — there is no
