@@ -18,6 +18,7 @@ from typing import Any, Mapping
 from douzero.config.schemas import (
     DecisionPolicyConfig,
     LossConfig,
+    ModelConfig,
     OptimizerConfig,
     TrainingConfig,
 )
@@ -83,14 +84,15 @@ def load_legacy_config() -> TrainingConfig:
 # --------------------------------------------------------------------------- #
 def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     """Construct a TrainingConfig from a raw mapping, validating keys."""
-    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy")}
+    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy", "model")}
     valid_opt_names = {f.name for f in fields(OptimizerConfig)}
     valid_loss_names = {f.name for f in fields(LossConfig)}
     valid_decision_names = {f.name for f in fields(DecisionPolicyConfig)}
+    valid_model_names = {f.name for f in fields(ModelConfig)}
 
-    # 'optimizer', 'loss', 'decision_policy', and 'rules' are valid top-level
-    # keys (handled separately).
-    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "rules"}
+    # 'optimizer', 'loss', 'decision_policy', 'model', and 'rules' are valid
+    # top-level keys (handled separately).
+    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "model", "rules"}
     if unknown_top:
         raise ValueError(f"Unknown config keys: {sorted(unknown_top)}")
 
@@ -117,6 +119,13 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
             f"Unknown decision_policy config keys: {sorted(unknown_decision)}"
         )
 
+    model_raw = raw.get("model", {})
+    if not isinstance(model_raw, Mapping):
+        raise TypeError("'model' must be a mapping")
+    unknown_model = set(model_raw.keys()) - valid_model_names
+    if unknown_model:
+        raise ValueError(f"Unknown model config keys: {sorted(unknown_model)}")
+
     # P02: a 'rules' block is accepted but not stored on TrainingConfig (which
     # only carries the version string). We validate it here so a malformed
     # rules block fails loudly, and so the ruleset version string is
@@ -136,6 +145,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
         kwargs["loss"] = LossConfig(**dict(loss_raw))
     if decision_raw:
         kwargs["decision_policy"] = DecisionPolicyConfig(**dict(decision_raw))
+    if model_raw:
+        kwargs["model"] = ModelConfig(**dict(model_raw))
     cfg = TrainingConfig(**kwargs)
     _validate_types(cfg)
     _validate_legacy_only_versions(cfg)
@@ -161,6 +172,10 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "lambda_uncertainty": float, "score_delta": float,
     "score_target_transform": str, "score_clamp": float,
     "mode": str, "abs_tol": float, "rel_tol": float, "risk_penalty": float,
+    # P06 r5: V2 model architecture nested fields.
+    "version": str, "hidden_size": int, "history_encoder": str,
+    "history_layers": int, "history_heads": int, "role_embedding_dim": int,
+    "belief_enabled": bool, "human_prior_enabled": bool,
 }
 
 
@@ -209,6 +224,12 @@ def _validate_types(cfg: TrainingConfig) -> None:
             _check_field(name, getattr(cfg.loss, name), "loss")
         elif name in {"mode", "abs_tol", "rel_tol", "risk_penalty"}:
             _check_field(name, getattr(cfg.decision_policy, name), "decision_policy")
+        elif name in {
+            "version", "hidden_size", "history_encoder", "history_layers",
+            "history_heads", "role_embedding_dim", "belief_enabled",
+            "human_prior_enabled",
+        }:
+            _check_field(name, getattr(cfg.model, name), "model")
         elif hasattr(cfg, name):
             _check_field(name, getattr(cfg, name), "training")
 
