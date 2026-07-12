@@ -432,14 +432,6 @@ def test_yaml_rejects_unsupported_ruleset(tmp_path):
         load_config(str(bad))
 
 
-def test_yaml_rejects_unsupported_model_version(tmp_path):
-    """A YAML config with model_version=v2 must be rejected (reserved for P05)."""
-    bad = tmp_path / "mv2.yaml"
-    bad.write_text("model_version: v2\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="model_version"):
-        load_config(str(bad))
-
-
 def test_yaml_accepts_factorized_model_version(tmp_path):
     """P04 widens the allowed model_version set: model_version=factorized is accepted.
 
@@ -450,6 +442,27 @@ def test_yaml_accepts_factorized_model_version(tmp_path):
     good.write_text("model_version: factorized\n", encoding="utf-8")
     cfg = load_config(str(good))
     assert cfg.model_version == "factorized"
+
+
+def test_yaml_accepts_v2_model_version(tmp_path):
+    """P05 widens the allowed model_version set: model_version=v2 is accepted.
+
+    "v2" selects the shared state/action model (P05). It is accepted by the
+    config layer so DeepAgentV2 / model construction can be selected; the
+    training gate in dmc.py still rejects v2 training until P06.
+    """
+    good = tmp_path / "v2.yaml"
+    good.write_text("model_version: v2\n", encoding="utf-8")
+    cfg = load_config(str(good))
+    assert cfg.model_version == "v2"
+
+
+def test_yaml_rejects_unknown_model_version(tmp_path):
+    """An unsupported model_version string is rejected (e.g. 'v3')."""
+    bad = tmp_path / "mv3.yaml"
+    bad.write_text("model_version: v3\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="model_version"):
+        load_config(str(bad))
 
 
 def test_cli_accepts_v2_feature_version():

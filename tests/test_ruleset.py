@@ -376,23 +376,26 @@ def test_cli_feature_version_rejects_unknown():
         parser.parse_args(["--feature_version", "v3"])
 
 
-def test_cli_model_version_rejects_v2_and_accepts_legacy_and_factorized():
-    """P04 widens model_version to {legacy, factorized}; v2 still rejected.
+def test_cli_model_version_accepts_legacy_factorized_and_v2():
+    """P05 widens model_version to {legacy, factorized, v2}.
 
-    "factorized" is a deployment-only, checkpoint-compatible forward (P04);
-    "v2" is reserved for Model V2 (P05) and must remain rejected by the CLI
-    until P05 wires it in.
+    "factorized" is a deployment-only, checkpoint-compatible forward (P04).
+    "v2" is the shared state/action model with multi-head outputs (P05);
+    it is accepted by the CLI so DeepAgentV2 can be selected. Training is
+    still gated to legacy in dmc.py until P06.
     """
     from douzero.dmc.arguments import parser
 
-    # legacy and factorized are accepted.
+    # legacy, factorized, and v2 are accepted.
     ns = parser.parse_args(["--model_version", "legacy"])
     assert ns.model_version == "legacy"
     ns = parser.parse_args(["--model_version", "factorized"])
     assert ns.model_version == "factorized"
-    # v2 is NOT yet a supported model_version (reserved for P05).
+    ns = parser.parse_args(["--model_version", "v2"])
+    assert ns.model_version == "v2"
+    # An unsupported version (e.g. "v3") is still rejected by argparse choices.
     with pytest.raises(SystemExit):
-        parser.parse_args(["--model_version", "v2"])
+        parser.parse_args(["--model_version", "v3"])
 
 
 # --------------------------------------------------------------------------- #

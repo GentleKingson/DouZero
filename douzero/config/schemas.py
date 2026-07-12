@@ -99,8 +99,39 @@ class TrainingConfig:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class ModelConfig:
-    # legacy | factorized (P04, deployment-only) | v2 (v2 arrives in P05)
+    """Model architecture selection (P05 widens to ``v2``).
+
+    ``version`` selects the model family:
+
+    - ``"legacy"`` (default): the original role-specific LSTM+MLP value
+      models. Preserved unchanged for backward compatibility.
+    - ``"factorized"`` (P04): a deployment-only, checkpoint-compatible
+      forward that is numerically equivalent to ``legacy`` under the same
+      weights (encodes the shared state/history once per decision).
+    - ``"v2"`` (P05): the shared state/action model with role embeddings,
+      a Transformer (or LSTM) history encoder, and multi-head outputs
+      (win probability + conditional scores). Enabled by
+      ``model_version=v2`` + ``feature_version=v2``.
+
+    The remaining fields configure the V2 architecture only; they are
+    ignored by the legacy and factorized paths. Defaults match
+    ``configs/enhanced.yaml`` and the V2 model constructor defaults.
+    """
+
     version: str = "legacy"
+
+    # --- V2 architecture knobs (P05). Defaults keep the model small enough
+    # to run a forward/backward smoke test on CPU while still representing a
+    # credible shared backbone. Tuned values belong in configs/, not here.
+    hidden_size: int = 256
+    history_encoder: str = "transformer"  # transformer | lstm
+    history_layers: int = 4
+    history_heads: int = 8
+    role_embedding_dim: int = 32
+    # Auxiliary heads are gated by config so ablations can disable them
+    # (P09 attaches more; P05 keeps the structural skeleton).
+    belief_enabled: bool = False
+    human_prior_enabled: bool = False
 
 
 @dataclass(frozen=True)
