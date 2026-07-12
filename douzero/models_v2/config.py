@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, fields
+from typing import ClassVar
 
 HISTORY_ENCODER_TRANSFORMER = "transformer"
 HISTORY_ENCODER_LSTM = "lstm"
@@ -125,7 +126,10 @@ class ModelV2Config:
     #: field set changes. Version 1 = P05 (no ``score_target_transform``);
     #: version 2 = P06 r5+ (adds ``score_target_transform``). The checkpoint
     #: loader uses this to migrate P05 checkpoints forward.
-    IDENTITY_VERSION: int = 2
+    #: Declared as ClassVar so the dataclass machinery does not treat it
+    #: as an instance field (otherwise ``ModelV2Config(IDENTITY_VERSION=999)``
+    #: would create a meaningless state).
+    IDENTITY_VERSION: ClassVar[int] = 2
 
     def compatibility_dict(self) -> dict:
         """Return the architecture-identity subset of this config.

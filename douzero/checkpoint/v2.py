@@ -125,13 +125,38 @@ def _validate_model_config_hash(
 
       A runtime using ``signed_log`` cannot accept a P05 checkpoint because
       the P05 model's score heads were implicitly on the raw scale.
+    - **Any other value** (0, 3, ``"2"``, ``True``, etc.): rejected.
+      Identity version is fail-closed so a corrupted or forged bundle
+      cannot bypass the strict v2 check by claiming an unknown version.
+      ``bool`` is rejected explicitly because ``True == 1`` in Python.
 
     ``runtime_model_config`` is the ModelV2Config the loader is about to
     construct the model with. It is required (not ``None``) so the v1 hash
     can be computed.
     """
     actual_cfg_hash = bundle.get(_MODEL_CONFIG_HASH_KEY, _NO_SCHEMA_HASH)
-    identity_version = bundle.get(_MODEL_CONFIG_IDENTITY_VERSION_KEY, 1)
+    raw_version = bundle.get(_MODEL_CONFIG_IDENTITY_VERSION_KEY, None)
+
+    # Fail-closed on unknown identity versions. bool is rejected explicitly
+    # because True == 1 and False == 0 in Python (isinstance(True, int) is
+    # True), so a bool could masquerade as a valid version.
+    if isinstance(raw_version, bool):
+        raise CheckpointCompatibilityError(
+            f"V2 checkpoint at {path!r} has model_config_identity_version="
+            f"{raw_version!r} (bool), expected int 1, 2, or absent. The "
+            f"identity version is fail-closed against unknown values."
+        )
+    if raw_version is None or raw_version == 1:
+        identity_version = 1
+    elif raw_version == 2:
+        identity_version = 2
+    else:
+        raise CheckpointCompatibilityError(
+            f"V2 checkpoint at {path!r} has unsupported "
+            f"model_config_identity_version={raw_version!r}. Supported "
+            f"values are 1 (P05), 2 (P06 r6+), or absent (treated as 1). "
+            f"The identity version is fail-closed against unknown values."
+        )
 
     if identity_version == 2:
         if actual_cfg_hash != expected_model_config_hash:

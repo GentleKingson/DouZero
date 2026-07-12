@@ -214,23 +214,26 @@ def test_trainer_accepts_matching_score_clamp():
     assert trainer.loss_fn.config.score_clamp == 16.0
 
 
-def test_trainer_accepts_mismatched_clamp_in_signed_log_mode():
+def test_trainer_rejects_mismatched_clamp_in_signed_log_mode():
+    """P06 r7: score_clamp mismatch is rejected in BOTH modes.
+
+    r5 made the loss target clamp universal (both raw and signed_log),
+    so a model with score_clamp=8 cannot fit a loss target clamped to
+    ±32 regardless of the transform.
+    """
     from douzero.models_v2.config import ModelV2Config
     from douzero.models_v2.model import ModelV2
     from douzero.observation.schema import build_v2_schema
     from douzero.training import LossConfig, TrainerConfig, V2Trainer
 
     torch.manual_seed(42)
-    # In signed_log mode the target is NOT clamped to score_clamp in raw
-    # mode's sense, so a raw-clamp mismatch is acceptable. Both model and
-    # loss must agree on score_target_transform="signed_log" (P06 r5).
     model = ModelV2(
         build_v2_schema(),
         ModelV2Config(score_clamp=8.0, score_target_transform="signed_log"),
     )
     loss_cfg = LossConfig(score_clamp=32.0, score_target_transform="signed_log")
-    trainer = V2Trainer(model, loss_config=loss_cfg, config=TrainerConfig(max_episodes=0))
-    assert trainer is not None
+    with pytest.raises(ValueError, match="score_clamp"):
+        V2Trainer(model, loss_config=loss_cfg, config=TrainerConfig(max_episodes=0))
 
 
 # --------------------------------------------------------------------------- #
