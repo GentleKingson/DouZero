@@ -756,6 +756,80 @@ class TestSaveLoad:
         )
         assert isinstance(state_dict, dict)
 
+    def test_v2_checkpoint_save_rejects_non_modelconfig_type(self, tmp_path):
+        """A wrong-typed model_config override raises TypeError (not
+        AttributeError), consistent with the schema_hash path and the
+        documented ValueError/TypeError contract."""
+        from douzero.checkpoint import save_v2_checkpoint
+
+        model = _build_model()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        with pytest.raises(TypeError, match="ModelV2Config"):
+            save_v2_checkpoint(
+                bundle_path, model, ruleset=RuleSet.legacy(),
+                schema_hash=model.schema.stable_hash(),
+                model_config="not_a_config",
+            )
+
+    def test_v2_position_sidecar_save_derives_identity_from_model(self, tmp_path):
+        """Blocker #2 (HIGH, deployment path): the deployment sidecar derives
+        its schema/config identity from the model too, so the default save (no
+        overrides) is loadable — the same closure as the full bundle."""
+        from douzero.checkpoint import (
+            load_v2_position_weights,
+            save_v2_position_weights,
+        )
+
+        model = _build_model()
+        ckpt = str(tmp_path / "v2.ckpt")
+        # Omit schema_hash / model_config: the save must derive them from model.
+        manifest = save_v2_position_weights(ckpt, model, ruleset=RuleSet.legacy())
+        assert manifest.model_version == "v2"
+        legacy = RuleSet.legacy()
+        assert (manifest.ruleset_id, manifest.ruleset_version, manifest.ruleset_hash) == (
+            legacy.ruleset_id, legacy.ruleset_version, legacy.stable_hash(),
+        )
+        # The sidecar loads against the model's own identity.
+        state_dict, _ = load_v2_position_weights(
+            ckpt,
+            expected_schema_hash=model.schema.stable_hash(),
+            expected_model_config_hash=model.config.stable_hash(),
+            expected_ruleset=RuleSet.legacy(),
+        )
+        assert isinstance(state_dict, dict)
+
+    def test_v2_position_sidecar_save_rejects_wrong_schema_hash(self, tmp_path):
+        """Blocker #2 (HIGH, deployment path): the sidecar cannot be mislabelled
+        — a caller-supplied schema_hash that differs from the model's is rejected
+        at SAVE time (the sidecar is what DeepAgentV2 loads in production)."""
+        from douzero.checkpoint import save_v2_position_weights
+
+        model = _build_model()
+        ckpt = str(tmp_path / "v2.ckpt")
+        with pytest.raises(ValueError, match="schema_hash mismatch"):
+            save_v2_position_weights(
+                ckpt, model, ruleset=RuleSet.legacy(),
+                schema_hash="0" * 64,
+                model_config=model.config,
+            )
+
+    def test_v2_position_sidecar_save_rejects_wrong_model_config(self, tmp_path):
+        """Blocker #2 (HIGH, deployment path): the sidecar cannot be mislabelled
+        with a different ModelV2Config — the same-shape relabelling attack is
+        closed on the deployment path too, not only on the full bundle."""
+        from douzero.checkpoint import save_v2_position_weights
+
+        model = _build_model()
+        wrong_cfg = ModelV2Config(history_heads=4)
+        assert wrong_cfg.stable_hash() != model.config.stable_hash()
+        ckpt = str(tmp_path / "v2.ckpt")
+        with pytest.raises(ValueError, match="model_config mismatch"):
+            save_v2_position_weights(
+                ckpt, model, ruleset=RuleSet.legacy(),
+                schema_hash=model.schema.stable_hash(),
+                model_config=wrong_cfg,
+            )
+
     def test_load_v2_model_rejects_bare_state_dict(self, tmp_path):
         """load_v2_model must reject a bare state_dict sidecar (no manifest)."""
         from douzero.evaluation.deep_agent import load_v2_model
