@@ -187,6 +187,10 @@ class DeepAgentV2:
         # production import graph (evaluation.simulation) free of a hard torch
         # model dependency at module load, mirroring the lazy imports above.
         from douzero.env.rules import RuleSet
+        from douzero.training.decision_policy import (
+            SUPPORTED_DECISION_MODES,
+            canonical_mode,
+        )
         if not isinstance(model, ModelV2):
             raise TypeError(
                 f"DeepAgentV2 requires a ModelV2 instance, got {type(model).__name__}"
@@ -202,10 +206,15 @@ class DeepAgentV2:
             raise TypeError(
                 f"ruleset must be a RuleSet instance, got {type(ruleset).__name__}"
             )
-        if decision_mode not in ("win", "score"):
+        # P06 widens decision_mode to the full multi-objective policy set.
+        # ``win`` and ``score`` are kept as aliases for ``pure_win`` /
+        # ``pure_score`` so the P05 contract is unchanged.
+        if decision_mode not in SUPPORTED_DECISION_MODES:
             raise ValueError(
-                f"decision_mode must be 'win' or 'score', got {decision_mode!r}"
+                f"decision_mode must be one of {SUPPORTED_DECISION_MODES}, "
+                f"got {decision_mode!r}"
             )
+        self.decision_mode = canonical_mode(decision_mode)
         # Blocker #3: if the model carries a verified checkpoint ruleset
         # identity (attached by load_v2_model), the agent's RuleSet MUST match
         # it exactly (id + version + hash). This prevents serving a
@@ -382,6 +391,7 @@ class DeepAgentV2:
     # --- Internal selection ------------------------------------------------- #
     def _select_from_observation(self, obs):
         from douzero.models_v2.batch import observation_to_model_inputs
+        from douzero.training.decision_policy import DecisionConfig, select_action
 
         bundle = observation_to_model_inputs(obs)
         if torch.cuda.is_available():
@@ -398,18 +408,17 @@ class DeepAgentV2:
                 bundle.action_mask,
                 bundle.acting_role,
             )
-        if self.decision_mode == "score":
-            # Highest expected score among valid actions.
-            scores = out.score_mean.squeeze(-1).clone()
-            scores[~out.action_mask] = float("-inf")
-            idx = int(torch.argmax(scores).item())
-        else:
-            idx = out.argmax_win()
+        # P06: route through the unified decision policy. The agent's
+        # ``decision_mode`` was canonicalized at construction time, so we
+        # build a DecisionConfig with the same mode and the default
+        # tolerances (evaluation must be deterministic; lexicographic
+        # tolerance bands are for deployment configuration, not default).
+        idx = select_action(out, DecisionConfig(mode=self.decision_mode))
         legal_actions = obs.actions.legal_actions
         # The action_mask may include padding rows beyond the real actions;
-        # argmax over the win logit already respects the mask, so the index is
-        # a real-action index as long as the observation's action block was not
-        # padded. observation_to_model_inputs does not pad, so idx < len.
+        # the decision policy respects the mask, so the index is a
+        # real-action index as long as the observation's action block was
+        # not padded. observation_to_model_inputs does not pad, so idx < len.
         if idx >= len(legal_actions):
             # Defensive: should never happen because we do not pad here.
             raise RuntimeError(

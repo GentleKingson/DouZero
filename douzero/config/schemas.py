@@ -48,6 +48,46 @@ class OptimizerConfig:
 
 
 # --------------------------------------------------------------------------- #
+# Loss (P06 multi-objective training)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class LossConfig:
+    """Multi-objective loss weights and Huber deltas (P06).
+
+    All weights default to 0.0 so the legacy training path (which uses the
+    single-head MSE in ``douzero.dmc.compute_loss``) is unchanged when this
+    config is absent. The V2 trainer (:mod:`douzero.training.v2_trainer`)
+    constructs its own :class:`~douzero.training.losses.LossConfig` from
+    these fields and runs the multi-objective combination.
+    """
+
+    lambda_win: float = 0.0
+    lambda_score: float = 0.0
+    lambda_log: float = 0.0
+    lambda_uncertainty: float = 0.0
+    score_delta: float = 1.0
+    log_score_delta: float = 1.0
+
+
+# --------------------------------------------------------------------------- #
+# Decision policy (P06 action selection)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class DecisionPolicyConfig:
+    """Configuration for the V2 deployment decision policy (P06).
+
+    Carried so a checkpoint manifest can audit which decision mode a model
+    was trained / evaluated under. Defaults preserve the P05 behaviour
+    (``pure_win`` with zero tolerance, deterministic).
+    """
+
+    mode: str = "pure_win"
+    abs_tol: float = 0.0
+    rel_tol: float = 0.0
+    risk_penalty: float = 0.0
+
+
+# --------------------------------------------------------------------------- #
 # Training -- mirrors douzero/dmc/arguments.py exactly (all 23 args)
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
@@ -91,6 +131,11 @@ class TrainingConfig:
 
     # Sub-configs
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    # P06 multi-objective training + decision policy. Defaults preserve the
+    # legacy single-target path; the V2 trainer reads these to construct its
+    # LossConfig / DecisionConfig.
+    loss: LossConfig = field(default_factory=LossConfig)
+    decision_policy: DecisionPolicyConfig = field(default_factory=DecisionPolicyConfig)
 
 
 # --------------------------------------------------------------------------- #

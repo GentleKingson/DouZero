@@ -1698,12 +1698,27 @@ class TestDeepAgentV2ActionAlignment:
         if len(obs.actions.legal_actions) < 2:
             pytest.skip("need >= 2 legal actions")
 
-        # Force argmax_win() == 0 so the selected row is known.
-        class _FixedOut:
-            def argmax_win(self):
-                return 0
+        # Force the selection of row 0 so the chosen row is known. We build a
+        # real ModelOutput (the P06 decision policy consumes ``action_mask``,
+        # ``p_win``, ``score_mean``) where action 0 has the highest p_win.
+        n = len(obs.actions.legal_actions)
+        import torch as _torch
 
-        agent.model.forward = lambda *a, **k: _FixedOut()
+        p_win = _torch.full((n, 1), 0.1, dtype=_torch.float32)
+        p_win[0, 0] = 0.9
+        score = _torch.zeros(n, 1, dtype=_torch.float32)
+        mask = _torch.ones(n, dtype=_torch.bool)
+        from douzero.models_v2 import ModelOutput as _ModelOutput
+
+        fixed_out = _ModelOutput(
+            win_logit=_torch.log(p_win / (1.0 - p_win)).clamp(-50.0, 50.0),
+            score_if_win=score.clone(),
+            score_if_loss=score.clone(),
+            p_win=p_win,
+            score_mean=score.clone(),
+            action_mask=mask,
+        )
+        agent.model.forward = lambda *a, **k: fixed_out
 
         # Forge the public list to the REVERSE order, bypassing __post_init__.
         reversed_public = list(reversed(list(obs.public.legal_actions)))
