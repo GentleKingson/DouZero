@@ -271,16 +271,28 @@ class DeepAgentV2:
                 f"{type(obs).__name__}"
             )
 
-        # Bug #3: schema-hash binding. The observation's feature_schema_hash
-        # must equal the model's. A mismatch means the observation was encoded
-        # under a different schema (e.g. a field reordered/resized) than the
-        # model was trained against — same shapes are NOT enough. Reject before
-        # forwarding so a mis-encoded observation cannot produce a silent
-        # garbage action.
-        if obs.feature_schema_hash != self._feature_schema_hash:
+        # Bug #3 / blocker: schema-hash binding, with recompute.
+        # ``ObservationV2.__post_init__`` already binds ``feature_schema_hash``
+        # to ``schema.stable_hash()`` at construction, but a value forged after
+        # construction (e.g. via ``object.__setattr__`` or pickle) would bypass
+        # it. Recompute from the attached schema here so the defense holds
+        # without trusting the carried string. Two distinct failures:
+        #   (a) obs carries a FALSE hash (hash != schema.stable_hash()) — the
+        #       container is lying about which schema encoded it;
+        #   (b) the schema the observation was actually encoded under differs
+        #       from the model's — same shapes are NOT enough.
+        actual_schema_hash = obs.schema.stable_hash()
+        if obs.feature_schema_hash != actual_schema_hash:
             raise ValueError(
-                f"DeepAgentV2 schema-hash mismatch: observation has "
-                f"{obs.feature_schema_hash!r}, model expects "
+                f"DeepAgentV2 received an ObservationV2 carrying a false "
+                f"schema hash: feature_schema_hash="
+                f"{obs.feature_schema_hash!r} but schema.stable_hash()="
+                f"{actual_schema_hash!r}. Refusing to forward."
+            )
+        if actual_schema_hash != self._feature_schema_hash:
+            raise ValueError(
+                f"DeepAgentV2 schema-hash mismatch: observation was encoded "
+                f"under schema {actual_schema_hash!r}, model expects "
                 f"{self._feature_schema_hash!r}. The observation was encoded "
                 f"under a different feature schema than the model was trained "
                 f"against. Refusing to forward."
@@ -307,7 +319,13 @@ class DeepAgentV2:
                 f"ruleset must not consume an observation encoded under another."
             )
 
-        legal_actions = obs.public.legal_actions
+        # Source the return action from ``obs.actions.legal_actions`` — the
+        # SAME container whose order matches ``obs.actions.features`` rows. The
+        # ``public.legal_actions`` list is verified to agree in order by
+        # ``ObservationV2.__post_init__``, but reading from the actions block
+        # guarantees the returned action is the one the model just scored even
+        # if a post-construction forge bypassed that check.
+        legal_actions = obs.actions.legal_actions
         # Bug #6: zero legal actions is a caller error. The model cannot select
         # from an empty action set; returning an empty tuple would let a silent
         # bug propagate downstream. Fail loudly.
@@ -343,12 +361,15 @@ class DeepAgentV2:
 
         obs = get_obs_v2(infoset, ruleset=self.ruleset)
         chosen = self.act_v2(obs)
-        # The V2 obs stores actions as tuples; the infoset stores them as lists.
-        # Map the chosen tuple back onto the infoset's canonical object so the
-        # returned action is the same type/identity the caller passed in.
-        chosen_key = tuple(chosen) if not isinstance(chosen, tuple) else chosen
+        # The V2 obs stores actions as sorted tuples (``actions.legal_actions``)
+        # and the infoset stores them as lists whose internal order may differ.
+        # Map the chosen sorted tuple back onto the infoset's canonical object
+        # by comparing as sorted tuples, so the returned action is the same
+        # type/identity the caller passed in (the legacy ``DeepAgent.act``
+        # returns the infoset's list, and this path matches).
+        chosen_sorted = tuple(sorted(chosen))
         for la in infoset.legal_actions:
-            if tuple(la) == chosen_key:
+            if tuple(sorted(la)) == chosen_sorted:
                 return la
         # Defensive: should be unreachable because get_obs_v2 preserves the
         # legal-action set. Fail loudly rather than returning a foreign object.
@@ -384,7 +405,7 @@ class DeepAgentV2:
             idx = int(torch.argmax(scores).item())
         else:
             idx = out.argmax_win()
-        legal_actions = obs.public.legal_actions
+        legal_actions = obs.actions.legal_actions
         # The action_mask may include padding rows beyond the real actions;
         # argmax over the win logit already respects the mask, so the index is
         # a real-action index as long as the observation's action block was not

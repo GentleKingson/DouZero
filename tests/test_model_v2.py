@@ -1417,19 +1417,27 @@ class TestStateFieldIdentity:
 # --------------------------------------------------------------------------- #
 class TestDeepAgentV2SchemaBinding:
     def test_act_v2_rejects_schema_hash_mismatch(self):
-        """An observation with a different schema hash is rejected."""
+        """An observation carrying a FALSE schema hash is rejected at the boundary.
+
+        ``ObservationV2.__post_init__`` already binds ``feature_schema_hash``
+        to ``schema.stable_hash()`` at construction. This test bypasses
+        ``__post_init__`` via ``object.__setattr__`` (simulating a pickle/reduce
+        forge or an in-place mutation attack) to verify the agent's OWN
+        recompute catches the forgery before any forward pass — the defense
+        must not trust the carried string.
+        """
         from douzero.evaluation.deep_agent import DeepAgentV2
 
         model = _build_model()
         model.eval()
         agent = DeepAgentV2("landlord", model, RuleSet.legacy())
         obs, _ = _build_v2_obs(seed=220, position="landlord")
-        # Corrupt the schema hash on the observation.
-        from douzero.observation.encode_v2 import ObservationV2
-        # ObservationV2 is frozen; reconstruct with a bogus hash via __replace__.
         import dataclasses
-        bad_obs = dataclasses.replace(obs, feature_schema_hash="bogus_hash")
-        with pytest.raises(ValueError, match="schema-hash mismatch"):
+        # Re-run __post_init__ on a still-consistent copy (no field changes),
+        # then forge the hash AFTER construction so __post_init__ is bypassed.
+        bad_obs = dataclasses.replace(obs)
+        object.__setattr__(bad_obs, "feature_schema_hash", "bogus_hash")
+        with pytest.raises(ValueError, match="false schema hash"):
             agent.act_v2(bad_obs)
 
     def test_agent_binds_to_model_schema_hash(self):
@@ -1657,6 +1665,109 @@ class TestZeroActionsRejection:
             action_mask=np.zeros((0,), dtype=np.int8),
             legal_actions=(),
         )
-        bad_obs = dataclasses.replace(obs, actions=empty_actions)
+        # ``ObservationV2.__post_init__`` now enforces public/actions legal-
+        # action alignment, so the public list must be emptied too for the
+        # container to be constructible. The point of this test is the batch
+        # bridge rejecting zero actions before the model sees them.
+        bad_public = dataclasses.replace(obs.public, legal_actions=())
+        bad_obs = dataclasses.replace(obs, public=bad_public, actions=empty_actions)
         with pytest.raises(ValueError, match="zero legal actions"):
             observation_to_model_inputs(bad_obs)
+
+
+# --------------------------------------------------------------------------- #
+# Round 3: DeepAgentV2 reads the return action from the actions block (same
+# source as the feature rows), the legacy act() mapping is robust to unsorted
+# infoset card lists, and an obs consistently encoded under a different schema
+# is rejected at the agent boundary.
+# --------------------------------------------------------------------------- #
+class TestDeepAgentV2ActionAlignment:
+    def test_act_v2_returns_action_from_actions_block_not_public(self, monkeypatch):
+        """When ``public.legal_actions`` and ``actions.legal_actions`` diverge
+        (forged post-construction via ``object.__setattr__`` so ``__post_init__``
+        is bypassed), ``act_v2`` must return the action aligned with the FEATURE
+        rows (``actions.legal_actions[idx]``), NOT ``public.legal_actions[idx]``.
+        """
+        import dataclasses
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        model.eval()
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
+        obs, _ = _build_v2_obs(seed=7, position="landlord")
+        if len(obs.actions.legal_actions) < 2:
+            pytest.skip("need >= 2 legal actions")
+
+        # Force argmax_win() == 0 so the selected row is known.
+        class _FixedOut:
+            def argmax_win(self):
+                return 0
+
+        agent.model.forward = lambda *a, **k: _FixedOut()
+
+        # Forge the public list to the REVERSE order, bypassing __post_init__.
+        reversed_public = list(reversed(list(obs.public.legal_actions)))
+        forged_public = dataclasses.replace(
+            obs.public, legal_actions=reversed_public)
+        object.__setattr__(obs, "public", forged_public)
+
+        chosen = agent.act_v2(obs)
+        # Must equal actions-block row 0 (aligned with the features the model
+        # just scored), NOT public row 0 (which now holds a different action).
+        assert tuple(sorted(chosen)) == tuple(sorted(obs.actions.legal_actions[0]))
+        assert tuple(sorted(chosen)) != tuple(sorted(reversed_public[0]))
+
+    def test_act_returns_an_infoset_legal_action(self):
+        """Regression for the act() mapping change (tuple-equality -> sorted-
+        tuple-equality): act() must still return exactly one infoset legal
+        action, robust to the infoset storing unsorted card lists."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()
+        model.eval()
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
+        obs, env = _build_v2_obs(seed=303, position="landlord", steps_into_game=2)
+        infoset = env.infoset
+        if len(infoset.legal_actions) <= 1:
+            pytest.skip("need >= 2 legal actions")
+        chosen = agent.act(infoset)
+        chosen_sorted = tuple(sorted(chosen))
+        matches = [la for la in infoset.legal_actions
+                   if tuple(sorted(la)) == chosen_sorted]
+        assert len(matches) == 1, (
+            f"act() returned {chosen!r} which does not map to exactly one "
+            f"infoset.legal_actions entry by sorted-tuple value")
+        # act() returns the canonical infoset object (identity or value match).
+        assert chosen is matches[0] or chosen == matches[0]
+
+    def test_act_v2_rejects_obs_encoded_under_different_schema(self):
+        """A self-consistent obs encoded under schema_B (its hash matches its
+        own schema) is still rejected when the model was trained under
+        schema_A. This exercises the agent's second-line check
+        (``actual_schema_hash != self._feature_schema_hash``), distinct from
+        the false-hash check exercised by ``test_act_v2_rejects_schema_hash_mismatch``.
+        """
+        import dataclasses
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        model = _build_model()  # bound to schema A
+        model.eval()
+        agent = DeepAgentV2("landlord", model, RuleSet.legacy())
+        obs, _ = _build_v2_obs(seed=220, position="landlord")
+        s_a = obs.schema
+        flds = list(s_a.state_fields)
+        f0, f1 = flds[0], flds[1]
+        # Same shape/dtype, swapped names -> same widths, different hash.
+        flds[0] = dataclasses.replace(f0, name=f1.name)
+        flds[1] = dataclasses.replace(f1, name=f0.name)
+        s_b = dataclasses.replace(s_a, state_fields=tuple(flds))
+        assert s_b.stable_hash() != s_a.stable_hash()
+        # Build a SELF-CONSISTENT obs under schema_b (hash matches schema_b),
+        # so the false-hash check passes and the model-mismatch check fires.
+        other_obs = dataclasses.replace(
+            obs, schema=s_b,
+            feature_schema_hash=s_b.stable_hash(),
+            feature_schema_version=s_b.schema_version,
+        )
+        with pytest.raises(ValueError, match="schema-hash mismatch"):
+            agent.act_v2(other_obs)

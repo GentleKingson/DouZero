@@ -954,3 +954,199 @@ class TestMultiplierRange:
             legal_actions=[[3]], total_multiplier=0)
         ctx = _build_context_block(pub, "playing", build_v2_schema())
         assert ctx.total_multiplier[0] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Round 3: ObservationV2 self-integrity + LegalActionBatch contract + public/
+# actions alignment. A forged container must not be able to claim a schema hash
+# it was not encoded under, and the action feature rows must stay aligned with
+# the returned legal-action list.
+# --------------------------------------------------------------------------- #
+class TestObservationSelfIntegrity:
+    """ObservationV2.__post_init__ binds feature_schema_hash to the schema."""
+
+    @staticmethod
+    def _real_obs():
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        return get_obs_v2(env.infoset)
+
+    def test_hash_matches_schema_at_construction(self):
+        obs = self._real_obs()
+        assert obs.feature_schema_hash == obs.schema.stable_hash()
+        assert obs.feature_schema_version == obs.schema.schema_version
+
+    def test_forged_hash_rejected_at_construction(self):
+        """A container claiming a hash that differs from its schema is rejected."""
+        import dataclasses
+        obs = self._real_obs()
+        with pytest.raises(ValueError, match="schema/hash mismatch"):
+            dataclasses.replace(obs, feature_schema_hash="0" * 64)
+
+    def test_forged_version_rejected_at_construction(self):
+        import dataclasses
+        obs = self._real_obs()
+        with pytest.raises(ValueError, match="schema-version mismatch"):
+            dataclasses.replace(obs, feature_schema_version="v9-bogus")
+
+    def test_same_width_reordered_field_names_changes_hash_and_is_rejected(self):
+        """A schema with the same total width but reordered state-field NAMES
+        hashes differently; an observation attaching it while keeping the
+        original hash is rejected at construction. This is the forgery vector
+        the review identified: identical shapes but different field order would
+        let a model silently consume wrong-semantics tensors if the hash were a
+        self-reported string instead of being bound to the schema object."""
+        import dataclasses
+        s_a = build_v2_schema()
+        flds = list(s_a.state_fields)
+        f0, f1 = flds[0], flds[1]
+        # Same shape/dtype, swapped names -> same total width, different hash.
+        flds[0] = dataclasses.replace(f0, name=f1.name)
+        flds[1] = dataclasses.replace(f1, name=f0.name)
+        s_b = dataclasses.replace(s_a, state_fields=tuple(flds))
+        assert s_b.stable_hash() != s_a.stable_hash()
+        # Attach schema_b but keep schema_a's hash -> __post_init__ rejects.
+        obs = self._real_obs()  # encoded under s_a
+        with pytest.raises(ValueError, match="schema/hash mismatch"):
+            dataclasses.replace(obs, schema=s_b)
+
+
+class TestLegalActionBatchContract:
+    """LegalActionBatch.__post_init__ enforces shape/mask/row alignment."""
+
+    @staticmethod
+    def _ref():
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        return get_obs_v2(env.infoset).actions
+
+    def test_features_must_be_2d(self):
+        from douzero.observation.encode_v2 import LegalActionBatch
+        w = self._ref().features.shape[1]
+        with pytest.raises(ValueError, match="2-D"):
+            LegalActionBatch(
+                features=np.zeros(w, dtype=np.int8),  # 1-D
+                action_mask=np.ones(1, dtype=np.int8),
+                legal_actions=((1,),),
+            )
+
+    def test_mask_wrong_length_rejected(self):
+        from douzero.observation.encode_v2 import LegalActionBatch
+        ref = self._ref()
+        with pytest.raises(ValueError, match="action_mask must have shape"):
+            LegalActionBatch(
+                features=ref.features,
+                action_mask=np.ones(ref.features.shape[0] + 1, dtype=np.int8),
+                legal_actions=ref.legal_actions,
+            )
+
+    def test_row_count_mismatch_rejected(self):
+        from douzero.observation.encode_v2 import LegalActionBatch
+        ref = self._ref()
+        n = ref.features.shape[0]
+        if n < 2:
+            pytest.skip("need >= 2 legal actions")
+        m = n - 1
+        with pytest.raises(ValueError, match="row-count mismatch"):
+            LegalActionBatch(
+                features=ref.features,
+                action_mask=np.ones(n, dtype=np.int8),
+                legal_actions=ref.legal_actions[:m],  # one fewer entry
+            )
+
+    def test_all_zero_mask_rejected(self):
+        from douzero.observation.encode_v2 import LegalActionBatch
+        ref = self._ref()
+        n = ref.features.shape[0]
+        with pytest.raises(ValueError, match="all-ones"):
+            LegalActionBatch(
+                features=ref.features,
+                action_mask=np.zeros(n, dtype=np.int8),
+                legal_actions=ref.legal_actions,
+            )
+
+    def test_non_binary_mask_rejected(self):
+        from douzero.observation.encode_v2 import LegalActionBatch
+        ref = self._ref()
+        mask = np.ones(ref.features.shape[0], dtype=np.int8)
+        mask[0] = 2  # non-binary value
+        with pytest.raises(ValueError, match="all-ones"):
+            LegalActionBatch(
+                features=ref.features,
+                action_mask=mask,
+                legal_actions=ref.legal_actions,
+            )
+
+    def test_partial_zero_mask_rejected(self):
+        from douzero.observation.encode_v2 import LegalActionBatch
+        ref = self._ref()
+        mask = np.ones(ref.features.shape[0], dtype=np.int8)
+        mask[0] = 0
+        with pytest.raises(ValueError, match="all-ones"):
+            LegalActionBatch(
+                features=ref.features,
+                action_mask=mask,
+                legal_actions=ref.legal_actions,
+            )
+
+    def test_empty_batch_is_legal(self):
+        """A zero-action batch (N=0) satisfies all invariants (vacuous mask)."""
+        from douzero.observation.encode_v2 import LegalActionBatch
+        w = self._ref().features.shape[1]
+        lab = LegalActionBatch(
+            features=np.zeros((0, w), dtype=np.int8),
+            action_mask=np.ones(0, dtype=np.int8),
+            legal_actions=(),
+        )
+        assert lab.features.shape == (0, w)
+        assert lab.action_mask.shape == (0,)
+
+
+class TestPublicActionAlignment:
+    """ObservationV2.__post_init__ enforces public/actions legal-action alignment."""
+
+    @staticmethod
+    def _obs():
+        env = Env("adp")
+        np.random.seed(0)
+        env.reset()
+        return get_obs_v2(env.infoset)
+
+    def test_count_mismatch_rejected(self):
+        import dataclasses
+        from douzero.observation.encode_v2 import LegalActionBatch
+        obs = self._obs()
+        n = obs.actions.features.shape[0]
+        if n < 2:
+            pytest.skip("need >= 2 legal actions")
+        m = n - 1
+        shorter = LegalActionBatch(
+            features=obs.actions.features[:m],
+            action_mask=np.ones(m, dtype=np.int8),
+            legal_actions=obs.actions.legal_actions[:m],
+        )
+        with pytest.raises(ValueError, match="legal-action count mismatch"):
+            dataclasses.replace(obs, actions=shorter)
+
+    def test_reordered_public_actions_rejected(self):
+        """Same set, but the public list reordered vs the feature rows. The
+        agent maps a feature-row index back through these lists, so a reorder
+        would silently return the wrong cards; reject it."""
+        import dataclasses
+        obs = self._obs()
+        pub = list(obs.public.legal_actions)
+        if len(pub) < 2:
+            pytest.skip("need >= 2 legal actions")
+        reordered = [pub[1], pub[0]] + list(pub[2:])
+        bad_public = dataclasses.replace(obs.public, legal_actions=reordered)
+        with pytest.raises(ValueError, match="legal-action 0 mismatch"):
+            dataclasses.replace(obs, public=bad_public)
+
+    def test_consistent_observation_constructs_cleanly(self):
+        """A legitimately encoded observation passes all new checks."""
+        obs = self._obs()
+        # Re-running __post_init__ via replace (no field changes) must NOT raise.
+        import dataclasses
+        dataclasses.replace(obs)

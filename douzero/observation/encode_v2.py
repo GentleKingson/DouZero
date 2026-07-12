@@ -171,6 +171,38 @@ class LegalActionBatch:
             object.__setattr__(self, "features", _freeze(self.features))
         if self.action_mask.flags.writeable:
             object.__setattr__(self, "action_mask", _freeze(self.action_mask))
+        # Shape contract: features is 2-D (N, action_width). The three
+        # per-action quantities — feature rows, mask entries, and action
+        # descriptors — must agree in row count, otherwise the i-th feature
+        # row could describe action A while legal_actions[i] names action B.
+        if self.features.ndim != 2:
+            raise ValueError(
+                f"LegalActionBatch.features must be 2-D (N, action_width), "
+                f"got shape {self.features.shape!r}"
+            )
+        n = self.features.shape[0]
+        if self.action_mask.shape != (n,):
+            raise ValueError(
+                f"LegalActionBatch.action_mask must have shape ({n},), "
+                f"got {self.action_mask.shape!r}"
+            )
+        if len(self.legal_actions) != n:
+            raise ValueError(
+                f"LegalActionBatch row-count mismatch: features has {n} rows "
+                f"but legal_actions has {len(self.legal_actions)} entries. "
+                f"Feature row i must describe legal_actions[i]."
+            )
+        # Mask value contract: every row of a real LegalActionBatch is a legal
+        # action, so action_mask is all-ones. Padding belongs to the batch
+        # bridge (observation_to_model_inputs / ModelOutput), not this type.
+        # ``== 1`` rejects all-zero, non-binary, and partial masks alike.
+        if not np.all(self.action_mask == 1):
+            raise ValueError(
+                "LegalActionBatch.action_mask must be all-ones for a real "
+                "legal-action batch (every row is a legal action). Got a "
+                "mask with zero or non-binary entries; padding belongs to "
+                "the batch bridge, not this container."
+            )
 
 
 @dataclass(frozen=True)
@@ -275,6 +307,54 @@ class ObservationV2:
     feature_schema_version: str
     feature_schema_hash: str
     card_play_action_seq: tuple[tuple[int, ...], ...] = ()
+
+    def __post_init__(self) -> None:
+        # Schema self-integrity. The carried ``feature_schema_hash`` /
+        # ``feature_schema_version`` MUST match the schema object actually
+        # attached. Without this, a forged container could carry ``schema_B``
+        # (same shapes, reordered/relabeled fields) while claiming schema_A's
+        # hash: the agent's hash-string check would pass, yet
+        # ``observation_to_model_inputs`` would split tensors by schema_B's
+        # field order and the model would silently consume wrong-semantics
+        # inputs. Recompute from ``self.schema`` so the hash is bound to the
+        # actual schema object, not a self-reported string.
+        if self.feature_schema_version != self.schema.schema_version:
+            raise ValueError(
+                f"ObservationV2 schema-version mismatch: "
+                f"feature_schema_version={self.feature_schema_version!r} "
+                f"but schema.schema_version={self.schema.schema_version!r}."
+            )
+        actual_hash = self.schema.stable_hash()
+        if self.feature_schema_hash != actual_hash:
+            raise ValueError(
+                f"ObservationV2 schema/hash mismatch: feature_schema_hash="
+                f"{self.feature_schema_hash!r} but schema.stable_hash()="
+                f"{actual_hash!r}. The observation carries a false schema hash."
+            )
+        # Legal-action alignment. ``obs.public.legal_actions`` holds the raw
+        # infoset actions (lists, possibly unsorted) while
+        # ``obs.actions.legal_actions`` holds the sorted-tuple form whose ORDER
+        # matches the feature rows. The agent selects an index from
+        # ``actions.features`` and maps it back through these lists, so the two
+        # must agree element-wise AND in order — a reordering would silently
+        # return the wrong cards. Compare as sorted tuples so the check is
+        # robust to the list-vs-tuple / internal-order representation difference.
+        public_la = self.public.legal_actions
+        actions_la = self.actions.legal_actions
+        if len(public_la) != len(actions_la):
+            raise ValueError(
+                f"ObservationV2 legal-action count mismatch: "
+                f"public has {len(public_la)} but actions has "
+                f"{len(actions_la)}."
+            )
+        for i, (pub, act) in enumerate(zip(public_la, actions_la)):
+            if tuple(sorted(pub)) != tuple(sorted(act)):
+                raise ValueError(
+                    f"ObservationV2 legal-action {i} mismatch: public entry "
+                    f"{pub!r} != actions entry {act!r} (compared as sorted "
+                    f"tuples). The public/action action lists must agree in "
+                    f"order; feature row i must describe public[i]."
+                )
 
     @property
     def is_privileged(self) -> bool:
