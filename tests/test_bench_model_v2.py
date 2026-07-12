@@ -29,6 +29,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BENCH = REPO_ROOT / "benchmarks" / "bench_model_v2.py"
 
@@ -79,6 +81,16 @@ def test_bench_model_v2_deep_agent_path_runs(tmp_path):
     assert "End-to-end DeepAgentV2.act" in md.read_text(), (
         "Markdown missing the end-to-end DeepAgentV2 section"
     )
+
+
+def test_landlord_env_overflow_fails_closed():
+    """An oversized steps_into_game (game ends mid-pre-roll) raises a clear
+    ValueError naming steps_into_game — not a cryptic crash and not a silent
+    bogus measurement. Pins the fail-closed contract on the shared pre-roll."""
+    from benchmarks.bench_model_v2 import _landlord_env
+
+    with pytest.raises(ValueError, match="steps_into_game"):
+        _landlord_env(42, 10_000)
 
 
 def test_bench_model_v2_constructs_agent_with_explicit_ruleset():

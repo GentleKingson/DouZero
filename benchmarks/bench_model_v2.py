@@ -96,14 +96,13 @@ def _landlord_env(seed: int, steps_into_game: int):
     numbers are measured at the SAME (non-degenerate) decision point with a REAL
     history — not an opening move whose empty history would understate the cost.
 
-    Fail-closed: the only legitimate early-exit from the pre-roll is the game
-    ending naturally, detected via the ``done`` flag returned by ``env.step``
-    (or an empty legal-action set). Any OTHER exception — e.g. an inconsistent
-    env state from stepping past the game's natural length — PROPAGATES so the
-    benchmark exits loudly instead of swallowing it and rendering bogus medians
-    (the anti-pattern blocker #3 closed on the deep-agent path; the same
-    contract applies to the forward-only setup). Keep ``steps_into_game`` well
-    within one game's length.
+    Fail-closed: ``steps_into_game`` must stay within one game's length. If a
+    pre-roll step ends the game (the ``done`` flag returned by ``env.step``), the
+    requested depth exceeds the game and a ``ValueError`` is raised with a clear
+    message — the benchmark exits loudly rather than falling through to step a
+    terminal game and crash cryptically. (Same fail-closed contract blocker #3
+    established for the deep-agent path.) The default ``--steps_into_game=4`` is
+    well within a full game.
     """
     import numpy as np
     from douzero.env.env import Env
@@ -112,13 +111,19 @@ def _landlord_env(seed: int, steps_into_game: int):
     env = Env("adp")
     env.reset()
     for _ in range(steps_into_game):
-        if not env.infoset.legal_actions:
-            break  # terminal: no moves left — stop the pre-roll cleanly
         _obs, _reward, done, _info = env.step(env.infoset.legal_actions[0])
         if done:
-            break  # game ended naturally before completing the pre-roll
+            raise ValueError(
+                f"--steps_into_game={steps_into_game} reaches/passes the end of "
+                f"the game; reduce it to stay within one game's length."
+            )
     while env._acting_player_position != "landlord":
-        env.step(env.infoset.legal_actions[0])
+        _obs, _reward, done, _info = env.step(env.infoset.legal_actions[0])
+        if done:
+            raise ValueError(
+                "no landlord turn is reachable before the game ends at the "
+                "requested depth; reduce --steps_into_game."
+            )
     return env
 
 

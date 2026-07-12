@@ -162,11 +162,11 @@ def _resolve_model_identity(
 
     ``schema_hash`` / ``model_config`` default to the model's own
     (``model.schema.stable_hash()`` / ``model.config.stable_hash()``). A caller-
-    supplied override is accepted ONLY if it equals the model's own identity —
-    otherwise ``ValueError``. A non-ModelV2 (no ``.schema`` / ``.config``) and a
-    wrong-typed ``model_config`` are ``TypeError`` (the type guard keeps the
-    error class consistent with the schema_hash path, which compares by value
-    and would otherwise raise ``AttributeError`` on a non-config object).
+    supplied override is accepted ONLY if it equals the model's own identity — a
+    wrong VALUE raises ``ValueError``. A wrong TYPE (a non-str ``schema_hash``, a
+    non-``ModelV2Config`` ``model_config``, or a non-ModelV2 ``model``) raises
+    ``TypeError``. The wrong-type contract is uniform across BOTH axes so a
+    caller catching ``TypeError`` for a bad type does not silently miss one axis.
     """
     try:
         actual_schema_hash = model.schema.stable_hash()
@@ -179,6 +179,10 @@ def _resolve_model_identity(
 
     if schema_hash is None:
         resolved_schema_hash = actual_schema_hash
+    elif not isinstance(schema_hash, str):
+        raise TypeError(
+            f"schema_hash must be a str, got {type(schema_hash).__name__}."
+        )
     elif schema_hash != actual_schema_hash:
         raise ValueError(
             f"schema_hash mismatch: passed {schema_hash!r} but the model's "

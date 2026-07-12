@@ -756,10 +756,25 @@ class TestSaveLoad:
         )
         assert isinstance(state_dict, dict)
 
+    def test_v2_checkpoint_save_rejects_non_str_schema_hash(self, tmp_path):
+        """A wrong-typed schema_hash override raises TypeError — the wrong-type
+        contract is uniform across both axes, so a caller catching TypeError for
+        a bad type does not silently miss the schema_hash axis."""
+        from douzero.checkpoint import save_v2_checkpoint
+
+        model = _build_model()
+        bundle_path = str(tmp_path / "model_v2.tar")
+        with pytest.raises(TypeError, match="schema_hash must be a str"):
+            save_v2_checkpoint(
+                bundle_path, model, ruleset=RuleSet.legacy(),
+                schema_hash=12345,
+                model_config=model.config,
+            )
+
     def test_v2_checkpoint_save_rejects_non_modelconfig_type(self, tmp_path):
-        """A wrong-typed model_config override raises TypeError (not
-        AttributeError), consistent with the schema_hash path and the
-        documented ValueError/TypeError contract."""
+        """A wrong-typed model_config override raises TypeError — wrong TYPE is
+        TypeError on both axes; wrong VALUE (a real but mismatched config) is
+        ValueError."""
         from douzero.checkpoint import save_v2_checkpoint
 
         model = _build_model()
