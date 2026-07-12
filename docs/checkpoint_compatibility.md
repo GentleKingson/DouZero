@@ -86,7 +86,37 @@ Consequences:
   (`legacy`) from a factorized-trained one (`factorized`). In P04, training
   is still legacy-only (the `dmc.py` gate rejects `model_version='factorized'`
   for training), so no `factorized`-stamped training checkpoint is produced
-  yet. P05/P06 widen this.
+  yet. P06 widens this.
+
+## P05 Model V2 — separate state_dict, strict load
+
+The P05 Model V2 (`douzero/models_v2/`) is a **different architecture** from
+the legacy / factorized models: it has a shared trunk, role embeddings, a
+Transformer/LSTM history encoder, and multi-head outputs. Its `state_dict`
+keys and shapes do **not** match the legacy models, so a legacy `.ckpt`
+**cannot** be loaded into a V2 model and vice versa.
+
+P05 adds V2-aware checkpoint helpers in `douzero/checkpoint/v2.py`:
+
+- `save_v2_checkpoint(path, model, schema_hash=...)` — writes a `model_v2.tar`
+  bundle (state_dict + manifest + config + feature schema hash). The manifest
+  is stamped with `model_version="v2"` and `feature_version="v2"`.
+- `load_v2_checkpoint(path, expected_schema_hash=...)` — reads a V2 bundle,
+  validates the manifest, and optionally binds the feature schema hash so a
+  schema drift is rejected. Raises `CheckpointCompatibilityError` on any
+  mismatch, including an attempt to load a legacy/factorized `model.tar` here.
+- `save_v2_position_weights(path, model, schema_hash=...)` — writes a bare
+  `.ckpt` sidecar for `DeepAgentV2` deployment (the strict manifest-bearing
+  sidecar arrives in P16).
+
+The strict V2 loader (`load_v2_model` in `deep_agent.py`) performs a full
+key-set + shape match and raises `ValueError` on any mismatch — there is no
+permissive partial load. The existing `load_checkpoint` (legacy/factorized
+`model.tar`) already rejects a `model_version` mismatch via the manifest
+validator, so a V2 bundle cannot be silently loaded as legacy.
+
+Training is still legacy-only (the `dmc.py` gate rejects `model_version='v2'`
+for training until P06); see `docs/model_v2.md` for the deployment path.
 
 ## Security: weights_only by default
 
