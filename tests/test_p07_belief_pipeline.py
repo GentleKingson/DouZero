@@ -173,4 +173,3 @@ class TestCLI:
             "--save_dir", "/tmp/x", "--num_episodes", "1", "--epochs", "1",
         ])
         assert args.num_episodes == 1
-        assert args.ruleset == "legacy"

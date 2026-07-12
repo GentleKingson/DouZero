@@ -20,9 +20,7 @@ from typing import Sequence
 import numpy as np
 import torch
 
-from douzero.belief import belief_metrics
 from douzero.belief.checkpoint import load_belief_checkpoint
-from douzero.belief.constraints import legal_mask
 from douzero.belief.data import collect_random_dataset
 from douzero.env.rules import RuleSet
 
@@ -38,8 +36,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--num_episodes", type=int, default=20,
                    help="number of random self-play games for evaluation data")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--ruleset", default="legacy",
-                   choices=["legacy", "standard"])
     return p.parse_args(argv)
 
 
@@ -48,7 +44,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    ruleset = RuleSet.legacy() if args.ruleset == "legacy" else RuleSet.standard()
+    # The belief collector only produces legacy-ruleset data in P07 (Blocker
+    # #2); the checkpoint is stamped legacy, so we validate against legacy.
+    ruleset = RuleSet.legacy()
     model = load_belief_checkpoint(
         args.checkpoint, expected_ruleset=ruleset, map_location="cpu"
     )
@@ -67,56 +65,93 @@ def main(argv: Sequence[str] | None = None) -> int:
     feats = torch.from_numpy(dataset.feature_matrix().astype(np.float32))
     legal = dataset.legal_mask_tensor().numpy()
     targets = np.stack([s.label.allocation for s in dataset.samples], axis=0)
+    totals = np.array(
+        [s.binput.opponent_a_total for s in dataset.samples], dtype=np.int64
+    )
 
-    # Forward in chunks to keep memory bounded on CPU.
+    # Forward in chunks to keep memory bounded on CPU. We compute BOTH:
+    #   (a) the independent per-rank "factor" argmax (informational; does NOT
+    #       respect the total-count constraint), and
+    #   (b) the constrained DP MAP decode (the actual deployment decoder; MUST
+    #       be 100% total-conservative by construction).
+    # Reporting both (Medium #4) makes the conservation guarantee visible and
+    # avoids presenting the unconstrained factor argmax as the model's output.
+
     model.eval()
-    chunk = 512
-    all_probs = []
-    conservation_ok = 0
-    conservation_total = 0
+    chunk = 256
+    factor_argmax_preds = []
+    map_preds = []
+    map_conservation_ok = 0
     with torch.no_grad():
         for start in range(0, feats.shape[0], chunk):
             sl = slice(start, start + chunk)
-            logits = model._forward_logits(feats[sl]).numpy()
-            lg = legal[sl]
-            masked = np.where(lg, logits, -1e30)
-            probs = torch.softmax(
-                torch.from_numpy(masked), dim=-1
-            ).numpy()
-            all_probs.append(probs)
-            # Conservation check: argmax-restricted MAP decodes must sum to the
-            # per-sample opponent-A total. We check the per-rank cap here; the
-            # exact-total DP is covered by the test suite.
-            pred = np.where(lg, probs, -1.0).argmax(axis=-1)
-            for i in range(pred.shape[0]):
-                if int(pred[i].sum()) == int(
-                    dataset.samples[start + i].binput.opponent_a_total
-                ):
-                    conservation_ok += 1
-                conservation_total += 1
-    probs_all = np.concatenate(all_probs, axis=0)
+            inputs = [s.binput for s in dataset.samples[start:start + chunk]]
+            out = model(inputs)
+            lg = out.legal.cpu().numpy()
+            factor_probs = out.factor_probs.cpu().numpy()
+            # (a) independent per-rank argmax (restricted to legal slots).
+            factor_argmax_preds.append(
+                np.where(lg, factor_probs, -1.0).argmax(axis=-1)
+            )
+            # (b) constrained DP MAP decode (exact total constraint).
+            map_alloc = model.decode_map(out)
+            map_preds.append(map_alloc)
+            for i in range(map_alloc.shape[0]):
+                if int(map_alloc[i].sum()) == int(totals[start + i]):
+                    map_conservation_ok += 1
+    factor_argmax_all = np.concatenate(factor_argmax_preds, axis=0)
+    map_all = np.concatenate(map_preds, axis=0)
+    map_conservation_total = int(map_all.shape[0])
 
-    metrics = belief_metrics(probs_all, targets, legal)
-    print("[evaluate_belief] metrics:", file=sys.stderr)
-    for k, v in metrics.items():
-        print(f"  {k}: {v:.4f}", file=sys.stderr)
+    # Factor-argmax metrics (independent per-rank; NOT total-conservative).
+    factor_metrics = belief_metrics(
+        np.where(legal, 1.0, 0.0)[np.arange(len(targets))[:, None],
+                                   np.arange(legal.shape[1])[None, :],
+                                   factor_argmax_all].reshape(-1, 1, 1),
+        targets, legal,
+    ) if False else _allocation_metrics(factor_argmax_all, targets, legal)
+    # Constrained DP MAP metrics (the deployment decoder).
+    map_metrics = _allocation_metrics(map_all, targets, legal)
+    map_conservation = map_conservation_ok / map_conservation_total
+
+    print("[evaluate_belief] factor-argmax metrics (independent per-rank):",
+          file=sys.stderr)
+    for k, v in factor_metrics.items():
+        print(f"  factor_argmax_{k}: {v:.4f}", file=sys.stderr)
+    print("[evaluate_belief] constrained MAP metrics (DP decoder, deployed):",
+          file=sys.stderr)
+    for k, v in map_metrics.items():
+        print(f"  constrained_map_{k}: {v:.4f}", file=sys.stderr)
     print(
-        f"[evaluate_belief] argmax-total conservation: "
-        f"{conservation_ok}/{conservation_total}",
+        f"[evaluate_belief] constrained_map_conservation: "
+        f"{map_conservation_ok}/{map_conservation_total} "
+        f"({map_conservation:.4f}) [must be 1.0]",
         file=sys.stderr,
     )
 
     # Machine-readable JSON to stdout for logging.
     import json
+
     out = {
         "checkpoint": args.checkpoint,
         "num_samples": n,
         "belief_config_hash": config.stable_hash(),
-        **metrics,
-        "argmax_total_conservation": conservation_ok / conservation_total,
+        "factor_argmax": factor_metrics,
+        "constrained_map": map_metrics,
+        "constrained_map_conservation": map_conservation,
     }
     print(json.dumps(out, indent=2))
     return 0
+
+
+def _allocation_metrics(pred, target, legal):
+    """Rank accuracy / exact match / count MAE for a (B,15) int allocation."""
+    rank_match = (pred == target)
+    return {
+        "rank_accuracy": float(rank_match.mean()),
+        "exact_match": float(rank_match.all(axis=-1).mean()),
+        "count_mae": float(np.abs(pred - target).mean()),
+    }
 
 
 if __name__ == "__main__":

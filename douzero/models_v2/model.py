@@ -228,6 +228,7 @@ class ModelV2(nn.Module):
         acting_role: str,
         belief_features: torch.Tensor | None = None,
         belief_stop_gradient: bool = True,
+        allow_missing_belief_features: bool = False,
     ) -> ModelOutput:
         """Run a full forward pass for one decision.
 
@@ -312,13 +313,23 @@ class ModelV2(nn.Module):
         # (default True) detaches the features so value loss never updates the
         # frozen belief weights — the "pretrain belief then freeze" path. A
         # caller doing joint training passes ``belief_stop_gradient=False``.
-        # When ``belief_enabled`` but no features are supplied, a zero vector is
-        # used so the model still runs (the belief signal is absent, not an
-        # error) — useful for ablations and the masked-zero baseline.
+        # When ``belief_enabled`` but no features are supplied, the model
+        # FAILS CLOSED by default (a belief-trained checkpoint must not silently
+        # degrade to a zero-feature baseline at deployment). Pass
+        # ``allow_missing_belief_features=True`` to opt into the zero-vector
+        # behaviour for ablations / unit tests.
         if self.belief_proj is not None:
             from douzero.belief.model import BELIEF_FEATURE_DIM
 
             if belief_features is None:
+                if not allow_missing_belief_features:
+                    raise ValueError(
+                        "belief_features were not supplied to a belief-ENABLED "
+                        "ModelV2. A checkpoint trained with belief fusion must "
+                        "receive the frozen belief posterior at every forward; "
+                        "pass allow_missing_belief_features=True only for "
+                        "explicit ablations."
+                    )
                 belief_features = state_trunk.new_zeros(BELIEF_FEATURE_DIM)
             else:
                 if belief_features.shape[-1] != BELIEF_FEATURE_DIM:
@@ -394,13 +405,19 @@ class ModelV2(nn.Module):
         parameters only (buffers like LayerNorm running stats are excluded).
         """
         counts: dict[str, int] = {}
-        for name, module in (
+        # Build the submodule list, including the optional belief projection
+        # when present, so a belief-enabled model's parameter report is not
+        # silently undercounted.
+        submodules: list[tuple[str, nn.Module]] = [
             ("state_encoder", self.state_encoder),
             ("history_encoder", self.history_encoder),
             ("action_encoder", self.action_encoder),
             ("fusion", self.fusion),
             ("heads", self.heads),
-        ):
+        ]
+        if self.belief_proj is not None:
+            submodules.append(("belief_proj", self.belief_proj))
+        for name, module in submodules:
             counts[name] = sum(p.numel() for p in module.parameters() if p.requires_grad)
         counts["total"] = sum(counts.values())
         return counts

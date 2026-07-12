@@ -128,20 +128,19 @@ def collect_random_dataset(
             if len(legal) > 1:
                 obs = get_obs_v2(infoset)
                 binput = build_belief_input(obs.public)
-                try:
-                    label = build_belief_label(
-                        acting_role=infoset.player_position,
-                        all_handcards=infoset.all_handcards,
-                        unseen_counts=binput.unseen_counts,
-                        num_cards_left=infoset.num_cards_left_dict,
-                        bottom_unplayed=infoset.three_landlord_cards,
-                    )
-                    dataset.samples.append(BeliefSample(binput, label))
-                except ValueError:
-                    # A conservation inconsistency would indicate an env bug;
-                    # skip rather than crash the whole collection. (No such
-                    # case has been observed; the guard is defensive.)
-                    pass
+                # Fail-fast: a conservation inconsistency here indicates an
+                # env/feature bug, NOT a recoverable data point. Earlier this
+                # was silently swallowed (Medium #5), which hid real
+                # inconsistencies and biased the dataset. Let it propagate with
+                # a state summary so the source is diagnosable.
+                label = build_belief_label(
+                    acting_role=infoset.player_position,
+                    all_handcards=infoset.all_handcards,
+                    unseen_counts=binput.unseen_counts,
+                    num_cards_left=infoset.num_cards_left_dict,
+                    bottom_unplayed=infoset.three_landlord_cards,
+                )
+                dataset.samples.append(BeliefSample(binput, label))
             _obs, _r, done, _info = env.step(action)
             if done:
                 break

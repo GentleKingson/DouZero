@@ -126,7 +126,11 @@ def save_belief_checkpoint(
         checkpoint_kind="belief_model",
         git_sha=_git_sha(),
         python_version=platform.python_version(),
-        torch_version=torch.__version__,
+        # str() coerces torch's TorchVersion (a str subclass) to a native
+        # Python str. Storing a TorchVersion object triggers an "Unsupported
+        # global" error under weights_only=True loading (torch.torch_version.
+        # TorchVersion is not in the safe allowlist). Mirrors the V2 manifest.
+        torch_version=str(torch.__version__),
         platform=platform.platform(),
         created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         frames=int(frames),
@@ -155,16 +159,35 @@ def save_belief_checkpoint(
 def load_belief_checkpoint(
     path: str,
     *,
+    expected_ruleset: "object",
+    expected_feature_version: str = "v2",
     expected_belief_config: "object | None" = None,
-    expected_ruleset: "object | None" = None,
     map_location: Any = "cpu",
+    allow_unsafe_pickle: bool = False,
 ) -> "object":
     """Load and validate a belief checkpoint, returning a ready model.
 
-    Validates the manifest's architecture hash against ``expected_belief_config``
-    (if provided) and the ruleset identity against ``expected_ruleset`` (if
-    provided). Raises :class:`ValueError` on any mismatch rather than
-    permissively partial-loading.
+    Security (Blocker #1): the bundle is loaded with ``weights_only=True`` by
+    default, so untrusted checkpoints cannot trigger arbitrary pickle
+    deserialization. ``allow_unsafe_pickle=True`` opts back into the legacy
+    unpickler and should only be set for locally-produced, trusted files when a
+    weights-only load fails (e.g. an older torch without full weights-only
+    support).
+
+    Validation (performed BEFORE any model construction so a malformed or
+    hostile bundle is rejected at the boundary):
+
+    - bundle is a dict with the expected keys and value types;
+    - manifest ``schema_version``, ``model_version``, ``checkpoint_kind`` and
+      ``feature_version`` match the expected values;
+    - the reconstructed ``BeliefConfig`` reproduces the manifest's
+      ``belief_config_hash`` (the strict architecture identity axis), and
+      matches ``expected_belief_config`` when supplied;
+    - the ruleset identity (id/version/hash) matches ``expected_ruleset``.
+
+    ``expected_ruleset`` is REQUIRED (callers must state the rule contract they
+    intend to load under). Raises :class:`ValueError` / :class:`TypeError` on
+    any mismatch rather than permissively partial-loading.
 
     Returns the reconstructed :class:`~douzero.belief.model.BeliefModel` in
     ``eval()`` mode.
@@ -173,25 +196,92 @@ def load_belief_checkpoint(
 
     from .model import BeliefConfig, BeliefModel
 
-    bundle = torch.load(path, map_location=map_location, weights_only=False)
-    if not isinstance(bundle, dict) or _MANIFEST_KEY not in bundle:
-        raise ValueError(
-            f"{path!r} is not a belief checkpoint bundle (missing "
-            f"{_MANIFEST_KEY!r})."
+    if expected_ruleset is None:
+        raise TypeError(
+            "expected_ruleset is REQUIRED: a caller must state the rule "
+            "contract it intends to load under. Pass a RuleSet instance."
         )
+    if not isinstance(expected_ruleset, RuleSet):
+        raise TypeError(
+            f"expected_ruleset must be a RuleSet, got "
+            f"{type(expected_ruleset).__name__}"
+        )
+
+    weights_only = not allow_unsafe_pickle
+    bundle = torch.load(
+        path, map_location=map_location, weights_only=weights_only
+    )
+    if not isinstance(bundle, dict):
+        raise ValueError(
+            f"{path!r} is not a belief checkpoint bundle (top-level object is "
+            f"{type(bundle).__name__}, expected dict)."
+        )
+    for key in (_STATE_DICT_KEY, _MANIFEST_KEY, _CONFIG_KEY):
+        if key not in bundle:
+            raise ValueError(
+                f"{path!r} is not a belief checkpoint bundle (missing "
+                f"{key!r})."
+            )
     manifest = bundle[_MANIFEST_KEY]
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            f"manifest must be a dict, got {type(manifest).__name__}"
+        )
+    config_fields = bundle[_CONFIG_KEY]
+    if not isinstance(config_fields, dict):
+        raise ValueError(
+            f"belief config fields must be a dict, got "
+            f"{type(config_fields).__name__}"
+        )
+    state_dict = bundle[_STATE_DICT_KEY]
+    if not isinstance(state_dict, dict):
+        raise ValueError(
+            f"state_dict must be a dict, got {type(state_dict).__name__}"
+        )
+
+    # Identity / schema validation.
+    if manifest.get("schema_version") != BELIEF_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            "belief checkpoint schema_version mismatch: checkpoint "
+            f"{manifest.get('schema_version')!r} != runtime "
+            f"{BELIEF_MANIFEST_SCHEMA_VERSION!r}."
+        )
     if manifest.get("model_version") != BELIEF_MODEL_VERSION:
         raise ValueError(
             f"checkpoint model_version {manifest.get('model_version')!r} != "
             f"expected {BELIEF_MODEL_VERSION!r}."
         )
+    if manifest.get("checkpoint_kind") != "belief_model":
+        raise ValueError(
+            "checkpoint_kind mismatch: checkpoint "
+            f"{manifest.get('checkpoint_kind')!r} != 'belief_model'. This "
+            "loader only consumes belief-model checkpoints."
+        )
+    if manifest.get("feature_version") != expected_feature_version:
+        raise ValueError(
+            "feature_version mismatch: checkpoint "
+            f"{manifest.get('feature_version')!r} != expected "
+            f"{expected_feature_version!r}."
+        )
+
     # Reconstruct the config from the CONSTRUCTOR fields (stored at the bundle
     # top level under _CONFIG_KEY), NOT from ``manifest['belief_config']``
     # (which is the full compatibility dict including derived constants that
     # are not valid constructor kwargs).
-    config = BeliefConfig(**bundle[_CONFIG_KEY])
-    # Architecture hash check (the strict identity axis).
+    try:
+        config = BeliefConfig(**config_fields)
+    except TypeError as exc:
+        raise ValueError(
+            f"belief config fields in checkpoint are invalid: {exc}"
+        ) from exc
     runtime_hash = config.stable_hash()
+    if runtime_hash != manifest.get("belief_config_hash"):
+        raise ValueError(
+            "belief config reconstructed from checkpoint does not reproduce "
+            f"its manifest hash ({runtime_hash!r} vs "
+            f"{manifest.get('belief_config_hash')!r}); the checkpoint is "
+            "corrupted or the config schema drifted."
+        )
     if expected_belief_config is not None:
         expected_hash = expected_belief_config.stable_hash()
         if expected_hash != manifest["belief_config_hash"]:
@@ -201,30 +291,28 @@ def load_belief_checkpoint(
                 f"{expected_hash!r}. The checkpoint was trained under a "
                 "different belief architecture."
             )
-    if runtime_hash != manifest["belief_config_hash"]:
-        raise ValueError(
-            "belief config reconstructed from checkpoint does not reproduce "
-            f"its manifest hash ({runtime_hash!r} vs "
-            f"{manifest['belief_config_hash']!r}); the config schema drifted."
-        )
-    # Ruleset identity check.
-    if expected_ruleset is not None:
-        rs_ident = expected_ruleset.identity()
-        for key in ("ruleset_id", "ruleset_version", "ruleset_hash"):
-            if manifest.get(key) != rs_ident.get(key):
-                raise ValueError(
-                    f"ruleset {key} mismatch: checkpoint {manifest.get(key)!r} "
-                    f"!= runtime {rs_ident.get(key)!r}."
-                )
+    # Ruleset identity check (REQUIRED).
+    rs_ident = expected_ruleset.identity()
+    for key in ("ruleset_id", "ruleset_version", "ruleset_hash"):
+        if manifest.get(key) != rs_ident.get(key):
+            raise ValueError(
+                f"ruleset {key} mismatch: checkpoint {manifest.get(key)!r} "
+                f"!= runtime {rs_ident.get(key)!r}."
+            )
     model = BeliefModel(config)
-    model.load_state_dict(bundle[_STATE_DICT_KEY])
+    model.load_state_dict(state_dict)
     model.eval()
     return model
 
 
-def manifest_hash(path: str) -> str:
-    """Return a short hash of a checkpoint's manifest (for logging)."""
-    bundle = torch.load(path, map_location="cpu", weights_only=False)
+def manifest_hash(path: str, *, allow_unsafe_pickle: bool = False) -> str:
+    """Return a short hash of a checkpoint's manifest (for logging).
+
+    Loads with ``weights_only=True`` unless ``allow_unsafe_pickle=True``.
+    """
+    bundle = torch.load(
+        path, map_location="cpu", weights_only=not allow_unsafe_pickle
+    )
     m = bundle[_MANIFEST_KEY]
     payload = json.dumps(m, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]

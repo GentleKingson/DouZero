@@ -88,6 +88,19 @@ class TestBeliefFusionGate:
             model(scv, scf, ccv, cf, ht, hmask, af, am, role,
                   belief_features=feats)
 
+    def test_parameter_count_includes_belief_proj(self):
+        off = ModelV2(build_v2_schema(),
+                      ModelV2Config(belief_enabled=False, hidden_size=32,
+                                    history_heads=4, history_layers=2))
+        on = ModelV2(build_v2_schema(),
+                     ModelV2Config(belief_enabled=True, hidden_size=32,
+                                   history_heads=4, history_layers=2))
+        off_pc = off.parameter_count()
+        on_pc = on.parameter_count()
+        assert "belief_proj" not in off_pc
+        assert "belief_proj" in on_pc
+        assert on_pc["total"] == off_pc["total"] + on_pc["belief_proj"]
+
 
 class TestBeliefFusionForward:
     def _belief_enabled_model(self):
@@ -95,17 +108,27 @@ class TestBeliefFusionForward:
                             history_heads=4, history_layers=2, nan_guard=False)
         return ModelV2(build_v2_schema(), cfg), cfg
 
-    def test_forward_runs_with_and_without_belief_features(self):
+    def test_missing_belief_features_fails_closed_by_default(self):
+        """A belief-enabled model without features must NOT silently degrade."""
         model, _ = self._belief_enabled_model()
-        model.eval()
+        (scv, scf, ccv, cf, ht, hmask, af, am, role, _obs) = _model_inputs()
+        with pytest.raises(ValueError):
+            model(scv, scf, ccv, cf, ht, hmask, af, am, role)
+
+    def test_missing_belief_features_allowed_with_explicit_flag(self):
+        model, _ = self._belief_enabled_model()
         (scv, scf, ccv, cf, ht, hmask, af, am, role, _obs) = _model_inputs()
         with torch.no_grad():
-            out_no = model(scv, scf, ccv, cf, ht, hmask, af, am, role)
             out_zero = model(scv, scf, ccv, cf, ht, hmask, af, am, role,
-                             belief_features=torch.zeros(BELIEF_FEATURE_DIM))
-        # No-features path uses an internal zero vector -> same as explicit zero.
+                             allow_missing_belief_features=True)
+            out_explicit_zero = model(
+                scv, scf, ccv, cf, ht, hmask, af, am, role,
+                belief_features=torch.zeros(BELIEF_FEATURE_DIM),
+            )
+        # The explicit-zero path == the allow-missing zero-vector path.
         np.testing.assert_allclose(
-            out_no.win_logit.numpy(), out_zero.win_logit.numpy(), atol=1e-6
+            out_zero.win_logit.numpy(),
+            out_explicit_zero.win_logit.numpy(), atol=1e-6,
         )
 
     def test_nonzero_belief_features_change_output(self):

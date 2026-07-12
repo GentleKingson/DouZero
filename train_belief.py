@@ -60,9 +60,6 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--lambda_count_reg", type=float, default=0.0)
     p.add_argument("--lambda_entropy_reg", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--ruleset", default="legacy",
-                   choices=["legacy", "standard"],
-                   help="ruleset identity stamped into the checkpoint manifest")
     return p.parse_args(argv)
 
 
@@ -128,7 +125,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    ruleset = RuleSet.legacy() if args.ruleset == "legacy" else RuleSet.standard()
+    # The P07 collector runs on the legacy card-play env (``Env("adp")``, which
+    # is ruleset=None = legacy). Standard-ruleset bidding/redeal collection is
+    # NOT implemented in this phase, so the checkpoint is always stamped legacy
+    # — never mislabeled as standard (Blocker #2 fix).
+    ruleset = RuleSet.legacy()
     import os
     os.makedirs(args.save_dir, exist_ok=True)
     out_path = os.path.join(args.save_dir, args.save_name)

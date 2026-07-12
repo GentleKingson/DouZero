@@ -38,6 +38,20 @@ bounded dynamic program. There are 15 rank categories (the 13 numeric ranks
 (count `0..4` per rank), masked to `[0, unseen_count[rank]]` and to `[0, 1]`
 for jokers.
 
+The model produces **two** probability views:
+
+- `factor_probs` — the independent per-rank masked softmax (the model's
+  per-rank *factor* distribution; NOT conditioned on the total).
+- `constrained_probs` — the per-rank **marginals of the constrained posterior**
+  `P(c_r = k | sum = total)`, computed by a forward-backward (log-sum-exp)
+  dynamic program. These are mutually consistent with the total-count
+  constraint: `sum_r E[c_A_r] == opponent_a_total` **exactly**.
+
+The value-fusion features (`belief_features_from_probs`) consume the
+**constrained** marginals (and assert the expected total matches the target);
+passing the independent `factor_probs` is rejected. The MAP decoder and the
+sampler (which enforce the constraint exactly) operate on the same logits.
+
 ### Public bottom cards
 
 The unplayed public bottom cards are *known* landlord property, so:
@@ -92,6 +106,10 @@ opponent A, opponent-A & B expected totals, total entropy) into the trunk and
 - The belief model itself is **not owned** by Model V2; the caller computes
   the public posterior and passes it in. This keeps the value checkpoint
   decoupled from the belief architecture.
+- **Fail-closed**: when `belief_enabled=True` but no `belief_features` are
+  supplied, the model raises by default (a belief-trained checkpoint must not
+  silently degrade to a zero-feature baseline at deployment). Pass
+  `allow_missing_belief_features=True` only for explicit ablations.
 
 ## Training and evaluation CLI
 
@@ -108,8 +126,23 @@ python evaluate_belief.py --checkpoint /tmp/belief_smoke/belief.pt \
 `train_belief.py` uses the masked cross-entropy loss, clips gradients, guards
 against non-finite loss, and writes a checkpoint with `model_version =
 "belief_v1"`, the `BeliefConfig.stable_hash()`, the ruleset identity, git sha,
-torch/python version, and frame count. `load_belief_checkpoint` validates the
-architecture hash and ruleset and rejects a mismatch.
+torch/python version, and frame count. `load_belief_checkpoint` loads with
+`weights_only=True` by default (safe unpickling — untrusted checkpoints cannot
+trigger arbitrary code execution) and validates the full manifest identity
+(schema version, model version, checkpoint kind, feature version, architecture
+hash, ruleset identity). `expected_ruleset` is **required**.
+
+The P07 collector runs on the **legacy** card-play env only (`Env("adp")`).
+Standard-ruleset bidding/redeal collection is NOT implemented in this phase, so
+the checkpoint is always stamped `legacy` — never mislabeled as `standard`.
+
+`evaluate_belief.py` reports metrics for **both** decoders:
+
+- `factor_argmax_*` — the independent per-rank argmax (informational; does not
+  respect the total-count constraint),
+- `constrained_map_*` — the DP MAP decoder used at deployment, and
+- `constrained_map_conservation` — the fraction of DP decodes that satisfy the
+  exact total constraint (**must be 1.0** by construction).
 
 ## Checkpoint impact
 
@@ -128,16 +161,23 @@ architecture hash and ruleset and rejects a mismatch.
 
 - **1000-random-state conservation sweep**: every MAP and sampled allocation
   satisfies the per-rank cap, `sum == opponent_A_hidden_total`, opponent B =
-  pool − A is non-negative, and A + B reconstructs the pool exactly.
+  pool − A is non-negative, and A + B reconstructs the pool exactly; the
+  constrained-marginal expected total equals the target exactly.
 - joker counts never exceed one in any sample.
 - DP MAP correctness on handcrafted examples; sampler distribution matches
-  normalized weights within tolerance.
+  normalized weights within tolerance; constrained marginals' expected total
+  matches the target for totals 0/1/2, and different totals yield different
+  posteriors.
 - Leakage: identical public footprint + swapped farmer cards → identical belief
   input; the label changes.
 - Masked CE loss: finite, gradient-bearing, λ=0 regularizers disable cleanly.
-- Checkpoint round-trip + identity-mismatch rejection.
+- Checkpoint security: `weights_only=True` default rejects a crafted pickle;
+  schema/kind/feature-version/config-hash/ruleset mismatches are rejected;
+  `expected_ruleset` is required.
 - Model V2 fusion: belief on/off gate, output changes with features,
-  stop-gradient on/off, wrong-dim rejection, disabled-model rejection.
+  stop-gradient on/off, wrong-dim rejection, disabled-model rejection,
+  fail-closed on missing features, parameter_count includes belief_proj.
+- Device/dtype: `BeliefModel.double()` produces float64 logits.
 - CLI smoke (`train_belief` / `evaluate_belief` end-to-end on CPU).
 
 ## What is **not** measured
