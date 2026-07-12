@@ -79,13 +79,15 @@ parser.add_argument('--ruleset', default='legacy', type=str, choices=['legacy', 
                     help='Rule set identifier (P02). "legacy" (default) reproduces the '
                          'original environment. "standard" adds bidding/scoring but is '
                          'not yet supported for training.')
-parser.add_argument('--model_version', default='legacy', type=str, choices=['legacy', 'factorized'],
+parser.add_argument('--model_version', default='legacy', type=str, choices=['legacy', 'factorized', 'v2'],
                     help='Model version. "legacy" (default) is the original per-action forward. '
                          '"factorized" (P04) encodes the shared state/history once per decision and '
                          'is numerically equivalent to legacy under the same weights; it is a '
                          'DEPLOYMENT-only optimization (DeepAgent backend=legacy_factorized). '
-                         'Training is NOT yet wired to factorized; the training gate in dmc.py '
-                         'rejects it until P05/P06.')
+                         '"v2" (P05) is the shared state/action model with role embeddings and '
+                         'multi-head outputs (DeepAgentV2 backend=v2); it requires '
+                         'feature_version=v2. Training is NOT yet wired to factorized/v2; the '
+                         'training gate in dmc.py rejects them until P06.')
 
 
 def _build_override_parser():

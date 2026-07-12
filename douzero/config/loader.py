@@ -183,12 +183,13 @@ _LEGACY_ONLY_VERSIONS: dict[str, frozenset[str]] = {
     "feature_version": frozenset({"legacy", "v2"}),
     # P02 widens the ruleset allowed set to include "standard".
     "ruleset": frozenset({"legacy", "standard"}),
-    # P04 widens the model_version allowed set to include "factorized". The
-    # factorized model is a deployment-only, checkpoint-compatible forward that
-    # is numerically equivalent to legacy under the same weights; training is
-    # NOT yet wired to it (the dmc.py gate rejects factorized training until
-    # P05/P06). The default stays "legacy".
-    "model_version": frozenset({"legacy", "factorized"}),
+    # P04 widened model_version to "factorized" (deployment-only,
+    # checkpoint-compatible forward). P05 widens it further to "v2", the
+    # shared state/action model with multi-head outputs. "v2" is accepted by
+    # the config layer so DeepAgentV2 and model construction can be selected;
+    # the training gate in dmc.py still rejects v2 training until P06 wires
+    # multi-objective losses and the actor/learner loop to it.
+    "model_version": frozenset({"legacy", "factorized", "v2"}),
 }
 
 
