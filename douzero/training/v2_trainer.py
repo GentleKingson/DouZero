@@ -92,6 +92,43 @@ class TrainerConfig:
     # RNG for action sampling / minibatch sampling.
     rng_seed: int = 0
 
+    def __post_init__(self) -> None:
+        """Validate ranges so a malformed config fails fast (P06 r2).
+
+        Without these checks a ``batch_size=0`` would silently produce zero
+        training, ``optimizer_steps=-1`` would skip the loop, and
+        ``exp_epsilon=2.0`` would explore outside [0, 1]. Each guard raises
+        a precise ValueError naming the field and the offending value.
+        """
+        import math as _math
+
+        if self.batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
+        if self.optimizer_steps < 0:
+            raise ValueError(f"optimizer_steps must be >= 0, got {self.optimizer_steps}")
+        if not (0.0 <= self.exp_epsilon <= 1.0):
+            raise ValueError(
+                f"exp_epsilon must be in [0, 1], got {self.exp_epsilon}"
+            )
+        if not (self.learning_rate > 0.0 and _math.isfinite(self.learning_rate)):
+            raise ValueError(
+                f"learning_rate must be positive and finite, got {self.learning_rate}"
+            )
+        if not (self.max_grad_norm > 0.0 and _math.isfinite(self.max_grad_norm)):
+            raise ValueError(
+                f"max_grad_norm must be positive and finite, got {self.max_grad_norm}"
+            )
+        if self.buffer_capacity < 1:
+            raise ValueError(
+                f"buffer_capacity must be >= 1, got {self.buffer_capacity}"
+            )
+        if self.max_steps_per_episode < 1:
+            raise ValueError(
+                f"max_steps_per_episode must be >= 1, got {self.max_steps_per_episode}"
+            )
+        if self.max_episodes < 0:
+            raise ValueError(f"max_episodes must be >= 0, got {self.max_episodes}")
+
 
 @dataclass
 class TrainerStats:
@@ -158,9 +195,30 @@ class V2Trainer:
         config: TrainerConfig | None = None,
     ) -> None:
         _legacy_only(ruleset)
+        loss_cfg = loss_config or LossConfig()
+        # P06 r2: when the score heads are supervised against the RAW team
+        # score, the loss target is clamped to loss_cfg.score_clamp. If that
+        # clamp does not match the model's head clamp, the target range and
+        # the representable output range disagree (a head clamped to ±8
+        # cannot fit a target clamped to ±32), producing a systematic fit
+        # gap. Reject this at construction rather than letting it poison
+        # every gradient step.
+        if (
+            loss_cfg.score_target_transform == "raw"
+            and abs(loss_cfg.score_clamp - model.config.score_clamp) > 1e-9
+        ):
+            raise ValueError(
+                f"LossConfig.score_clamp ({loss_cfg.score_clamp}) does not match "
+                f"model.config.score_clamp ({model.config.score_clamp}). In raw "
+                f"score mode the loss target is clamped to score_clamp, so it "
+                f"must equal the model's head clamp or the target range and the "
+                f"representable output range disagree. Either align both values, "
+                f"pass score_target_transform='signed_log', or construct the "
+                f"model with ModelV2Config(score_clamp=loss_cfg.score_clamp)."
+            )
         self.model = model
         self.ruleset = ruleset
-        self.loss_fn = MultiObjectiveLoss(loss_config or LossConfig())
+        self.loss_fn = MultiObjectiveLoss(loss_cfg)
         self.decision_config = decision_config or DecisionConfig()
         self.config = config or TrainerConfig()
         self.optimizer = torch.optim.RMSprop(
@@ -200,9 +258,14 @@ class V2Trainer:
         episode = Episode()
         steps = 0
         while True:
-            assert steps < self.config.max_steps_per_episode, (
-                "episode exceeded max_steps_per_episode; possible infinite loop"
-            )
+            # P06 r2: use an explicit raise, not assert — ``python -O`` strips
+            # asserts, which would disable this infinite-loop guard.
+            if steps >= self.config.max_steps_per_episode:
+                raise RuntimeError(
+                    f"episode exceeded max_steps_per_episode "
+                    f"({self.config.max_steps_per_episode}); possible infinite "
+                    f"loop in the env or the decision policy."
+                )
             steps += 1
             position = env._acting_player_position
             infoset = env.infoset
