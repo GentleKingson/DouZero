@@ -121,6 +121,12 @@ class ModelV2Config:
     # ------------------------------------------------------------------ #
     # Canonical identity (blocker #2 fix)
     # ------------------------------------------------------------------ #
+    #: The current identity version. Increment when the compatibility-dict
+    #: field set changes. Version 1 = P05 (no ``score_target_transform``);
+    #: version 2 = P06 r5+ (adds ``score_target_transform``). The checkpoint
+    #: loader uses this to migrate P05 checkpoints forward.
+    IDENTITY_VERSION: int = 2
+
     def compatibility_dict(self) -> dict:
         """Return the architecture-identity subset of this config.
 
@@ -155,6 +161,32 @@ class ModelV2Config:
             "nan_guard": self.nan_guard,
         }
 
+    def compatibility_dict_v1(self) -> dict:
+        """P05-era compatibility dict (without ``score_target_transform``).
+
+        P05 checkpoints were saved before ``score_target_transform`` was added
+        to :meth:`compatibility_dict`. This method reproduces the EXACT field
+        set P05 used, so the loader can validate a P05 checkpoint's hash
+        against the runtime config's v1 hash. A P05 checkpoint is only
+        loadable when the runtime ``score_target_transform == "raw"`` (the P05
+        default), because the P05 model's score heads were implicitly on the
+        raw scale.
+        """
+        return {
+            "hidden_size": self.hidden_size,
+            "history_encoder": self.history_encoder,
+            "history_layers": self.history_layers,
+            "history_heads": self.history_heads,
+            "history_dropout": self.history_dropout,
+            "role_embedding_dim": self.role_embedding_dim,
+            "mlp_layers": self.mlp_layers,
+            "mlp_dropout": self.mlp_dropout,
+            "belief_enabled": self.belief_enabled,
+            "human_prior_enabled": self.human_prior_enabled,
+            "score_clamp": self.score_clamp,
+            "nan_guard": self.nan_guard,
+        }
+
     def stable_hash(self) -> str:
         """A SHA-256 hex digest of :meth:`compatibility_dict`.
 
@@ -163,6 +195,17 @@ class ModelV2Config:
         same-shape-different-config drift.
         """
         payload = json.dumps(self.compatibility_dict(), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def stable_hash_v1(self) -> str:
+        """SHA-256 of :meth:`compatibility_dict_v1` (P05 identity).
+
+        Used by the checkpoint loader to validate a P05 checkpoint whose
+        bundle lacks ``model_config_identity_version`` (or carries version 1).
+        The hash must match AND the runtime ``score_target_transform`` must be
+        ``"raw"`` (the P05 default) for the migration to succeed.
+        """
+        payload = json.dumps(self.compatibility_dict_v1(), sort_keys=True, default=str)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @classmethod

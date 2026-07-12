@@ -528,6 +528,9 @@ def load_v2_model(model_path, schema, ruleset, config=None):
         expected_schema_hash=expected_schema_hash,
         expected_model_config_hash=expected_cfg_hash,
         expected_ruleset=ruleset,
+        # P06 r6: pass the runtime config so P05-format checkpoints can be
+        # migrated via the v1 hash + raw-transform check.
+        runtime_model_config=cfg,
     )
 
     # STRICT load (strict=True is the default for load_state_dict). A key/shape
