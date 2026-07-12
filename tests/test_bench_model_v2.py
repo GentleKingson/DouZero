@@ -66,6 +66,10 @@ def test_bench_model_v2_deep_agent_path_runs(tmp_path):
     )
     for key in ("median_ms", "mean_ms", "p95_ms"):
         assert key in da, f"deep-agent result missing {key}:\n{da}"
+    # A positive latency confirms a forward actually fired — guards against a
+    # future silent-zero stub (e.g. a short-circuit returning {median_ms: 0.0})
+    # that would pass a mere key-presence check.
+    assert da["median_ms"] > 0, f"deep-agent median_ms is non-positive:\n{da}"
 
     # The Markdown summary must have rendered the end-to-end section — it only
     # renders when deep_agent_act_ms has a median_ms, so this confirms the path
@@ -79,10 +83,27 @@ def test_bench_model_v2_deep_agent_path_runs(tmp_path):
 
 def test_bench_model_v2_constructs_agent_with_explicit_ruleset():
     """Blocker #3 (contract pin): the benchmark must construct DeepAgentV2 with
-    an explicit RuleSet (the 2-arg bare form is a regression). The functional
-    test above catches the runtime failure; this pins the source contract."""
-    src = BENCH.read_text()
-    assert 'DeepAgentV2("landlord", model, RuleSet.legacy())' in src, (
-        "benchmark must construct DeepAgentV2 with an explicit RuleSet.legacy() "
-        "(the required ruleset argument), not the bare 2-arg form."
-    )
+    an explicit ruleset argument (the bare 2-arg form is a regression). AST-
+    based so it survives positional/keyword refactors and cannot be satisfied by
+    a comment or docstring. The functional test above catches the runtime
+    failure; this pins the source contract."""
+    import ast
+
+    tree = ast.parse(BENCH.read_text())
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "DeepAgentV2"
+    ]
+    assert calls, "benchmark never constructs DeepAgentV2"
+    for call in calls:
+        has_ruleset = len(call.args) >= 3 or any(
+            kw.arg == "ruleset" for kw in call.keywords
+        )
+        assert has_ruleset, (
+            "DeepAgentV2 must be constructed with an explicit ruleset (a 3rd "
+            "positional arg or ruleset=...). The bare 2-arg form is rejected "
+            "by DeepAgentV2 and would silently break the benchmark's deep-agent "
+            "path."
+        )

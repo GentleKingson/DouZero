@@ -88,22 +88,45 @@ def _bench(fn, rounds, warmup):
     }
 
 
-def _make_v2_obs(seed: int = 42, steps_into_game: int = 0):
-    """Build a real ObservationV2 at the landlord's turn for benchmarking."""
+def _landlord_env(seed: int, steps_into_game: int):
+    """Reset and pre-roll an ``Env("adp")`` to a landlord decision point.
+
+    Shared by the forward-only path (via :func:`_make_v2_obs`) and the
+    end-to-end DeepAgent path (:func:`bench_deep_agent_act`) so the two latency
+    numbers are measured at the SAME (non-degenerate) decision point with a REAL
+    history — not an opening move whose empty history would understate the cost.
+
+    Fail-closed: the only legitimate early-exit from the pre-roll is the game
+    ending naturally, detected via the ``done`` flag returned by ``env.step``
+    (or an empty legal-action set). Any OTHER exception — e.g. an inconsistent
+    env state from stepping past the game's natural length — PROPAGATES so the
+    benchmark exits loudly instead of swallowing it and rendering bogus medians
+    (the anti-pattern blocker #3 closed on the deep-agent path; the same
+    contract applies to the forward-only setup). Keep ``steps_into_game`` well
+    within one game's length.
+    """
     import numpy as np
     from douzero.env.env import Env
-    from douzero.observation import get_obs_v2
 
     np.random.seed(seed)
     env = Env("adp")
     env.reset()
     for _ in range(steps_into_game):
-        try:
-            env.step(env.infoset.legal_actions[0])
-        except Exception:
-            break
+        if not env.infoset.legal_actions:
+            break  # terminal: no moves left — stop the pre-roll cleanly
+        _obs, _reward, done, _info = env.step(env.infoset.legal_actions[0])
+        if done:
+            break  # game ended naturally before completing the pre-roll
     while env._acting_player_position != "landlord":
         env.step(env.infoset.legal_actions[0])
+    return env
+
+
+def _make_v2_obs(seed: int = 42, steps_into_game: int = 0):
+    """Build a real ObservationV2 at the landlord's turn for benchmarking."""
+    from douzero.observation import get_obs_v2
+
+    env = _landlord_env(seed, steps_into_game)
     return get_obs_v2(env.infoset)
 
 
@@ -164,15 +187,17 @@ def bench_forward_only(model, obs, rounds, warmup):
     return results
 
 
-def bench_deep_agent_act(agent, env_seed, rounds, warmup):
-    """Full DeepAgentV2.act(infoset) latency (encode + forward + select)."""
-    import numpy as np
-    from douzero.env.env import Env
+def bench_deep_agent_act(agent, env_seed, rounds, warmup, steps_into_game=0):
+    """Full DeepAgentV2.act(infoset) latency (encode + forward + select).
+
+    Pre-rolled to a landlord turn with a REAL history (``steps_into_game``),
+    matching :func:`_make_v2_obs`, so the end-to-end number is measured at the
+    same non-degenerate decision point as the forward-only rows — not at an
+    opening move whose empty history understates the act() cost.
+    """
 
     def _fn():
-        np.random.seed(env_seed)
-        env = Env("adp")
-        env.reset()
+        env = _landlord_env(env_seed, steps_into_game)
         agent.act(env.infoset)
 
     return _bench(_fn, rounds, warmup)
@@ -220,7 +245,7 @@ def main():
     agent = DeepAgentV2("landlord", model, RuleSet.legacy())
     report["deep_agent_act_ms"] = bench_deep_agent_act(
         agent, env_seed=42, rounds=max(args.rounds // 3, 5),
-        warmup=max(args.warmup, 1),
+        warmup=max(args.warmup, 1), steps_into_game=args.steps_into_game,
     )
     report["deep_agent_act_ms"]["note"] = (
         "Full act(infoset) path: get_obs_v2 + tensor build + forward + "
