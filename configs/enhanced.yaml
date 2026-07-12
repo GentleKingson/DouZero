@@ -9,43 +9,54 @@
 # The legacy train.py path does NOT read this file. Enabling any of these
 # knobs through the legacy entry point has no effect (the legacy loop uses
 # the single-target MSE in douzero.dmc.compute_loss regardless).
+#
+# IMPORTANT (P06 r3): only the fields marked "consumed" below are actually
+# read by the P06 single-process V2 trainer (train_v2.py). The legacy
+# multiprocessing fields (actor_device_cpu, gpu_devices, num_actors, etc.)
+# are carried because this file is loaded as a TrainingConfig, but they are
+# NOT consumed by the V2 trainer and setting them to non-default values
+# produces a visible warning at startup. P14's high-throughput trainer will
+# consume them.
 
-# General
-xpid: douzero_v2
-save_interval: 30
-objective: adp
+# General (consumed: objective for the identity gate)
+xpid: douzero_v2          # (ignored by train_v2.py; legacy multiprocess only)
+save_interval: 30         # (ignored by train_v2.py; legacy checkpoint only)
+objective: adp            # consumed: identity gate requires 'adp'
 
-# Training settings
-actor_device_cpu: false
-gpu_devices: "0"
-num_actor_devices: 1
-num_actors: 5
-training_device: "0"
-load_model: false
-disable_checkpoint: false
-savedir: douzero_v2_checkpoints
+# --- Legacy multiprocess settings (NOT consumed by train_v2.py) --- #
+# These are carried for TrainingConfig schema compatibility. Setting any to
+# a non-default value triggers a startup warning in train_v2.py. They will
+# be consumed when P14 wires the multiprocessing actor/learner.
+actor_device_cpu: false   # (ignored; train_v2.py is CPU-only)
+gpu_devices: "0"          # (ignored; train_v2.py forces CUDA_VISIBLE_DEVICES="")
+num_actor_devices: 1      # (ignored; single-process trainer)
+num_actors: 5             # (ignored; single-process trainer)
+training_device: "0"      # (ignored; CPU-only)
+load_model: false         # (ignored; no checkpoint resume in P06)
+disable_checkpoint: false # (ignored; no checkpoint save in P06)
+savedir: douzero_v2_checkpoints  # (ignored; no checkpoint save in P06)
 
-# Hyperparameters
-total_frames: 600000
-exp_epsilon: 0.05
-batch_size: 32
-unroll_length: 100
-num_buffers: 50
-num_threads: 4
-max_grad_norm: 40.0
+# --- Hyperparameters --- #
+# Consumed: exp_epsilon, batch_size, max_grad_norm.
+# Ignored: total_frames, unroll_length, num_buffers, num_threads.
+total_frames: 600000      # (ignored; train_v2.py uses --episodes / max_episodes)
+exp_epsilon: 0.05         # consumed: exploration epsilon
+batch_size: 32            # consumed: minibatch size
+unroll_length: 100        # (ignored; legacy multiprocess buffer only)
+num_buffers: 50           # (ignored; legacy multiprocess buffer only)
+num_threads: 4            # (ignored; legacy multiprocess learner only)
+max_grad_norm: 40.0       # consumed: gradient clip
 
-# Reproducibility
+# Reproducibility (consumed: seed=0 means no-op per the project convention)
 seed: 0
 deterministic: false
 
-# Version identifiers. V2 model + V2 observation schema. The default ruleset
-# is still legacy (card-play-only) so the P06 smoke can run without bidding;
-# switch to `standard` once the trainer drives bidding (P11 league work).
+# Version identifiers (consumed: identity gate requires these exact values)
 feature_version: v2
 ruleset: legacy
 model_version: v2
 
-# Optimizer (RMSProp)
+# Optimizer (RMSProp) — consumed by the V2 trainer's optimizer
 optimizer:
   learning_rate: 0.0001
   alpha: 0.99
