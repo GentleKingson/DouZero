@@ -80,6 +80,7 @@ class Transition:
 
         Raises :class:`ValueError` / :class:`TypeError` for:
         - ``position`` not in the three valid roles;
+        - ``position`` does not match ``obs.public.acting_role`` (P06 r6);
         - ``action_index`` is a bool, not an int, or outside
           ``[0, len(obs.actions.legal_actions))``;
         - ``target_win`` non-finite or not in ``{0.0, 1.0}``;
@@ -95,6 +96,23 @@ class Transition:
             raise ValueError(
                 f"Transition.position must be one of {sorted(_VALID_POSITIONS)}, "
                 f"got {self.position!r}"
+            )
+        # P06 r6: the position that determines the team-perspective label
+        # must match the acting role encoded in the observation. Without
+        # this check, a transition could carry a farmer observation with a
+        # landlord position: the model sees a farmer view, but the terminal
+        # label is stamped from the landlord's team target — a silent
+        # label/observation mismatch that poisons training without producing
+        # any non-finite value.
+        obs_acting_role = self.obs.public.acting_role
+        if self.position != obs_acting_role:
+            raise ValueError(
+                f"Transition.position ({self.position!r}) does not match the "
+                f"observation's acting_role ({obs_acting_role!r}). The "
+                f"position that selects the team-perspective label must "
+                f"match the role encoded in the observation, or the model "
+                f"trains on a farmer view with a landlord label (or vice "
+                f"versa)."
             )
         # bool is a subclass of int; reject it so True/False do not pass as
         # an action index.

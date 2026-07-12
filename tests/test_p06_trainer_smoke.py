@@ -75,9 +75,12 @@ def test_buffer_sample_returns_none_when_insufficient():
 def test_buffer_capacity_eviction():
     buf = V2ReplayBuffer(capacity_transitions=2)
     obs = _fake_obs()
+    # P06 r6: all transitions must have position == obs.public.acting_role.
+    # _fake_obs() returns a landlord observation, so all three use
+    # position="landlord". The test is about eviction logic, not role diversity.
     t1 = Transition(obs=obs, action_index=0, position="landlord", target_win=1.0, target_score=1.0, target_log_score=0.5)
-    t2 = Transition(obs=obs, action_index=0, position="landlord_up", target_win=0.0, target_score=-1.0, target_log_score=-0.5)
-    t3 = Transition(obs=obs, action_index=0, position="landlord_down", target_win=1.0, target_score=1.0, target_log_score=0.5)
+    t2 = Transition(obs=obs, action_index=0, position="landlord", target_win=0.0, target_score=-1.0, target_log_score=-0.5)
+    t3 = Transition(obs=obs, action_index=0, position="landlord", target_win=1.0, target_score=1.0, target_log_score=0.5)
     buf.add_episode(Episode(transitions=[t1], terminal_result={}))
     buf.add_episode(Episode(transitions=[t2, t3], terminal_result={}))
     # Capacity is 2; the first episode should be evicted.
