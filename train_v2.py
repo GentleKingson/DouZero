@@ -80,8 +80,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--deterministic",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable full deterministic mode (torch.use_deterministic_algorithms).",
+        default=argparse.SUPPRESS,
+        help="Enable full deterministic mode (torch.use_deterministic_algorithms). "
+        "Absent: defer to the YAML 'deterministic' value (default false).",
     )
     return parser
 
@@ -91,6 +92,47 @@ def _load_yaml_config(path: str):
     if not path:
         return None
     return load_config(path)
+
+
+def _assert_v2_identity(cfg) -> None:
+    """Reject a YAML config whose identity does not match the V2 trainer.
+
+    P06 r2 fix: the r0/r1 entry unconditionally built a ModelV2 even when
+    the YAML declared feature_version=legacy / model_version=legacy, so
+    ``--config configs/legacy.yaml`` would silently run a V2 model under a
+    legacy identity. This gate fails FAST — before any model/env is built
+    — with a precise error.
+
+    The V2 trainer (P06) only supports the legacy card-play-only ruleset
+    and the ADP objective; the standard ruleset requires a bidding driver
+    that is part of P11's league work, and non-ADP objectives are not wired
+    through the multi-objective label path.
+    """
+    if cfg is None:
+        return
+    if cfg.feature_version != "v2":
+        raise ValueError(
+            f"train_v2.py requires feature_version='v2', got "
+            f"{cfg.feature_version!r}. The V2 trainer builds a ModelV2 that "
+            f"consumes the V2 observation schema; a legacy feature_version "
+            f"would silently pair a V2 model with legacy observations. Use "
+            f"configs/enhanced.yaml or set feature_version: v2."
+        )
+    if cfg.model_version != "v2":
+        raise ValueError(
+            f"train_v2.py requires model_version='v2', got {cfg.model_version!r}."
+        )
+    if cfg.ruleset != "legacy":
+        raise NotImplementedError(
+            f"train_v2.py (P06) only supports ruleset='legacy' (the card-play-"
+            f"only env); got {cfg.ruleset!r}. Standard mode requires a bidding "
+            f"driver that is part of P11's league work."
+        )
+    if cfg.objective != "adp":
+        raise NotImplementedError(
+            f"train_v2.py (P06) only supports objective='adp' (the multi-objective "
+            f"label path derives team-perspective ADP scores); got {cfg.objective!r}."
+        )
 
 
 def _resolve_ruleset(cfg):
@@ -173,21 +215,38 @@ def main() -> None:
 
     yaml_cfg = _load_yaml_config(args.config)
 
-    # Resolve the seed/deterministic with CLI > YAML > default precedence.
-    # Both --seed and --deterministic use real argparse defaults, so when
-    # the YAML is present and the CLI did not override, prefer the YAML.
-    if yaml_cfg is not None:
-        seed = args.seed if "seed" in vars(args) else yaml_cfg.seed
-        deterministic = (
-            args.deterministic if "deterministic" in vars(args) else yaml_cfg.deterministic
-        )
-    else:
-        seed = args.seed if "seed" in vars(args) else 0
-        deterministic = args.deterministic
+    # P06 r2: fail FAST on an identity mismatch. The V2 trainer builds a
+    # ModelV2 + V2 observation schema; a legacy/standard identity would
+    # silently pair them with the wrong observation path.
+    _assert_v2_identity(yaml_cfg)
+
+    # Build the seed/deterministic resolver. ``resolve(cli_dest, yaml_value,
+    # default_value)`` implements CLI > YAML > built-in-default precedence.
+    # argparse SUPPRESS defaults mean absent CLI flags do NOT appear in
+    # vars(args), so the YAML value wins when the user did not pass the flag.
+    from douzero.training import TrainerConfig
+
+    defaults = TrainerConfig()
+
+    def resolve(cli_dest, yaml_value, default_value):
+        if hasattr(args, cli_dest):
+            return getattr(args, cli_dest)
+        if yaml_value is not None:
+            return yaml_value
+        return default_value
+
+    opt = yaml_cfg.optimizer if yaml_cfg is not None else None
+    seed = resolve("seed", yaml_cfg.seed if yaml_cfg else None, defaults.seed)
+    deterministic = resolve(
+        "deterministic",
+        yaml_cfg.deterministic if yaml_cfg else None,
+        False,
+    )
     set_global_seed(seed)
     maybe_set_global_deterministic(deterministic)
 
-    # Build the V2 model from the schema + config (honouring score_clamp).
+    # Build the V2 model from the schema + config (honouring score_clamp so
+    # the head clamp matches the loss target clamp exactly).
     import torch
 
     from douzero.models_v2.model import ModelV2
@@ -198,46 +257,37 @@ def main() -> None:
     model_cfg = _build_model_cfg(yaml_cfg)
     model = ModelV2(schema, model_cfg)
 
-    # Resolve TrainerConfig with CLI > YAML > built-in-default precedence.
-    # CLI overrides come from vars(args); YAML values come from yaml_cfg;
-    # built-in defaults come from TrainerConfig().
-    from douzero.training import TrainerConfig, V2Trainer
-
-    defaults = TrainerConfig()
-
-    def pick(name, yaml_obj=None):
-        if name in vars(args):
-            return getattr(args, name)
-        if yaml_obj is not None and hasattr(yaml_obj, name):
-            return getattr(yaml_obj, name)
-        return getattr(defaults, name)
+    from douzero.training import V2Trainer
 
     trainer_cfg = TrainerConfig(
         seed=seed,
         rng_seed=seed,
-        max_episodes=pick("episodes", yaml_cfg),
-        optimizer_steps=pick("optimizer_steps", yaml_cfg),
-        batch_size=pick("batch_size", yaml_cfg),
-        buffer_capacity=pick("buffer_capacity", yaml_cfg),
-        exp_epsilon=pick("exp_epsilon", yaml_cfg),
-        learning_rate=pick(
+        # CLI dest "episodes" maps to TrainerConfig.max_episodes (TrainingConfig
+        # has no episodes field; it comes from CLI or the TrainerConfig default).
+        max_episodes=resolve("episodes", None, defaults.max_episodes),
+        optimizer_steps=resolve("optimizer_steps", None, defaults.optimizer_steps),
+        batch_size=resolve("batch_size", yaml_cfg.batch_size if yaml_cfg else None, defaults.batch_size),
+        # buffer_capacity / max_steps_per_episode are TrainerConfig-only
+        # (TrainingConfig has no such field), so they come from CLI or the
+        # TrainerConfig default only.
+        buffer_capacity=resolve("buffer_capacity", None, defaults.buffer_capacity),
+        exp_epsilon=resolve("exp_epsilon", yaml_cfg.exp_epsilon if yaml_cfg else None, defaults.exp_epsilon),
+        learning_rate=resolve(
             "learning_rate",
-            getattr(yaml_cfg, "optimizer", None) if yaml_cfg else None,
+            opt.learning_rate if opt else None,
+            defaults.learning_rate,
         ),
-        rmsprop_alpha=pick(
-            "alpha",
-            getattr(yaml_cfg, "optimizer", None) if yaml_cfg else None,
+        rmsprop_alpha=resolve("rmsprop_alpha", opt.alpha if opt else None, defaults.rmsprop_alpha),
+        rmsprop_momentum=resolve(
+            "rmsprop_momentum", opt.momentum if opt else None, defaults.rmsprop_momentum
         ),
-        rmsprop_momentum=pick(
-            "momentum",
-            getattr(yaml_cfg, "optimizer", None) if yaml_cfg else None,
+        rmsprop_epsilon=resolve(
+            "rmsprop_epsilon", opt.epsilon if opt else None, defaults.rmsprop_epsilon
         ),
-        rmsprop_epsilon=pick(
-            "epsilon",
-            getattr(yaml_cfg, "optimizer", None) if yaml_cfg else None,
+        max_grad_norm=resolve(
+            "max_grad_norm", yaml_cfg.max_grad_norm if yaml_cfg else None, defaults.max_grad_norm
         ),
-        max_grad_norm=pick("max_grad_norm", yaml_cfg),
-        max_steps_per_episode=pick("max_steps_per_episode", yaml_cfg),
+        max_steps_per_episode=resolve("max_steps_per_episode", None, defaults.max_steps_per_episode),
     )
 
     ruleset = _resolve_ruleset(yaml_cfg)
