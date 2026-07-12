@@ -31,15 +31,34 @@ def _build_model():
     return ModelV2(schema, ModelV2Config())
 
 
+def _fake_obs():
+    """Build a real ObservationV2 for buffer size/eviction tests.
+
+    P06 r4: Transition.validate() checks action_index against the
+    observation's legal-action range, so the fake transitions used in
+    these size-logic tests need a real obs (not None).
+    """
+    from douzero.env.env import Env
+    from douzero.observation.encode_v2 import get_obs_v2
+
+    import numpy as np
+
+    np.random.seed(999)
+    env = Env("adp")
+    env.reset()
+    while env._acting_player_position != "landlord":
+        env.step(env.infoset.legal_actions[0])
+    return get_obs_v2(env.infoset)
+
+
 # --------------------------------------------------------------------------- #
 # Replay buffer
 # --------------------------------------------------------------------------- #
 def test_buffer_sample_returns_none_when_insufficient():
     buf = V2ReplayBuffer(capacity_transitions=10)
-    # Build a tiny episode with one fake transition (no real obs needed
-    # because we only test the size guard here).
+    obs = _fake_obs()
     fake_transition = Transition(
-        obs=None,  # type: ignore[arg-type]
+        obs=obs,
         action_index=0,
         position="landlord",
         target_win=1.0,
@@ -55,9 +74,10 @@ def test_buffer_sample_returns_none_when_insufficient():
 
 def test_buffer_capacity_eviction():
     buf = V2ReplayBuffer(capacity_transitions=2)
-    t1 = Transition(obs=None, action_index=0, position="landlord", target_win=1.0, target_score=1.0, target_log_score=0.5)  # type: ignore[arg-type]
-    t2 = Transition(obs=None, action_index=0, position="landlord_up", target_win=0.0, target_score=-1.0, target_log_score=-0.5)  # type: ignore[arg-type]
-    t3 = Transition(obs=None, action_index=0, position="landlord_down", target_win=1.0, target_score=1.0, target_log_score=0.5)  # type: ignore[arg-type]
+    obs = _fake_obs()
+    t1 = Transition(obs=obs, action_index=0, position="landlord", target_win=1.0, target_score=1.0, target_log_score=0.5)
+    t2 = Transition(obs=obs, action_index=0, position="landlord_up", target_win=0.0, target_score=-1.0, target_log_score=-0.5)
+    t3 = Transition(obs=obs, action_index=0, position="landlord_down", target_win=1.0, target_score=1.0, target_log_score=0.5)
     buf.add_episode(Episode(transitions=[t1], terminal_result={}))
     buf.add_episode(Episode(transitions=[t2, t3], terminal_result={}))
     # Capacity is 2; the first episode should be evicted.

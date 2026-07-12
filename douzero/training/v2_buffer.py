@@ -28,6 +28,7 @@ multiprocessing/shmem equivalent.
 
 from __future__ import annotations
 
+import math
 import random
 from collections import deque
 from dataclasses import dataclass, field
@@ -36,6 +37,11 @@ from typing import Iterable
 import torch
 
 from douzero.observation.encode_v2 import ObservationV2
+
+#: Valid acting positions (mirrors douzero.env.scoring.ALL_POSITIONS).
+_VALID_POSITIONS: frozenset[str] = frozenset(
+    {"landlord", "landlord_up", "landlord_down"}
+)
 
 
 @dataclass
@@ -57,23 +63,65 @@ class Transition:
     target_log_score: float = float("nan")
 
     def has_labels(self) -> bool:
-        """Return True iff all three team-perspective labels are finite.
+        """Quick NaN check for the label-stamping loop.
 
-        P06 r3: previously checked only ``target_win``; now also checks
-        ``target_score`` and ``target_log_score`` so a partially-labelled
-        transition (e.g. a bug in ``label_from_terminal`` that left one
-        field NaN) is caught at buffer-entry time.
+        :meth:`validate` is the comprehensive check (finiteness, binary,
+        action-index range, position); this method is a cheaper pre-check
+        used to decide whether :meth:`Episode.label_from_terminal` should
+        be called.
         """
         for value in (self.target_win, self.target_score, self.target_log_score):
-            if isinstance(value, float) and math_isnan(value):
+            if isinstance(value, float) and math.isnan(value):
                 return False
         return True
 
+    def validate(self) -> None:
+        """Comprehensive integrity check (P06 r4).
 
-def math_isnan(x: float) -> bool:
-    import math
+        Raises :class:`ValueError` / :class:`TypeError` for:
+        - ``position`` not in the three valid roles;
+        - ``action_index`` is a bool, not an int, or outside
+          ``[0, len(obs.actions.legal_actions))``;
+        - ``target_win`` non-finite or not in ``{0.0, 1.0}``;
+        - ``target_score`` / ``target_log_score`` non-finite.
 
-    return isinstance(x, float) and math.isnan(x)
+        This is called at buffer entry (:meth:`V2ReplayBuffer.add_episode`)
+        so a corrupted transition is caught immediately rather than
+        bypassing the non-finite-loss guard downstream (e.g.
+        ``target_score=+inf`` clamped to ``score_clamp`` produces a finite
+        loss, silently training on corrupted data).
+        """
+        if self.position not in _VALID_POSITIONS:
+            raise ValueError(
+                f"Transition.position must be one of {sorted(_VALID_POSITIONS)}, "
+                f"got {self.position!r}"
+            )
+        # bool is a subclass of int; reject it so True/False do not pass as
+        # an action index.
+        if isinstance(self.action_index, bool) or not isinstance(self.action_index, int):
+            raise TypeError(
+                f"Transition.action_index must be int, got "
+                f"{type(self.action_index).__name__}: {self.action_index!r}"
+            )
+        n_actions = len(self.obs.actions.legal_actions)
+        if not (0 <= self.action_index < n_actions):
+            raise ValueError(
+                f"Transition.action_index {self.action_index} is outside the "
+                f"observation's legal-action range [0, {n_actions})."
+            )
+        for name, value in (
+            ("target_win", self.target_win),
+            ("target_score", self.target_score),
+            ("target_log_score", self.target_log_score),
+        ):
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"Transition.{name} must be finite, got {value!r}"
+                )
+        if self.target_win not in (0.0, 1.0):
+            raise ValueError(
+                f"Transition.target_win must be 0.0 or 1.0, got {self.target_win!r}"
+            )
 
 
 @dataclass
@@ -123,6 +171,30 @@ class Minibatch:
     def batch_size(self) -> int:
         return int(self.action_indices.shape[0])
 
+    def validate(self) -> None:
+        """Check batch-length consistency across all fields (P06 r4).
+
+        Ensures the observations list, the action_indices tensor, and the
+        three label tensors all have the same length ``B``, so the trainer's
+        per-decision gather loop cannot index out of bounds.
+        """
+        b_obs = len(self.observations)
+        b_act = int(self.action_indices.shape[0])
+        b_win = int(self.target_win.shape[0])
+        b_score = int(self.target_score.shape[0])
+        b_log = int(self.target_log_score.shape[0])
+        lengths = {
+            "observations": b_obs,
+            "action_indices": b_act,
+            "target_win": b_win,
+            "target_score": b_score,
+            "target_log_score": b_log,
+        }
+        if len(set(lengths.values())) != 1:
+            raise ValueError(
+                f"Minibatch batch lengths disagree: {lengths}"
+            )
+
 
 class V2ReplayBuffer:
     """A bounded, label-checked replay buffer for the V2 trainer.
@@ -150,12 +222,22 @@ class V2ReplayBuffer:
         return self._capacity
 
     def add_episode(self, episode: Episode) -> None:
-        """Append a labelled episode, evicting oldest episodes as needed."""
+        """Append a labelled episode, validating every transition (P06 r4).
+
+        Each transition is :meth:`Transition.validate`-d so corrupted
+        labels (e.g. ``target_win=2.0``, ``target_score=+inf``) or an
+        out-of-range ``action_index`` is caught at buffer entry — before
+        it can bypass the non-finite-loss guard downstream.
+        """
         if not episode.transitions:
             return
         # Ensure labels are stamped.
         if any(not tr.has_labels() for tr in episode.transitions):
             episode.label_from_terminal()
+        # Comprehensive validation: every transition must pass the
+        # integrity check before entering the buffer.
+        for tr in episode.transitions:
+            tr.validate()
         self._episodes.append(episode)
         self._size += len(episode.transitions)
         while self._size > self._capacity and self._episodes:
@@ -175,6 +257,8 @@ class V2ReplayBuffer:
 
         Returns ``None`` if the buffer has fewer than ``batch_size``
         transitions. The trainer treats ``None`` as "not enough data yet".
+        The returned :class:`Minibatch` is :meth:`Minibatch.validate`-d as
+        a boundary defense.
         """
         if self._size < batch_size:
             return None
@@ -185,7 +269,7 @@ class V2ReplayBuffer:
         for ep in self._episodes:
             flat.extend(ep.transitions)
         picks = rng.sample(flat, batch_size)
-        return Minibatch(
+        minibatch = Minibatch(
             observations=[p.obs for p in picks],
             action_indices=torch.tensor(
                 [p.action_index for p in picks], dtype=torch.long
@@ -198,3 +282,5 @@ class V2ReplayBuffer:
                 [p.target_log_score for p in picks], dtype=torch.float32
             ),
         )
+        minibatch.validate()
+        return minibatch
