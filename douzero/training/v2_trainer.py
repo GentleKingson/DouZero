@@ -212,6 +212,8 @@ class V2Trainer:
         belief_model=None,
         bc_aux_samples=None,
         bc_schedule=None,
+        bc_temperature: float = 1.0,
+        bc_label_smoothing: float = 0.0,
     ) -> None:
         _legacy_only(ruleset)
         loss_cfg = loss_config or LossConfig()
@@ -291,6 +293,11 @@ class V2Trainer:
             # Default: a constant schedule at the loss config's lambda_bc.
             self.bc_schedule = BCSchedule(base_lambda=base_lambda)
         self.bc_aux_samples = list(bc_aux_samples) if bc_aux_samples is not None else []
+        # Blocker 3: temperature + label_smoothing actually reach listwise_bc_loss
+        # in the RL+BC path (previously ignored, so bc.temperature/label_smoothing
+        # in the YAML had no effect on the auxiliary term).
+        self.bc_temperature = float(bc_temperature)
+        self.bc_label_smoothing = float(bc_label_smoothing)
         if self.bc_schedule.base_lambda > 0:
             if getattr(self.model.config, "human_prior_enabled", False) is not True:
                 raise ValueError(
@@ -496,6 +503,8 @@ class V2Trainer:
                 out.action_mask,
                 s.human_action_index,
                 weight=s.sample_weight,
+                temperature=self.bc_temperature,
+                label_smoothing=self.bc_label_smoothing,
             )
             per_decision.append((loss, hit))
         return average_bc_losses(per_decision)

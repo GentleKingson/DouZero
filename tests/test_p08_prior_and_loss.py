@@ -421,12 +421,17 @@ class TestBCConfigPlumbing:
         assert LossConfig().lambda_bc == 0.0
         assert LossConfig(lambda_bc=0.3).lambda_bc == 0.3
 
-    def test_training_config_has_bc_default_disabled(self):
+    def test_training_config_has_bc_defaults(self):
+        """Blocker 3: BCConfig no longer has enabled/lambda_bc (single source
+        of truth is loss.lambda_bc). Verify the remaining fields default
+        cleanly and the enable condition is loss.lambda_bc."""
         from douzero.config.schemas import TrainingConfig
 
         cfg = TrainingConfig()
-        assert cfg.bc.enabled is False
-        assert cfg.bc.lambda_bc == 0.0
+        assert cfg.bc.data_path == ""
+        assert cfg.bc.temperature == 1.0
+        assert cfg.bc.label_smoothing == 0.0
+        assert cfg.loss.lambda_bc == 0.0  # the sole enable condition
 
     def test_yaml_loads_bc_block(self, tmp_path):
         from douzero.config.loader import load_config
@@ -435,20 +440,39 @@ class TestBCConfigPlumbing:
         yaml.write_text(
             "xpid: bc_test\nobjective: adp\n"
             "feature_version: legacy\nruleset: legacy\nmodel_version: legacy\n"
+            "loss:\n  lambda_bc: 0.25\n"
             "bc:\n"
-            "  enabled: true\n"
-            "  lambda_bc: 0.25\n"
+            "  data_path: /tmp/x.jsonl\n"
+            "  temperature: 0.8\n"
+            "  label_smoothing: 0.05\n"
             "  schedule: linear_decay\n"
             "  schedule_steps: 1000\n"
             "  schedule_floor: 0.05\n",
             encoding="utf-8",
         )
         cfg = load_config(str(yaml))
-        assert cfg.bc.enabled is True
-        assert cfg.bc.lambda_bc == 0.25
+        assert cfg.loss.lambda_bc == 0.25  # the sole enable/weight source
+        assert cfg.bc.data_path == "/tmp/x.jsonl"
+        assert cfg.bc.temperature == 0.8
+        assert cfg.bc.label_smoothing == 0.05
         assert cfg.bc.schedule == "linear_decay"
         assert cfg.bc.schedule_steps == 1000
         assert cfg.bc.schedule_floor == 0.05
+
+    def test_yaml_rejects_removed_bc_enabled_and_lambda_bc(self, tmp_path):
+        """Blocker 3: bc.enabled and bc.lambda_bc were removed (single source
+        of truth); a YAML still setting them must fail loudly."""
+        from douzero.config.loader import load_config
+
+        yaml = tmp_path / "bad.yaml"
+        yaml.write_text(
+            "xpid: bc_test\nobjective: adp\n"
+            "feature_version: legacy\nruleset: legacy\nmodel_version: legacy\n"
+            "bc:\n  enabled: true\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="Unknown bc config keys"):
+            load_config(str(yaml))
 
     def test_yaml_rejects_unknown_bc_key(self, tmp_path):
         from douzero.config.loader import load_config
@@ -467,7 +491,7 @@ class TestBCConfigPlumbing:
         from douzero.config.loader import load_config
 
         cfg = load_config("configs/enhanced.yaml")
-        assert cfg.bc.enabled is False  # default off; legacy path preserved
+        # BC is off by default (loss.lambda_bc == 0); legacy path preserved.
         assert cfg.loss.lambda_bc == 0.0
 
 

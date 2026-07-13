@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 import pytest
@@ -142,6 +143,37 @@ class TestBCTrainer:
         m = _build_prior_model()
         with pytest.raises(BCTrainerError):
             BCTrainer(m, bc_samples, BCTrainerConfig(learning_rate=0.0))
+
+    def test_rejects_zero_batch_size(self, bc_samples):
+        """batch_size=0 crashes range(..., step=0); reject at construction."""
+        m = _build_prior_model()
+        with pytest.raises(BCTrainerError):
+            BCTrainer(m, bc_samples, BCTrainerConfig(batch_size=0))
+
+    def test_empty_val_set_does_not_fake_metrics_or_restore(self, bc_samples):
+        """When val_ratio=0 (or rounds to empty), val metrics are NaN (not
+        0.0), early stopping is disabled, and the last-epoch model is kept
+        (no best-state restore from a bogus 0.0 'best')."""
+        torch.manual_seed(0)
+        m = _build_prior_model()
+        # Force an empty val set by using a single game with val_ratio that
+        # sends its one game to train (round(1*0.0)=0 val games).
+        single_game = [s for s in bc_samples if s.game_id == bc_samples[0].game_id]
+        trainer = BCTrainer(
+            m, single_game,
+            BCTrainerConfig(
+                epochs=2, batch_size=4, learning_rate=1e-3,
+                val_ratio=0.0, seed=1,
+            ),
+        )
+        assert trainer.val_samples == []
+        stats = trainer.train()
+        # Val metrics are NaN, not 0.0.
+        for e in stats.epoch_stats:
+            assert math.isnan(e.val_loss)
+            assert math.isnan(e.val_top1)
+        # best_epoch stays -1 (no best was ever tracked).
+        assert stats.best_epoch == -1
 
     def test_restores_best_validation_state_dict(self, bc_samples):
         """Medium #1: after train(), the model holds the best-validation

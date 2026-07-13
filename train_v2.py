@@ -458,21 +458,63 @@ def main() -> None:
         from douzero.human_data.validate import validate_record
         from douzero.human_data.weights import WeightConfig, apply_sample_weights
 
+        # Blocker 1: load + validate + sample with NO silent drops. Records
+        # that fail replay validation are collected into validation_quarantine
+        # and written to a bc_quarantine.jsonl alongside the checkpoint, with
+        # the game_id + reason + error. They are NEVER swallowed by a filter
+        # generator (the earlier `r for r in ... if validate_record(r).ok`
+        # silently dropped them with no trace).
         bc_records = list(read_jsonl(bc_cfg.data_path))
-        bc_report = build_bc_samples_with_report(
-            r for r in bc_records
-            if validate_record(r).ok  # fail-closed; invalid records skipped here
-        )
-        if bc_report.quarantined:
+        valid_records = []
+        validation_quarantine: list[str] = []
+        import json as _json
+
+        for record in bc_records:
+            result = validate_record(record)
+            if result.ok:
+                valid_records.append(record)
+            else:
+                validation_quarantine.append(
+                    _json.dumps(
+                        {
+                            "game_id": record.game_id,
+                            "stage": "replay_validation",
+                            "reason": result.reason,
+                            "error": result.error,
+                        },
+                        sort_keys=True, ensure_ascii=False,
+                    )
+                )
+        bc_report = build_bc_samples_with_report(valid_records)
+        # Merge the sampling-stage quarantine with the validation-stage one.
+        for game_id, error in bc_report.quarantined:
+            validation_quarantine.append(
+                _json.dumps(
+                    {
+                        "game_id": game_id,
+                        "stage": "bc_sampling",
+                        "reason": "BCSampleError",
+                        "error": error,
+                    },
+                    sort_keys=True, ensure_ascii=False,
+                )
+            )
+        if validation_quarantine:
+            q_path = "bc_quarantine.jsonl"
+            with open(q_path, "w", encoding="utf-8") as fh:
+                for line in validation_quarantine:
+                    fh.write(line)
+                    fh.write("\n")
             print(
-                f"[train_v2] WARNING: {len(bc_report.quarantined)} BC records "
-                f"failed sampling and were skipped (run validate_human_games.py "
-                f"to quarantine them upstream).",
+                f"[train_v2] BC quarantine: {len(validation_quarantine)} "
+                f"records failed validation/sampling -> {q_path} "
+                f"(run validate_human_games.py to quarantine upstream).",
                 file=sys.stderr,
             )
         if not bc_report.samples:
             raise ValueError(
-                f"bc.data_path {bc_cfg.data_path!r} yielded no BC samples."
+                f"bc.data_path {bc_cfg.data_path!r} yielded no BC samples "
+                f"({len(validation_quarantine)} quarantined)."
             )
         bc_aux_samples = apply_sample_weights(
             bc_report.samples,
@@ -502,6 +544,8 @@ def main() -> None:
         belief_model=belief_model,
         bc_aux_samples=bc_aux_samples,
         bc_schedule=bc_schedule,
+        bc_temperature=(bc_cfg.temperature if bc_cfg is not None else 1.0),
+        bc_label_smoothing=(bc_cfg.label_smoothing if bc_cfg is not None else 0.0),
     )
 
     print(

@@ -106,21 +106,20 @@ decision_policy:
   rel_tol: 0.0
   risk_penalty: 0.0
 
-# P08 human-data behaviour-cloning prior. Disabled by default so the legacy /
-# pre-P08 path is byte-identical. Enable by setting model.human_prior_enabled:
-# true and bc.enabled: true with a validated human-game JSONL at bc.data_path
-# (produced by ingest_human_games.py + validate_human_games.py).
+# P08 human-data behaviour-cloning prior. The BC auxiliary loss is enabled iff
+# loss.lambda_bc > 0 (single source of truth — there is no separate bc.enabled
+# or bc.lambda_bc). Enable by setting model.human_prior_enabled: true,
+# loss.lambda_bc: <weight>, and pointing bc.data_path at a validated human-game
+# JSONL (produced by ingest_human_games.py + validate_human_games.py).
 #
 # schedule selects how loss.lambda_bc evolves over RL training:
-#   constant     — lambda_bc fixed (default).
-#   linear_decay — lambda_bc decays to schedule_floor over schedule_steps,
+#   constant     — fixed weight (default).
+#   linear_decay — decays to schedule_floor over schedule_steps,
 #                  never forced below the floor so a residual prior survives.
 bc:
-  enabled: false
-  data_path: ""            # validated canonical JSONL of human games
-  lambda_bc: 0.0           # BC auxiliary weight (also settable under loss:)
-  temperature: 1.0
-  label_smoothing: 0.0
+  data_path: ""             # validated canonical JSONL of human games
+  temperature: 1.0          # BC softmax temperature (RL+BC + pretrain paths)
+  label_smoothing: 0.0      # mask-aware smoothing over the legal-action list
   skill_weight_clip: 10.0
   schedule: constant
   schedule_steps: 0

@@ -66,9 +66,15 @@ class BCTrainerConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
+        # batch_size and epochs must be POSITIVE (0 makes range(..., step=0)
+        # crash, and epochs=0 would save a fully untrained checkpoint).
+        for name, val in (("batch_size", self.batch_size),):
+            if not isinstance(val, int) or isinstance(val, bool) or val < 1:
+                raise BCTrainerError(
+                    f"{name} must be a positive int, got {val!r}"
+                )
         for name, val in (
             ("epochs", self.epochs),
-            ("batch_size", self.batch_size),
             ("early_stopping_patience", self.early_stopping_patience),
         ):
             if not isinstance(val, int) or isinstance(val, bool) or val < 0:
@@ -257,6 +263,11 @@ class BCTrainer:
 
         # Medium #1: keep the best-validation state_dict so we can restore it.
         best_state_dict: dict | None = None
+        # When there is no validation set, do NOT fake val metrics as 0.0 (that
+        # would make epoch 0 look "best" and wrongly trigger early stopping /
+        # best-state restore). Instead disable both and report NaN.
+        has_val = bool(self.val_samples)
+        nan = float("nan")
 
         for epoch in range(self.config.epochs):
             order = list(range(len(self.train_samples)))
@@ -271,22 +282,26 @@ class BCTrainer:
                 train_hits += comps.top1_correct
                 train_n += comps.num_decisions
 
-            val_loss, val_hits, val_n = self._evaluate(self.val_samples)
+            if has_val:
+                val_loss, val_hits, val_n = self._evaluate(self.val_samples)
+            else:
+                val_loss, val_hits, val_n = nan, 0, 0
             es = BCEpochStats(
                 epoch=epoch,
                 train_loss=train_loss / max(1, train_n),
                 train_top1=train_hits / max(1, train_n),
                 train_num_decisions=train_n,
                 val_loss=val_loss,
-                val_top1=val_hits / max(1, val_n),
+                val_top1=(val_hits / max(1, val_n)) if has_val else nan,
                 val_num_decisions=val_n,
             )
             stats.epoch_stats.append(es)
             stats.epochs_run += 1
             stats.final_val_loss = val_loss
-            stats.final_val_top1 = val_hits / max(1, val_n)
+            stats.final_val_top1 = es.val_top1
 
-            if val_loss < best_loss - 1e-9:
+            # Best-tracking / early stopping only when there is a real val set.
+            if has_val and val_loss < best_loss - 1e-9:
                 best_loss = val_loss
                 stats.best_val_loss = val_loss
                 stats.best_epoch = epoch
@@ -296,7 +311,7 @@ class BCTrainer:
                 best_state_dict = {
                     k: v.detach().clone() for k, v in self.model.state_dict().items()
                 }
-            else:
+            elif has_val:
                 epochs_since_best += 1
                 if (
                     self.config.early_stopping_patience > 0

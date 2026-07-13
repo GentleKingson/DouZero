@@ -47,9 +47,7 @@ def _write_bc_yaml(tmp_path, *, data_path, lambda_bc, human_prior=True,
         },
         "decision_policy": {"mode": "pure_win"},
         "bc": {
-            "enabled": True,
             "data_path": str(data_path),
-            "lambda_bc": lambda_bc,
             "schedule": schedule,
             "schedule_steps": schedule_steps,
             "schedule_floor": schedule_floor,
@@ -124,3 +122,44 @@ class TestTrainV2BCConfig:
             schedule="linear_decay", schedule_steps=100, schedule_floor=0.05,
         )
         _run_train_v2(yaml_path)
+
+    def test_validation_failed_records_quarantined_not_dropped(
+        self, tmp_path, monkeypatch
+    ):
+        """Blocker 1: a record that fails replay validation is written to
+        bc_quarantine.jsonl, not silently dropped by the filter generator."""
+        from douzero.human_data import write_jsonl
+        from douzero.human_data.synthetic import generate_synthetic_record
+        from douzero.human_data import HumanGameRecord
+
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+        # One good + one bad (illegal first action) record.
+        good = generate_synthetic_record("e2e-good", seed=1)
+        bad = generate_synthetic_record("e2e-bad", seed=2)
+        bad = HumanGameRecord(
+            game_id=bad.game_id, ruleset_id=bad.ruleset_id,
+            ruleset_version=bad.ruleset_version, ruleset_hash=bad.ruleset_hash,
+            seats=bad.seats, initial_hands=bad.initial_hands,
+            bottom_cards=bad.bottom_cards, bidding_history=bad.bidding_history,
+            action_history=(("landlord", (30, 20)),) + bad.action_history[1:],
+            final_result=bad.final_result,
+        )
+        data_path = str(tmp_path / "mixed.jsonl")
+        write_jsonl([good, bad], data_path)
+        yaml_path = _write_bc_yaml(
+            tmp_path, data_path=data_path, lambda_bc=0.3, human_prior=True
+        )
+        # Run from a clean CWD so the quarantine file lands predictably.
+        monkeypatch.chdir(tmp_path)
+        _run_train_v2(yaml_path)
+        import json
+        import os
+
+        q_path = str(tmp_path / "bc_quarantine.jsonl")
+        assert os.path.isfile(q_path), "validation-failed record was silently dropped"
+        with open(q_path, "r", encoding="utf-8") as fh:
+            lines = [l for l in fh.read().splitlines() if l.strip()]
+        assert len(lines) == 1
+        entry = json.loads(lines[0])
+        assert entry["game_id"] == "e2e-bad"
+        assert entry["stage"] in ("replay_validation", "bc_sampling")

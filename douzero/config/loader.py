@@ -214,8 +214,10 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "version": str, "hidden_size": int, "history_encoder": str,
     "history_layers": int, "history_heads": int, "role_embedding_dim": int,
     "belief_enabled": bool, "human_prior_enabled": bool,
-    # P08: behaviour-cloning nested fields.
-    "enabled": bool, "data_path": str, "lambda_bc": float,
+    # P08: behaviour-cloning nested fields. (Blocker 3: ``enabled`` and
+    # ``lambda_bc`` were removed from BCConfig — ``loss.lambda_bc`` is the sole
+    # enable condition / weight, so they are no longer valid bc: keys.)
+    "data_path": str,
     "temperature": float, "label_smoothing": float,
     "skill_weight_clip": float, "schedule": str,
     "schedule_steps": int, "schedule_floor": float,
@@ -274,14 +276,9 @@ def _validate_types(cfg: TrainingConfig) -> None:
         }:
             _check_field(name, getattr(cfg.model, name), "model")
         elif name in {
-            "enabled", "data_path", "temperature", "label_smoothing",
+            "data_path", "temperature", "label_smoothing",
             "skill_weight_clip", "schedule", "schedule_steps", "schedule_floor",
         }:
-            # 'lambda_bc' also lives on BCConfig; route the bc: block's
-            # lambda_bc here only when it is the bc-block field (handled below
-            # by name). The loss.lambda_bc is routed above.
-            if name == "lambda_bc":
-                continue
             _check_field(name, getattr(cfg.bc, name), "bc")
         elif hasattr(cfg, name):
             _check_field(name, getattr(cfg, name), "training")

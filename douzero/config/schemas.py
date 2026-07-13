@@ -102,24 +102,25 @@ class DecisionPolicyConfig:
 class BCConfig:
     """Human-data behaviour-cloning configuration (P08).
 
-    Controls the listwise BC prior: whether it is enabled, where the validated
-    human-game JSONL lives, the loss weight, and a coarse weight schedule.
-    Defaults preserve the legacy / pre-P08 path (BC disabled, ``lambda_bc=0``),
-    so omitting this block changes nothing.
+    SINGLE SOURCE OF TRUTH (Blocker 3): the BC auxiliary loss is enabled **iff**
+    ``loss.lambda_bc > 0``. This block carries only the BC-specific settings
+    (data path, temperature, label smoothing, weight schedule). There is no
+    separate ``enabled`` flag or duplicate ``lambda_bc`` here — both were
+    removed because they could silently disagree with ``loss.lambda_bc`` and
+    leave BC off when the user thought it was on.
 
-    ``schedule`` selects how ``lambda_bc`` evolves over RL training (the BC
-    pretraining path itself ignores it and uses the pretrain_bc.py CLI weight):
+    ``schedule`` selects how ``loss.lambda_bc`` evolves over RL training (the
+    BC pretraining path itself ignores it and uses the pretrain_bc.py CLI
+    weight):
 
-    - ``"constant"`` (default): ``lambda_bc`` is fixed.
-    - ``"linear_decay"``: ``lambda_bc`` linearly decays to 0 over
-      ``schedule_steps`` (but is NOT forced below ``schedule_floor``); the
-      default floor keeps a residual prior so the model never fully forgets
-      the human signal.
+    - ``"constant"`` (default): the weight is fixed.
+    - ``"linear_decay"``: the weight linearly decays to ``schedule_floor``
+      over ``schedule_steps`` (but is NOT forced below the floor); the default
+      floor keeps a residual prior so the model never fully forgets the human
+      signal.
     """
 
-    enabled: bool = False
     data_path: str = ""  # validated canonical JSONL (human games)
-    lambda_bc: float = 0.0
     temperature: float = 1.0
     label_smoothing: float = 0.0
     skill_weight_clip: float = 10.0
