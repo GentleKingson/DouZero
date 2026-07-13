@@ -97,20 +97,65 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.manual_seed(args.seed)
 
     # 1. Load + validate records, then build BC samples.
+    # Blocker 3: records that fail replay validation are QUARANTINED to a
+    # structured file (never silently dropped). The BC sample builder is
+    # fail-closed per-record: a record that does not replay raises rather than
+    # silently yielding no samples, so we catch and quarantine here.
+    import json as _json
+
     print(f"[pretrain_bc] loading records...", file=sys.stderr)
     samples = []
     n_records = 0
     n_valid = 0
+    quarantined: list[str] = []
     for record in _load_records(args):
         n_records += 1
         if not args.skip_validation and not args.synthetic:
-            if not validate_record(record).ok:
-                continue  # quarantine handled upstream by validate_human_games
+            result = validate_record(record)
+            if not result.ok:
+                quarantined.append(
+                    _json.dumps(
+                        {
+                            "game_id": record.game_id,
+                            "stage": "replay_validation",
+                            "reason": result.reason,
+                            "error": result.error,
+                        },
+                        sort_keys=True, ensure_ascii=False,
+                    )
+                )
+                continue
         n_valid += 1
-        samples.extend(build_bc_samples(record))
+        try:
+            samples.extend(build_bc_samples(record))
+        except Exception as exc:  # BCSampleError or ReplayValidationError
+            quarantined.append(
+                _json.dumps(
+                    {
+                        "game_id": record.game_id,
+                        "stage": "bc_sampling",
+                        "reason": type(exc).__name__,
+                        "error": str(exc),
+                    },
+                    sort_keys=True, ensure_ascii=False,
+                )
+            )
+    # Write the quarantine file alongside the checkpoint so invalid records
+    # are auditable (Blocker 3: no silent drops in the production path).
+    if quarantined:
+        q_path = os.path.join(args.save_dir, "quarantine.jsonl")
+        os.makedirs(args.save_dir, exist_ok=True)
+        with open(q_path, "w", encoding="utf-8") as fh:
+            for line in quarantined:
+                fh.write(line)
+                fh.write("\n")
+        print(
+            f"[pretrain_bc] quarantined {len(quarantined)} records -> {q_path}",
+            file=sys.stderr,
+        )
     print(
         f"[pretrain_bc] records={n_records} valid={n_valid} bc_samples="
-        f"{len(samples)}",
+        f"{len(samples)} quarantined={len(quarantined)}",
         file=sys.stderr,
     )
     if not samples:

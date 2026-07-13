@@ -9,8 +9,10 @@ from douzero.human_data.sample import (
     BC_SAMPLE_KIND,
     BCSample,
     BCSampleError,
+    BatchSampleReport,
     build_bc_samples,
     build_bc_samples_batch,
+    build_bc_samples_with_report,
 )
 from douzero.human_data.synthetic import generate_synthetic_record
 from douzero.human_data.validate import validate_record
@@ -109,6 +111,8 @@ class TestBuildBCSamples:
             build_bc_samples(bad)
 
     def test_batch_stream_skips_bad_records(self):
+        """Blocker 3: the batch builder defaults to fail-fast; the with_report
+        variant quarantines bad records (no silent drops)."""
         good = generate_synthetic_record("good", seed=7)
         bad = generate_synthetic_record("bad", seed=8)
         bad = HumanGameRecord(
@@ -123,10 +127,16 @@ class TestBuildBCSamples:
             action_history=(("landlord", (30, 20)),) + bad.action_history[1:],
             final_result=bad.final_result,
         )
-        out = list(build_bc_samples_batch([good, bad]))
-        # Only the good record's samples survive (bad skipped, not raised).
-        assert all(s.game_id == "good" for s in out)
-        assert len(out) > 0
+        # Default: fail-fast raises on the bad record.
+        with pytest.raises(BCSampleError):
+            list(build_bc_samples_batch([good, bad]))
+        # Explicit stop_on_error=False + with_report: bad record quarantined.
+        report = build_bc_samples_with_report([good, bad])
+        assert isinstance(report, BatchSampleReport)
+        assert all(s.game_id == "good" for s in report.samples)
+        assert len(report.samples) > 0
+        assert len(report.quarantined) == 1
+        assert report.quarantined[0][0] == "bad"
 
     def test_batch_stop_on_error(self):
         bad = generate_synthetic_record("bad2", seed=9)

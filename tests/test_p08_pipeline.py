@@ -307,3 +307,99 @@ class TestSplit:
             assert stats[name]["total"] == sum(
                 v for k, v in stats[name].items() if k != "total"
             )
+
+
+# --------------------------------------------------------------------------- #
+# Quarantine contract (Blocker 3)
+# --------------------------------------------------------------------------- #
+class TestQuarantineContract:
+    def test_resilient_jsonl_quarantines_parse_errors(self, tmp_path):
+        """A malformed JSONL line is quarantined, not fatal (Blocker 3)."""
+        from douzero.human_data import iter_jsonl_resilient
+
+        good = generate_synthetic_record("good-jsonl", seed=1)
+        path = str(tmp_path / "mixed.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(good.to_jsonl_line() + "\n")
+            fh.write("{not valid json\n")
+            fh.write('{"kind": "wrong"}\n')
+        results = list(iter_jsonl_resilient(path))
+        assert len(results) == 3
+        assert results[0].record is not None
+        assert results[0].error == ""
+        assert results[1].record is None
+        assert results[1].error
+        assert results[2].record is None
+        assert results[2].error
+
+    def test_validate_human_games_quarantines_parse_errors(self, tmp_path):
+        """validate_human_games.py writes parse-error records to the quarantine
+        file rather than aborting on the first bad line (Blocker 3)."""
+        import validate_human_games
+
+        good = generate_synthetic_record("vhg-good", seed=2)
+        data_path = str(tmp_path / "mixed.jsonl")
+        with open(data_path, "w", encoding="utf-8") as fh:
+            fh.write(good.to_jsonl_line() + "\n")
+            fh.write("{broken json\n")
+            fh.write('{"kind": "wrong"}\n')
+        out_base = str(tmp_path / "out")
+        rc = validate_human_games.main([
+            "--input", data_path, "--output", out_base,
+        ])
+        assert rc == 0
+        import json as _json
+        import os
+
+        q_path = out_base + ".quarantine.jsonl"
+        assert os.path.isfile(q_path)
+        with open(q_path, "r", encoding="utf-8") as fh:
+            lines = [l for l in fh.read().splitlines() if l.strip()]
+        assert len(lines) == 2  # two parse-error lines quarantined (not fatal)
+        for line in lines:
+            entry = _json.loads(line)
+            assert entry["reason"] == "parse_error"
+        v_path = out_base + ".jsonl"
+        assert os.path.isfile(v_path)
+
+    def test_pretrain_quarantines_bad_records(self, tmp_path):
+        """pretrain_bc.py writes a quarantine file for records that fail replay
+        (Blocker 3: no silent continue in the production path)."""
+        import pretrain_bc
+
+        from douzero.human_data import write_jsonl
+
+        good = generate_synthetic_record("pre-good", seed=3)
+        bad = generate_synthetic_record("pre-bad", seed=4)
+        bad = HumanGameRecord(
+            game_id=bad.game_id,
+            ruleset_id=bad.ruleset_id,
+            ruleset_version=bad.ruleset_version,
+            ruleset_hash=bad.ruleset_hash,
+            seats=bad.seats,
+            initial_hands=bad.initial_hands,
+            bottom_cards=bad.bottom_cards,
+            bidding_history=bad.bidding_history,
+            action_history=(("landlord", (30, 20)),) + bad.action_history[1:],
+            final_result=bad.final_result,
+        )
+        data_path = str(tmp_path / "data.jsonl")
+        write_jsonl([good, bad], data_path)
+        save_dir = str(tmp_path / "bc")
+        rc = pretrain_bc.main([
+            "--data", data_path, "--save_dir", save_dir,
+            "--epochs", "1", "--batch_size", "8",
+            "--hidden_size", "32", "--history_layers", "1",
+            "--history_heads", "4", "--seed", "1",
+        ])
+        assert rc == 0
+        import json as _json
+        import os
+
+        q_path = os.path.join(save_dir, "quarantine.jsonl")
+        assert os.path.isfile(q_path)
+        with open(q_path, "r", encoding="utf-8") as fh:
+            lines = [l for l in fh.read().splitlines() if l.strip()]
+        assert len(lines) == 1
+        entry = _json.loads(lines[0])
+        assert entry["game_id"] == "pre-bad"

@@ -480,8 +480,10 @@ def write_jsonl(records: Iterable[HumanGameRecord], path: str) -> int:
 def read_jsonl(path: str) -> Iterator[HumanGameRecord]:
     """Stream records from a JSONL file, yielding one :class:`HumanGameRecord`.
 
-    Each line is parsed independently so a single malformed line does not
-    invalidate the whole file (the caller can quarantine it).
+    Fail-fast: the first malformed line (invalid JSON, wrong schema version,
+    missing field, bad type) raises :class:`RecordValidationError` with the
+    file path and line number. Use this when the input is expected to be clean
+    and any corruption should stop the pipeline immediately.
     """
     with open(path, "r", encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
@@ -491,3 +493,43 @@ def read_jsonl(path: str) -> Iterator[HumanGameRecord]:
                 raise RecordValidationError(
                     f"{path}:{lineno}: {exc}"
                 ) from exc
+
+
+@dataclass(frozen=True)
+class JsonlLineResult:
+    """Outcome of parsing one JSONL line (resilient mode).
+
+    Exactly one of ``record`` / ``error`` is set. ``lineno`` is 1-based.
+    A blank line yields ``error="empty line"`` so the caller can decide whether
+    to skip or quarantine it.
+    """
+
+    lineno: int
+    record: HumanGameRecord | None = None
+    error: str = ""
+
+
+def iter_jsonl_resilient(path: str) -> Iterator[JsonlLineResult]:
+    """Stream JSONL, yielding one :class:`JsonlLineResult` per line.
+
+    Resilient (Blocker 3): a malformed line (invalid JSON, wrong schema
+    version, missing field, bad type) NEVER raises — it yields a result with
+    ``error`` set so the caller can quarantine it alongside replay failures.
+    This is the reader ``validate_human_games.py`` uses so that JSON/schema
+    errors are quarantined, not fatal.
+
+    Empty lines are reported as errors (the caller decides whether to skip or
+    quarantine). The yield order matches the file order.
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            stripped = line.strip()
+            if not stripped:
+                yield JsonlLineResult(lineno=lineno, error="empty line")
+                continue
+            try:
+                record = record_from_jsonl_line(line)
+            except RecordValidationError as exc:
+                yield JsonlLineResult(lineno=lineno, error=str(exc))
+                continue
+            yield JsonlLineResult(lineno=lineno, record=record)

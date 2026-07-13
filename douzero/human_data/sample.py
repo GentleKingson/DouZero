@@ -248,19 +248,38 @@ def build_bc_samples(
     return samples
 
 
+@dataclass
+class BatchSampleReport:
+    """Outcome of :func:`build_bc_samples_batch` (auditable, no silent drops).
+
+    ``samples`` are the built BC samples; ``quarantined`` carries the
+    ``(game_id, error)`` pairs for records that failed replay/sampling so the
+    caller can write a quarantine file. Nothing is dropped silently.
+    """
+
+    samples: list[BCSample]
+    quarantined: list[tuple[str, str]]
+
+
 def build_bc_samples_batch(
     records,
     *,
     skip_single_action: bool = True,
-    stop_on_error: bool = False,
+    stop_on_error: bool = True,
 ) -> Iterator[BCSample]:
-    """Stream BC samples from a batch of validated records.
+    """Stream BC samples from a batch of records.
 
-    Each record is replayed independently; a record that fails to replay yields
-    no samples and (when ``stop_on_error``) raises. Otherwise the bad record is
-    skipped with its game_id noted for the caller to quarantine.
+    Blocker 3: the default is now ``stop_on_error=True`` (fail-fast). A record
+    that fails replay/sampling raises :class:`BCSampleError` immediately rather
+    than being silently skipped — the quarantine contract requires that no bad
+    record disappears without a trace. Callers that want collect-and-quarantine
+    semantics should use :func:`build_bc_samples_with_report` instead, which
+    returns a :class:`BatchSampleReport` with the bad records listed.
     """
     for record in records:
+        # Re-raise on error by default (stop_on_error=True). The only way to
+        # skip is to explicitly pass stop_on_error=False, and even then the
+        # caller should use build_bc_samples_with_report to audit the skips.
         try:
             for sample in build_bc_samples(
                 record, skip_single_action=skip_single_action
@@ -269,6 +288,28 @@ def build_bc_samples_batch(
         except BCSampleError:
             if stop_on_error:
                 raise
-            # Caller should have validated first; skip silently here. A
-            # production pipeline runs validate_record before sampling.
             continue
+
+
+def build_bc_samples_with_report(
+    records,
+    *,
+    skip_single_action: bool = True,
+) -> BatchSampleReport:
+    """Build BC samples, quarantining (not dropping) records that fail.
+
+    Blocker 3: this is the production path. Every record that fails replay or
+    sampling appears in ``report.quarantined`` with its ``game_id`` and the
+    error, so nothing disappears silently. Valid records' samples accumulate in
+    ``report.samples``.
+    """
+    report = BatchSampleReport(samples=[], quarantined=[])
+    for record in records:
+        try:
+            for sample in build_bc_samples(
+                record, skip_single_action=skip_single_action
+            ):
+                report.samples.append(sample)
+        except BCSampleError as exc:
+            report.quarantined.append((record.game_id, str(exc)))
+    return report

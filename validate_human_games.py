@@ -28,8 +28,7 @@ from typing import Sequence
 
 from douzero.human_data.schema import (
     HumanGameRecord,
-    read_jsonl,
-    record_from_jsonl_line,
+    iter_jsonl_resilient,
     write_jsonl,
 )
 from douzero.human_data.synthetic import generate_synthetic_records
@@ -64,41 +63,73 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _iter_input(args: argparse.Namespace):
-    if args.synthetic:
-        yield from generate_synthetic_records(
-            num_games=args.num_synthetic, base_seed=args.synthetic_seed
-        )
-        return
-    if not args.input:
-        raise SystemExit("--input is required when --synthetic is not set")
-    yield from read_jsonl(args.input)
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
 
     valid: list[HumanGameRecord] = []
-    quarantined: list[str] = []  # JSONL lines: {"reason":..., "record":...}
+    quarantined: list[str] = []  # JSONL lines: {"reason":..., "record"/"line":...}
     total = 0
-    for record in _iter_input(args):
-        total += 1
-        result = validate_record(record)
-        if result.ok:
-            valid.append(record)
-        else:
-            quarantined.append(
-                json.dumps(
-                    {
-                        "game_id": record.game_id,
-                        "reason": result.reason,
-                        "error": result.error,
-                        "record": record.to_dict(),
-                    },
-                    sort_keys=True,
-                    ensure_ascii=False,
+    n_parse_errors = 0
+
+    if args.synthetic:
+        for record in generate_synthetic_records(
+            num_games=args.num_synthetic, base_seed=args.synthetic_seed
+        ):
+            total += 1
+            result = validate_record(record)
+            if result.ok:
+                valid.append(record)
+            else:
+                quarantined.append(
+                    json.dumps(
+                        {
+                            "game_id": record.game_id,
+                            "reason": result.reason,
+                            "error": result.error,
+                            "record": record.to_dict(),
+                        },
+                        sort_keys=True, ensure_ascii=False,
+                    )
                 )
-            )
+    else:
+        if not args.input:
+            raise SystemExit("--input is required when --synthetic is not set")
+        # Resilient read (Blocker 3): a malformed line (invalid JSON / wrong
+        # schema version / missing field / bad type) is QUARANTINED, not fatal.
+        # This is the only way JSON/schema errors reach the quarantine file
+        # alongside replay failures.
+        for line_result in iter_jsonl_resilient(args.input):
+            total += 1
+            if line_result.error:
+                n_parse_errors += 1
+                quarantined.append(
+                    json.dumps(
+                        {
+                            "lineno": line_result.lineno,
+                            "reason": "parse_error",
+                            "error": line_result.error,
+                        },
+                        sort_keys=True, ensure_ascii=False,
+                    )
+                )
+                continue
+            record = line_result.record
+            assert record is not None  # guaranteed when error is empty
+            result = validate_record(record)
+            if result.ok:
+                valid.append(record)
+            else:
+                quarantined.append(
+                    json.dumps(
+                        {
+                            "game_id": record.game_id,
+                            "reason": result.reason,
+                            "error": result.error,
+                            "record": record.to_dict(),
+                        },
+                        sort_keys=True, ensure_ascii=False,
+                    )
+                )
 
     valid_path = args.output + ".jsonl"
     quarantine_path = args.output + ".quarantine.jsonl"
@@ -110,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(
         f"[validate_human_games] total={total} valid={n_valid} "
-        f"quarantined={len(quarantined)}",
+        f"quarantined={len(quarantined)} parse_errors={n_parse_errors}",
         file=sys.stderr,
     )
     print(f"[validate_human_games] valid -> {valid_path}", file=sys.stderr)
