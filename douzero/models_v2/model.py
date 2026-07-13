@@ -180,6 +180,22 @@ class ModelV2(nn.Module):
             score_clamp=cfg.score_clamp,
         )
 
+        # P07: optional belief fusion. When ``belief_enabled`` the model gains
+        # a projection that maps the (frozen, externally-computed) belief
+        # posterior features into the trunk and adds them to the state
+        # representation before fusion. The belief FEATURES are produced by a
+        # separate :class:`~douzero.belief.model.BeliefModel` (pretrained then
+        # frozen); this model never owns or reads true hidden hands. The
+        # architecture delta is exactly ``belief_enabled`` (already an identity
+        # axis in :meth:`ModelV2Config.compatibility_dict`), so no checkpoint
+        # identity-version bump is required and existing belief-disabled
+        # checkpoints remain loadable unchanged.
+        self.belief_proj: nn.Module | None = None
+        if cfg.belief_enabled:
+            from douzero.belief.model import BELIEF_FEATURE_DIM
+
+            self.belief_proj = nn.Linear(BELIEF_FEATURE_DIM, cfg.hidden_size)
+
         # Cache the role-name -> index map so forward() does no dict lookup.
         self._role_to_index = {role: i for i, role in enumerate(SUPPORTED_ROLES)}
 
@@ -210,6 +226,9 @@ class ModelV2(nn.Module):
         action_features: torch.Tensor,
         action_mask: torch.Tensor,
         acting_role: str,
+        belief_features: torch.Tensor | None = None,
+        belief_stop_gradient: bool = True,
+        allow_missing_belief_features: bool = False,
     ) -> ModelOutput:
         """Run a full forward pass for one decision.
 
@@ -246,6 +265,28 @@ class ModelV2(nn.Module):
         acting_role:
             The acting role name (``"landlord"`` / ``"landlord_up"`` /
             ``"landlord_down"``).
+        belief_features:
+            Optional ``(BELIEF_FEATURE_DIM,)`` float tensor — the **constrained**
+            belief posterior features from a frozen
+            :class:`~douzero.belief.model.BeliefModel`. Only consumed when
+            ``config.belief_enabled``; passing it to a belief-disabled model
+            raises ``ValueError``. When ``belief_enabled`` and ``None``, the
+            model **fails closed** by default (a belief-trained checkpoint must
+            not silently degrade to a zero-feature baseline) — pass
+            ``allow_missing_belief_features=True`` to opt into the zero-vector
+            behaviour for ablations only. The features are cast to the trunk's
+            device/dtype and detached before fusion.
+        belief_stop_gradient:
+            Always True in effect. The "pretrain belief, freeze its features,
+            train ``belief_proj``" path is the only supported one. Passing
+            ``False`` raises ``NotImplementedError`` — joint value+belief
+            training (value loss updating the BeliefModel) is not implemented
+            because the constrained-marginal DP and the feature projection are
+            non-differentiable (NumPy).
+        allow_missing_belief_features:
+            When ``belief_enabled`` and ``belief_features`` is None, the model
+            raises by default; set this True only for explicit ablations that
+            want the zero-vector baseline.
 
         Returns
         -------
@@ -275,6 +316,73 @@ class ModelV2(nn.Module):
         all_card_vectors = state_card_vectors + context_card_vectors
         full_context_flat = torch.cat([state_context_flat, context_flat], dim=-1)
         state_trunk = self.state_encoder(all_card_vectors, full_context_flat)
+
+        # P07: optional belief fusion. The belief features (posterior expected
+        # counts, entropy, key-card probabilities) are produced by a separate,
+        # pretrained-and-frozen BeliefModel from the PUBLIC observation only;
+        # they are projected into the trunk and added. ``belief_stop_gradient``
+        # (default True) detaches the features so value loss never updates the
+        # frozen belief weights — the "pretrain belief then freeze" path. A
+        # caller doing joint training passes ``belief_stop_gradient=False``.
+        # When ``belief_enabled`` but no features are supplied, the model
+        # FAILS CLOSED by default (a belief-trained checkpoint must not silently
+        # degrade to a zero-feature baseline at deployment). Pass
+        # ``allow_missing_belief_features=True`` to opt into the zero-vector
+        # behaviour for ablations / unit tests.
+        #
+        # Joint training (``belief_stop_gradient=False``) is NOT supported in
+        # P07: the constrained-marginal DP and the feature projection run in
+        # NumPy, which permanently cuts the graph between the value loss and
+        # the belief parameters. Passing ``belief_stop_gradient=False`` raises
+        # ``NotImplementedError`` so the API never promises a path it cannot
+        # deliver (review blocker #1). The default (``True``) keeps the
+        # ``belief_proj`` layer trainable while treating the (frozen) belief
+        # features as constants.
+        if self.belief_proj is not None:
+            from douzero.belief.model import BELIEF_FEATURE_DIM
+
+            if not belief_stop_gradient:
+                raise NotImplementedError(
+                    "Joint value+belief training (belief_stop_gradient=False) "
+                    "is not implemented in P07: the constrained-marginal DP "
+                    "and the belief-feature projection are non-differentiable "
+                    "(NumPy), so value loss cannot reach the BeliefModel "
+                    "parameters. Use the pretrained-then-frozen path "
+                    "(belief_stop_gradient=True, the default); a differentiable "
+                    "belief path is future work."
+                )
+            if belief_features is None:
+                if not allow_missing_belief_features:
+                    raise ValueError(
+                        "belief_features were not supplied to a belief-ENABLED "
+                        "ModelV2. A checkpoint trained with belief fusion must "
+                        "receive the frozen belief posterior at every forward; "
+                        "pass allow_missing_belief_features=True only for "
+                        "explicit ablations."
+                    )
+                belief_features = state_trunk.new_zeros(BELIEF_FEATURE_DIM)
+            else:
+                # Exact shape check (review: only the trailing dim was checked,
+                # and the device/dtype were not aligned with the trunk).
+                if tuple(belief_features.shape) != (BELIEF_FEATURE_DIM,):
+                    raise ValueError(
+                        f"belief_features must have shape "
+                        f"({BELIEF_FEATURE_DIM},), got "
+                        f"{tuple(belief_features.shape)}"
+                    )
+                # Align device/dtype with the trunk so a GPU value model
+                # receiving CPU belief features does not mismatch.
+                belief_features = belief_features.to(
+                    device=state_trunk.device, dtype=state_trunk.dtype
+                ).detach()
+            state_trunk = state_trunk + self.belief_proj(belief_features)
+        elif belief_features is not None:
+            raise ValueError(
+                "belief_features were passed to a belief-DISABLED ModelV2 "
+                "(config.belief_enabled is False). Drop belief_features or "
+                "rebuild the model with belief_enabled=True."
+            )
+        del belief_stop_gradient  # consumed; guard against accidental reuse
 
         # --- Encode the history once. ---
         history_summary = self.history_encoder(history_tokens, history_key_padding_mask)
@@ -333,13 +441,19 @@ class ModelV2(nn.Module):
         parameters only (buffers like LayerNorm running stats are excluded).
         """
         counts: dict[str, int] = {}
-        for name, module in (
+        # Build the submodule list, including the optional belief projection
+        # when present, so a belief-enabled model's parameter report is not
+        # silently undercounted.
+        submodules: list[tuple[str, nn.Module]] = [
             ("state_encoder", self.state_encoder),
             ("history_encoder", self.history_encoder),
             ("action_encoder", self.action_encoder),
             ("fusion", self.fusion),
             ("heads", self.heads),
-        ):
+        ]
+        if self.belief_proj is not None:
+            submodules.append(("belief_proj", self.belief_proj))
+        for name, module in submodules:
             counts[name] = sum(p.numel() for p in module.parameters() if p.requires_grad)
         counts["total"] = sum(counts.values())
         return counts

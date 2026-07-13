@@ -340,8 +340,12 @@ deferred to P14.
 
 - Training integration (P06): multi-objective losses, decision policies,
   calibration metrics, and the actor/learner loop for V2.
-- Belief model integration (P07): `belief_enabled` is carried as a config flag
-  but no belief head is attached yet.
+- Belief model integration (P07): `belief_enabled` now attaches a belief
+  feature projection (see `docs/belief_model.md`). When `belief_enabled=True`
+  the model gains a `belief_proj` layer that fuses a frozen belief posterior
+  into the state trunk; the architecture delta is captured by the existing
+  `belief_enabled` identity axis, so belief-disabled checkpoints are
+  unaffected.
 - Human prior / auxiliary heads (P08/P09): `human_prior_enabled` is carried but
   no prior head is attached yet.
 - AMP / DDP / `torch.compile` (P14).
