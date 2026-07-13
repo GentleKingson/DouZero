@@ -192,27 +192,34 @@ class HumanGameRecord:
                 f"schema_version {self.schema_version!r} != supported "
                 f"{HUMAN_RECORD_SCHEMA_VERSION!r}"
             )
-        # Identity strings must be non-empty. game_id is the only user-
-        # controlled free-text identity field, so it gets a PII value scan
-        # (round 5 Blocker 1: "alice@example.com" must not hide here). The
-        # ruleset_* fields are structural (short enum/hash) and are NOT scanned
-        # (a SHA-256 hash legitimately contains long digit runs that would
-        # false-positive on a phone pattern).
+        # Identity strings must be non-empty. Round 6: PII-scan ALL identity
+        # fields (game_id + ruleset_id + ruleset_version) and validate
+        # ruleset_hash is a 64-char hex string (structural format constraint
+        # that inherently blocks PII). The tightened phone pattern (requires +
+        # or separators) avoids false positives on short enum strings.
         for name, val in (
             ("game_id", self.game_id),
             ("ruleset_id", self.ruleset_id),
             ("ruleset_version", self.ruleset_version),
-            ("ruleset_hash", self.ruleset_hash),
         ):
             if not isinstance(val, str) or not val:
                 raise RecordValidationError(
                     f"{name} must be a non-empty string, got {val!r}"
                 )
-        # PII scan only on game_id (the free-text field).
-        try:
-            _assert_no_forbidden_privacy(self.game_id, label="game_id")
-        except ValueError as exc:
-            raise RecordValidationError(str(exc)) from exc
+            try:
+                _assert_no_forbidden_privacy(val, label=name)
+            except ValueError as exc:
+                raise RecordValidationError(str(exc)) from exc
+        # ruleset_hash: must be a 64-char lowercase hex string (SHA-256).
+        if not isinstance(self.ruleset_hash, str) or not self.ruleset_hash:
+            raise RecordValidationError(
+                f"ruleset_hash must be a non-empty string, got {self.ruleset_hash!r}"
+            )
+        if not re.match(r"^[0-9a-f]{64}$", self.ruleset_hash):
+            raise RecordValidationError(
+                f"ruleset_hash must be a 64-char lowercase hex SHA-256, got "
+                f"{self.ruleset_hash!r}"
+            )
         if self.kind != HUMAN_RECORD_KIND:  # defensive; default already sets it
             object.__setattr__(self, "kind", HUMAN_RECORD_KIND)
 
@@ -248,9 +255,7 @@ class HumanGameRecord:
         object.__setattr__(
             self, "initial_hands", MappingProxyType(coerced_hands)
         )
-        object.__setattr__(
-            self, "final_result", MappingProxyType(dict(self.final_result))
-        )
+        # final_result is deep-frozen AFTER per-field validation below.
         object.__setattr__(
             self,
             "player_skill_weight",
@@ -300,7 +305,10 @@ class HumanGameRecord:
             self, "action_history", tuple(coerced_actions)
         )
 
-        # bidding_history: tuple of (seat, int).
+        # bidding_history: tuple of (seat, int). Round 6 Blocker 1a: PII-scan
+        # the seat string so "alice@example.com" cannot hide here. (Legacy
+        # records must have empty bidding_history — enforced by
+        # assert_legacy_rulesat at the validation boundary.)
         coerced_bids: list[tuple[str, int]] = []
         for entry in self.bidding_history:
             if not isinstance(entry, tuple) or len(entry) != 2:
@@ -313,6 +321,10 @@ class HumanGameRecord:
                 raise RecordValidationError(
                     f"bid seat must be a non-empty string, got {seat!r}"
                 )
+            try:
+                _assert_no_forbidden_privacy(seat, label="bidding_history seat")
+            except ValueError as exc:
+                raise RecordValidationError(str(exc)) from exc
             if isinstance(val, bool) or not isinstance(val, int):
                 raise RecordValidationError(
                     f"bid value must be an int, got {val!r}"
@@ -332,23 +344,58 @@ class HumanGameRecord:
                 f"final_result['winner_team'] must be 'landlord' or 'farmer', "
                 f"got {wt!r}"
             )
-        # Blocker 2 (round 4): whitelist final_result keys so arbitrary
-        # extension fields cannot carry PII into the serialized record.
+        wp = self.final_result.get("winner_position", "")
+        if wp and wp not in LEGAL_ROLES:
+            raise RecordValidationError(
+                f"final_result['winner_position'] must be a legal role or '', "
+                f"got {wp!r}"
+            )
+        # Whitelist keys.
         unknown = set(self.final_result.keys()) - FINAL_RESULT_ALLOWED_KEYS
         if unknown:
             raise RecordValidationError(
                 f"final_result contains unknown keys {sorted(unknown)!r}; "
-                f"allowed keys are {sorted(FINAL_RESULT_ALLOWED_KEYS)}. "
-                f"Arbitrary extension fields are rejected to prevent PII from "
-                f"entering the serialized record."
+                f"allowed keys are {sorted(FINAL_RESULT_ALLOWED_KEYS)}."
             )
+        # Round 6 Blocker 1c: per-field type + finite validation for numeric
+        # scoring fields. Prevents a nested dict/list from hiding PII and
+        # ensures all floats are finite (standard JSON).
+        _FR_INT_FIELDS = frozenset({
+            "bid_value", "bomb_count", "rocket_count", "bomb_num", "multiplier",
+        })
+        _FR_FLOAT_FIELDS = frozenset({"landlord_score", "farmer_score"})
+        _FR_BOOL_FIELDS = frozenset({"spring", "anti_spring"})
+        coerced_fr: dict[str, Any] = {}
+        for key, val in self.final_result.items():
+            if key in _FR_INT_FIELDS:
+                if isinstance(val, bool) or not isinstance(val, int):
+                    raise RecordValidationError(
+                        f"final_result['{key}'] must be an int, got {val!r}"
+                    )
+            elif key in _FR_FLOAT_FIELDS:
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
+                    raise RecordValidationError(
+                        f"final_result['{key}'] must be a number, got {val!r}"
+                    )
+                if not math.isfinite(float(val)):
+                    raise RecordValidationError(
+                        f"final_result['{key}'] must be finite, got {val}"
+                    )
+                val = float(val)
+            elif key in _FR_BOOL_FIELDS:
+                if not isinstance(val, bool):
+                    raise RecordValidationError(
+                        f"final_result['{key}'] must be a bool, got {val!r}"
+                    )
+            coerced_fr[key] = val
         # Scan final_result values for sensitive data (PII/credentials).
         try:
-            _assert_no_forbidden_privacy(
-                dict(self.final_result), label="final_result"
-            )
+            _assert_no_forbidden_privacy(coerced_fr, label="final_result")
         except ValueError as exc:
             raise RecordValidationError(str(exc)) from exc
+        # DEEP-FREEZE final_result (same as source_metadata) so nested mutation
+        # cannot inject PII after construction.
+        object.__setattr__(self, "final_result", _deep_freeze(coerced_fr))
 
         # player_skill_weight: non-negative finite floats, legal roles only.
         coerced_w = {}
@@ -443,7 +490,7 @@ class HumanGameRecord:
             "action_history": [
                 [pos, list(cards)] for pos, cards in self.action_history
             ],
-            "final_result": dict(self.final_result),
+            "final_result": _deep_to_json(self.final_result),
             "player_skill_weight": dict(self.player_skill_weight),
             "source_metadata": _deep_to_json(self.source_metadata),
             "timestamp": self.timestamp,
@@ -580,16 +627,62 @@ def _deep_to_json(obj: Any) -> Any:
     return obj
 
 
+#: Allowed top-level keys in a canonical record dict (round 6: reject unknown
+#: top-level fields so a canonical fixed-schema record cannot silently carry
+#: arbitrary extra data).
+_ALLOWED_TOP_KEYS: frozenset[str] = frozenset({
+    "format_version", "schema_version", "kind",
+    "game_id", "ruleset_id", "ruleset_version", "ruleset_hash",
+    "seats", "initial_hands", "bottom_cards",
+    "bidding_history", "action_history", "final_result",
+    "player_skill_weight", "source_metadata", "timestamp",
+})
+
+
+def _require_mapping(d: Any, field: str) -> Mapping[str, Any]:
+    """Return ``d`` if it is a Mapping; raise RecordValidationError otherwise."""
+    if not isinstance(d, Mapping):
+        raise RecordValidationError(
+            f"record field {field!r} must be a JSON object/mapping, got "
+            f"{type(d).__name__}"
+        )
+    return d
+
+
+def _require_sequence(d: Any, field: str) -> Sequence:
+    """Return ``d`` if it is a non-string Sequence; raise otherwise."""
+    if isinstance(d, str) or not isinstance(d, (list, tuple)):
+        raise RecordValidationError(
+            f"record field {field!r} must be a JSON array, got "
+            f"{type(d).__name__}"
+        )
+    return d
+
+
 def record_from_dict(d: Mapping[str, Any]) -> HumanGameRecord:
     """Build a :class:`HumanGameRecord` from a raw mapping.
 
     Validates the envelope (``kind``, ``format_version``, ``schema_version``)
     BEFORE construction so a malformed or hostile payload is rejected at the
     boundary. Raises :class:`RecordValidationError` on any mismatch.
+
+    Round 6 Blocker 2: ALL malformed nested shapes (null, wrong type, missing
+    ``.items()``) are converted to :class:`RecordValidationError` — never
+    ``AttributeError`` or bare ``TypeError`` — so the resilient JSONL reader
+    can quarantine the line instead of crashing the whole validation process.
+    Also rejects unknown top-level keys (canonical fixed-schema enforcement).
     """
     if not isinstance(d, Mapping):
         raise RecordValidationError(
             f"record must be a mapping, got {type(d).__name__}"
+        )
+
+    # Reject unknown top-level keys (canonical fixed schema).
+    unknown_top = set(d.keys()) - _ALLOWED_TOP_KEYS
+    if unknown_top:
+        raise RecordValidationError(
+            f"record has unknown top-level keys {sorted(unknown_top)!r}; "
+            f"canonical schema does not allow arbitrary top-level fields."
         )
 
     kind = d.get("kind")
@@ -611,19 +704,28 @@ def record_from_dict(d: Mapping[str, Any]) -> HumanGameRecord:
         )
 
     required = (
-        "game_id",
-        "ruleset_id",
-        "ruleset_version",
-        "ruleset_hash",
-        "seats",
-        "initial_hands",
-        "bottom_cards",
-        "action_history",
-        "final_result",
+        "game_id", "ruleset_id", "ruleset_version", "ruleset_hash",
+        "seats", "initial_hands", "bottom_cards",
+        "action_history", "final_result",
     )
     for key in required:
         if key not in d:
             raise RecordValidationError(f"record missing required key {key!r}")
+
+    # Type-check all nested fields BEFORE accessing their methods (.items(),
+    # etc.) so a null/list value converts to RecordValidationError, not
+    # AttributeError (round 6 Blocker 2).
+    _require_sequence(d["seats"], "seats")
+    _require_mapping(d["initial_hands"], "initial_hands")
+    _require_sequence(d["bottom_cards"], "bottom_cards")
+    _require_sequence(d["action_history"], "action_history")
+    _require_mapping(d["final_result"], "final_result")
+    if "bidding_history" in d and d["bidding_history"] is not None:
+        _require_sequence(d["bidding_history"], "bidding_history")
+    if "player_skill_weight" in d and d["player_skill_weight"] is not None:
+        _require_mapping(d["player_skill_weight"], "player_skill_weight")
+    if "source_metadata" in d and d["source_metadata"] is not None:
+        _require_mapping(d["source_metadata"], "source_metadata")
 
     try:
         return HumanGameRecord(
@@ -638,20 +740,23 @@ def record_from_dict(d: Mapping[str, Any]) -> HumanGameRecord:
             },
             bottom_cards=tuple(d["bottom_cards"]),
             bidding_history=tuple(
-                (seat, val) for seat, val in d.get("bidding_history", [])
+                (seat, val) for seat, val in d.get("bidding_history") or []
             ),
             action_history=tuple(
                 (pos, tuple(cards))
                 for pos, cards in d["action_history"]
             ),
             final_result=dict(d["final_result"]),
-            player_skill_weight=dict(d.get("player_skill_weight", {})),
-            source_metadata=dict(d.get("source_metadata", {})),
+            player_skill_weight=dict(d.get("player_skill_weight") or {}),
+            source_metadata=dict(d.get("source_metadata") or {}),
             timestamp=d.get("timestamp", ""),
         )
     except RecordValidationError:
         raise
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, AttributeError) as exc:
+        # AttributeError: a null/wrong-type nested field whose .items() was
+        # called. Convert to RecordValidationError so iter_jsonl_resilient
+        # quarantines it instead of crashing.
         raise RecordValidationError(f"malformed record: {exc}") from exc
 
 

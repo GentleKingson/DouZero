@@ -646,3 +646,86 @@ class TestAdapters:
 
         with pytest.raises(ValueError):
             json.dumps(d, allow_nan=False)
+
+    # ------------------------------------------------------------------ #
+    # Round 6: bidding PII, ruleset format, final_result deep-freeze,
+    #          record_from_dict robustness, top-level key allowlist
+    # ------------------------------------------------------------------ #
+    def test_bidding_history_seat_pii_rejected(self):
+        with pytest.raises(RecordValidationError, match="bidding_history seat"):
+            HumanGameRecord(**self._base_record_args(
+                bidding_history=(("alice@example.com", 1),),
+            ))
+
+    def test_ruleset_version_pii_rejected(self):
+        with pytest.raises(RecordValidationError, match="ruleset_version"):
+            HumanGameRecord(**self._base_record_args(
+                ruleset_version="alice@example.com"
+            ))
+
+    def test_ruleset_hash_non_hex_rejected(self):
+        with pytest.raises(RecordValidationError, match="64-char"):
+            HumanGameRecord(**self._base_record_args(
+                ruleset_hash="not-a-hex-hash"
+            ))
+
+    def test_final_result_nested_mutation_raises(self):
+        """Round 6: final_result is deep-frozen (nested mutation blocked)."""
+        rec = HumanGameRecord(**self._base_record_args(
+            final_result={"winner_team": "landlord", "winner_position": "landlord",
+                          "bomb_count": 2}
+        ))
+        with pytest.raises(TypeError):
+            rec.final_result["bomb_count"] = 5
+
+    def test_final_result_wrong_type_rejected(self):
+        """bomb_count must be int, not string/dict."""
+        with pytest.raises(RecordValidationError, match="must be an int"):
+            HumanGameRecord(**self._base_record_args(
+                final_result={"winner_team": "landlord", "winner_position": "landlord",
+                              "bomb_count": "two"}
+            ))
+
+    def test_final_result_nan_score_rejected(self):
+        with pytest.raises(RecordValidationError, match="finite"):
+            HumanGameRecord(**self._base_record_args(
+                final_result={"winner_team": "landlord", "winner_position": "landlord",
+                              "landlord_score": float("nan")}
+            ))
+
+    def test_record_from_dict_null_initial_hands_quarantined(self):
+        """Round 6 Blocker 2: null initial_hands → RecordValidationError (not
+        AttributeError that crashes the resilient reader)."""
+        payload = _minimal_payload()
+        payload["initial_hands"] = None
+        with pytest.raises(RecordValidationError, match="must be a JSON object"):
+            record_from_dict(payload)
+
+    def test_record_from_dict_list_initial_hands_quarantined(self):
+        payload = _minimal_payload()
+        payload["initial_hands"] = []
+        with pytest.raises(RecordValidationError, match="must be a JSON object"):
+            record_from_dict(payload)
+
+    def test_record_from_dict_rejects_unknown_top_level_key(self):
+        payload = _minimal_payload()
+        payload["extra_field"] = "x"
+        with pytest.raises(RecordValidationError, match="unknown top-level"):
+            record_from_dict(payload)
+
+    def test_resilient_reader_quarantines_null_field_not_crash(self, tmp_path):
+        """End-to-end: iter_jsonl_resilient quarantines a null-field line
+        instead of crashing (round 6 Blocker 2)."""
+        from douzero.human_data import iter_jsonl_resilient
+
+        good = _minimal_payload()
+        bad = _minimal_payload()
+        bad["initial_hands"] = None  # would crash without type check
+        path = str(tmp_path / "mixed.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(good, sort_keys=True) + "\n")
+            fh.write(json.dumps(bad, sort_keys=True) + "\n")
+        results = list(iter_jsonl_resilient(path))
+        assert len(results) == 2
+        assert results[0].record is not None  # good line parsed
+        assert results[1].error  # bad line quarantined, not crashed

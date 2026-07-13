@@ -187,6 +187,7 @@ class BCTrainer:
         model,
         samples: Sequence[BCSample],
         config: BCTrainerConfig | None = None,
+        belief_model=None,
     ) -> None:
         if getattr(model, "prior_head", None) is None:
             raise BCTrainerError(
@@ -201,6 +202,31 @@ class BCTrainer:
         self.model = model
         self.config = config or BCTrainerConfig()
         self.samples = list(samples)
+
+        # Round 6 Blocker 3: support P07+P08 combo (belief+prior). A belief-
+        # enabled model FAILS CLOSED at forward when belief_features are
+        # omitted, so either a belief_model must be supplied (frozen, computes
+        # the public posterior features per sample) or the combo is rejected.
+        belief_enabled = bool(getattr(self.model.config, "belief_enabled", False))
+        if belief_enabled and belief_model is None:
+            raise BCTrainerError(
+                "The value model has belief_enabled=True but no belief_model "
+                "was supplied to BCTrainer. A belief-enabled model fails closed "
+                "at forward without belief_features. Pass a pretrained frozen "
+                "belief_model, or rebuild the value model with "
+                "belief_enabled=False for standalone BC pretraining."
+            )
+        if belief_model is not None and not belief_enabled:
+            raise BCTrainerError(
+                "A belief_model was supplied but the value model has "
+                "belief_enabled=False. Drop belief_model or rebuild with "
+                "belief_enabled=True."
+            )
+        self.belief_model = belief_model
+        if self.belief_model is not None:
+            for p in self.belief_model.parameters():
+                p.requires_grad_(False)
+            self.belief_model.eval()
 
         # Train/val split by game_id (no game leaks across the split). The
         # split is deterministic for a fixed (config.seed, samples order).
@@ -356,6 +382,29 @@ class BCTrainer:
                 )
         return stats
 
+    def _compute_belief_feature(self, obs):
+        """Compute the frozen belief posterior feature for one observation.
+
+        Mirrors V2Trainer._compute_belief_feature. Returns None when belief
+        fusion is disabled. Round 6 Blocker 3: enables the P07+P08 combo in
+        standalone BC pretraining.
+        """
+        if self.belief_model is None:
+            return None
+        import numpy as np
+        from douzero.belief import build_belief_input
+        from douzero.belief.model import belief_features_from_probs
+
+        binput = build_belief_input(obs.public)
+        with torch.inference_mode():
+            bout = self.belief_model([binput])
+            feat_np = belief_features_from_probs(
+                bout.constrained_probs,
+                bout.opponent_a_total,
+                np.stack([binput.unseen_counts]),
+            )[0]
+        return torch.from_numpy(feat_np).detach()
+
     def _train_step(self, batch: list[BCSample]) -> BCLossComponents:
         """One optimizer step over a minibatch of BC samples."""
         per_decision: list[tuple[torch.Tensor, bool]] = []
@@ -363,6 +412,7 @@ class BCTrainer:
         try:
             for s in batch:
                 bundle = observation_to_model_inputs(s.obs)
+                belief_features = self._compute_belief_feature(s.obs)
                 out = self.model(
                     bundle.state_card_vectors,
                     bundle.state_context_flat,
@@ -373,6 +423,7 @@ class BCTrainer:
                     bundle.action_features,
                     bundle.action_mask,
                     bundle.acting_role,
+                    belief_features=belief_features,
                 )
                 if out.prior_logit is None:
                     raise BCTrainerError(
@@ -419,6 +470,7 @@ class BCTrainer:
         n = 0
         for s in samples:
             bundle = observation_to_model_inputs(s.obs)
+            belief_features = self._compute_belief_feature(s.obs)
             out = self.model(
                 bundle.state_card_vectors,
                 bundle.state_context_flat,
@@ -429,6 +481,7 @@ class BCTrainer:
                 bundle.action_features,
                 bundle.action_mask,
                 bundle.acting_role,
+                belief_features=belief_features,
             )
             if out.prior_logit is None:
                 raise BCTrainerError(

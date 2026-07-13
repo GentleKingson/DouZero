@@ -192,6 +192,50 @@ class TestBCTrainer:
         # best_epoch stays -1 (no best was ever tracked).
         assert stats.best_epoch == -1
 
+    def test_belief_plus_prior_combo_supported(self, bc_samples):
+        """Round 6 Blocker 3: BCTrainer supports belief+prior (P07+P08 combo).
+        A belief_model is supplied; belief features are computed per sample."""
+        from douzero.belief import BeliefConfig, BeliefModel
+
+        torch.manual_seed(0)
+        cfg = ModelV2Config(
+            hidden_size=32, history_layers=1, history_heads=4,
+            history_encoder="lstm",
+            belief_enabled=True, human_prior_enabled=True, nan_guard=False,
+        )
+        m = ModelV2(build_v2_schema(), cfg)
+        belief_model = BeliefModel(BeliefConfig(hidden_size=16, num_layers=1))
+        trainer = BCTrainer(
+            m, bc_samples,
+            BCTrainerConfig(epochs=1, batch_size=8, learning_rate=1e-3, seed=1),
+            belief_model=belief_model,
+        )
+        stats = trainer.train()
+        assert stats.epochs_run == 1  # no crash => belief features passed
+
+    def test_belief_enabled_without_belief_model_rejected(self, bc_samples):
+        """Round 6 Blocker 3: belief+prior without belief_model fails fast."""
+        cfg = ModelV2Config(
+            hidden_size=32, history_layers=1, history_heads=4,
+            history_encoder="lstm",
+            belief_enabled=True, human_prior_enabled=True, nan_guard=False,
+        )
+        m = ModelV2(build_v2_schema(), cfg)
+        with pytest.raises(BCTrainerError, match="belief"):
+            BCTrainer(m, bc_samples, BCTrainerConfig(epochs=1))
+
+    def test_belief_model_without_belief_enabled_rejected(self, bc_samples):
+        """belief_model supplied but model has belief_enabled=False."""
+        from douzero.belief import BeliefConfig, BeliefModel
+
+        m = _build_prior_model()  # belief_enabled=False
+        belief_model = BeliefModel(BeliefConfig(hidden_size=16, num_layers=1))
+        with pytest.raises(BCTrainerError, match="belief"):
+            BCTrainer(
+                m, bc_samples, BCTrainerConfig(epochs=1),
+                belief_model=belief_model,
+            )
+
     def test_restores_best_validation_state_dict(self, bc_samples):
         """Medium #1: after train(), the model holds the best-validation
         weights, not the last-epoch weights. We verify by snapshotting the

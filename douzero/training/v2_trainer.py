@@ -648,6 +648,9 @@ class V2Trainer:
             loss_log = components.as_log_dict()
             if bc_diag:
                 loss_log.update(bc_diag)
+                # Round 6 suggestion: loss_total must reflect the ACTUAL total
+                # that was back-propagated (RL + BC), not just the RL part.
+                loss_log["loss_total"] = float(total_loss.detach().item())
             self.stats.last_loss = loss_log
             self.stats.grad_norm_last_step = float(grad_norm.detach().float().item())
             # p_win distribution diagnostics.
