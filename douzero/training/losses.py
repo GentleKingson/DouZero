@@ -110,6 +110,12 @@ class LossConfig:
     lambda_win: float = 1.0
     lambda_score: float = 0.5
     lambda_uncertainty: float = 0.0
+    #: P08: listwise BC auxiliary weight. Default 0 disables the BC term (the
+    #: pre-P08 path is unchanged). When > 0 the V2 trainer adds
+    #: ``lambda_bc * L_BC`` to the RL loss, where ``L_BC`` is the listwise
+    #: cross-entropy over the legal-action list on human BC samples. Requires a
+    #: model built with ``human_prior_enabled=True`` and a BC sample source.
+    lambda_bc: float = 0.0
     score_delta: float = 1.0
     score_target_transform: str = SCORE_TARGET_RAW
     #: The head clamp magnitude. The raw target is clamped to
@@ -123,6 +129,7 @@ class LossConfig:
             ("lambda_win", self.lambda_win),
             ("lambda_score", self.lambda_score),
             ("lambda_uncertainty", self.lambda_uncertainty),
+            ("lambda_bc", self.lambda_bc),
         ):
             _validate_nonneg_weight(name, value)
         if self.score_delta <= 0.0 or not math.isfinite(self.score_delta):
@@ -141,6 +148,7 @@ class LossConfig:
             "lambda_win": float(self.lambda_win),
             "lambda_score": float(self.lambda_score),
             "lambda_uncertainty": float(self.lambda_uncertainty),
+            "lambda_bc": float(self.lambda_bc),
             "score_delta": float(self.score_delta),
             "score_target_transform": str(self.score_target_transform),
             "score_clamp": float(self.score_clamp),
