@@ -45,6 +45,7 @@ import math
 import random
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -208,6 +209,7 @@ class V2Trainer:
         loss_config: LossConfig | None = None,
         decision_config: DecisionConfig | None = None,
         config: TrainerConfig | None = None,
+        belief_model=None,
     ) -> None:
         _legacy_only(ruleset)
         loss_cfg = loss_config or LossConfig()
@@ -242,6 +244,35 @@ class V2Trainer:
             )
         self.model = model
         self.ruleset = ruleset
+        # P07 belief training integration (review round 3). A belief-enabled
+        # value model can only be trained via the "pretrain belief, freeze its
+        # features, train belief_proj" path: the trainer holds the frozen
+        # BeliefModel, computes the constrained posterior features from each
+        # obs.public, and passes them into ModelV2.forward at both the
+        # collection and optimizer call sites. Without this, a belief_enabled
+        # value model fails closed at the first forward.
+        belief_enabled = bool(getattr(self.model.config, "belief_enabled", False))
+        if belief_enabled and belief_model is None:
+            raise ValueError(
+                "The value model has belief_enabled=True but no belief_model "
+                "was supplied to V2Trainer. A belief-enabled value model can "
+                "only be trained with a frozen BeliefModel that computes its "
+                "posterior features. Pass a pretrained belief_model= (load it "
+                "with load_belief_checkpoint)."
+            )
+        if belief_model is not None and not belief_enabled:
+            raise ValueError(
+                "A belief_model was supplied but the value model has "
+                "belief_enabled=False. Drop belief_model or rebuild the value "
+                "model with belief_enabled=True."
+            )
+        if belief_model is not None:
+            # Freeze the belief model: only belief_proj (a value-model param)
+            # is trained; the belief posterior is a frozen feature source.
+            for p in belief_model.parameters():
+                p.requires_grad_(False)
+            belief_model.eval()
+        self.belief_model = belief_model
         self.loss_fn = MultiObjectiveLoss(loss_cfg)
         self.decision_config = decision_config or DecisionConfig()
         self.config = config or TrainerConfig()
@@ -349,12 +380,40 @@ class V2Trainer:
                 break
         return episode
 
+    def _compute_belief_feature(self, obs) -> "torch.Tensor | None":
+        """Compute the (frozen) belief posterior feature for one observation.
+
+        Returns the 48-dim feature vector (detached) built from ``obs.public``
+        via the frozen :class:`BeliefModel`, or ``None`` when belief fusion is
+        disabled (so the value model's fail-closed path is not triggered and
+        ``belief_features`` is simply omitted). Always runs under
+        ``inference_mode`` and never builds a graph — the belief model is a
+        frozen feature source, not an optimization target.
+        """
+        if self.belief_model is None:
+            return None
+        from douzero.belief import build_belief_input
+        from douzero.belief.model import belief_features_from_probs
+
+        binput = build_belief_input(obs.public)
+        with torch.inference_mode():
+            bout = self.belief_model([binput])
+            feat_np = belief_features_from_probs(
+                bout.constrained_probs,
+                bout.opponent_a_total,
+                np.stack([binput.unseen_counts]),
+            )[0]
+        # Detached leaf tensor: the value model casts it to its trunk
+        # device/dtype and the value loss updates only belief_proj.
+        return torch.from_numpy(feat_np).detach()
+
     def _choose_action_index(self, obs) -> int:
         """Epsilon-greedy action selection over the model's valid actions."""
         if self.config.exp_epsilon > 0.0 and self.rng.random() < self.config.exp_epsilon:
             mask = obs.actions.action_mask
             valid = [i for i, m in enumerate(mask) if m]
             return self.rng.choice(valid)
+        belief_features = self._compute_belief_feature(obs)
         with torch.inference_mode():
             bundle = observation_to_model_inputs(obs)
             out = self.model(
@@ -367,6 +426,7 @@ class V2Trainer:
                 bundle.action_features,
                 bundle.action_mask,
                 bundle.acting_role,
+                belief_features=belief_features,
             )
         return select_action(out, self.decision_config)
 
@@ -404,6 +464,7 @@ class V2Trainer:
             gathered_sil: list[torch.Tensor] = []
             for i, obs in enumerate(batch.observations):
                 bundle = observation_to_model_inputs(obs)
+                belief_features = self._compute_belief_feature(obs)
                 out = self.model(
                     bundle.state_card_vectors,
                     bundle.state_context_flat,
@@ -414,6 +475,7 @@ class V2Trainer:
                     bundle.action_features,
                     bundle.action_mask,
                     bundle.acting_role,
+                    belief_features=belief_features,
                 )
                 idx = int(batch.action_indices[i].item())
                 gathered_win.append(out.win_logit[idx : idx + 1])

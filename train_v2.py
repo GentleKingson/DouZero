@@ -84,6 +84,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Enable full deterministic mode (torch.use_deterministic_algorithms). "
         "Absent: defer to the YAML 'deterministic' value (default false).",
     )
+    parser.add_argument(
+        "--belief_checkpoint",
+        default=argparse.SUPPRESS,
+        help="Path to a pretrained belief checkpoint (.pt) for belief-enabled "
+        "value models (model.belief_enabled=true). Loaded with "
+        "load_belief_checkpoint (ruleset + feature identity validated) and "
+        "passed to V2Trainer as a frozen feature source. REQUIRED when the "
+        "value model has belief_enabled=true; ignored otherwise.",
+    )
     return parser
 
 
@@ -379,12 +388,39 @@ def main() -> None:
     loss_cfg = _build_loss_config(yaml_cfg)
     decision_cfg = _build_decision_config(yaml_cfg)
 
+    # P07: load a frozen belief model when the value model is belief-enabled.
+    # The checkpoint is validated (ruleset + feature version + architecture
+    # hash) via load_belief_checkpoint; the trainer freezes it and computes the
+    # constrained posterior features at both the collection and optimizer call
+    # sites. Without this a belief_enabled value model fails closed at forward.
+    belief_model = None
+    if getattr(model_cfg, "belief_enabled", False):
+        belief_ckpt = getattr(args, "belief_checkpoint", None)
+        if not belief_ckpt:
+            raise ValueError(
+                "The value model has belief_enabled=true but no "
+                "--belief_checkpoint was supplied. A belief-enabled value "
+                "model can only be trained with a frozen pretrained "
+                "BeliefModel. Run train_belief.py first, then pass its "
+                "checkpoint via --belief_checkpoint."
+            )
+        from douzero.belief.checkpoint import load_belief_checkpoint
+
+        belief_model = load_belief_checkpoint(
+            belief_ckpt,
+            expected_ruleset=ruleset or __import__(
+                "douzero.env.rules", fromlist=["RuleSet"]
+            ).RuleSet.legacy(),
+            expected_feature_version="v2",
+        )
+
     trainer = V2Trainer(
         model,
         ruleset=ruleset,
         loss_config=loss_cfg,
         decision_config=decision_cfg,
         config=trainer_cfg,
+        belief_model=belief_model,
     )
 
     print(

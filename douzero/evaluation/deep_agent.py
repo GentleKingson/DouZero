@@ -472,20 +472,22 @@ class DeepAgentV2:
         # belief posterior features from the PUBLIC observation and pass them
         # to the value model. The belief model reads only obs.public (never a
         # hidden hand); the features are cast to the value model's device/dtype
-        # inside ModelV2.forward. Under inference_mode the belief forward and
-        # the (NumPy) constrained DP both run without building a graph.
+        # inside ModelV2.forward. Both the belief forward and the value forward
+        # run under inference_mode (no autograd graph at deployment; the belief
+        # model is a frozen feature source).
         belief_features = None
         if self.belief_model is not None:
             from douzero.belief import build_belief_input
             from douzero.belief.model import belief_features_from_probs
 
             binput = build_belief_input(obs.public)
-            bout = self.belief_model([binput])
-            feat_np = belief_features_from_probs(
-                bout.constrained_probs,
-                bout.opponent_a_total,
-                np.stack([binput.unseen_counts]),
-            )[0]
+            with torch.inference_mode():
+                bout = self.belief_model([binput])
+                feat_np = belief_features_from_probs(
+                    bout.constrained_probs,
+                    bout.opponent_a_total,
+                    np.stack([binput.unseen_counts]),
+                )[0]
             belief_features = torch.from_numpy(feat_np)
         with torch.inference_mode():
             out = self.model(

@@ -115,6 +115,24 @@ opponent A, opponent-A & B expected totals, total entropy) into the trunk and
   silently degrade to a zero-feature baseline at deployment). Pass
   `allow_missing_belief_features=True` only for explicit ablations.
 
+## Training the value model with belief fusion
+
+A belief-enabled value model is trained via `train_v2.py` with the frozen
+pretrained belief model supplied as a feature source:
+
+```bash
+python train_v2.py --config configs/enhanced.yaml --belief_checkpoint /path/belief.pt
+```
+
+`V2Trainer(model, ..., belief_model=belief)` freezes the BeliefModel
+(`requires_grad=False`, `eval()`), computes the constrained posterior features
+from each `obs.public` at both the self-play collection and the optimizer
+forward, and fuses them into `ModelV2`. Only `belief_proj` (a value-model
+parameter) is optimized; the belief posterior is a frozen feature source. The
+checkpoint is validated by `load_belief_checkpoint` (ruleset + feature version +
+architecture hash). A belief-enabled value model without `--belief_checkpoint`
+fails fast at trainer construction.
+
 ## Deployment: `DeepAgentV2`
 
 A belief-enabled value model deploys via `DeepAgentV2(position, model, ruleset,

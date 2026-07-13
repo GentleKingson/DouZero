@@ -266,16 +266,27 @@ class ModelV2(nn.Module):
             The acting role name (``"landlord"`` / ``"landlord_up"`` /
             ``"landlord_down"``).
         belief_features:
-            Optional ``(BELIEF_FEATURE_DIM,)`` float tensor — the belief
-            posterior features from a frozen
+            Optional ``(BELIEF_FEATURE_DIM,)`` float tensor — the **constrained**
+            belief posterior features from a frozen
             :class:`~douzero.belief.model.BeliefModel`. Only consumed when
             ``config.belief_enabled``; passing it to a belief-disabled model
-            raises ``ValueError``. When ``belief_enabled`` and ``None``, a zero
-            vector is used (belief signal absent).
+            raises ``ValueError``. When ``belief_enabled`` and ``None``, the
+            model **fails closed** by default (a belief-trained checkpoint must
+            not silently degrade to a zero-feature baseline) — pass
+            ``allow_missing_belief_features=True`` to opt into the zero-vector
+            behaviour for ablations only. The features are cast to the trunk's
+            device/dtype and detached before fusion.
         belief_stop_gradient:
-            If True (default), detach ``belief_features`` so the value loss
-            cannot update the (frozen) belief model — the "pretrain then freeze"
-            path. Pass False for joint training.
+            Always True in effect. The "pretrain belief, freeze its features,
+            train ``belief_proj``" path is the only supported one. Passing
+            ``False`` raises ``NotImplementedError`` — joint value+belief
+            training (value loss updating the BeliefModel) is not implemented
+            because the constrained-marginal DP and the feature projection are
+            non-differentiable (NumPy).
+        allow_missing_belief_features:
+            When ``belief_enabled`` and ``belief_features`` is None, the model
+            raises by default; set this True only for explicit ablations that
+            want the zero-vector baseline.
 
         Returns
         -------
