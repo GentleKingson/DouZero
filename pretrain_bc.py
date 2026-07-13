@@ -64,6 +64,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--early_stopping_patience", type=int, default=0)
     p.add_argument("--max_grad_norm", type=float, default=40.0)
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--label_smoothing", type=float, default=0.0,
+                   help="mask-aware label smoothing over the legal-action list")
     p.add_argument("--skill_weight_clip", type=float, default=10.0,
                    help="cap on the composite sample weight before normalization")
     p.add_argument("--seed", type=int, default=0)
@@ -207,9 +209,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             learning_rate=args.learning_rate,
             val_ratio=args.val_ratio,
             early_stopping_patience=args.early_stopping_patience,
-            max_grad_norm=args.max_grad_norm,
-            temperature=args.temperature,
-            seed=args.seed,
+        max_grad_norm=args.max_grad_norm,
+        temperature=args.temperature,
+        label_smoothing=args.label_smoothing,
+        seed=args.seed,
         )
         trainer = BCTrainer(model, samples, trainer_cfg)
         stats = trainer.train()

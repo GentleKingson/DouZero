@@ -29,6 +29,7 @@ AGENTS.md "Human-game data" rules this module enforces:
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -76,9 +77,26 @@ FINAL_RESULT_ALLOWED_KEYS: frozenset[str] = frozenset({
     "spring", "anti_spring",
 })
 
+#: The EXACT set of keys allowed in ``initial_hands`` for a legacy record.
+#: Extra keys are rejected so PII cannot hide in an undeclared hand slot.
+LEGACY_HAND_KEYS: frozenset[str] = frozenset({
+    "landlord", "landlord_up", "landlord_down", "three_landlord_cards",
+})
+
+#: The three legal card-play roles (used for seats, action positions, skill
+#: weights). A record carrying a non-canonical role is rejected so PII cannot
+#: hide in a free-text role string.
+LEGAL_ROLES: frozenset[str] = frozenset({
+    "landlord", "landlord_down", "landlord_up",
+})
+
+#: The canonical legacy seat order (turn order). A legacy record's ``seats``
+#: must equal this exactly.
+LEGACY_SEATS: tuple[str, ...] = ("landlord", "landlord_down", "landlord_up")
+
 #: Allowed ``timestamp`` formats (Blocker 2: prevents a free-text timestamp
 #: from carrying PII). Empty string or a coarse ``YYYY-MM`` month bucket.
-_TIMESTAMP_PATTERN: re.Pattern[str] = re.compile(r"^\d{4}-\d{2}$")
+_TIMESTAMP_PATTERN: re.Pattern[str] = re.compile(r"^(\d{4})-(\d{2})$")
 
 
 class RecordValidationError(ValueError):
@@ -174,7 +192,12 @@ class HumanGameRecord:
                 f"schema_version {self.schema_version!r} != supported "
                 f"{HUMAN_RECORD_SCHEMA_VERSION!r}"
             )
-        # Identity strings must be non-empty.
+        # Identity strings must be non-empty. game_id is the only user-
+        # controlled free-text identity field, so it gets a PII value scan
+        # (round 5 Blocker 1: "alice@example.com" must not hide here). The
+        # ruleset_* fields are structural (short enum/hash) and are NOT scanned
+        # (a SHA-256 hash legitimately contains long digit runs that would
+        # false-positive on a phone pattern).
         for name, val in (
             ("game_id", self.game_id),
             ("ruleset_id", self.ruleset_id),
@@ -185,31 +208,43 @@ class HumanGameRecord:
                 raise RecordValidationError(
                     f"{name} must be a non-empty string, got {val!r}"
                 )
+        # PII scan only on game_id (the free-text field).
+        try:
+            _assert_no_forbidden_privacy(self.game_id, label="game_id")
+        except ValueError as exc:
+            raise RecordValidationError(str(exc)) from exc
         if self.kind != HUMAN_RECORD_KIND:  # defensive; default already sets it
             object.__setattr__(self, "kind", HUMAN_RECORD_KIND)
 
-        # Seats: non-empty tuple of non-empty strings.
-        if not isinstance(self.seats, tuple) or not self.seats:
+        # Seats: must equal the canonical legacy seat order exactly (round 5
+        # Blocker 1: prevents a free-text seat like "user@example.com").
+        if not isinstance(self.seats, tuple) or self.seats != LEGACY_SEATS:
             raise RecordValidationError(
-                f"seats must be a non-empty tuple, got {self.seats!r}"
+                f"seats must equal the canonical legacy seat order {LEGACY_SEATS}, "
+                f"got {self.seats!r}"
             )
-        for s in self.seats:
-            if not isinstance(s, str) or not s:
-                raise RecordValidationError(
-                    f"each seat must be a non-empty string, got {s!r}"
-                )
 
         # Wrap caller mappings read-only and coerce card lists to sorted-int
         # tuples in one pass (deep immutability + canonical card ordering).
+        # Round 5 Blocker 1: reject extra keys so PII cannot hide in an
+        # undeclared hand slot (e.g. "user_email_alice@example.com": []).
+        hand_keys = set(self.initial_hands.keys())
+        extra = hand_keys - LEGACY_HAND_KEYS
+        if extra:
+            raise RecordValidationError(
+                f"initial_hands has unknown keys {sorted(extra)!r}; allowed "
+                f"keys are {sorted(LEGACY_HAND_KEYS)}. Extra keys are rejected "
+                f"to prevent PII from entering the record."
+            )
+        missing = LEGACY_HAND_KEYS - hand_keys
+        if missing:
+            raise RecordValidationError(
+                f"initial_hands missing required keys {sorted(missing)!r}"
+            )
         coerced_hands = {
             role: _coerce_sorted_int_tuple(cards, f"initial_hands[{role!r}]")
             for role, cards in self.initial_hands.items()
         }
-        for role in coerced_hands:
-            if not isinstance(role, str) or not role:
-                raise RecordValidationError(
-                    f"initial_hands role must be non-empty string, got {role!r}"
-                )
         object.__setattr__(
             self, "initial_hands", MappingProxyType(coerced_hands)
         )
@@ -221,15 +256,13 @@ class HumanGameRecord:
             "player_skill_weight",
             MappingProxyType(dict(self.player_skill_weight)),
         )
-        # Blocker 2: deep-normalize source_metadata to canonical JSON types
-        # so a tuple/set value (which json.dumps silently serializes as a JSON
-        # array, leaking any PII it carries to disk) is converted to a list
-        # BEFORE the read-only wrapper. This also rejects non-JSON types
-        # (e.g. bytes, custom objects) that would break serialization.
+        # Round 5 Blocker 1.3: normalize -> privacy-scan -> DEEP-FREEZE so the
+        # privacy boundary is durable (nested mutation raises TypeError).
+        _normalized_meta = _normalize_json_mapping(self.source_metadata)
         object.__setattr__(
             self,
             "source_metadata",
-            MappingProxyType(_normalize_json_mapping(self.source_metadata)),
+            _deep_freeze(_normalized_meta),
         )
 
         # bottom_cards: sorted-int tuple.
@@ -253,9 +286,12 @@ class HumanGameRecord:
                     f"tuple, got {entry!r}"
                 )
             pos, cards = entry
-            if not isinstance(pos, str) or not pos:
+            # Round 5 Blocker 1: position must be a canonical legal role.
+            if pos not in LEGAL_ROLES:
                 raise RecordValidationError(
-                    f"action position must be a non-empty string, got {pos!r}"
+                    f"action_history position {pos!r} is not a legal role "
+                    f"(one of {sorted(LEGAL_ROLES)}); free-text positions are "
+                    f"rejected to prevent PII."
                 )
             coerced_actions.append(
                 (pos, _coerce_sorted_int_tuple(cards, f"action[{pos!r}]"))
@@ -314,17 +350,24 @@ class HumanGameRecord:
         except ValueError as exc:
             raise RecordValidationError(str(exc)) from exc
 
-        # player_skill_weight: non-negative floats.
+        # player_skill_weight: non-negative finite floats, legal roles only.
         coerced_w = {}
         for role, w in self.player_skill_weight.items():
-            if not isinstance(role, str) or not role:
+            # Round 5 Blocker 1: role must be a canonical legal role.
+            if role not in LEGAL_ROLES:
                 raise RecordValidationError(
-                    f"player_skill_weight role must be non-empty string, "
-                    f"got {role!r}"
+                    f"player_skill_weight role {role!r} is not a legal role "
+                    f"(one of {sorted(LEGAL_ROLES)}); free-text roles are "
+                    f"rejected to prevent PII."
                 )
             if isinstance(w, bool) or not isinstance(w, (int, float)):
                 raise RecordValidationError(
                     f"player_skill_weight[{role!r}] must be a number, got {w!r}"
+                )
+            # Round 5 Blocker 2: reject NaN/Inf (non-standard JSON).
+            if not math.isfinite(float(w)):
+                raise RecordValidationError(
+                    f"player_skill_weight[{role!r}] must be finite, got {w}"
                 )
             if w < 0:
                 raise RecordValidationError(
@@ -347,6 +390,15 @@ class HumanGameRecord:
             raise RecordValidationError(
                 f"timestamp must be empty or 'YYYY-MM', got {ts!r}"
             )
+        if ts:
+            # Round 5 Blocker 2: validate the month is 01-12.
+            m = _TIMESTAMP_PATTERN.match(ts)
+            assert m is not None  # guaranteed by the check above
+            month = int(m.group(2))
+            if not 1 <= month <= 12:
+                raise RecordValidationError(
+                    f"timestamp month must be 01-12, got {ts!r}"
+                )
         # Scan timestamp for sensitive data (an email/IP shaped value must not
         # hide here even if it matched the YYYY-MM regex — defense in depth).
         if ts:
@@ -393,13 +445,20 @@ class HumanGameRecord:
             ],
             "final_result": dict(self.final_result),
             "player_skill_weight": dict(self.player_skill_weight),
-            "source_metadata": dict(self.source_metadata),
+            "source_metadata": _deep_to_json(self.source_metadata),
             "timestamp": self.timestamp,
         }
 
     def to_jsonl_line(self) -> str:
-        """Return the canonical JSONL encoding (single line, no trailing NL)."""
-        return json.dumps(self.to_dict(), sort_keys=True, ensure_ascii=False)
+        """Return the canonical JSONL encoding (single line, no trailing NL).
+
+        ``allow_nan=False`` rejects NaN/Infinity (round 5 Blocker 2: the
+        canonical JSONL must be strict standard JSON, not Python's extended
+        subset that silently writes ``NaN``/``Infinity`` tokens).
+        """
+        return json.dumps(
+            self.to_dict(), sort_keys=True, ensure_ascii=False, allow_nan=False
+        )
 
     @property
     def winner_team(self) -> str:
@@ -442,18 +501,32 @@ def _coerce_sorted_int_tuple(value: Any, label: str) -> tuple[int, ...]:
 def _normalize_json_value(value: Any, label: str) -> Any:
     """Recursively normalize ``value`` to a canonical JSON type.
 
-    Blocker 2: tuple/set/frozenset are converted to list (so json.dumps never
-    silently serializes a tuple carrying PII to a JSON array, and so the
-    metadata privacy scanner sees a list it can recurse into). Non-JSON scalar
-    types (bytes, complex, custom objects) are rejected so serialization cannot
-    fail later or leak an unexpected repr.
+    Round 5 Blocker 2: rejects NaN/Inf floats (non-standard JSON), rejects
+    set/frozenset (non-deterministic iteration order breaks reproducible
+    canonical output), converts tuple to list, and rejects non-JSON scalar
+    types (bytes, custom objects).
     """
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        # Reject NaN/Infinity — they are not valid standard JSON and
+        # json.dumps(allow_nan=False) would raise at serialization.
+        if not math.isfinite(value):
+            raise RecordValidationError(
+                f"{label}: source_metadata contains a non-finite float "
+                f"({value}); NaN/Infinity are not valid standard JSON."
+            )
         return value
     if isinstance(value, Mapping):
         return _normalize_json_mapping(value)
-    if isinstance(value, (list, tuple, set, frozenset)):
+    if isinstance(value, (list, tuple)):
         return [_normalize_json_value(item, label) for item in value]
+    if isinstance(value, (set, frozenset)):
+        raise RecordValidationError(
+            f"{label}: source_metadata contains a set/frozenset, which has "
+            f"non-deterministic iteration order and would break reproducible "
+            f"canonical JSONL output. Use a list instead."
+        )
     raise RecordValidationError(
         f"{label}: source_metadata contains a non-JSON value of type "
         f"{type(value).__name__}; only dict/list/str/int/float/bool/None are "
@@ -475,6 +548,36 @@ def _normalize_json_mapping(metadata: Mapping[str, Any]) -> dict[str, Any]:
             )
         out[key] = _normalize_json_value(value, f"source_metadata[{key!r}]")
     return out
+
+
+def _deep_freeze(obj: Any) -> Any:
+    """Recursively freeze a normalized JSON value to be deeply immutable.
+
+    Round 5 Blocker 1.3: wraps every nested dict in :class:`MappingProxyType`
+    and converts every list to a tuple, so post-construction mutation (e.g.
+    ``record.source_metadata["nested"]["contact"] = "alice@example.com"``)
+    raises ``TypeError`` rather than silently injecting PII that survives into
+    serialization. The privacy scan ran at construction; the deep freeze makes
+    that boundary durable.
+    """
+    if isinstance(obj, Mapping):
+        return MappingProxyType(
+            {k: _deep_freeze(v) for k, v in obj.items()}
+        )
+    if isinstance(obj, list):
+        return tuple(_deep_freeze(item) for item in obj)
+    if isinstance(obj, tuple):
+        return tuple(_deep_freeze(item) for item in obj)
+    return obj
+
+
+def _deep_to_json(obj: Any) -> Any:
+    """Recursively convert a deep-frozen value back to plain JSON types."""
+    if isinstance(obj, Mapping):
+        return {k: _deep_to_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_deep_to_json(item) for item in obj]
+    return obj
 
 
 def record_from_dict(d: Mapping[str, Any]) -> HumanGameRecord:

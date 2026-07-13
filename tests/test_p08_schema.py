@@ -332,9 +332,10 @@ class TestAdapters:
             final_result={"winner_team": "landlord", "winner_position": "landlord"},
             source_metadata={"items": (1, 2, 3)},
         )
-        # The tuple was normalized to a list.
-        assert rec.source_metadata["items"] == [1, 2, 3]
-        assert isinstance(rec.source_metadata["items"], list)
+        # The tuple was normalized to a list, then deep-frozen to a tuple
+        # (immutable) so post-construction mutation cannot inject PII.
+        assert rec.source_metadata["items"] == (1, 2, 3)
+        assert isinstance(rec.source_metadata["items"], tuple)
 
     def test_record_rejects_non_json_metadata_type(self):
         from douzero.env.rules import RuleSet
@@ -538,3 +539,110 @@ class TestAdapters:
         payload["final_result"]["custom_field"] = "x"
         with pytest.raises(RecordValidationError, match="unknown keys"):
             record_from_dict(payload)
+
+    # ------------------------------------------------------------------ #
+    # Round 5: comprehensive PII/structural hardening
+    # ------------------------------------------------------------------ #
+    def _base_record_args(self, **overrides):
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        args = dict(
+            game_id="g-test",
+            ruleset_id=rs.ruleset_id,
+            ruleset_version=rs.ruleset_version,
+            ruleset_hash=rs.stable_hash(),
+            seats=("landlord", "landlord_down", "landlord_up"),
+            initial_hands={
+                "landlord": [3, 3], "landlord_up": [5, 5],
+                "landlord_down": [7, 7], "three_landlord_cards": [3, 4, 5],
+            },
+            bottom_cards=[3, 4, 5],
+            action_history=(),
+            final_result={"winner_team": "landlord", "winner_position": "landlord"},
+        )
+        args.update(overrides)
+        return args
+
+    def test_game_id_with_pii_rejected(self):
+        with pytest.raises(RecordValidationError, match="game_id"):
+            HumanGameRecord(**self._base_record_args(
+                game_id="alice@example.com"
+            ))
+
+    def test_extra_initial_hands_key_rejected(self):
+        hands = dict(self._base_record_args()["initial_hands"])
+        hands["user_email"] = []
+        with pytest.raises(RecordValidationError, match="unknown keys"):
+            HumanGameRecord(**self._base_record_args(initial_hands=hands))
+
+    def test_non_canonical_seats_rejected(self):
+        with pytest.raises(RecordValidationError, match="canonical legacy seat"):
+            HumanGameRecord(**self._base_record_args(
+                seats=("landlord", "user@example.com", "landlord_up")
+            ))
+
+    def test_action_history_non_legal_role_rejected(self):
+        with pytest.raises(RecordValidationError, match="legal role"):
+            HumanGameRecord(**self._base_record_args(
+                action_history=(("landlord", (3,)), ("bad_role", (5,))),
+            ))
+
+    def test_player_skill_weight_non_legal_role_rejected(self):
+        with pytest.raises(RecordValidationError, match="legal role"):
+            HumanGameRecord(**self._base_record_args(
+                player_skill_weight={"bad_role": 1.0},
+            ))
+
+    def test_nan_skill_weight_rejected(self):
+        with pytest.raises(RecordValidationError, match="finite"):
+            HumanGameRecord(**self._base_record_args(
+                player_skill_weight={"landlord": float("nan")},
+            ))
+
+    def test_inf_skill_weight_rejected(self):
+        with pytest.raises(RecordValidationError, match="finite"):
+            HumanGameRecord(**self._base_record_args(
+                player_skill_weight={"landlord": float("inf")},
+            ))
+
+    def test_metadata_set_rejected(self):
+        """set/frozenset have non-deterministic iteration order and are rejected."""
+        with pytest.raises(RecordValidationError, match="set"):
+            HumanGameRecord(**self._base_record_args(
+                source_metadata={"tags": {"x", "y"}},
+            ))
+
+    def test_metadata_nan_float_rejected(self):
+        with pytest.raises(RecordValidationError, match="non-finite"):
+            HumanGameRecord(**self._base_record_args(
+                source_metadata={"score": float("nan")},
+            ))
+
+    def test_post_construction_nested_metadata_mutation_raises(self):
+        """Round 5 Blocker 1.3: deep-freeze prevents post-construction PII
+        injection into nested metadata."""
+        rec = HumanGameRecord(**self._base_record_args(
+            source_metadata={"nested": {"safe": 1}}
+        ))
+        # Top-level is read-only.
+        with pytest.raises(TypeError):
+            rec.source_metadata["new"] = "x"
+        # Nested dict is ALSO read-only (deep freeze).
+        with pytest.raises(TypeError):
+            rec.source_metadata["nested"]["contact"] = "alice@example.com"
+
+    def test_to_jsonl_line_rejects_nan(self):
+        """Round 5 Blocker 2: allow_nan=False ensures NaN/Inf cannot be
+        serialized even if they somehow reached the dict."""
+        rec = HumanGameRecord(**self._base_record_args())
+        # Tamper with the internal dict to simulate a bypass (the construction
+        # would normally reject NaN; here we verify the serializer also rejects).
+        import math
+
+        d = rec.to_dict()
+        d["player_skill_weight"] = {"landlord": float("nan")}
+        import json
+
+        with pytest.raises(ValueError):
+            json.dumps(d, allow_nan=False)

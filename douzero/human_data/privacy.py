@@ -47,12 +47,16 @@ CREDENTIAL_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 )
 
 # PII VALUE patterns — personal identifiers under benign keys.
+# The phone patterns are deliberately tight: a bare run of 8+ digits (which a
+# SHA-256 hash contains) is NOT a phone number. We require EITHER a '+' prefix
+# (international format) OR explicit group separators (US-style ddd-ddd-dddd).
 PII_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
         r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}",      # email
         r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",       # IPv4
-        r"\+?\d[\d\s\-().]{7,}\d",                        # phone
+        r"\+\d[\d\s\-().]{7,}\d",                         # phone: +1-555-...
+        r"\d{3}[-.\s]\d{3}[-.\s]\d{4}",                  # phone: 555-123-4567
     )
 )
 

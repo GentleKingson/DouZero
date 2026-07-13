@@ -75,12 +75,11 @@ class ModelOutput:
             raise ValueError(
                 f"action_mask must be bool, got {self.action_mask.dtype}"
             )
-        # P08: validate the optional prior head shape when present.
+        # P08: validate the optional prior head shape when present. Require
+        # EXACTLY 2D (N, 1) — a (N, 2, 1) tensor would pass a trailing-dim-only
+        # check but is semantically wrong (round 5 non-blocking hardening).
         if self.prior_logit is not None:
-            if (
-                self.prior_logit.shape[0] != n
-                or self.prior_logit.shape[-1] != 1
-            ):
+            if self.prior_logit.ndim != 2 or self.prior_logit.shape != (n, 1):
                 raise ValueError(
                     f"prior_logit must have shape ({n}, 1), got "
                     f"{tuple(self.prior_logit.shape)}"
