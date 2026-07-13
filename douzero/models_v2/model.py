@@ -67,7 +67,7 @@ from douzero.observation.schema import (
 from .action_encoder import ActionEncoder
 from .config import HISTORY_ENCODER_TRANSFORMER, ModelV2Config, SUPPORTED_ROLES
 from .fusion import StateActionFusion
-from .heads import ValueHeads
+from .heads import PriorHead, ValueHeads
 from .history_encoder import build_history_encoder
 from .output import ModelOutput
 from .state_encoder import StateEncoder
@@ -195,6 +195,18 @@ class ModelV2(nn.Module):
             from douzero.belief.model import BELIEF_FEATURE_DIM
 
             self.belief_proj = nn.Linear(BELIEF_FEATURE_DIM, cfg.hidden_size)
+
+        # P08: optional listwise policy-prior head. When ``human_prior_enabled``
+        # the model gains a :class:`~douzero.models_v2.heads.PriorHead` that
+        # emits one prior logit per legal action, trained by listwise BC. The
+        # head reads only the fused public action representation; it never sees
+        # hidden hands. ``human_prior_enabled`` is already an identity axis in
+        # :meth:`ModelV2Config.compatibility_dict`, so flipping it changes the
+        # checkpoint hash and the strict loader rejects a cross-load (a
+        # prior-enabled checkpoint has extra ``prior_head.*`` keys).
+        self.prior_head: PriorHead | None = None
+        if cfg.human_prior_enabled:
+            self.prior_head = PriorHead(hidden_size=cfg.hidden_size)
 
         # Cache the role-name -> index map so forward() does no dict lookup.
         self._role_to_index = {role: i for i, role in enumerate(SUPPORTED_ROLES)}
@@ -422,6 +434,15 @@ class ModelV2(nn.Module):
             assert_finite(head_out["p_win"], "p_win")
             assert_finite(head_out["score_mean"], "score_mean")
 
+        # P08: optional listwise prior head. Only computed when the model was
+        # built with ``human_prior_enabled``; the head reads only the fused
+        # public action representation (no hidden hands, no privileged label).
+        prior_logit: torch.Tensor | None = None
+        if self.prior_head is not None:
+            prior_logit = self.prior_head(fused)
+            if self.config.nan_guard:
+                assert_finite(prior_logit, "prior_logit")
+
         return ModelOutput(
             win_logit=head_out["win_logit"],
             score_if_win=head_out["score_if_win"],
@@ -429,6 +450,7 @@ class ModelV2(nn.Module):
             p_win=head_out["p_win"],
             score_mean=head_out["score_mean"],
             action_mask=action_mask,
+            prior_logit=prior_logit,
         )
 
     # ------------------------------------------------------------------ #
@@ -453,6 +475,8 @@ class ModelV2(nn.Module):
         ]
         if self.belief_proj is not None:
             submodules.append(("belief_proj", self.belief_proj))
+        if self.prior_head is not None:
+            submodules.append(("prior_head", self.prior_head))
         for name, module in submodules:
             counts[name] = sum(p.numel() for p in module.parameters() if p.requires_grad)
         counts["total"] = sum(counts.values())

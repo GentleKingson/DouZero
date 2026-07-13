@@ -71,6 +71,7 @@ class LossConfig:
     lambda_win: float = 0.0
     lambda_score: float = 0.0
     lambda_uncertainty: float = 0.0
+    lambda_bc: float = 0.0  # P08: listwise BC auxiliary weight (default off)
     score_delta: float = 1.0
     score_target_transform: str = "raw"  # "raw" | "signed_log"
     score_clamp: float = 32.0
@@ -92,6 +93,39 @@ class DecisionPolicyConfig:
     abs_tol: float = 0.0
     rel_tol: float = 0.0
     risk_penalty: float = 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Behaviour cloning (P08 human-data prior)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class BCConfig:
+    """Human-data behaviour-cloning configuration (P08).
+
+    Controls the listwise BC prior: whether it is enabled, where the validated
+    human-game JSONL lives, the loss weight, and a coarse weight schedule.
+    Defaults preserve the legacy / pre-P08 path (BC disabled, ``lambda_bc=0``),
+    so omitting this block changes nothing.
+
+    ``schedule`` selects how ``lambda_bc`` evolves over RL training (the BC
+    pretraining path itself ignores it and uses the pretrain_bc.py CLI weight):
+
+    - ``"constant"`` (default): ``lambda_bc`` is fixed.
+    - ``"linear_decay"``: ``lambda_bc`` linearly decays to 0 over
+      ``schedule_steps`` (but is NOT forced below ``schedule_floor``); the
+      default floor keeps a residual prior so the model never fully forgets
+      the human signal.
+    """
+
+    enabled: bool = False
+    data_path: str = ""  # validated canonical JSONL (human games)
+    lambda_bc: float = 0.0
+    temperature: float = 1.0
+    label_smoothing: float = 0.0
+    skill_weight_clip: float = 10.0
+    schedule: str = "constant"  # "constant" | "linear_decay"
+    schedule_steps: int = 0
+    schedule_floor: float = 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +220,10 @@ class TrainingConfig:
     # P06 r5: V2 model architecture block. The legacy train.py path ignores
     # this; train_v2.py reads it via ModelV2Config.from_model_config().
     model: ModelConfig = field(default_factory=ModelConfig)
+    # P08: behaviour-cloning prior configuration. Defaults preserve the
+    # pre-P08 path (BC disabled). Consumed by pretrain_bc.py and the optional
+    # BC auxiliary loss hook in the V2 trainer.
+    bc: BCConfig = field(default_factory=BCConfig)
 
 
 # --------------------------------------------------------------------------- #

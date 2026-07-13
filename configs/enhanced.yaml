@@ -97,9 +97,31 @@ loss:
 # Decision policy. `pure_win` is the deployment default (matches the P05
 # DeepAgentV2). Switch to `win_then_score` / `score_then_win` for
 # lexicographic selection, or `risk_aware` (default off via risk_penalty 0)
-# for the uncertainty-penalized mode.
+# for the uncertainty-penalized mode. `pure_prior` selects the highest
+# human-play prior logit and requires a model built with
+# human_prior_enabled=true (P08 ablation).
 decision_policy:
   mode: pure_win
   abs_tol: 0.0
   rel_tol: 0.0
   risk_penalty: 0.0
+
+# P08 human-data behaviour-cloning prior. Disabled by default so the legacy /
+# pre-P08 path is byte-identical. Enable by setting model.human_prior_enabled:
+# true and bc.enabled: true with a validated human-game JSONL at bc.data_path
+# (produced by ingest_human_games.py + validate_human_games.py).
+#
+# schedule selects how loss.lambda_bc evolves over RL training:
+#   constant     — lambda_bc fixed (default).
+#   linear_decay — lambda_bc decays to schedule_floor over schedule_steps,
+#                  never forced below the floor so a residual prior survives.
+bc:
+  enabled: false
+  data_path: ""            # validated canonical JSONL of human games
+  lambda_bc: 0.0           # BC auxiliary weight (also settable under loss:)
+  temperature: 1.0
+  label_smoothing: 0.0
+  skill_weight_clip: 10.0
+  schedule: constant
+  schedule_steps: 0
+  schedule_floor: 0.0

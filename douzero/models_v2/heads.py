@@ -108,3 +108,45 @@ class ValueHeads(nn.Module):
             "p_win": p_win,
             "score_mean": score_mean,
         }
+
+
+class PriorHead(nn.Module):
+    """Listwise policy-prior head over N fused action representations (P08).
+
+    Produces one prior logit per legal action: ``prior_logit`` has shape
+    ``(N, 1)``. The head is trained by a listwise cross-entropy over the N
+    legal actions against the recorded human action index (behaviour cloning).
+    It is the imperfect-information-safe way to inject a human-play prior: the
+    head scores the *current* legal-action list (variable N), never a global
+    action class id, exactly as AGENTS.md requires.
+
+    The head reads only the fused action representation (derived from the
+    public observation). It never sees hidden hands or the privileged human
+    label at inference; the label is consumed only by the BC loss.
+
+    Parameters
+    ----------
+    hidden_size:
+        Width of the fused action representations. Must be positive.
+    """
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        if hidden_size <= 0:
+            raise ValueError(f"hidden_size must be positive, got {hidden_size}")
+        self.hidden_size = hidden_size
+        self.prior_head = nn.Linear(hidden_size, 1)
+
+    def forward(self, fused: torch.Tensor) -> torch.Tensor:
+        """Return the per-action prior logits, shape ``(N, 1)``.
+
+        The logits are raw (no log-softmax); the listwise cross-entropy loss
+        applies ``F.cross_entropy`` directly, which is numerically stable. The
+        decision policy masks padded rows before argmax.
+        """
+        if fused.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"fused trailing dim {fused.shape[-1]} != hidden_size "
+                f"{self.hidden_size}"
+            )
+        return self.prior_head(fused)

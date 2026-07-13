@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from douzero.config.schemas import (
+    BCConfig,
     DecisionPolicyConfig,
     LossConfig,
     ModelConfig,
@@ -84,15 +85,16 @@ def load_legacy_config() -> TrainingConfig:
 # --------------------------------------------------------------------------- #
 def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     """Construct a TrainingConfig from a raw mapping, validating keys."""
-    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy", "model")}
+    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy", "model", "bc")}
     valid_opt_names = {f.name for f in fields(OptimizerConfig)}
     valid_loss_names = {f.name for f in fields(LossConfig)}
     valid_decision_names = {f.name for f in fields(DecisionPolicyConfig)}
     valid_model_names = {f.name for f in fields(ModelConfig)}
+    valid_bc_names = {f.name for f in fields(BCConfig)}
 
-    # 'optimizer', 'loss', 'decision_policy', 'model', and 'rules' are valid
-    # top-level keys (handled separately).
-    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "model", "rules"}
+    # 'optimizer', 'loss', 'decision_policy', 'model', 'bc', and 'rules' are
+    # valid top-level keys (handled separately).
+    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "model", "bc", "rules"}
     if unknown_top:
         raise ValueError(f"Unknown config keys: {sorted(unknown_top)}")
 
@@ -125,6 +127,14 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     unknown_model = set(model_raw.keys()) - valid_model_names
     if unknown_model:
         raise ValueError(f"Unknown model config keys: {sorted(unknown_model)}")
+
+    # P08: 'bc' block (behaviour-cloning prior).
+    bc_raw = raw.get("bc", {})
+    if not isinstance(bc_raw, Mapping):
+        raise TypeError("'bc' must be a mapping")
+    unknown_bc = set(bc_raw.keys()) - valid_bc_names
+    if unknown_bc:
+        raise ValueError(f"Unknown bc config keys: {sorted(unknown_bc)}")
 
     # P06 r6: unify top-level ``model_version`` and nested ``model.version``
     # into a single source of truth. Without this, a YAML like
@@ -173,6 +183,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
         kwargs["decision_policy"] = DecisionPolicyConfig(**dict(decision_raw))
     if model_raw:
         kwargs["model"] = ModelConfig(**dict(model_raw))
+    if bc_raw:
+        kwargs["bc"] = BCConfig(**dict(bc_raw))
     cfg = TrainingConfig(**kwargs)
     _validate_types(cfg)
     _validate_legacy_only_versions(cfg)
@@ -202,6 +214,11 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "version": str, "hidden_size": int, "history_encoder": str,
     "history_layers": int, "history_heads": int, "role_embedding_dim": int,
     "belief_enabled": bool, "human_prior_enabled": bool,
+    # P08: behaviour-cloning nested fields.
+    "enabled": bool, "data_path": str, "lambda_bc": float,
+    "temperature": float, "label_smoothing": float,
+    "skill_weight_clip": float, "schedule": str,
+    "schedule_steps": int, "schedule_floor": float,
 }
 
 
@@ -242,7 +259,7 @@ def _validate_types(cfg: TrainingConfig) -> None:
         if name in {"learning_rate", "alpha", "momentum", "epsilon"}:
             _check_field(name, getattr(cfg.optimizer, name), "optimizer")
         elif name in {
-            "lambda_win", "lambda_score", "lambda_uncertainty",
+            "lambda_win", "lambda_score", "lambda_uncertainty", "lambda_bc",
             "score_delta", "score_clamp",
         }:
             _check_field(name, getattr(cfg.loss, name), "loss")
@@ -256,6 +273,16 @@ def _validate_types(cfg: TrainingConfig) -> None:
             "human_prior_enabled",
         }:
             _check_field(name, getattr(cfg.model, name), "model")
+        elif name in {
+            "enabled", "data_path", "temperature", "label_smoothing",
+            "skill_weight_clip", "schedule", "schedule_steps", "schedule_floor",
+        }:
+            # 'lambda_bc' also lives on BCConfig; route the bc: block's
+            # lambda_bc here only when it is the bc-block field (handled below
+            # by name). The loss.lambda_bc is routed above.
+            if name == "lambda_bc":
+                continue
+            _check_field(name, getattr(cfg.bc, name), "bc")
         elif hasattr(cfg, name):
             _check_field(name, getattr(cfg, name), "training")
 
