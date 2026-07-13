@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from typing import Iterator
 
 from .schema import HumanGameRecord
-from .validate import _REPLAY_ROLES, _ReplayAgent, ReplayValidationError
+from .validate import _REPLAY_ROLES, _ReplayAgent, ReplayValidationError, assert_legacy_ruleset
 
 #: Kind stamp identifying a BCSample as privileged training data. A deployment
 #: guard can reject any object/dict carrying this kind.
@@ -169,6 +169,17 @@ def build_bc_samples(
     from douzero.observation.encode_v2 import get_obs_v2
 
     from douzero.env.game import GameEnv
+
+    # Ruleset identity: reject a non-legacy record before replay (Blocker 2).
+    # The validator does this too, but the sample builder is a separate entry
+    # point and must fail-closed on its own. Wrap as BCSampleError so the
+    # builder's error contract is consistent.
+    try:
+        assert_legacy_ruleset(record)
+    except ReplayValidationError as exc:
+        raise BCSampleError(
+            f"{record.game_id}: {exc}"
+        ) from exc
 
     samples: list[BCSample] = []
     players = {pos: _ReplayAgent(pos) for pos in _REPLAY_ROLES}

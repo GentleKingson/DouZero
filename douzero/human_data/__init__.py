@@ -47,6 +47,7 @@ from .schema import (
     read_jsonl,
     write_jsonl,
 )
+from .validate import assert_legacy_ruleset
 
 __all__ = [
     "CANONICAL_FORMAT_VERSION",
@@ -60,4 +61,5 @@ __all__ = [
     "record_from_jsonl_line",
     "read_jsonl",
     "write_jsonl",
+    "assert_legacy_ruleset",
 ]

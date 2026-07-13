@@ -214,12 +214,44 @@ def listwise_bc_loss(
     logits = prior_logit.squeeze(-1) / float(temperature)
     masked = logits.clone()
     masked[~action_mask] = float("-inf")
-    # F.cross_entropy expects (batch, classes, [optional dims]); one decision.
-    loss = F.cross_entropy(
-        masked.unsqueeze(0),
-        torch.tensor([target_index], dtype=torch.long, device=masked.device),
-        label_smoothing=float(label_smoothing),
+
+    # Mask-aware label smoothing (Medium #2 fix). PyTorch's
+    # ``F.cross_entropy(label_smoothing=ε)`` distributes ε uniformly over ALL N
+    # classes — including padded ones. With padded logits set to -inf the
+    # softmax assigns them 0 probability, but the smoothed target assigns them
+    # ε/N > 0, producing an infinite loss. Instead we implement the CE by hand
+    # so the smoothing mass is redistributed over the VALID classes only:
+    #
+    #   target_prob = (1 - ε) on the human action + ε/(num_valid) on each
+    #                 other VALID action, and 0 on padded actions.
+    #
+    # This is the standard "label smoothing over the legal set" and is finite
+    # by construction. When label_smoothing == 0 it reduces to plain CE.
+    num_valid = int(action_mask.sum().item())
+    eps = float(label_smoothing)
+    log_softmax = F.log_softmax(masked.unsqueeze(0), dim=-1).squeeze(0)
+    # log_softmax at -inf padded positions is -inf (since softmax prob is 0).
+    # The target distribution is 0 there, but 0 * -inf = NaN in IEEE float, so
+    # use torch.where to zero the contribution at padded positions rather than
+    # multiplying. This keeps the loss finite by construction.
+    with torch.no_grad():
+        target_probs = torch.zeros(n, dtype=log_softmax.dtype, device=log_softmax.device)
+        if eps > 0.0 and num_valid > 1:
+            # Spread eps over the OTHER valid actions (num_valid - 1 of them).
+            other = eps / float(num_valid)
+            target_probs[action_mask] = other
+            target_probs[target_index] = 1.0 - eps
+        else:
+            target_probs[target_index] = 1.0
+    # Cross-entropy: -sum(target_probs * log_softmax). Gradient flows through
+    # log_softmax (the target_probs are constants). torch.where avoids 0*-inf=NaN
+    # at padded positions where log_softmax is -inf but target_probs is 0.
+    contrib = torch.where(
+        target_probs > 0,
+        target_probs * log_softmax,
+        torch.zeros_like(log_softmax),
     )
+    loss = -contrib.sum()
     weighted = loss * float(weight)
     pred = int(torch.argmax(masked).item())
     return weighted, pred == target_index

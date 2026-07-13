@@ -283,6 +283,49 @@ class TestListwiseBCLoss:
         assert logits.grad is not None
         assert torch.isfinite(logits.grad).all()
 
+    def test_label_smoothing_with_padded_mask_is_finite(self):
+        """Medium #2: label smoothing must remain finite when some actions are
+        padded (-inf logits). PyTorch's F.cross_entropy would put smoothing
+        mass on padded classes and yield inf; the mask-aware implementation
+        redistributes over valid classes only."""
+        # 4 actions, 1 padded (index 3); smoothing > 0.
+        logits = torch.tensor([[0.2], [0.5], [-0.3], [9.0]], requires_grad=True)
+        mask = torch.tensor([True, True, True, False])
+        loss, hit = listwise_bc_loss(
+            logits, mask, 1, label_smoothing=0.1
+        )
+        assert torch.isfinite(loss)
+        assert hit  # index 1 has the highest valid logit
+        loss.backward()
+        assert torch.isfinite(logits.grad).all()
+        # The padded row (index 3) receives NO gradient (mass redistributed
+        # over valid classes only).
+        assert logits.grad[3].abs() < 1e-9
+
+    def test_label_smoothing_zero_equals_plain_ce(self):
+        """label_smoothing=0 must reproduce plain cross-entropy exactly."""
+        torch.manual_seed(0)
+        logits = torch.randn(5, 1)
+        mask = torch.tensor([True, True, True, True, True])
+        idx = 2
+        plain, _ = listwise_bc_loss(logits, mask, idx, label_smoothing=0.0)
+        # Hand-computed plain CE: -log_softmax at idx.
+        import torch.nn.functional as F
+
+        log_softmax = F.log_softmax(logits.squeeze(-1), dim=-1)
+        expected = -log_softmax[idx]
+        assert torch.allclose(plain, expected, atol=1e-6)
+
+    def test_label_smoothing_reduces_loss_on_wrong_prediction(self):
+        """Label smoothing should reduce the loss ceiling when the model is
+        confidently wrong (the whole point of smoothing)."""
+        # Confidently wrong: high logit on index 0, target is index 1.
+        logits = torch.tensor([[5.0], [0.0]])
+        mask = torch.tensor([True, True])
+        plain, _ = listwise_bc_loss(logits, mask, 1, label_smoothing=0.0)
+        smooth, _ = listwise_bc_loss(logits, mask, 1, label_smoothing=0.2)
+        assert smooth.item() < plain.item()
+
 
 class TestAverageBCLosses:
     def test_empty_returns_zero_loss(self):

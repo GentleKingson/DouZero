@@ -197,6 +197,43 @@ def validate_deal_conservation(record: HumanGameRecord) -> None:
         )
 
 
+def assert_legacy_ruleset(record: HumanGameRecord) -> None:
+    """Fail-closed ruleset identity check (P08 Blocker 2).
+
+    P08's replay validator / sample builder / pretrain path only support the
+    legacy card-play ruleset (the only collection mode in this phase, matching
+    the belief collector and the eval data path). A record that declares a
+    different ruleset — ``standard``, a mismatched version, a forged hash, or a
+    non-empty bidding history — is rejected BEFORE replay, so a non-legacy game
+    can never be accepted and later mislabelled as a legacy checkpoint.
+
+    The full identity triple (id + version + hash) must match
+    :meth:`RuleSet.legacy().identity()`, mirroring the checkpoint loader's
+    identity contract.
+    """
+    from douzero.env.rules import RuleSet
+
+    expected = RuleSet.legacy().identity()
+    for key in ("ruleset_id", "ruleset_version", "ruleset_hash"):
+        got = getattr(record, key)
+        want = expected[key]
+        if got != want:
+            raise ReplayValidationError(
+                f"ruleset {key} mismatch: record declares {got!r} but P08 only "
+                f"supports the legacy card-play ruleset ({want!r}). A non-legacy "
+                f"record cannot be replayed on the legacy engine and must not be "
+                f"accepted (it would later be mislabelled as a legacy checkpoint)."
+            )
+    # Legacy cardplay has no bidding phase; a record carrying bids cannot be a
+    # legacy card-play record.
+    if record.bidding_history:
+        raise ReplayValidationError(
+            f"record carries {len(record.bidding_history)} bidding entries but "
+            f"declares the legacy card-play ruleset, which has no bidding phase. "
+            f"A legacy record must have empty bidding_history."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Core single-record replay
 # --------------------------------------------------------------------------- #
@@ -220,6 +257,10 @@ def _classify(exc: ReplayValidationError) -> str:
     error.
     """
     msg = str(exc).lower()
+    if "ruleset" in msg:
+        return "ruleset_mismatch"
+    if "bidding" in msg:
+        return "ruleset_mismatch"
     if "winner" in msg:
         return "winner_mismatch"
     if "did not terminate" in msg or "extra actions after terminal" in msg:
@@ -237,6 +278,13 @@ def _classify(exc: ReplayValidationError) -> str:
 
 def _validate_record_or_raise(record: HumanGameRecord) -> None:
     from douzero.env.game import GameEnv
+
+    # 0. Ruleset identity: P08 only supports the legacy card-play ruleset.
+    # A record declaring standard / a different version / a forged hash is
+    # rejected BEFORE replay so a non-legacy game can never be accepted (and
+    # later mislabelled as a legacy checkpoint). The full identity triple
+    # (id + version + hash) must match, mirroring RuleSet.identity().
+    assert_legacy_ruleset(record)
 
     # 1. Deal conservation first (cheap, no env construction).
     validate_deal_conservation(record)

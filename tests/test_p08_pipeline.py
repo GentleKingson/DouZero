@@ -121,6 +121,70 @@ class TestValidateRecord:
         assert not result.ok
         assert result.reason == "winner_mismatch"
 
+    def test_non_legacy_ruleset_rejected(self):
+        """A record declaring a standard ruleset is rejected before replay
+        (Blocker 2: ruleset identity must be verified, never silently accepted
+        and later mislabelled as a legacy checkpoint)."""
+        from douzero.env.rules import RuleSet
+
+        rec = generate_synthetic_record("syn-rs", seed=7)
+        std = RuleSet.standard().identity()
+        bad = HumanGameRecord(
+            game_id=rec.game_id,
+            ruleset_id=std["ruleset_id"],
+            ruleset_version=rec.ruleset_version,
+            ruleset_hash=rec.ruleset_hash,
+            seats=rec.seats,
+            initial_hands=rec.initial_hands,
+            bottom_cards=rec.bottom_cards,
+            bidding_history=rec.bidding_history,
+            action_history=rec.action_history,
+            final_result=rec.final_result,
+        )
+        result = validate_record(bad)
+        assert not result.ok
+        assert result.reason == "ruleset_mismatch"
+
+    def test_forged_ruleset_hash_rejected(self):
+        """A record with the right ruleset_id but a wrong/forged hash is
+        rejected (the full identity triple must match)."""
+        rec = generate_synthetic_record("syn-hash", seed=8)
+        bad = HumanGameRecord(
+            game_id=rec.game_id,
+            ruleset_id=rec.ruleset_id,
+            ruleset_version=rec.ruleset_version,
+            ruleset_hash="0" * 64,  # forged hash
+            seats=rec.seats,
+            initial_hands=rec.initial_hands,
+            bottom_cards=rec.bottom_cards,
+            bidding_history=rec.bidding_history,
+            action_history=rec.action_history,
+            final_result=rec.final_result,
+        )
+        result = validate_record(bad)
+        assert not result.ok
+        assert result.reason == "ruleset_mismatch"
+
+    def test_legacy_record_with_bidding_rejected(self):
+        """A legacy-ruleset record carrying bidding entries is rejected (legacy
+        card-play has no bidding phase)."""
+        rec = generate_synthetic_record("syn-bid", seed=9)
+        bad = HumanGameRecord(
+            game_id=rec.game_id,
+            ruleset_id=rec.ruleset_id,
+            ruleset_version=rec.ruleset_version,
+            ruleset_hash=rec.ruleset_hash,
+            seats=rec.seats,
+            initial_hands=rec.initial_hands,
+            bottom_cards=rec.bottom_cards,
+            bidding_history=(("landlord", 3),),  # non-empty bids
+            action_history=rec.action_history,
+            final_result=rec.final_result,
+        )
+        result = validate_record(bad)
+        assert not result.ok
+        assert result.reason == "ruleset_mismatch"
+
 
 # --------------------------------------------------------------------------- #
 # Ingest

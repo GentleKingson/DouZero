@@ -145,6 +145,28 @@ class TestBuildBCSamples:
         with pytest.raises(BCSampleError):
             list(build_bc_samples_batch([bad], stop_on_error=True))
 
+    def test_non_legacy_ruleset_rejected_at_sampling(self):
+        """The sample builder rejects a non-legacy record before replay
+        (Blocker 2: ruleset identity verified at every entry point)."""
+        from douzero.env.rules import RuleSet
+
+        rec = generate_synthetic_record("rs-sample", seed=11)
+        std = RuleSet.standard().identity()
+        bad = HumanGameRecord(
+            game_id=rec.game_id,
+            ruleset_id=std["ruleset_id"],
+            ruleset_version=rec.ruleset_version,
+            ruleset_hash=rec.ruleset_hash,
+            seats=rec.seats,
+            initial_hands=rec.initial_hands,
+            bottom_cards=rec.bottom_cards,
+            bidding_history=rec.bidding_history,
+            action_history=rec.action_history,
+            final_result=rec.final_result,
+        )
+        with pytest.raises(BCSampleError):
+            build_bc_samples(bad)
+
 
 # --------------------------------------------------------------------------- #
 # BCSample validation
