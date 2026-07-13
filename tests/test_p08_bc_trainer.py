@@ -150,6 +150,23 @@ class TestBCTrainer:
         with pytest.raises(BCTrainerError):
             BCTrainer(m, bc_samples, BCTrainerConfig(batch_size=0))
 
+    def test_rejects_zero_epochs(self, bc_samples):
+        """Blocker (round 3): epochs=0 would skip training yet save an
+        untrained checkpoint; reject at construction."""
+        m = _build_prior_model()
+        with pytest.raises(BCTrainerError):
+            BCTrainer(m, bc_samples, BCTrainerConfig(epochs=0))
+
+    def test_rejects_invalid_label_smoothing(self, bc_samples):
+        """Blocker 3: label_smoothing outside [0,1) or non-finite is rejected."""
+        m = _build_prior_model()
+        with pytest.raises(BCTrainerError):
+            BCTrainer(m, bc_samples, BCTrainerConfig(label_smoothing=1.0))
+        with pytest.raises(BCTrainerError):
+            BCTrainer(m, bc_samples, BCTrainerConfig(label_smoothing=2.0))
+        with pytest.raises(BCTrainerError):
+            BCTrainer(m, bc_samples, BCTrainerConfig(label_smoothing=-0.1))
+
     def test_empty_val_set_does_not_fake_metrics_or_restore(self, bc_samples):
         """When val_ratio=0 (or rounds to empty), val metrics are NaN (not
         0.0), early stopping is disabled, and the last-epoch model is kept
@@ -247,6 +264,22 @@ class TestPretrainCLI:
             pretrain_bc.main([
                 "--save_dir", str(tmp_path), "--epochs", "1",
             ])
+
+    def test_epochs_zero_does_not_save_checkpoint(self, tmp_path):
+        """Blocker (round 3): --epochs 0 must not produce a checkpoint."""
+        import os
+        import pretrain_bc
+
+        save_dir = str(tmp_path / "bc0")
+        rc = pretrain_bc.main([
+            "--synthetic", "--num_synthetic", "2",
+            "--save_dir", save_dir, "--epochs", "0",
+            "--hidden_size", "32", "--history_layers", "1",
+            "--history_heads", "4",
+        ])
+        # epochs=0 is rejected by BCTrainerConfig -> main returns 1.
+        assert rc == 1
+        assert not os.path.exists(os.path.join(save_dir, "bc_prior.pt"))
 
 
 # --------------------------------------------------------------------------- #

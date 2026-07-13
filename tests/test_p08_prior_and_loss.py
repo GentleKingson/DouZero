@@ -410,6 +410,56 @@ class TestBCLossConfig:
         d = BCLossConfig(lambda_bc=0.5).to_dict()
         assert d["lambda_bc"] == 0.5
 
+    # ------------------------------------------------------------------ #
+    # Blocker 3 (round 3): label_smoothing range validation
+    # ------------------------------------------------------------------ #
+    def test_listwise_bc_loss_rejects_label_smoothing_above_one(self):
+        logits = torch.tensor([[0.0], [0.0]])
+        mask = torch.tensor([True, True])
+        with pytest.raises(BCLossError, match="label_smoothing"):
+            listwise_bc_loss(logits, mask, 0, label_smoothing=1.0)
+
+    def test_listwise_bc_loss_rejects_label_smoothing_negative(self):
+        logits = torch.tensor([[0.0], [0.0]])
+        mask = torch.tensor([True, True])
+        with pytest.raises(BCLossError, match="label_smoothing"):
+            listwise_bc_loss(logits, mask, 0, label_smoothing=-0.1)
+
+    def test_listwise_bc_loss_rejects_nan_label_smoothing(self):
+        logits = torch.tensor([[0.0], [0.0]])
+        mask = torch.tensor([True, True])
+        with pytest.raises(BCLossError, match="label_smoothing"):
+            listwise_bc_loss(logits, mask, 0, label_smoothing=float("nan"))
+
+    def test_listwise_bc_loss_rejects_inf_label_smoothing(self):
+        logits = torch.tensor([[0.0], [0.0]])
+        mask = torch.tensor([True, True])
+        with pytest.raises(BCLossError, match="label_smoothing"):
+            listwise_bc_loss(logits, mask, 0, label_smoothing=float("inf"))
+
+    def test_bcconfig_rejects_invalid_label_smoothing(self):
+        from douzero.config.schemas import BCConfig
+
+        with pytest.raises(ValueError, match="label_smoothing"):
+            BCConfig(label_smoothing=2.0)
+        with pytest.raises(ValueError, match="label_smoothing"):
+            BCConfig(label_smoothing=1.0)
+        with pytest.raises(ValueError, match="label_smoothing"):
+            BCConfig(label_smoothing=-0.1)
+
+    def test_yaml_rejects_invalid_label_smoothing(self, tmp_path):
+        from douzero.config.loader import load_config
+
+        yaml = tmp_path / "bad_ls.yaml"
+        yaml.write_text(
+            "xpid: t\nobjective: adp\n"
+            "feature_version: legacy\nruleset: legacy\nmodel_version: legacy\n"
+            "bc:\n  label_smoothing: 2.0\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            load_config(str(yaml))
+
 
 # --------------------------------------------------------------------------- #
 # Config plumbing (BC block + loss.lambda_bc)

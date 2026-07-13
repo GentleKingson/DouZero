@@ -259,3 +259,100 @@ class TestAdapters:
 
     def test_assert_no_forbidden_metadata_passes_clean(self):
         assert_no_forbidden_metadata({"source": "ok"})  # no raise
+
+    # ------------------------------------------------------------------ #
+    # Blocker 2 (round 3): PII value detection + tuple recursion
+    # ------------------------------------------------------------------ #
+    def test_audit_drops_email_value_under_neutral_key(self):
+        """A plain email under a benign key is dropped (PII value detection)."""
+        cleaned = audit_source_metadata(
+            {"contact": "alice@example.com", "source": "ok"}
+        )
+        assert "contact" not in cleaned
+        assert cleaned == {"source": "ok"}
+
+    def test_audit_drops_ip_value(self):
+        cleaned = audit_source_metadata(
+            {"origin": "203.0.113.10", "source": "ok"}
+        )
+        assert "origin" not in cleaned
+
+    def test_audit_drops_phone_value(self):
+        cleaned = audit_source_metadata(
+            {"note": "phone: +1-555-123-4567", "source": "ok"}
+        )
+        assert "note" not in cleaned
+
+    def test_audit_recurses_into_tuple(self):
+        """A tuple of dicts is recursed into (Blocker 2: tuples bypassed)."""
+        cleaned = audit_source_metadata(
+            {"players": ({"user_email": "a@b.c", "seat": 0},), "source": "s"}
+        )
+        # tuple -> list; the forbidden key is dropped.
+        assert isinstance(cleaned["players"], list)
+        assert "user_email" not in cleaned["players"][0]
+        assert cleaned["players"][0] == {"seat": 0}
+
+    def test_audit_recurses_into_set(self):
+        cleaned = audit_source_metadata(
+            {"tags": {"x", "user_id"}, "source": "s"}
+        )
+        assert isinstance(cleaned["tags"], list)
+
+    def test_assert_raises_on_pii_value(self):
+        with pytest.raises(RecordValidationError):
+            assert_no_forbidden_metadata({"contact": "alice@example.com"})
+
+    def test_assert_raises_on_tuple_nested_forbidden(self):
+        with pytest.raises(RecordValidationError):
+            assert_no_forbidden_metadata(
+                {"items": ({"email": "a@b.c"},)}
+            )
+
+    def test_record_normalizes_tuple_metadata_to_list(self):
+        """HumanGameRecord converts tuple/set in source_metadata to list at
+        construction so json.dumps never silently leaks a tuple's contents."""
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        rec = HumanGameRecord(
+            game_id="g-tuple",
+            ruleset_id=rs.ruleset_id,
+            ruleset_version=rs.ruleset_version,
+            ruleset_hash=rs.stable_hash(),
+            seats=("landlord", "landlord_down", "landlord_up"),
+            initial_hands={
+                "landlord": [3, 3, 4, 4],
+                "landlord_up": [5, 5, 6, 6],
+                "landlord_down": [7, 7, 8, 8],
+                "three_landlord_cards": [3, 4, 5],
+            },
+            bottom_cards=[3, 4, 5],
+            action_history=(("landlord", (3, 3)),),
+            final_result={"winner_team": "landlord", "winner_position": "landlord"},
+            source_metadata={"items": (1, 2, 3)},
+        )
+        # The tuple was normalized to a list.
+        assert rec.source_metadata["items"] == [1, 2, 3]
+        assert isinstance(rec.source_metadata["items"], list)
+
+    def test_record_rejects_non_json_metadata_type(self):
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        with pytest.raises(RecordValidationError):
+            HumanGameRecord(
+                game_id="g-bad",
+                ruleset_id=rs.ruleset_id,
+                ruleset_version=rs.ruleset_version,
+                ruleset_hash=rs.stable_hash(),
+                seats=("landlord", "landlord_down", "landlord_up"),
+                initial_hands={
+                    "landlord": [3, 3], "landlord_up": [5, 5],
+                    "landlord_down": [7, 7], "three_landlord_cards": [3, 4, 5],
+                },
+                bottom_cards=[3, 4, 5],
+                action_history=(),
+                final_result={"winner_team": "landlord", "winner_position": "landlord"},
+                source_metadata={"bad": b"bytes"},
+            )

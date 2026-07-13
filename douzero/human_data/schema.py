@@ -204,10 +204,15 @@ class HumanGameRecord:
             "player_skill_weight",
             MappingProxyType(dict(self.player_skill_weight)),
         )
+        # Blocker 2: deep-normalize source_metadata to canonical JSON types
+        # so a tuple/set value (which json.dumps silently serializes as a JSON
+        # array, leaking any PII it carries to disk) is converted to a list
+        # BEFORE the read-only wrapper. This also rejects non-JSON types
+        # (e.g. bytes, custom objects) that would break serialization.
         object.__setattr__(
             self,
             "source_metadata",
-            MappingProxyType(dict(self.source_metadata)),
+            MappingProxyType(_normalize_json_mapping(self.source_metadata)),
         )
 
         # bottom_cards: sorted-int tuple.
@@ -368,6 +373,36 @@ def _coerce_sorted_int_tuple(value: Any, label: str) -> tuple[int, ...]:
             )
         out.append(c)
     return tuple(sorted(out))
+
+
+def _normalize_json_value(value: Any, label: str) -> Any:
+    """Recursively normalize ``value`` to a canonical JSON type.
+
+    Blocker 2: tuple/set/frozenset are converted to list (so json.dumps never
+    silently serializes a tuple carrying PII to a JSON array, and so the
+    metadata privacy scanner sees a list it can recurse into). Non-JSON scalar
+    types (bytes, complex, custom objects) are rejected so serialization cannot
+    fail later or leak an unexpected repr.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return _normalize_json_mapping(value)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_normalize_json_value(item, label) for item in value]
+    raise RecordValidationError(
+        f"{label}: source_metadata contains a non-JSON value of type "
+        f"{type(value).__name__}; only dict/list/str/int/float/bool/None are "
+        f"allowed."
+    )
+
+
+def _normalize_json_mapping(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Deep-normalize a metadata mapping to canonical JSON types."""
+    out: dict[str, Any] = {}
+    for key, value in metadata.items():
+        out[key] = _normalize_json_value(value, f"source_metadata[{key!r}]")
+    return out
 
 
 def record_from_dict(d: Mapping[str, Any]) -> HumanGameRecord:

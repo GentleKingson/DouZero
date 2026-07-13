@@ -49,6 +49,24 @@ _CREDENTIAL_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
+# PII VALUE patterns — personal identifiers that must not be stored even under
+# a benign key (Blocker 2: the value detector previously caught only credential
+# shapes, letting plain emails/phones/IPs through). These are searched anywhere
+# in the string value (not just at the start).
+_PII_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}",      # email
+        r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",       # IPv4 address
+        r"\+?\d[\d\s\-().]{7,}\d",                        # phone (8+ digits)
+    )
+)
+
+# Container types that are recursively scanned/sanitized. tuple and set are
+# included (Blocker 2: a tuple of dicts bypassed the earlier Mapping/list-only
+# recursion). frozenset is NOT JSON-serializable and is rejected at the boundary.
+_RECURSABLE_CONTAINERS = (Mapping, list, tuple, set, frozenset)
+
 
 def _key_is_forbidden(key: str) -> bool:
     """Return True if ``key`` (any case) contains a forbidden substring."""
@@ -58,14 +76,28 @@ def _key_is_forbidden(key: str) -> bool:
     return any(sub in kl for sub in _FORBIDDEN_KEY_SUBSTRINGS)
 
 
-def _value_is_credential(value: Any) -> bool:
-    """Return True if ``value`` looks like a leaked credential."""
+def _value_is_sensitive(value: Any) -> bool:
+    """Return True if ``value`` looks like a leaked credential OR PII.
+
+    Blocker 2: the earlier ``_value_is_credential`` only matched credential
+    shapes (Bearer, PEM, token shapes). Plain personal identifiers — emails,
+    phone numbers, IPv4 addresses — under benign keys slipped through. This
+    also matches PII patterns so ``{"contact": "alice@example.com"}`` or
+    ``{"origin": "203.0.113.10"}`` are caught and dropped.
+    """
     if not isinstance(value, str):
         return False
     v = value.strip()
     if not v:
         return False
-    return any(p.search(v) for p in _CREDENTIAL_VALUE_PATTERNS)
+    return (
+        any(p.search(v) for p in _CREDENTIAL_VALUE_PATTERNS)
+        or any(p.search(v) for p in _PII_VALUE_PATTERNS)
+    )
+
+
+# Backward-compatible alias.
+_value_is_credential = _value_is_sensitive
 
 
 def _scan_for_forbidden(
@@ -73,26 +105,26 @@ def _scan_for_forbidden(
 ) -> Iterator[tuple[str, str]]:
     """Recursively yield ``(path, reason)`` for forbidden keys/values.
 
-    Traverses nested mappings and lists so a credential hidden inside
-    ``{"profile": {"email": ...}}`` or ``[{"token": ...}]`` is still found.
+    Traverses nested mappings, lists, tuples, AND sets so a credential or PII
+    hidden inside ``{"profile": {"email": ...}}``, ``[{"token": ...}]``, or
+    ``({"user_email": ...},)`` is still found (Blocker 2: tuples previously
+    bypassed the recursion).
     """
     if isinstance(obj, Mapping):
         for key, value in obj.items():
             child_path = f"{path}.{key}" if path else str(key)
             if isinstance(key, str) and _key_is_forbidden(key):
                 yield (child_path, f"forbidden key {key!r}")
-            # Recurse into the value regardless (a benign key may hide a
-            # credential value or a nested forbidden key).
-            if isinstance(value, (Mapping, list)):
+            if isinstance(value, _RECURSABLE_CONTAINERS):
                 yield from _scan_for_forbidden(value, child_path)
-            elif _value_is_credential(value):
-                yield (child_path, "credential-like value")
-    elif isinstance(obj, list):
+            elif _value_is_sensitive(value):
+                yield (child_path, "sensitive value")
+    elif isinstance(obj, (list, tuple, set, frozenset)):
         for i, item in enumerate(obj):
             child_path = f"{path}[{i}]"
             yield from _scan_for_forbidden(item, child_path)
-    elif _value_is_credential(obj):
-        yield (path or "<root>", "credential-like value")
+    elif _value_is_sensitive(obj):
+        yield (path or "<root>", "sensitive value")
 
 
 @runtime_checkable
@@ -141,7 +173,7 @@ def audit_source_metadata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _sanitize_mapping(obj: Mapping[str, Any]) -> dict[str, Any]:
-    """Recursively rebuild a mapping without forbidden keys/credential values."""
+    """Recursively rebuild a mapping without forbidden keys/sensitive values."""
     out: dict[str, Any] = {}
     for key, value in obj.items():
         if isinstance(key, str) and _key_is_forbidden(key):
@@ -153,8 +185,10 @@ def _sanitize_mapping(obj: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _sanitize_list(obj: list) -> list:
-    """Recursively rebuild a list without credential-like scalar items."""
+def _sanitize_sequence(obj: "list | tuple | set | frozenset") -> list:
+    """Recursively rebuild a sequence (list/tuple/set -> list) without
+    sensitive scalar items. tuple/set are converted to list so the output is
+    JSON-serializable (Blocker 2: tuples previously bypassed sanitization)."""
     out: list = []
     for item in obj:
         sanitized = _sanitize_value(item)
@@ -177,10 +211,10 @@ def _sanitize_value(value: Any) -> Any:
     """Sanitize one value; returns :data:`_DROP` if it should be removed."""
     if isinstance(value, Mapping):
         return _sanitize_mapping(value)
-    if isinstance(value, list):
-        return _sanitize_list(value)
-    # Scalar: drop credential-like strings.
-    if _value_is_credential(value):
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return _sanitize_sequence(value)
+    # Scalar: drop credential-like / PII strings.
+    if _value_is_sensitive(value):
         return _DROP
     return value
 

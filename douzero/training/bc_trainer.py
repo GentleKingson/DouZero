@@ -66,17 +66,17 @@ class BCTrainerConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        # batch_size and epochs must be POSITIVE (0 makes range(..., step=0)
-        # crash, and epochs=0 would save a fully untrained checkpoint).
-        for name, val in (("batch_size", self.batch_size),):
+        # batch_size and epochs must be POSITIVE: batch_size=0 makes
+        # range(..., step=0) crash, and epochs=0 would skip training entirely
+        # yet still save a fully-untrained checkpoint (Blocker: epochs guard).
+        for name, val in (("batch_size", self.batch_size),
+                          ("epochs", self.epochs)):
             if not isinstance(val, int) or isinstance(val, bool) or val < 1:
                 raise BCTrainerError(
                     f"{name} must be a positive int, got {val!r}"
                 )
-        for name, val in (
-            ("epochs", self.epochs),
-            ("early_stopping_patience", self.early_stopping_patience),
-        ):
+        # early_stopping_patience is 0 = disabled, so non-negative is correct.
+        for name, val in (("early_stopping_patience", self.early_stopping_patience),):
             if not isinstance(val, int) or isinstance(val, bool) or val < 0:
                 raise BCTrainerError(
                     f"{name} must be a non-negative int, got {val!r}"
@@ -102,10 +102,27 @@ class BCTrainerConfig:
             raise BCTrainerError(
                 f"val_ratio must be in [0, 1), got {self.val_ratio}"
             )
-        for name, val in (("rmsprop_momentum", self.rmsprop_momentum),
-                          ("label_smoothing", self.label_smoothing)):
+        for name, val in (("rmsprop_momentum", self.rmsprop_momentum),):
             if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
                 raise BCTrainerError(f"{name} must be non-negative, got {val}")
+        # Blocker: label_smoothing must be finite and in [0, 1) — values >= 1
+        # silently corrupt the loss (negative target probs filtered away),
+        # and NaN/Inf propagate. Validate here so misconfigurations fail at
+        # construction, not silently mid-training.
+        if not isinstance(self.label_smoothing, (int, float)) or isinstance(
+            self.label_smoothing, bool
+        ):
+            raise BCTrainerError(
+                f"label_smoothing must be a number, got {type(self.label_smoothing).__name__}"
+            )
+        if not math.isfinite(self.label_smoothing):
+            raise BCTrainerError(
+                f"label_smoothing must be finite, got {self.label_smoothing}"
+            )
+        if not 0.0 <= self.label_smoothing < 1.0:
+            raise BCTrainerError(
+                f"label_smoothing must be in [0, 1), got {self.label_smoothing}"
+            )
 
 
 @dataclass

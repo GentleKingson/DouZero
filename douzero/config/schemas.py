@@ -128,6 +128,53 @@ class BCConfig:
     schedule_steps: int = 0
     schedule_floor: float = 0.0
 
+    def __post_init__(self) -> None:
+        import math
+
+        # Blocker: label_smoothing must be finite and in [0, 1) — values >= 1
+        # silently corrupt the listwise loss (negative target probs), and
+        # NaN/Inf propagate. Validate at the config boundary so a bad YAML
+        # fails at load, not silently mid-training.
+        if isinstance(self.label_smoothing, bool) or not isinstance(
+            self.label_smoothing, (int, float)
+        ):
+            raise ValueError(
+                f"BCConfig.label_smoothing must be a number, got "
+                f"{type(self.label_smoothing).__name__}"
+            )
+        if not math.isfinite(self.label_smoothing):
+            raise ValueError(
+                f"BCConfig.label_smoothing must be finite, got {self.label_smoothing}"
+            )
+        if not 0.0 <= self.label_smoothing < 1.0:
+            raise ValueError(
+                f"BCConfig.label_smoothing must be in [0, 1), got {self.label_smoothing}"
+            )
+        if not math.isfinite(self.temperature) or self.temperature <= 0.0:
+            raise ValueError(
+                f"BCConfig.temperature must be positive finite, got {self.temperature}"
+            )
+        if not math.isfinite(self.skill_weight_clip) or self.skill_weight_clip <= 0.0:
+            raise ValueError(
+                f"BCConfig.skill_weight_clip must be positive finite, "
+                f"got {self.skill_weight_clip}"
+            )
+        if not isinstance(self.schedule_steps, int) or isinstance(
+            self.schedule_steps, bool
+        ) or self.schedule_steps < 0:
+            raise ValueError(
+                f"BCConfig.schedule_steps must be a non-negative int, "
+                f"got {self.schedule_steps}"
+            )
+        if (
+            not math.isfinite(self.schedule_floor)
+            or self.schedule_floor < 0.0
+        ):
+            raise ValueError(
+                f"BCConfig.schedule_floor must be non-negative finite, "
+                f"got {self.schedule_floor}"
+            )
+
 
 # --------------------------------------------------------------------------- #
 # Model architecture (P05 widens to ``v2``; referenced by TrainingConfig)

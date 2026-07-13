@@ -36,7 +36,7 @@ from douzero.human_data.validate import validate_record
 from douzero.models_v2.config import ModelV2Config
 from douzero.models_v2.model import ModelV2
 from douzero.observation.schema import build_v2_schema
-from douzero.training.bc_trainer import BCTrainer, BCTrainerConfig
+from douzero.training.bc_trainer import BCTrainer, BCTrainerConfig, BCTrainerError
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -197,19 +197,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     schema = build_v2_schema()
     model = ModelV2(schema, model_cfg)
 
-    # 3. Train.
-    trainer_cfg = BCTrainerConfig(
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
-        val_ratio=args.val_ratio,
-        early_stopping_patience=args.early_stopping_patience,
-        max_grad_norm=args.max_grad_norm,
-        temperature=args.temperature,
-        seed=args.seed,
-    )
-    trainer = BCTrainer(model, samples, trainer_cfg)
-    stats = trainer.train()
+    # 3. Train. Wrap config construction + training so a bad config (e.g.
+    # epochs=0, label_smoothing out of range) returns rc=1 without saving a
+    # checkpoint (Blocker: --epochs 0 must not produce a checkpoint).
+    try:
+        trainer_cfg = BCTrainerConfig(
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate,
+            val_ratio=args.val_ratio,
+            early_stopping_patience=args.early_stopping_patience,
+            max_grad_norm=args.max_grad_norm,
+            temperature=args.temperature,
+            seed=args.seed,
+        )
+        trainer = BCTrainer(model, samples, trainer_cfg)
+        stats = trainer.train()
+    except (BCTrainerError, ValueError) as exc:
+        print(f"[pretrain_bc] ERROR: invalid configuration: {exc}", file=sys.stderr)
+        return 1
     for e in stats.epoch_stats:
         print(
             f"[pretrain_bc] epoch {e.epoch}: "

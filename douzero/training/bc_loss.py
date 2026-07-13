@@ -284,6 +284,20 @@ def listwise_bc_loss(
         raise BCLossError(f"weight must be non-negative, got {weight}")
     if temperature <= 0.0:
         raise BCLossError(f"temperature must be positive, got {temperature}")
+    # Blocker: label_smoothing must be finite and in [0, 1). Values >= 1 make
+    # the target probability at the human action negative (eps/K + (1-eps) < 0
+    # when eps > 1), silently corrupting the loss; the ``torch.where(
+    # target_probs > 0, ...)`` filter then drops the negative target term and
+    # the remaining mass exceeds 1, producing a wrong-but-finite gradient that
+    # does NOT fail-fast. Reject here so the bug surfaces immediately.
+    if not math.isfinite(label_smoothing):
+        raise BCLossError(
+            f"label_smoothing must be finite, got {label_smoothing}"
+        )
+    if not 0.0 <= label_smoothing < 1.0:
+        raise BCLossError(
+            f"label_smoothing must be in [0, 1), got {label_smoothing}"
+        )
 
     logits = prior_logit.squeeze(-1) / float(temperature)
     masked = logits.clone()
