@@ -14,31 +14,85 @@ drop personal identifiers and credentials (see
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Protocol, runtime_checkable
+import re
+from typing import Any, Iterator, Mapping, Protocol, runtime_checkable
 
 from .schema import HumanGameRecord, RecordValidationError
 
 
-# Keys that must NEVER appear in source_metadata (personal identifiers /
-# credentials). An adapter carrying any of these is rejected at ingest.
-_FORBIDDEN_METADATA_KEYS: frozenset[str] = frozenset(
-    {
-        "user_id",
-        "username",
-        "user_name",
-        "account",
-        "account_id",
-        "email",
-        "phone",
-        "ip",
-        "ip_address",
-        "password",
-        "token",
-        "cookie",
-        "session",
-        "device_id",
-    }
+# Forbidden KEY substrings — a key is rejected if its lowercased form CONTAINS
+# any of these (so ``api_token``, ``client_secret``, ``user_email``,
+# ``auth_token``, ``device_id`` are all caught, not just exact matches).
+_FORBIDDEN_KEY_SUBSTRINGS: tuple[str, ...] = (
+    "password", "passwd", "pwd",
+    "token", "secret", "apikey", "api_key",
+    "cookie", "session",
+    "email", "phone",
+    "ip_address", "ipaddress",
+    "user_id", "userid", "username", "user_name",
+    "account", "device_id", "deviceid",
+    "credential", "private_key", "privatekey",
+    "ssn", "national_id",
 )
+
+# Credential-like VALUE patterns. A string value matching any of these is
+# treated as a leaked credential even when the key looks benign
+# (e.g. ``{"note": "Bearer abc123"}``).
+_CREDENTIAL_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"^bearer\s+",                 # Authorization: Bearer ...
+        r"^(?:api[_-]?key|token|password|secret)\s*[:=]\s*\S",  # key=value form
+        r"^-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----",  # PEM private key
+        r"^gh[ps]_[A-Za-z0-9]{20,}",   # GitHub token shape
+        r"^AKIA[0-9A-Z]{16}",          # AWS access key id shape
+    )
+)
+
+
+def _key_is_forbidden(key: str) -> bool:
+    """Return True if ``key`` (any case) contains a forbidden substring."""
+    if not isinstance(key, str):
+        return False
+    kl = key.lower()
+    return any(sub in kl for sub in _FORBIDDEN_KEY_SUBSTRINGS)
+
+
+def _value_is_credential(value: Any) -> bool:
+    """Return True if ``value`` looks like a leaked credential."""
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    if not v:
+        return False
+    return any(p.search(v) for p in _CREDENTIAL_VALUE_PATTERNS)
+
+
+def _scan_for_forbidden(
+    obj: Any, path: str = ""
+) -> Iterator[tuple[str, str]]:
+    """Recursively yield ``(path, reason)`` for forbidden keys/values.
+
+    Traverses nested mappings and lists so a credential hidden inside
+    ``{"profile": {"email": ...}}`` or ``[{"token": ...}]`` is still found.
+    """
+    if isinstance(obj, Mapping):
+        for key, value in obj.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if isinstance(key, str) and _key_is_forbidden(key):
+                yield (child_path, f"forbidden key {key!r}")
+            # Recurse into the value regardless (a benign key may hide a
+            # credential value or a nested forbidden key).
+            if isinstance(value, (Mapping, list)):
+                yield from _scan_for_forbidden(value, child_path)
+            elif _value_is_credential(value):
+                yield (child_path, "credential-like value")
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj):
+            child_path = f"{path}[{i}]"
+            yield from _scan_for_forbidden(item, child_path)
+    elif _value_is_credential(obj):
+        yield (path or "<root>", "credential-like value")
 
 
 @runtime_checkable
@@ -68,47 +122,86 @@ class Adapter(Protocol):
     def __call__(self, raw: Mapping[str, Any]) -> HumanGameRecord:
         ...
 
-
 def audit_source_metadata(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return a sanitized, audited copy of ``source_metadata``.
+    """Return a recursively sanitized copy of ``source_metadata``.
 
-    Drops any key in :data:`_FORBIDDEN_METADATA_KEYS` and any key whose value
-    looks like a credential (a string containing ``"password"`` or
-    ``"token"``). Adapters should pass their metadata through this before
-    attaching it to a record.
+    Drops any key whose lowercased form contains a forbidden substring
+    (``api_token``, ``client_secret``, ``user_email``, …), recurses into nested
+    mappings/lists, and drops credential-like string values
+    (``Bearer ...``, ``api_key=...``, PEM private keys, known token shapes).
+    Adapters should pass their metadata through this before attaching it to a
+    record. The returned mapping never shares mutable structure with the input.
     """
     if not isinstance(metadata, Mapping):
         raise RecordValidationError(
             f"source_metadata must be a mapping, got {type(metadata).__name__}"
         )
-    cleaned: dict[str, Any] = {}
-    for key, value in metadata.items():
-        if not isinstance(key, str):
-            continue
-        if key.lower() in _FORBIDDEN_METADATA_KEYS:
-            continue
-        if isinstance(key, str) and any(
-            bad in key.lower() for bad in ("password", "token", "secret", "cookie")
-        ):
-            continue
-        cleaned[key] = value
+    cleaned = _sanitize_mapping(metadata)
     return cleaned
 
 
+def _sanitize_mapping(obj: Mapping[str, Any]) -> dict[str, Any]:
+    """Recursively rebuild a mapping without forbidden keys/credential values."""
+    out: dict[str, Any] = {}
+    for key, value in obj.items():
+        if isinstance(key, str) and _key_is_forbidden(key):
+            continue
+        sanitized = _sanitize_value(value)
+        if sanitized is _DROP:
+            continue
+        out[key] = sanitized
+    return out
+
+
+def _sanitize_list(obj: list) -> list:
+    """Recursively rebuild a list without credential-like scalar items."""
+    out: list = []
+    for item in obj:
+        sanitized = _sanitize_value(item)
+        if sanitized is _DROP:
+            continue
+        out.append(sanitized)
+    return out
+
+
+class _DropSentinel:
+    """Sentinel returned by :func:`_sanitize_value` to mean 'drop this entry'."""
+
+    __slots__ = ()
+
+
+_DROP = _DropSentinel()
+
+
+def _sanitize_value(value: Any) -> Any:
+    """Sanitize one value; returns :data:`_DROP` if it should be removed."""
+    if isinstance(value, Mapping):
+        return _sanitize_mapping(value)
+    if isinstance(value, list):
+        return _sanitize_list(value)
+    # Scalar: drop credential-like strings.
+    if _value_is_credential(value):
+        return _DROP
+    return value
+
+
 def assert_no_forbidden_metadata(metadata: Mapping[str, Any]) -> None:
-    """Raise if ``metadata`` carries a forbidden identifier/credential key.
+    """Raise if ``metadata`` (recursively) carries a forbidden field.
 
     Used by the ingest boundary so an adapter that forgets to call
-    :func:`audit_source_metadata` still cannot leak a forbidden field into a
-    canonical record.
+    :func:`audit_source_metadata` still cannot leak a personal identifier or
+    credential into a canonical record. Scans nested mappings/lists and
+    credential-like values, not just top-level exact-match keys.
     """
     if not isinstance(metadata, Mapping):
         raise RecordValidationError(
             f"source_metadata must be a mapping, got {type(metadata).__name__}"
         )
-    for key in metadata:
-        if isinstance(key, str) and key.lower() in _FORBIDDEN_METADATA_KEYS:
-            raise RecordValidationError(
-                f"source_metadata key {key!r} is a forbidden personal "
-                f"identifier/credential; drop it in the adapter."
-            )
+    findings = list(_scan_for_forbidden(metadata))
+    if findings:
+        detail = ", ".join(f"{p} ({r})" for p, r in findings[:5])
+        raise RecordValidationError(
+            f"source_metadata carries forbidden personal-identifier/credential "
+            f"field(s): {detail}. Drop/sanitize them in the adapter "
+            f"(audit_source_metadata)."
+        )

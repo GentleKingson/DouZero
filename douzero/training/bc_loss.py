@@ -289,18 +289,22 @@ def listwise_bc_loss(
     masked = logits.clone()
     masked[~action_mask] = float("-inf")
 
-    # Mask-aware label smoothing (Medium #2 fix). PyTorch's
-    # ``F.cross_entropy(label_smoothing=ε)`` distributes ε uniformly over ALL N
-    # classes — including padded ones. With padded logits set to -inf the
-    # softmax assigns them 0 probability, but the smoothed target assigns them
-    # ε/N > 0, producing an infinite loss. Instead we implement the CE by hand
-    # so the smoothing mass is redistributed over the VALID classes only:
+    # Mask-aware label smoothing. PyTorch's ``F.cross_entropy(label_smoothing=ε)``
+    # distributes ε uniformly over ALL N classes — including padded ones. With
+    # padded logits set to -inf the softmax assigns them 0 probability, but the
+    # smoothed target assigns them ε/N > 0, producing an infinite loss. Instead
+    # we implement the CE by hand so the smoothing mass is redistributed over
+    # the VALID classes only, AND the target distribution sums to exactly 1:
     #
-    #   target_prob = (1 - ε) on the human action + ε/(num_valid) on each
-    #                 other VALID action, and 0 on padded actions.
+    #   target_prob[target]   = (1 - ε) + ε/num_valid
+    #   target_prob[other V]  = ε/num_valid
+    #   target_prob[padded]   = 0
     #
-    # This is the standard "label smoothing over the legal set" and is finite
-    # by construction. When label_smoothing == 0 it reduces to plain CE.
+    # Sum over valid = (1 - ε) + num_valid × ε/num_valid = (1 - ε) + ε = 1.
+    # (The earlier implementation overwrote the target slot with ``1 - ε``,
+    # dropping its ε/num_valid share and making the sum 1 − ε/num_valid < 1,
+    # which shrunk the loss/gradient by a K-dependent factor.)
+    # When label_smoothing == 0 this reduces to plain one-hot CE.
     num_valid = int(action_mask.sum().item())
     eps = float(label_smoothing)
     log_softmax = F.log_softmax(masked.unsqueeze(0), dim=-1).squeeze(0)
@@ -311,10 +315,10 @@ def listwise_bc_loss(
     with torch.no_grad():
         target_probs = torch.zeros(n, dtype=log_softmax.dtype, device=log_softmax.device)
         if eps > 0.0 and num_valid > 1:
-            # Spread eps over the OTHER valid actions (num_valid - 1 of them).
-            other = eps / float(num_valid)
-            target_probs[action_mask] = other
-            target_probs[target_index] = 1.0 - eps
+            # ε/num_valid on EVERY valid action, then ADD (1-ε) to the target so
+            # the target keeps its smoothing share and the total sums to 1.
+            target_probs[action_mask] = eps / float(num_valid)
+            target_probs[target_index] += 1.0 - eps
         else:
             target_probs[target_index] = 1.0
     # Cross-entropy: -sum(target_probs * log_softmax). Gradient flows through

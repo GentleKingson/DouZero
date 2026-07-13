@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -325,6 +327,51 @@ class TestListwiseBCLoss:
         plain, _ = listwise_bc_loss(logits, mask, 1, label_smoothing=0.0)
         smooth, _ = listwise_bc_loss(logits, mask, 1, label_smoothing=0.2)
         assert smooth.item() < plain.item()
+
+    def test_label_smoothing_target_distribution_sums_to_one(self):
+        """Blocker 2: the smoothed target distribution MUST sum to exactly 1
+        (the earlier bug dropped the target's ε/K share, giving 1 − ε/K)."""
+        # Reconstruct the target the loss builds internally and check its sum.
+        # 4 valid actions, label_smoothing=0.2 -> each valid gets 0.05, target
+        # gets 0.05 + 0.8 = 0.85. Sum = 0.85 + 3*0.05 = 1.0.
+        import torch.nn.functional as F
+
+        logits = torch.tensor([[0.0], [0.5], [-0.3], [0.2]])
+        mask = torch.tensor([True, True, True, True])
+        eps = 0.2
+        num_valid = 4
+        target_idx = 1
+        # Hand-compute the expected target probs (mirrors the fix).
+        expected = torch.full((4,), eps / num_valid)
+        expected[target_idx] += 1.0 - eps
+        assert expected.sum().item() == pytest.approx(1.0)
+        assert expected[target_idx].item() == pytest.approx(1.0 - eps + eps / num_valid)
+        # The loss equals -sum(expected * log_softmax(logits)).
+        log_sm = F.log_softmax(logits.squeeze(-1), dim=-1)
+        expected_loss = -(expected * log_sm).sum()
+        actual_loss, _ = listwise_bc_loss(logits, mask, target_idx, label_smoothing=eps)
+        assert torch.allclose(actual_loss, expected_loss, atol=1e-6)
+
+    def test_label_smoothing_sum_independent_of_action_count(self):
+        """Blocker 2: the target sum is 1 regardless of K (the bug made the
+        shortfall depend on K). Compare K=2 vs K=8 at the same eps."""
+        for k in (2, 3, 5, 8):
+            logits = torch.zeros(k, 1)
+            mask = torch.ones(k, dtype=torch.bool)
+            _, _ = listwise_bc_loss(logits, mask, 0, label_smoothing=0.2)
+            # If the sum were < 1 the loss would be artificially shrunk; with
+            # uniform logits the CE for a proper 1-sum target is exactly
+            # -((1-eps+eps/k)*log(p_target) + (k-1)*(eps/k)*log(p_other))
+            # where p = 1/k for all. Verify it matches the closed form.
+            import torch.nn.functional as F
+
+            eps = 0.2
+            p = 1.0 / k
+            target_prob = 1.0 - eps + eps / k
+            other_prob = eps / k
+            expected = -(target_prob * math.log(p) + (k - 1) * other_prob * math.log(p))
+            actual, _ = listwise_bc_loss(logits, mask, 0, label_smoothing=eps)
+            assert actual.item() == pytest.approx(expected, abs=1e-5)
 
 
 class TestAverageBCLosses:

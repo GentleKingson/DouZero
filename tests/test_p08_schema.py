@@ -196,9 +196,66 @@ class TestAdapters:
         assert "session_cookie" not in cleaned
         assert cleaned == {"source": "ok"}
 
+    def test_audit_substring_key_match_catches_compound_keys(self):
+        """Blocker 4: substring matching catches api_token, client_secret,
+        user_email — not just exact key matches."""
+        cleaned = audit_source_metadata(
+            {"api_token": "x", "client_secret": "y",
+             "user_email": "a@b.c", "source": "ok"}
+        )
+        assert cleaned == {"source": "ok"}
+
+    def test_audit_recurses_into_nested_mappings(self):
+        """Blocker 4: a credential hidden inside a nested mapping is dropped."""
+        cleaned = audit_source_metadata(
+            {"profile": {"email": "a@b.c", "name": "ok"}, "source": "s"}
+        )
+        assert "email" not in cleaned["profile"]
+        assert cleaned["profile"]["name"] == "ok"
+        assert cleaned["source"] == "s"
+
+    def test_audit_recurses_into_lists(self):
+        cleaned = audit_source_metadata(
+            {"players": [{"user_id": 1, "seat": 0}], "source": "s"}
+        )
+        assert "user_id" not in cleaned["players"][0]
+        assert cleaned["players"][0] == {"seat": 0}
+
+    def test_audit_drops_credential_like_values(self):
+        """Blocker 4: a credential-looking string value is dropped even when
+        the key is benign."""
+        cleaned = audit_source_metadata(
+            {"note": "Bearer abc123xyz", "source": "ok"}
+        )
+        assert "note" not in cleaned
+        assert cleaned == {"source": "ok"}
+
+    def test_audit_drops_pem_private_key_value(self):
+        cleaned = audit_source_metadata(
+            {"key": "-----BEGIN RSA PRIVATE KEY-----\nMIIE", "source": "ok"}
+        )
+        assert "key" not in cleaned
+
     def test_assert_no_forbidden_metadata_raises(self):
         with pytest.raises(RecordValidationError):
             assert_no_forbidden_metadata({"user_id": 1})
+
+    def test_assert_raises_on_compound_forbidden_key(self):
+        """Blocker 4: substring matching at the assert boundary too."""
+        with pytest.raises(RecordValidationError):
+            assert_no_forbidden_metadata({"api_token": "x"})
+        with pytest.raises(RecordValidationError):
+            assert_no_forbidden_metadata({"client_secret": "x"})
+
+    def test_assert_raises_on_nested_forbidden(self):
+        with pytest.raises(RecordValidationError):
+            assert_no_forbidden_metadata(
+                {"profile": {"email": "a@b.c"}}
+            )
+
+    def test_assert_raises_on_credential_value(self):
+        with pytest.raises(RecordValidationError):
+            assert_no_forbidden_metadata({"note": "Bearer leak"})
 
     def test_assert_no_forbidden_metadata_passes_clean(self):
         assert_no_forbidden_metadata({"source": "ok"})  # no raise
