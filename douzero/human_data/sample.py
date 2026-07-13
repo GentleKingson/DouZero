@@ -64,9 +64,17 @@ class BCSample:
         Provenance: the source record's ``game_id``. Used for split integrity
         and per-game diagnostics.
     skill_weight:
-        Non-negative sample weight derived from
-        ``record.player_skill_weight[position]`` (default 1.0). Clipped/
-        normalized downstream in :mod:`douzero.human_data.weights`.
+        Non-negative raw per-role skill weight derived from
+        ``record.player_skill_weight[position]`` (default 1.0). This is the
+        UNPROCESSED signal; :attr:`sample_weight` is what the loss reads.
+    sample_weight:
+        The composite, clipped+normalized weight the BC loss actually uses
+        (Blocker 4). Defaults to ``skill_weight`` when no composite weighting
+        is applied; :func:`douzero.human_data.weights.compute_sample_weights`
+        overwrites it across a dataset.
+    winner_team:
+        The record's terminal winner team (``"landlord"`` / ``"farmer"``), for
+        survivorship-bias-stratified statistics (Blocker 4).
     num_legal_actions:
         Cached count of legal actions at this decision (== len of
         ``obs.actions.legal_actions``). Stored so a downstream collator can
@@ -78,6 +86,8 @@ class BCSample:
     position: str
     game_id: str
     skill_weight: float = 1.0
+    sample_weight: float = 1.0
+    winner_team: str = ""
     num_legal_actions: int = 0
     kind: str = field(default=BC_SAMPLE_KIND, init=False)
 
@@ -100,16 +110,14 @@ class BCSample:
             raise BCSampleError(
                 f"position must be one of {_REPLAY_ROLES}, got {self.position!r}"
             )
-        if not isinstance(self.skill_weight, (int, float)) or isinstance(
-            self.skill_weight, bool
-        ):
-            raise BCSampleError(
-                f"skill_weight must be a number, got {type(self.skill_weight).__name__}"
-            )
-        if self.skill_weight < 0:
-            raise BCSampleError(
-                f"skill_weight must be non-negative, got {self.skill_weight}"
-            )
+        for name, val in (("skill_weight", self.skill_weight),
+                          ("sample_weight", self.sample_weight)):
+            if not isinstance(val, (int, float)) or isinstance(val, bool):
+                raise BCSampleError(
+                    f"{name} must be a number, got {type(val).__name__}"
+                )
+            if val < 0:
+                raise BCSampleError(f"{name} must be non-negative, got {val}")
         if self.num_legal_actions < 0:
             raise BCSampleError(
                 f"num_legal_actions must be non-negative, got "
@@ -231,6 +239,8 @@ def build_bc_samples(
                 position=pos,
                 game_id=record.game_id,
                 skill_weight=weight,
+                sample_weight=weight,  # overwritten by compute_sample_weights
+                winner_team=str(record.final_result.get("winner_team", "")),
                 num_legal_actions=len(obs_legal),
             )
             sample.validate()

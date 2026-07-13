@@ -64,6 +64,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--early_stopping_patience", type=int, default=0)
     p.add_argument("--max_grad_norm", type=float, default=40.0)
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--skill_weight_clip", type=float, default=10.0,
+                   help="cap on the composite sample weight before normalization")
     p.add_argument("--seed", type=int, default=0)
     # Model architecture (small defaults so CPU smoke runs quickly).
     p.add_argument("--hidden_size", type=int, default=64)
@@ -162,6 +164,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("[pretrain_bc] ERROR: no BC samples (provide valid data).",
               file=sys.stderr)
         return 1
+
+    # 1b. Compute composite sample weights (Blocker 4): clip + mean-normalize
+    # the raw skill weights so a single high-skill outlier cannot dominate a
+    # minibatch, then stamp them onto each sample's `sample_weight`.
+    from douzero.human_data.weights import (
+        WeightConfig,
+        apply_sample_weights,
+        stratified_stats,
+    )
+
+    samples = apply_sample_weights(
+        samples, config=WeightConfig(skill_weight_clip=args.skill_weight_clip)
+    )
+    stats_summary = stratified_stats(samples)
+    print(
+        f"[pretrain_bc] sample-weight stats: total={stats_summary['total']} "
+        f"by_position={stats_summary['by_position']} "
+        f"by_winner_team={stats_summary['by_winner_team']}",
+        file=sys.stderr,
+    )
 
     # 2. Build the model with the prior head enabled.
     model_cfg = ModelV2Config(

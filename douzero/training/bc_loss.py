@@ -100,6 +100,80 @@ class BCLossConfig:
         }
 
 
+@dataclass(frozen=True)
+class BCSchedule:
+    """Per-step BC auxiliary weight schedule (Blocker 1 / task 11).
+
+    Computes the effective ``lambda_bc`` at optimizer step ``t``:
+
+    - ``constant`` (default): ``base_lambda`` at every step.
+    - ``linear_decay``: decays linearly from ``base_lambda`` to ``floor`` over
+      ``schedule_steps``, then stays at ``floor``. The floor is NOT forced to
+      zero (a residual prior survives) unless the caller explicitly sets
+      ``floor=0``.
+
+    At step 0 both schedules return ``base_lambda``. The V2 trainer applies
+    :meth:`effective_lambda` at each optimizer step so the BC term's weight
+    evolves as configured without re-constructing the trainer.
+    """
+
+    base_lambda: float = 0.0
+    schedule: str = "constant"  # "constant" | "linear_decay"
+    schedule_steps: int = 0
+    schedule_floor: float = 0.0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.base_lambda, bool) or not isinstance(
+            self.base_lambda, (int, float)
+        ):
+            raise BCLossError(
+                f"base_lambda must be a number, got {type(self.base_lambda).__name__}"
+            )
+        if self.base_lambda < 0.0 or not math.isfinite(self.base_lambda):
+            raise BCLossError(
+                f"base_lambda must be non-negative finite, got {self.base_lambda}"
+            )
+        if self.schedule not in ("constant", "linear_decay"):
+            raise BCLossError(
+                f"schedule must be 'constant' or 'linear_decay', got {self.schedule!r}"
+            )
+        if not isinstance(self.schedule_steps, int) or isinstance(
+            self.schedule_steps, bool
+        ) or self.schedule_steps < 0:
+            raise BCLossError(
+                f"schedule_steps must be a non-negative int, got {self.schedule_steps}"
+            )
+        if (
+            not isinstance(self.schedule_floor, (int, float))
+            or isinstance(self.schedule_floor, bool)
+            or self.schedule_floor < 0.0
+            or self.schedule_floor > self.base_lambda
+        ):
+            raise BCLossError(
+                f"schedule_floor must be in [0, base_lambda], got "
+                f"{self.schedule_floor} (base_lambda={self.base_lambda})"
+            )
+
+    def effective_lambda(self, step: int) -> float:
+        """Return the BC auxiliary weight at optimizer step ``step``."""
+        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+            raise BCLossError(f"step must be a non-negative int, got {step}")
+        if self.schedule == "constant" or self.schedule_steps <= 0:
+            return self.base_lambda
+        if step >= self.schedule_steps:
+            return self.schedule_floor
+        frac = 1.0 - (step / float(self.schedule_steps))
+        return self.schedule_floor + (self.base_lambda - self.schedule_floor) * frac
+
+    def to_dict(self) -> dict[str, float | str]:
+        return {
+            "base_lambda": float(self.base_lambda),
+            "schedule": self.schedule,
+            "schedule_steps": int(self.schedule_steps),
+            "schedule_floor": float(self.schedule_floor),
+        }
+
+
 @dataclass
 class BCLossComponents:
     """Result of a BC loss computation.

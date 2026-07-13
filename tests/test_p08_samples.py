@@ -303,3 +303,58 @@ class TestStratifiedStats:
     def test_stats_handle_empty(self):
         stats = stratified_stats([])
         assert stats["total"] == 0
+
+    def test_stats_report_winner_team(self):
+        """Blocker 4: stratified_stats reports by_winner_team (survivorship
+        bias audit), not just position/action counts."""
+        rec = generate_synthetic_record("st-team", seed=1)
+        samples = build_bc_samples(rec)
+        stats = stratified_stats(samples)
+        assert "by_winner_team" in stats
+        # The record's winner team is present in the distribution.
+        team = rec.final_result["winner_team"]
+        assert stats["by_winner_team"].get(team, 0) > 0
+
+
+# --------------------------------------------------------------------------- #
+# Composite sample weights (Blocker 4)
+# --------------------------------------------------------------------------- #
+class TestCompositeWeights:
+    def test_bcsample_carries_sample_weight_and_winner_team(self):
+        """Blocker 4: BCSample carries the composite sample_weight + winner_team
+        (not just raw skill_weight)."""
+        rec = generate_synthetic_record("sw-1", seed=1)
+        samples = build_bc_samples(rec)
+        for s in samples:
+            assert hasattr(s, "sample_weight")
+            assert hasattr(s, "winner_team")
+            assert s.sample_weight == s.skill_weight  # default = skill
+            assert s.winner_team in ("landlord", "farmer")
+
+    def test_apply_sample_weights_normalizes(self):
+        """Blocker 4: apply_sample_weights stamps clipped+normalized weights."""
+        from douzero.human_data.weights import (
+            WeightConfig,
+            apply_sample_weights,
+        )
+
+        rec = generate_synthetic_record("sw-2", seed=2)
+        samples = build_bc_samples(rec)
+        # Inject diverse raw skill weights.
+        import dataclasses
+
+        for i, s in enumerate(samples):
+            samples[i] = dataclasses.replace(
+                s, skill_weight=float(i + 1)
+            )
+        out = apply_sample_weights(
+            samples, config=WeightConfig(skill_weight_clip=100.0)
+        )
+        # sample_weight is now normalized so the mean is ~1.0.
+        mean = sum(s.sample_weight for s in out) / len(out)
+        assert abs(mean - 1.0) < 0.01
+        # skill_weight is preserved (raw).
+        for orig, stamped in zip(samples, out):
+            assert stamped.skill_weight == orig.skill_weight
+        # Relative ordering preserved.
+        assert out[0].sample_weight < out[-1].sample_weight

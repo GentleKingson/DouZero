@@ -237,7 +237,13 @@ class BCTrainer:
     # Training
     # ------------------------------------------------------------------ #
     def train(self) -> BCTrainerStats:
-        """Run the configured number of epochs with early stopping."""
+        """Run the configured number of epochs with early stopping.
+
+        Medium #1: the best-validation state_dict is snapshot-restored at the
+        end of training, so the saved model is the validation-optimal one, not
+        whatever the last epoch produced (which may be worse after early
+        stopping triggered).
+        """
         stats = BCTrainerStats(
             train_size=len(self.train_samples),
             val_size=len(self.val_samples),
@@ -248,6 +254,9 @@ class BCTrainer:
         # Snapshot one parameter so we can assert the optimizer actually moved
         # the weights when at least one epoch ran (mirrors V2Trainer).
         first_param = next(self.model.parameters()).detach().clone()
+
+        # Medium #1: keep the best-validation state_dict so we can restore it.
+        best_state_dict: dict | None = None
 
         for epoch in range(self.config.epochs):
             order = list(range(len(self.train_samples)))
@@ -282,6 +291,11 @@ class BCTrainer:
                 stats.best_val_loss = val_loss
                 stats.best_epoch = epoch
                 epochs_since_best = 0
+                # Medium #1: snapshot the best model so far (deep-ish copy of
+                # the state_dict tensors; load_state_dict restores it).
+                best_state_dict = {
+                    k: v.detach().clone() for k, v in self.model.state_dict().items()
+                }
             else:
                 epochs_since_best += 1
                 if (
@@ -290,6 +304,13 @@ class BCTrainer:
                 ):
                     stats.stopped_early = True
                     break
+
+        # Medium #1: restore the best-validation weights so the returned (and
+        # later saved) model is the validation-optimal one. Only restore when
+        # we actually snapshot a best (val set non-empty); when there is no val
+        # set the last-epoch model is the only candidate.
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
 
         self.model.eval()
         # Sanity: if at least one step ran, the parameters should have moved.
@@ -330,7 +351,7 @@ class BCTrainer:
                     out.prior_logit,
                     out.action_mask,
                     s.human_action_index,
-                    weight=s.skill_weight,
+                    weight=s.sample_weight,
                     temperature=self.config.temperature,
                     label_smoothing=self.config.label_smoothing,
                 )

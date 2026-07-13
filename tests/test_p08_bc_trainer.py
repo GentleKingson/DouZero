@@ -143,6 +143,28 @@ class TestBCTrainer:
         with pytest.raises(BCTrainerError):
             BCTrainer(m, bc_samples, BCTrainerConfig(learning_rate=0.0))
 
+    def test_restores_best_validation_state_dict(self, bc_samples):
+        """Medium #1: after train(), the model holds the best-validation
+        weights, not the last-epoch weights. We verify by snapshotting the
+        state at best_epoch via a re-eval and comparing."""
+        torch.manual_seed(0)
+        m = _build_prior_model()
+        trainer = BCTrainer(
+            m, bc_samples,
+            BCTrainerConfig(
+                epochs=4, batch_size=16, learning_rate=5e-3, val_ratio=0.3,
+                seed=5,
+            ),
+        )
+        stats = trainer.train()
+        # The model's current weights ARE the best-validation weights (restored
+        # at the end of train). Re-evaluate on the val set and confirm the loss
+        # equals best_val_loss (within float tolerance), not the final-epoch
+        # loss — which can differ when early epochs were best.
+        if trainer.val_samples and stats.best_epoch >= 0:
+            val_loss, _, _ = trainer._evaluate(trainer.val_samples)
+            assert val_loss == pytest.approx(stats.best_val_loss, abs=1e-4)
+
 
 # --------------------------------------------------------------------------- #
 # pretrain_bc CLI smoke
@@ -219,7 +241,7 @@ class TestRLBCAuxHook:
             bc_aux_samples=bc_samples,
         )
         # lambda_bc=0 -> bc_aux_samples are accepted but warned as unused.
-        assert trainer.lambda_bc == 0.0
+        assert trainer.bc_schedule.base_lambda == 0.0
         # The trainer runs without touching the BC path.
         stats = trainer.train()
         assert stats.optimizer_steps >= 1
@@ -275,6 +297,117 @@ class TestRLBCAuxHook:
             ),
             bc_aux_samples=bc_samples,
         )
-        assert trainer.lambda_bc == 0.5
+        assert trainer.bc_schedule.base_lambda == 0.5
         stats = trainer.train()
         assert stats.optimizer_steps >= 1
+
+    def test_linear_decay_schedule(self, bc_samples):
+        """The BC schedule linearly decays lambda over schedule_steps to a
+        non-zero floor (Blocker 1)."""
+        from douzero.training.bc_loss import BCSchedule
+        from douzero.training.v2_trainer import V2Trainer, TrainerConfig
+
+        sched = BCSchedule(
+            base_lambda=1.0, schedule="linear_decay",
+            schedule_steps=10, schedule_floor=0.2,
+        )
+        assert sched.effective_lambda(0) == 1.0
+        assert sched.effective_lambda(5) == pytest.approx(0.6)
+        assert sched.effective_lambda(10) == 0.2  # at the floor
+        assert sched.effective_lambda(20) == 0.2  # stays at floor
+        # The V2 trainer uses the schedule per-step.
+        from douzero.training.v2_trainer import V2Trainer, TrainerConfig
+
+        torch.manual_seed(0)
+        cfg = ModelV2Config(
+            hidden_size=32, history_layers=1, history_heads=4,
+            history_encoder="lstm", human_prior_enabled=True, nan_guard=False,
+        )
+        model = ModelV2(build_v2_schema(), cfg)
+        trainer = V2Trainer(
+            model,
+            loss_config=LossConfig(lambda_win=1.0, lambda_bc=1.0),
+            config=TrainerConfig(
+                max_episodes=2, optimizer_steps=1, batch_size=4,
+                exp_epsilon=0.5, rng_seed=1,
+            ),
+            bc_aux_samples=bc_samples,
+            bc_schedule=sched,
+        )
+        assert trainer.bc_schedule.schedule == "linear_decay"
+        stats = trainer.train()
+        assert stats.optimizer_steps >= 1
+
+    def test_belief_plus_prior_combo_runs(self, bc_samples):
+        """P07+P08 combo: a belief+prior-enabled model must run an optimizer
+        step. _compute_bc_aux_loss must pass belief features (Blocker 1)."""
+        from douzero.belief import BeliefConfig, BeliefModel
+        from douzero.training.v2_trainer import V2Trainer, TrainerConfig
+
+        torch.manual_seed(0)
+        cfg = ModelV2Config(
+            hidden_size=32, history_layers=1, history_heads=4,
+            history_encoder="lstm",
+            belief_enabled=True, human_prior_enabled=True, nan_guard=False,
+        )
+        model = ModelV2(build_v2_schema(), cfg)
+        belief_model = BeliefModel(BeliefConfig(hidden_size=16, num_layers=1))
+        trainer = V2Trainer(
+            model,
+            loss_config=LossConfig(lambda_win=1.0, lambda_bc=0.3),
+            config=TrainerConfig(
+                max_episodes=2, optimizer_steps=1, batch_size=4,
+                exp_epsilon=0.5, rng_seed=2,
+            ),
+            belief_model=belief_model,
+            bc_aux_samples=bc_samples,
+        )
+        stats = trainer.train()
+        assert stats.optimizer_steps >= 1  # no crash => belief features passed
+
+
+# --------------------------------------------------------------------------- #
+# BCSchedule unit tests
+# --------------------------------------------------------------------------- #
+class TestBCSchedule:
+    def test_constant_schedule(self):
+        from douzero.training.bc_loss import BCSchedule
+
+        s = BCSchedule(base_lambda=0.5)
+        assert s.effective_lambda(0) == 0.5
+        assert s.effective_lambda(100) == 0.5
+
+    def test_linear_decay_to_floor(self):
+        from douzero.training.bc_loss import BCSchedule
+
+        s = BCSchedule(
+            base_lambda=1.0, schedule="linear_decay",
+            schedule_steps=4, schedule_floor=0.2,
+        )
+        assert s.effective_lambda(0) == 1.0
+        assert s.effective_lambda(2) == pytest.approx(0.6)
+        assert s.effective_lambda(4) == 0.2
+        assert s.effective_lambda(8) == 0.2
+
+    def test_floor_not_forced_to_zero(self):
+        from douzero.training.bc_loss import BCSchedule
+
+        s = BCSchedule(
+            base_lambda=0.5, schedule="linear_decay",
+            schedule_steps=10, schedule_floor=0.1,
+        )
+        # Never goes below the floor.
+        for step in range(20):
+            assert s.effective_lambda(step) >= 0.1 - 1e-9
+
+    def test_rejects_floor_above_base(self):
+        from douzero.training.bc_loss import BCSchedule, BCLossError
+
+        with pytest.raises(BCLossError):
+            BCSchedule(base_lambda=0.3, schedule_floor=0.5)
+
+    def test_rejects_bad_schedule_name(self):
+        from douzero.training.bc_loss import BCSchedule, BCLossError
+
+        with pytest.raises(BCLossError):
+            BCSchedule(base_lambda=1.0, schedule="bogus")

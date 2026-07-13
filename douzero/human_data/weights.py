@@ -171,23 +171,28 @@ def compute_sample_weights(
 # Stratified statistics (survivorship-bias audit)
 # --------------------------------------------------------------------------- #
 def stratified_stats(samples) -> dict[str, dict[str, int | float]]:
-    """Return per-position and per-winner-team counts for a BC sample set.
+    """Return per-position, per-winner-team, and per-action-count counts.
 
     AGENTS.md: "Do not train only on won games. Provide result-stratified
-    statistics, to avoid survivorship bias." This helper reports the team and
-    position distribution so a training run can be audited for imbalance. The
-    ``winner_team`` is read off the sample's observation's public state where
-    available, falling back to "" when the terminal result is not on the obs.
+    statistics, to avoid survivorship bias." This helper reports the team,
+    position, and legal-action-count distribution so a training run can be
+    audited for imbalance. ``by_winner_team`` is the survivorship-bias audit
+    key — a dataset where ``by_winner_team`` is dominated by one team signals
+    that only winners' decisions were kept.
     """
     by_position: dict[str, int] = {}
+    by_winner_team: dict[str, int] = {}
     by_num_actions: dict[str, int] = {}
     for s in samples:
         by_position[s.position] = by_position.get(s.position, 0) + 1
+        team = getattr(s, "winner_team", "") or "unknown"
+        by_winner_team[team] = by_winner_team.get(team, 0) + 1
         bucket = _bucket(s.num_legal_actions)
         by_num_actions[bucket] = by_num_actions.get(bucket, 0) + 1
     return {
         "total": len(samples),
         "by_position": by_position,
+        "by_winner_team": by_winner_team,
         "by_num_legal_actions": by_num_actions,
     }
 
@@ -202,3 +207,40 @@ def _bucket(n: int) -> str:
     if n <= 30:
         return "11-30"
     return "31+"
+
+
+def apply_sample_weights(
+    samples,
+    *,
+    config: WeightConfig | None = None,
+    integrity_weights=None,
+    rule_matches=None,
+    action_advantages=None,
+):
+    """Compute composite weights across a dataset and stamp them onto samples.
+
+    Blocker 4: this is the production wiring. It reads each sample's raw
+    ``skill_weight``, computes the clipped+normalized composite weight via
+    :func:`compute_sample_weights`, and returns NEW samples (BCSample is frozen)
+    with ``sample_weight`` set. The original ``skill_weight`` is preserved.
+
+    ``integrity_weights`` / ``rule_matches`` / ``action_advantages`` default to
+    "all neutral" (integrity 1.0, rule_match True, advantage 0.0). Future
+    callers can supply per-sample signals (e.g. a ruleset-mismatch mask from
+    the record identity).
+    """
+    import dataclasses
+
+    n = len(samples)
+    skill = [float(s.skill_weight) for s in samples]
+    computed = compute_sample_weights(
+        skill_weights=skill,
+        integrity_weights=integrity_weights,
+        rule_matches=rule_matches,
+        action_advantages=action_advantages,
+        config=config,
+    )
+    out = []
+    for s, w in zip(samples, computed):
+        out.append(dataclasses.replace(s, sample_weight=float(w)))
+    return out

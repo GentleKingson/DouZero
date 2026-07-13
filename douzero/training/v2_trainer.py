@@ -211,6 +211,7 @@ class V2Trainer:
         config: TrainerConfig | None = None,
         belief_model=None,
         bc_aux_samples=None,
+        bc_schedule=None,
     ) -> None:
         _legacy_only(ruleset)
         loss_cfg = loss_config or LossConfig()
@@ -274,27 +275,34 @@ class V2Trainer:
                 p.requires_grad_(False)
             belief_model.eval()
         self.belief_model = belief_model
-        # P08: optional listwise BC auxiliary loss. When loss_config.lambda_bc
-        # > 0 the trainer adds ``lambda_bc * L_BC`` to the multi-objective RL
-        # loss at each optimizer step, where L_BC is the listwise
-        # cross-entropy over the legal-action list on a minibatch of human BC
-        # samples. This is the combined RL+BC path (task 11). A model without
-        # a prior head, or missing BC samples, is rejected when lambda_bc > 0.
-        self.lambda_bc = float(getattr(loss_cfg, "lambda_bc", 0.0))
+        # P08: optional listwise BC auxiliary loss. When the BC schedule's base
+        # lambda is > 0 the trainer adds ``effective_lambda(t) * L_BC`` to the
+        # multi-objective RL loss at each optimizer step, where L_BC is the
+        # listwise cross-entropy over the legal-action list on a minibatch of
+        # human BC samples. This is the combined RL+BC path (task 11). A model
+        # without a prior head, or missing BC samples, is rejected when the
+        # base lambda is > 0.
+        from douzero.training.bc_loss import BCSchedule
+
+        base_lambda = float(getattr(loss_cfg, "lambda_bc", 0.0))
+        if bc_schedule is not None:
+            self.bc_schedule = bc_schedule
+        else:
+            # Default: a constant schedule at the loss config's lambda_bc.
+            self.bc_schedule = BCSchedule(base_lambda=base_lambda)
         self.bc_aux_samples = list(bc_aux_samples) if bc_aux_samples is not None else []
-        self.bc_temperature = 1.0
-        if self.lambda_bc > 0:
+        if self.bc_schedule.base_lambda > 0:
             if getattr(self.model.config, "human_prior_enabled", False) is not True:
                 raise ValueError(
-                    "loss_config.lambda_bc > 0 requires a value model built "
-                    "with human_prior_enabled=True (no prior head found). The "
+                    "BC lambda_bc > 0 requires a value model built with "
+                    "human_prior_enabled=True (no prior head found). The "
                     "BC auxiliary loss trains the prior head."
                 )
             if not self.bc_aux_samples:
                 raise ValueError(
-                    "loss_config.lambda_bc > 0 requires bc_aux_samples (the "
-                    "validated human BC dataset). Pass bc_aux_samples= to "
-                    "V2Trainer, or set lambda_bc=0 to disable the BC aux term."
+                    "BC lambda_bc > 0 requires bc_aux_samples (the validated "
+                    "human BC dataset). Pass bc_aux_samples= to V2Trainer, or "
+                    "set lambda_bc=0 to disable the BC aux term."
                 )
         elif self.bc_aux_samples:
             # BC samples supplied but lambda_bc=0 -> they are unused. Warn
@@ -302,7 +310,7 @@ class V2Trainer:
             import warnings
 
             warnings.warn(
-                "bc_aux_samples were supplied but loss_config.lambda_bc == 0; "
+                "bc_aux_samples were supplied but lambda_bc == 0; "
                 "the BC auxiliary loss is disabled and the samples are unused.",
                 stacklevel=2,
             )
@@ -460,6 +468,12 @@ class V2Trainer:
         for i in idxs:
             s = self.bc_aux_samples[i]
             bundle = observation_to_model_inputs(s.obs)
+            # P08 Blocker 1: compute the frozen belief features for this BC
+            # sample when the value model is belief-enabled. A belief-enabled
+            # model FAILS CLOSED at forward when belief_features are omitted,
+            # so without this the P07+P08 combo would crash at every optimizer
+            # step. The features come from the PUBLIC observation only.
+            belief_features = self._compute_belief_feature(s.obs)
             out = self.model(
                 bundle.state_card_vectors,
                 bundle.state_context_flat,
@@ -470,6 +484,7 @@ class V2Trainer:
                 bundle.action_features,
                 bundle.action_mask,
                 bundle.acting_role,
+                belief_features=belief_features,
             )
             if out.prior_logit is None:
                 raise RuntimeError(
@@ -480,8 +495,7 @@ class V2Trainer:
                 out.prior_logit,
                 out.action_mask,
                 s.human_action_index,
-                weight=s.skill_weight,
-                temperature=self.bc_temperature,
+                weight=s.sample_weight,
             )
             per_decision.append((loss, hit))
         return average_bc_losses(per_decision)
@@ -579,9 +593,15 @@ class V2Trainer:
             # cross-entropy scaled by lambda_bc to the RL loss. Both terms
             # contribute gradients in a single backward pass.
             total_loss = components.total
-            if self.lambda_bc > 0:
+            # P08 Blocker 1: the BC auxiliary weight follows the configured
+            # schedule (constant or linear_decay with a floor), evaluated at
+            # the CURRENT optimizer step so the weight evolves as configured.
+            eff_lambda = self.bc_schedule.effective_lambda(
+                self.stats.optimizer_steps
+            )
+            if eff_lambda > 0.0:
                 bc_term = self._compute_bc_aux_loss()
-                total_loss = total_loss + self.lambda_bc * bc_term.total
+                total_loss = total_loss + eff_lambda * bc_term.total
 
             # Fail-closed: a non-finite loss means something is wrong.
             if not torch.isfinite(total_loss):
