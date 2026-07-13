@@ -102,7 +102,11 @@ opponent A, opponent-A & B expected totals, total entropy) into the trunk and
   unchanged.
 - `belief_stop_gradient` (default `True`) detaches the belief features so the
   value loss never updates the frozen belief weights — the "pretrain belief
-  then freeze" path. Pass `False` for joint training (future work).
+  then freeze" path. **Joint training (`belief_stop_gradient=False`) is NOT
+  implemented in P07** and raises `NotImplementedError`: the constrained-marginal
+  DP and the feature projection run in NumPy, which cuts the graph between the
+  value loss and the belief parameters. A differentiable belief path is future
+  work. The `belief_proj` layer itself stays trainable under the default path.
 - The belief model itself is **not owned** by Model V2; the caller computes
   the public posterior and passes it in. This keeps the value checkpoint
   decoupled from the belief architecture.
@@ -110,6 +114,23 @@ opponent A, opponent-A & B expected totals, total entropy) into the trunk and
   supplied, the model raises by default (a belief-trained checkpoint must not
   silently degrade to a zero-feature baseline at deployment). Pass
   `allow_missing_belief_features=True` only for explicit ablations.
+
+## Deployment: `DeepAgentV2`
+
+A belief-enabled value model deploys via `DeepAgentV2(position, model, ruleset,
+belief_model=...)`. The agent holds the frozen `BeliefModel`, builds a
+`BeliefInput` from the **public** observation (`obs.public` — never a hidden
+hand), runs the constrained posterior, projects it into the 48-dim feature
+vector, and passes it into `ModelV2.forward` (cast to the value model's
+device/dtype inside the forward).
+
+- A belief-enabled value model **without** a `belief_model` is rejected at
+  construction with a precise error (no silent crash at inference).
+- A `belief_model` supplied to a belief-**disabled** value model is also
+  rejected (configuration mismatch).
+- Both the canonical `act_v2(obs)` and the legacy `act(infoset)` paths fuse
+  belief features. The imperfect-information boundary is preserved: the belief
+  model reads only `obs.public`.
 
 ## Training and evaluation CLI
 
@@ -180,7 +201,7 @@ the checkpoint is always stamped `legacy` — never mislabeled as `standard`.
 - Device/dtype: `BeliefModel.double()` produces float64 logits.
 - CLI smoke (`train_belief` / `evaluate_belief` end-to-end on CPU).
 
-## What is **not** measured
+## What is **not** measured / out of scope
 
 - No GPU runs; no real playing-strength evaluation. The CPU smoke verifies the
   loss decreases (e.g. `0.56 → 0.37` cross-entropy over 3 epochs on random
@@ -188,13 +209,15 @@ the checkpoint is always stamped `legacy` — never mislabeled as `standard`.
   it does **not** claim a stronger belief or a stronger value model. That
   requires the P15 paired-evaluation framework and model-guided self-play
   collection (P14), both out of scope here.
-- Joint value+belief training (gradient flowing into the belief model) is
-  wired behind `belief_stop_gradient=False` but not exercised by a training
-  run in this phase.
-- `DeepAgentV2` is not yet wired to compute belief features internally at
-  deployment; a belief-enabled value checkpoint loaded into `DeepAgentV2` runs
-  with zeroed belief features (functional, degraded) until that deployment
-  wiring is added.
+- **Joint value+belief training is NOT supported.** The constrained-marginal
+  DP and the belief-feature projection are non-differentiable (NumPy), so
+  `belief_stop_gradient=False` raises `NotImplementedError`. Only the
+  "pretrain belief, then freeze its features while training `belief_proj`"
+  path is available. A differentiable belief path (so value loss can update
+  the BeliefModel) is deferred to a later phase.
+- `DeepAgentV2` **does** wire belief features end-to-end (see "Deployment"
+  above) on CPU; the optional CUDA path is symmetric but not exercised in CI
+  (the test image is CPU-only).
 
 ## Migration and rollback
 

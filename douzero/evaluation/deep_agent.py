@@ -186,6 +186,15 @@ class DeepAgentV2:
         :class:`DecisionConfig` is built from ``decision_mode`` with default
         tolerances (preserving the P05 contract for callers that only pass
         ``decision_mode``).
+    belief_model:
+        Optional :class:`~douzero.belief.model.BeliefModel`. REQUIRED when the
+        value model has ``belief_enabled=True``: at deployment the agent builds
+        a :class:`~douzero.belief.features.BeliefInput` from the PUBLIC
+        observation, runs the (frozen) belief model, computes the constrained
+        posterior features, and passes them into ``ModelV2.forward``. Supplying
+        a ``belief_model`` for a belief-disabled value model raises
+        ``ValueError``. The belief model reads only ``obs.public`` — never a
+        hidden hand — so the imperfect-information boundary is preserved.
     """
 
     def __init__(
@@ -195,6 +204,7 @@ class DeepAgentV2:
         ruleset,
         decision_mode=None,
         decision_config=None,
+        belief_model=None,
     ):
         from douzero.models_v2.model import ModelV2  # local import: keep the
         # production import graph (evaluation.simulation) free of a hard torch
@@ -275,6 +285,27 @@ class DeepAgentV2:
         self.model = model
         self.ruleset = ruleset
         self.backend = "v2"
+        # P07 belief deployment wiring (review blocker #2). A belief-enabled
+        # value model REQUIRES a BeliefModel at deployment so the constrained
+        # posterior features are computed and fused; without it the value model
+        # fails closed at forward. Conversely a belief model supplied to a
+        # belief-disabled value model is a configuration mistake.
+        belief_enabled = bool(getattr(self.model.config, "belief_enabled", False))
+        if belief_enabled and belief_model is None:
+            raise ValueError(
+                "The value model has belief_enabled=True but no belief_model "
+                "was supplied to DeepAgentV2. A belief-enabled checkpoint "
+                "cannot run without the frozen BeliefModel that computes its "
+                "posterior features. Pass a pretrained BeliefModel via "
+                "belief_model= (load it with load_belief_checkpoint)."
+            )
+        if belief_model is not None and not belief_enabled:
+            raise ValueError(
+                "A belief_model was supplied but the value model has "
+                "belief_enabled=False. Drop belief_model or rebuild the value "
+                "model with belief_enabled=True."
+            )
+        self.belief_model = belief_model
         # Bug #3: bind the agent to the model's feature schema hash. Every
         # observation forwarded through act_v2 must carry the SAME schema hash,
         # so a model trained under schema A cannot silently consume an
@@ -289,7 +320,11 @@ class DeepAgentV2:
         )
         if torch.cuda.is_available():
             self.model.cuda()
+            if self.belief_model is not None:
+                self.belief_model.cuda()
         self.model.eval()
+        if self.belief_model is not None:
+            self.belief_model.eval()
 
     # --- The canonical public-only entry point ------------------------------ #
     def act_v2(self, obs):
@@ -433,6 +468,25 @@ class DeepAgentV2:
         bundle = observation_to_model_inputs(obs)
         if torch.cuda.is_available():
             bundle.to("cuda")
+        # P07: when the value model is belief-enabled, compute the constrained
+        # belief posterior features from the PUBLIC observation and pass them
+        # to the value model. The belief model reads only obs.public (never a
+        # hidden hand); the features are cast to the value model's device/dtype
+        # inside ModelV2.forward. Under inference_mode the belief forward and
+        # the (NumPy) constrained DP both run without building a graph.
+        belief_features = None
+        if self.belief_model is not None:
+            from douzero.belief import build_belief_input
+            from douzero.belief.model import belief_features_from_probs
+
+            binput = build_belief_input(obs.public)
+            bout = self.belief_model([binput])
+            feat_np = belief_features_from_probs(
+                bout.constrained_probs,
+                bout.opponent_a_total,
+                np.stack([binput.unseen_counts]),
+            )[0]
+            belief_features = torch.from_numpy(feat_np)
         with torch.inference_mode():
             out = self.model(
                 bundle.state_card_vectors,
@@ -444,6 +498,7 @@ class DeepAgentV2:
                 bundle.action_features,
                 bundle.action_mask,
                 bundle.acting_role,
+                belief_features=belief_features,
             )
         # P06 r1: route through the unified decision policy using the FULL
         # DecisionConfig (carrying abs_tol / rel_tol / risk_penalty), not a

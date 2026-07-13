@@ -318,9 +318,28 @@ class ModelV2(nn.Module):
         # degrade to a zero-feature baseline at deployment). Pass
         # ``allow_missing_belief_features=True`` to opt into the zero-vector
         # behaviour for ablations / unit tests.
+        #
+        # Joint training (``belief_stop_gradient=False``) is NOT supported in
+        # P07: the constrained-marginal DP and the feature projection run in
+        # NumPy, which permanently cuts the graph between the value loss and
+        # the belief parameters. Passing ``belief_stop_gradient=False`` raises
+        # ``NotImplementedError`` so the API never promises a path it cannot
+        # deliver (review blocker #1). The default (``True``) keeps the
+        # ``belief_proj`` layer trainable while treating the (frozen) belief
+        # features as constants.
         if self.belief_proj is not None:
             from douzero.belief.model import BELIEF_FEATURE_DIM
 
+            if not belief_stop_gradient:
+                raise NotImplementedError(
+                    "Joint value+belief training (belief_stop_gradient=False) "
+                    "is not implemented in P07: the constrained-marginal DP "
+                    "and the belief-feature projection are non-differentiable "
+                    "(NumPy), so value loss cannot reach the BeliefModel "
+                    "parameters. Use the pretrained-then-frozen path "
+                    "(belief_stop_gradient=True, the default); a differentiable "
+                    "belief path is future work."
+                )
             if belief_features is None:
                 if not allow_missing_belief_features:
                     raise ValueError(
@@ -332,14 +351,19 @@ class ModelV2(nn.Module):
                     )
                 belief_features = state_trunk.new_zeros(BELIEF_FEATURE_DIM)
             else:
-                if belief_features.shape[-1] != BELIEF_FEATURE_DIM:
+                # Exact shape check (review: only the trailing dim was checked,
+                # and the device/dtype were not aligned with the trunk).
+                if tuple(belief_features.shape) != (BELIEF_FEATURE_DIM,):
                     raise ValueError(
-                        f"belief_features trailing dim "
-                        f"{belief_features.shape[-1]} != BELIEF_FEATURE_DIM "
-                        f"{BELIEF_FEATURE_DIM}"
+                        f"belief_features must have shape "
+                        f"({BELIEF_FEATURE_DIM},), got "
+                        f"{tuple(belief_features.shape)}"
                     )
-                if belief_stop_gradient:
-                    belief_features = belief_features.detach()
+                # Align device/dtype with the trunk so a GPU value model
+                # receiving CPU belief features does not mismatch.
+                belief_features = belief_features.to(
+                    device=state_trunk.device, dtype=state_trunk.dtype
+                ).detach()
             state_trunk = state_trunk + self.belief_proj(belief_features)
         elif belief_features is not None:
             raise ValueError(
@@ -347,6 +371,7 @@ class ModelV2(nn.Module):
                 "(config.belief_enabled is False). Drop belief_features or "
                 "rebuild the model with belief_enabled=True."
             )
+        del belief_stop_gradient  # consumed; guard against accidental reuse
 
         # --- Encode the history once. ---
         history_summary = self.history_encoder(history_tokens, history_key_padding_mask)

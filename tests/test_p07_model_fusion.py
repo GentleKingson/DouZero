@@ -27,6 +27,7 @@ from douzero.belief.model import belief_features_from_probs
 from douzero.models_v2.config import ModelV2Config
 from douzero.models_v2.model import ModelV2
 from douzero.observation.schema import build_v2_schema
+from douzero.env.rules import RuleSet
 
 
 def _model_inputs(num_actions: int = 3, *, schema=None):
@@ -145,6 +146,11 @@ class TestBeliefFusionForward:
                                out_on.win_logit.numpy(), atol=1e-5)
 
     def test_stop_gradient_default_blocks_flow_into_belief_features(self):
+        """Default path: belief features are detached (frozen-features path).
+
+        The belief_proj layer is still trainable, but the (frozen) belief
+        features themselves receive no gradient.
+        """
         model, _ = self._belief_enabled_model()
         (scv, scf, ccv, cf, ht, hmask, af, am, role, _obs) = _model_inputs()
         feats = torch.randn(BELIEF_FEATURE_DIM, requires_grad=True)
@@ -153,23 +159,34 @@ class TestBeliefFusionForward:
         out.win_logit.sum().backward()
         # Detached inside -> no grad reached the leaf belief feature tensor.
         assert feats.grad is None
+        # But the belief_proj layer DID receive gradient (it is trainable).
+        assert model.belief_proj.weight.grad is not None
 
-    def test_stop_gradient_false_allows_flow_into_belief_features(self):
+    def test_joint_training_is_not_implemented(self):
+        """belief_stop_gradient=False must raise NotImplementedError.
+
+        Joint value+belief training is not supported in P07: the constrained
+        DP and feature projection are non-differentiable (NumPy), so the API
+        must not promise a gradient path it cannot deliver (review blocker #1).
+        """
         model, _ = self._belief_enabled_model()
         (scv, scf, ccv, cf, ht, hmask, af, am, role, _obs) = _model_inputs()
-        feats = torch.randn(BELIEF_FEATURE_DIM, requires_grad=True)
-        out = model(scv, scf, ccv, cf, ht, hmask, af, am, role,
-                    belief_features=feats, belief_stop_gradient=False)
-        out.win_logit.sum().backward()
-        assert feats.grad is not None
-        assert torch.isfinite(feats.grad).all()
+        with pytest.raises(NotImplementedError):
+            model(scv, scf, ccv, cf, ht, hmask, af, am, role,
+                  belief_features=torch.zeros(BELIEF_FEATURE_DIM),
+                  belief_stop_gradient=False)
 
-    def test_rejects_wrong_belief_feature_dim(self):
+    def test_rejects_wrong_belief_feature_shape(self):
+        """Exact shape (BELIEF_FEATURE_DIM,) is required, not just trailing dim."""
         model, _ = self._belief_enabled_model()
         (scv, scf, ccv, cf, ht, hmask, af, am, role, _obs) = _model_inputs()
         with pytest.raises(ValueError):
             model(scv, scf, ccv, cf, ht, hmask, af, am, role,
                   belief_features=torch.zeros(BELIEF_FEATURE_DIM + 1))
+        # A 2-D tensor with the right trailing dim must also be rejected.
+        with pytest.raises(ValueError):
+            model(scv, scf, ccv, cf, ht, hmask, af, am, role,
+                  belief_features=torch.zeros(1, BELIEF_FEATURE_DIM))
 
 
 class TestBeliefValueIntegration:
@@ -220,3 +237,88 @@ class TestBeliefValueIntegration:
         # NO privileged field (the public observation is the only input source
         # for both models).
         assert obs.is_privileged is False
+
+
+class TestDeepAgentV2BeliefDeployment:
+    """A belief-enabled value model deploys via DeepAgentV2 (review blocker #2).
+
+    The agent holds a frozen BeliefModel, computes the constrained posterior
+    features from the public observation, and fuses them into the value model.
+    A belief-enabled value model WITHOUT a belief_model is rejected with a
+    precise error (no silent crash at inference, no false 'degraded' claim).
+    """
+
+    def _build_agent_inputs(self):
+        from douzero.env.env import Env
+        from douzero.observation.encode_v2 import get_obs_v2
+
+        np.random.seed(7)
+        torch.manual_seed(7)
+        env = Env("adp")
+        env.reset()
+        obs = get_obs_v2(env.infoset)
+        return obs
+
+    def _belief_enabled_value_model(self):
+        cfg = ModelV2Config(belief_enabled=True, hidden_size=32,
+                            history_heads=4, history_layers=2, nan_guard=False)
+        return ModelV2(build_v2_schema(), cfg)
+
+    def test_belief_enabled_agent_runs_end_to_end(self):
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        value = self._belief_enabled_value_model()
+        belief = BeliefModel(BeliefConfig(hidden_size=24, num_layers=1))
+        agent = DeepAgentV2("landlord", value, RuleSet.legacy(),
+                            belief_model=belief)
+        obs = self._build_agent_inputs()
+        chosen = agent.act_v2(obs)
+        assert chosen in obs.public.legal_actions
+
+    def test_belief_enabled_without_belief_model_rejected(self):
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        value = self._belief_enabled_value_model()
+        with pytest.raises(ValueError, match="belief_enabled=True"):
+            DeepAgentV2("landlord", value, RuleSet.legacy())
+
+    def test_belief_model_with_belief_disabled_value_rejected(self):
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        value = ModelV2(build_v2_schema(),
+                        ModelV2Config(belief_enabled=False, hidden_size=32,
+                                      history_heads=4, history_layers=2))
+        belief = BeliefModel(BeliefConfig(hidden_size=24, num_layers=1))
+        with pytest.raises(ValueError, match="belief_enabled=False"):
+            DeepAgentV2("landlord", value, RuleSet.legacy(),
+                        belief_model=belief)
+
+    def test_belief_disabled_agent_ignores_belief_path(self):
+        """A belief-disabled agent must not compute or require belief features."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        value = ModelV2(build_v2_schema(),
+                        ModelV2Config(belief_enabled=False, hidden_size=32,
+                                      history_heads=4, history_layers=2))
+        assert value.belief_proj is None
+        agent = DeepAgentV2("landlord", value, RuleSet.legacy())
+        assert agent.belief_model is None
+        obs = self._build_agent_inputs()
+        chosen = agent.act_v2(obs)
+        assert chosen in obs.public.legal_actions
+
+    def test_act_from_infoset_path_also_fuses_belief(self):
+        """The legacy act(infoset) entry must also wire belief features."""
+        from douzero.evaluation.deep_agent import DeepAgentV2
+
+        value = self._belief_enabled_value_model()
+        belief = BeliefModel(BeliefConfig(hidden_size=24, num_layers=1))
+        agent = DeepAgentV2("landlord", value, RuleSet.legacy(),
+                            belief_model=belief)
+        from douzero.env.env import Env
+
+        np.random.seed(9)
+        env = Env("adp")
+        env.reset()
+        chosen = agent.act(env.infoset)
+        assert chosen in env.infoset.legal_actions

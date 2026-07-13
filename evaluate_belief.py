@@ -62,12 +62,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("[evaluate_belief] ERROR: no samples", file=sys.stderr)
         return 1
 
-    feats = torch.from_numpy(dataset.feature_matrix().astype(np.float32))
-    legal = dataset.legal_mask_tensor().numpy()
     targets = np.stack([s.label.allocation for s in dataset.samples], axis=0)
     totals = np.array(
         [s.binput.opponent_a_total for s in dataset.samples], dtype=np.int64
     )
+    n_samples = len(dataset)
 
     # Forward in chunks to keep memory bounded on CPU. We compute BOTH:
     #   (a) the independent per-rank "factor" argmax (informational; does NOT
@@ -83,7 +82,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     map_preds = []
     map_conservation_ok = 0
     with torch.no_grad():
-        for start in range(0, feats.shape[0], chunk):
+        for start in range(0, n_samples, chunk):
             sl = slice(start, start + chunk)
             inputs = [s.binput for s in dataset.samples[start:start + chunk]]
             out = model(inputs)
@@ -104,14 +103,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     map_conservation_total = int(map_all.shape[0])
 
     # Factor-argmax metrics (independent per-rank; NOT total-conservative).
-    factor_metrics = belief_metrics(
-        np.where(legal, 1.0, 0.0)[np.arange(len(targets))[:, None],
-                                   np.arange(legal.shape[1])[None, :],
-                                   factor_argmax_all].reshape(-1, 1, 1),
-        targets, legal,
-    ) if False else _allocation_metrics(factor_argmax_all, targets, legal)
+    factor_metrics = _allocation_metrics(factor_argmax_all, targets)
     # Constrained DP MAP metrics (the deployment decoder).
-    map_metrics = _allocation_metrics(map_all, targets, legal)
+    map_metrics = _allocation_metrics(map_all, targets)
     map_conservation = map_conservation_ok / map_conservation_total
 
     print("[evaluate_belief] factor-argmax metrics (independent per-rank):",
@@ -144,7 +138,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-def _allocation_metrics(pred, target, legal):
+def _allocation_metrics(pred, target):
     """Rank accuracy / exact match / count MAE for a (B,15) int allocation."""
     rank_match = (pred == target)
     return {
