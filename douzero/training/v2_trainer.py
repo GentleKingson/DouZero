@@ -608,9 +608,21 @@ class V2Trainer:
             eff_lambda = self.bc_schedule.effective_lambda(
                 self.stats.optimizer_steps
             )
+            bc_diag: dict[str, float] = {}
             if eff_lambda > 0.0:
                 bc_term = self._compute_bc_aux_loss()
                 total_loss = total_loss + eff_lambda * bc_term.total
+                # Non-blocking (round 4): record BC diagnostics for logging so
+                # schedule effects / BC collapse / weight imbalance are visible.
+                bc_diag = {
+                    "bc_cross_entropy": bc_term.cross_entropy,
+                    "bc_top1_accuracy": (
+                        bc_term.top1_correct / bc_term.num_decisions
+                        if bc_term.num_decisions > 0 else 0.0
+                    ),
+                    "bc_effective_lambda": eff_lambda,
+                    "bc_num_decisions": bc_term.num_decisions,
+                }
 
             # Fail-closed: a non-finite loss means something is wrong.
             if not torch.isfinite(total_loss):
@@ -632,7 +644,11 @@ class V2Trainer:
             )
             self.optimizer.step()
             self.stats.optimizer_steps += 1
-            self.stats.last_loss = components.as_log_dict()
+            # Merge BC diagnostics into the last_loss log dict when active.
+            loss_log = components.as_log_dict()
+            if bc_diag:
+                loss_log.update(bc_diag)
+            self.stats.last_loss = loss_log
             self.stats.grad_norm_last_step = float(grad_norm.detach().float().item())
             # p_win distribution diagnostics.
             with torch.no_grad():

@@ -153,20 +153,24 @@ python pretrain_bc.py --data /tmp/valid.jsonl --save_dir /tmp/bc_prior
 
 ## Configuration (`configs/enhanced.yaml`)
 
+The BC auxiliary loss is enabled **iff** `loss.lambda_bc > 0` (single source of
+truth — there is no separate `bc.enabled` or `bc.lambda_bc`). To turn on RL+BC:
+
 ```yaml
 model:
-  human_prior_enabled: false   # flip to true to build the prior head
+  human_prior_enabled: true    # build the prior head
 
-bc:
-  enabled: false
-  data_path: ""                # validated canonical JSONL
-  lambda_bc: 0.0               # also settable under loss:
+loss:
+  lambda_bc: 0.3               # > 0 enables the BC auxiliary term (sole switch)
+
+bc:                            # BC-specific settings (no enabled/lambda_bc here)
+  data_path: /path/to/validated.jsonl   # validated canonical JSONL
+  temperature: 1.0
+  label_smoothing: 0.0
+  skill_weight_clip: 10.0
   schedule: constant           # constant | linear_decay
   schedule_steps: 0
   schedule_floor: 0.0          # residual prior floor (never forced to 0)
-
-loss:
-  lambda_bc: 0.0               # RL+BC auxiliary weight (default off)
 ```
 
 ## Compatibility

@@ -356,3 +356,185 @@ class TestAdapters:
                 final_result={"winner_team": "landlord", "winner_position": "landlord"},
                 source_metadata={"bad": b"bytes"},
             )
+
+    # ------------------------------------------------------------------ #
+    # Blocker 2 (round 4): canonical record boundary privacy
+    # ------------------------------------------------------------------ #
+    def test_record_rejects_pii_in_source_metadata_at_boundary(self):
+        """A record constructed directly (bypassing ingest) with PII in
+        source_metadata is rejected at the canonical boundary."""
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        with pytest.raises(RecordValidationError):
+            HumanGameRecord(
+                game_id="g-pii",
+                ruleset_id=rs.ruleset_id,
+                ruleset_version=rs.ruleset_version,
+                ruleset_hash=rs.stable_hash(),
+                seats=("landlord", "landlord_down", "landlord_up"),
+                initial_hands={
+                    "landlord": [3, 3], "landlord_up": [5, 5],
+                    "landlord_down": [7, 7], "three_landlord_cards": [3, 4, 5],
+                },
+                bottom_cards=[3, 4, 5],
+                action_history=(),
+                final_result={"winner_team": "landlord", "winner_position": "landlord"},
+                source_metadata={"contact": "alice@example.com"},
+            )
+
+    def test_record_rejects_pii_in_final_result(self):
+        """final_result values are scanned for PII at the boundary."""
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        with pytest.raises(RecordValidationError):
+            HumanGameRecord(
+                game_id="g-fr-pii",
+                ruleset_id=rs.ruleset_id,
+                ruleset_version=rs.ruleset_version,
+                ruleset_hash=rs.stable_hash(),
+                seats=("landlord", "landlord_down", "landlord_up"),
+                initial_hands={
+                    "landlord": [3, 3], "landlord_up": [5, 5],
+                    "landlord_down": [7, 7], "three_landlord_cards": [3, 4, 5],
+                },
+                bottom_cards=[3, 4, 5],
+                action_history=(),
+                final_result={
+                    "winner_team": "landlord", "winner_position": "landlord",
+                    "landlord_score": "alice@example.com",  # PII in a value
+                },
+            )
+
+    def test_record_rejects_unknown_final_result_key(self):
+        """final_result keys are whitelisted; arbitrary keys are rejected."""
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        with pytest.raises(RecordValidationError, match="unknown keys"):
+            HumanGameRecord(
+                game_id="g-fr-ext",
+                ruleset_id=rs.ruleset_id,
+                ruleset_version=rs.ruleset_version,
+                ruleset_hash=rs.stable_hash(),
+                seats=("landlord", "landlord_down", "landlord_up"),
+                initial_hands={
+                    "landlord": [3, 3], "landlord_up": [5, 5],
+                    "landlord_down": [7, 7], "three_landlord_cards": [3, 4, 5],
+                },
+                bottom_cards=[3, 4, 5],
+                action_history=(),
+                final_result={
+                    "winner_team": "landlord", "winner_position": "landlord",
+                    "player_email": "alice@example.com",
+                },
+            )
+
+    def test_record_rejects_pii_in_timestamp(self):
+        """timestamp with a PII-shaped value is rejected."""
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        with pytest.raises(RecordValidationError):
+            HumanGameRecord(
+                game_id="g-ts-pii",
+                ruleset_id=rs.ruleset_id,
+                ruleset_version=rs.ruleset_version,
+                ruleset_hash=rs.stable_hash(),
+                seats=("landlord", "landlord_down", "landlord_up"),
+                initial_hands={
+                    "landlord": [3, 3], "landlord_up": [5, 5],
+                    "landlord_down": [7, 7], "three_landlord_cards": [3, 4, 5],
+                },
+                bottom_cards=[3, 4, 5],
+                action_history=(),
+                final_result={"winner_team": "landlord", "winner_position": "landlord"},
+                timestamp="alice@example.com",
+            )
+
+    def test_record_rejects_bad_timestamp_format(self):
+        """timestamp must be empty or YYYY-MM."""
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        with pytest.raises(RecordValidationError, match="YYYY-MM"):
+            HumanGameRecord(
+                game_id="g-ts-bad",
+                ruleset_id=rs.ruleset_id,
+                ruleset_version=rs.ruleset_version,
+                ruleset_hash=rs.stable_hash(),
+                seats=("landlord", "landlord_down", "landlord_up"),
+                initial_hands={
+                    "landlord": [3, 3], "landlord_up": [5, 5],
+                    "landlord_down": [7, 7], "three_landlord_cards": [3, 4, 5],
+                },
+                bottom_cards=[3, 4, 5],
+                action_history=(),
+                final_result={"winner_team": "landlord", "winner_position": "landlord"},
+                timestamp="2026-07-13T12:00:00Z",  # too fine-grained
+            )
+
+    def test_record_accepts_valid_timestamp(self):
+        """Empty string and YYYY-MM are accepted."""
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        for ts in ("", "2026-07"):
+            rec = HumanGameRecord(
+                game_id=f"g-ts-{ts}",
+                ruleset_id=rs.ruleset_id,
+                ruleset_version=rs.ruleset_version,
+                ruleset_hash=rs.stable_hash(),
+                seats=("landlord", "landlord_down", "landlord_up"),
+                initial_hands={
+                    "landlord": [3, 3], "landlord_up": [5, 5],
+                    "landlord_down": [7, 7], "three_landlord_cards": [3, 4, 5],
+                },
+                bottom_cards=[3, 4, 5],
+                action_history=(),
+                final_result={"winner_team": "landlord", "winner_position": "landlord"},
+                timestamp=ts,
+            )
+            assert rec.timestamp == ts
+
+    def test_record_rejects_non_string_metadata_key(self):
+        """metadata mapping keys must be strings."""
+        from douzero.env.rules import RuleSet
+
+        rs = RuleSet.legacy()
+        with pytest.raises(RecordValidationError, match="must be a string"):
+            HumanGameRecord(
+                game_id="g-key",
+                ruleset_id=rs.ruleset_id,
+                ruleset_version=rs.ruleset_version,
+                ruleset_hash=rs.stable_hash(),
+                seats=("landlord", "landlord_down", "landlord_up"),
+                initial_hands={
+                    "landlord": [3, 3], "landlord_up": [5, 5],
+                    "landlord_down": [7, 7], "three_landlord_cards": [3, 4, 5],
+                },
+                bottom_cards=[3, 4, 5],
+                action_history=(),
+                final_result={"winner_team": "landlord", "winner_position": "landlord"},
+                source_metadata={1: "value"},  # non-string key
+            )
+
+    def test_record_from_dict_rejects_pii_in_source_metadata(self):
+        """record_from_dict (the direct JSONL load path) also scans for PII."""
+        payload = _minimal_payload()
+        payload["source_metadata"] = {"contact": "alice@example.com"}
+        with pytest.raises(RecordValidationError):
+            record_from_dict(payload)
+
+    def test_record_from_dict_rejects_pii_in_final_result(self):
+        payload = _minimal_payload()
+        payload["final_result"]["landlord_score"] = "alice@example.com"
+        with pytest.raises(RecordValidationError):
+            record_from_dict(payload)
+
+    def test_record_from_dict_rejects_unknown_final_result_key(self):
+        payload = _minimal_payload()
+        payload["final_result"]["custom_field"] = "x"
+        with pytest.raises(RecordValidationError, match="unknown keys"):
+            record_from_dict(payload)

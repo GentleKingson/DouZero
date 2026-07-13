@@ -29,9 +29,12 @@ AGENTS.md "Human-game data" rules this module enforces:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping, Sequence
+
+from .privacy import assert_no_forbidden as _assert_no_forbidden_privacy
 
 # --------------------------------------------------------------------------- #
 # Canonical version stamps
@@ -62,6 +65,20 @@ FINAL_RESULT_KEYS: tuple[str, ...] = (
     "winner_team",      # "landlord" | "farmer"
     "winner_position",  # one of ACTION_ROLES, or "" if undetermined
 )
+
+#: Whitelist of ALL allowed ``final_result`` keys (Blocker 2, round 4: prevents
+#: arbitrary extension fields from carrying PII into the serialized record).
+#: Known scoring fields from the legacy + standard rulesets are included.
+FINAL_RESULT_ALLOWED_KEYS: frozenset[str] = frozenset({
+    "winner_team", "winner_position",
+    "bid_value", "bomb_count", "rocket_count", "bomb_num",
+    "landlord_score", "farmer_score", "multiplier",
+    "spring", "anti_spring",
+})
+
+#: Allowed ``timestamp`` formats (Blocker 2: prevents a free-text timestamp
+#: from carrying PII). Empty string or a coarse ``YYYY-MM`` month bucket.
+_TIMESTAMP_PATTERN: re.Pattern[str] = re.compile(r"^\d{4}-\d{2}$")
 
 
 class RecordValidationError(ValueError):
@@ -279,6 +296,23 @@ class HumanGameRecord:
                 f"final_result['winner_team'] must be 'landlord' or 'farmer', "
                 f"got {wt!r}"
             )
+        # Blocker 2 (round 4): whitelist final_result keys so arbitrary
+        # extension fields cannot carry PII into the serialized record.
+        unknown = set(self.final_result.keys()) - FINAL_RESULT_ALLOWED_KEYS
+        if unknown:
+            raise RecordValidationError(
+                f"final_result contains unknown keys {sorted(unknown)!r}; "
+                f"allowed keys are {sorted(FINAL_RESULT_ALLOWED_KEYS)}. "
+                f"Arbitrary extension fields are rejected to prevent PII from "
+                f"entering the serialized record."
+            )
+        # Scan final_result values for sensitive data (PII/credentials).
+        try:
+            _assert_no_forbidden_privacy(
+                dict(self.final_result), label="final_result"
+            )
+        except ValueError as exc:
+            raise RecordValidationError(str(exc)) from exc
 
         # player_skill_weight: non-negative floats.
         coerced_w = {}
@@ -301,6 +335,36 @@ class HumanGameRecord:
         object.__setattr__(
             self, "player_skill_weight", MappingProxyType(coerced_w)
         )
+
+        # Blocker 2 (round 4): timestamp must be a coarse format (empty or
+        # YYYY-MM) so a free-text timestamp cannot carry PII.
+        ts = self.timestamp
+        if not isinstance(ts, str):
+            raise RecordValidationError(
+                f"timestamp must be a string, got {type(ts).__name__}"
+            )
+        if ts and not _TIMESTAMP_PATTERN.match(ts):
+            raise RecordValidationError(
+                f"timestamp must be empty or 'YYYY-MM', got {ts!r}"
+            )
+        # Scan timestamp for sensitive data (an email/IP shaped value must not
+        # hide here even if it matched the YYYY-MM regex — defense in depth).
+        if ts:
+            try:
+                _assert_no_forbidden_privacy(ts, label="timestamp")
+            except ValueError as exc:
+                raise RecordValidationError(str(exc)) from exc
+
+        # Blocker 2 (round 4): fail-closed privacy scan on source_metadata at
+        # the canonical record boundary. This catches PII/credentials that
+        # bypassed ingest (e.g. a direct record_from_dict / JSONL load) so they
+        # can never reach validation, BC sampling, or training.
+        try:
+            _assert_no_forbidden_privacy(
+                dict(self.source_metadata), label="source_metadata"
+            )
+        except ValueError as exc:
+            raise RecordValidationError(str(exc)) from exc
 
     # ------------------------------------------------------------------ #
     # Serialisation
@@ -401,6 +465,14 @@ def _normalize_json_mapping(metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Deep-normalize a metadata mapping to canonical JSON types."""
     out: dict[str, Any] = {}
     for key, value in metadata.items():
+        # Blocker 2 (round 4): require string keys (a non-string key would
+        # either fail json.dumps or silently coerce, and masks a malformed
+        # adapter payload).
+        if not isinstance(key, str):
+            raise RecordValidationError(
+                f"source_metadata key {key!r} must be a string, got "
+                f"{type(key).__name__}"
+            )
         out[key] = _normalize_json_value(value, f"source_metadata[{key!r}]")
     return out
 

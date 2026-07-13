@@ -544,6 +544,41 @@ class TestBCConfigPlumbing:
         # BC is off by default (loss.lambda_bc == 0); legacy path preserved.
         assert cfg.loss.lambda_bc == 0.0
 
+    def test_doc_yaml_example_loads(self, tmp_path):
+        """Blocker 1 (round 4): the YAML example in docs/human_data_and_bc.md
+        must actually load via load_config (no removed fields like bc.enabled
+        or bc.lambda_bc)."""
+        from douzero.config.loader import load_config
+
+        yaml = tmp_path / "doc_example.yaml"
+        yaml.write_text(
+            "xpid: doc_test\nobjective: adp\n"
+            "feature_version: v2\nruleset: legacy\nmodel_version: v2\n"
+            "model:\n"
+            "  version: v2\n"
+            "  hidden_size: 64\n"
+            "  history_encoder: lstm\n"
+            "  history_layers: 1\n"
+            "  history_heads: 4\n"
+            "  role_embedding_dim: 16\n"
+            "  human_prior_enabled: true\n"
+            "loss:\n"
+            "  lambda_bc: 0.3\n"
+            "bc:\n"
+            "  data_path: /path/to/validated.jsonl\n"
+            "  temperature: 1.0\n"
+            "  label_smoothing: 0.0\n"
+            "  skill_weight_clip: 10.0\n"
+            "  schedule: constant\n"
+            "  schedule_steps: 0\n"
+            "  schedule_floor: 0.0\n",
+            encoding="utf-8",
+        )
+        cfg = load_config(str(yaml))
+        assert cfg.loss.lambda_bc == 0.3
+        assert cfg.model.human_prior_enabled is True
+        assert cfg.bc.data_path == "/path/to/validated.jsonl"
+
 
 # --------------------------------------------------------------------------- #
 # Imperfect-information boundary: BC label never reaches the deployment path
