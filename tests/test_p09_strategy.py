@@ -371,6 +371,43 @@ class TestModelStrategyWiring:
         loss.total.backward()
         assert predictions["min_turns_after"].grad.item() == 0.0
 
+    @pytest.mark.parametrize(
+        ("spring", "anti_spring", "expected"),
+        [
+            (True, False, 1.0),
+            (False, True, 1.0),
+            (False, False, 0.0),
+        ],
+    )
+    def test_standard_terminal_spring_target_includes_anti_spring(
+        self, spring, anti_spring, expected
+    ):
+        from douzero.env.env import Env
+        from douzero.training.v2_buffer import Episode, Transition
+
+        env = Env("adp")
+        env.reset()
+        observation = get_obs_v2(env.infoset)
+        transition = Transition(
+            obs=observation,
+            action_index=0,
+            position="landlord",
+        )
+        episode = Episode(
+            transitions=[transition],
+            terminal_result={
+                "ruleset_id": "standard",
+                "winner_team": "landlord" if spring else "farmer",
+                "winner_position": "landlord" if spring else "landlord_down",
+                "spring": spring,
+                "anti_spring": anti_spring,
+            },
+        )
+
+        episode.label_strategy_auxiliary(node_budget=5, time_budget_ms=0)
+
+        assert transition.target_spring_probability == expected
+
     def test_v2_trainer_updates_auxiliary_heads(self, seed_factory):
         from douzero.training.v2_trainer import TrainerConfig, V2Trainer
 

@@ -216,8 +216,14 @@ class Episode:
         if winner_position in ("", "farmer") and self.action_trace:
             winner_position = self.action_trace[-1][0]
         ruleset_id = str(self.terminal_result.get("ruleset_id", ""))
-        if "spring" in self.terminal_result and ruleset_id != "legacy":
-            spring = float(bool(self.terminal_result["spring"]))
+        if ruleset_id != "legacy" and (
+            "spring" in self.terminal_result
+            or "anti_spring" in self.terminal_result
+        ):
+            spring = float(
+                bool(self.terminal_result.get("spring", False))
+                or bool(self.terminal_result.get("anti_spring", False))
+            )
         else:
             non_pass_by_role = {role: 0 for role in _VALID_POSITIONS}
             trace = self.action_trace or [

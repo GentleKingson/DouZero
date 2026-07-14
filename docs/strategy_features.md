@@ -59,7 +59,7 @@ action. Label provenance is explicit:
 | `structure_cost` | Direct deterministic structure calculation |
 | `regain_initiative` | Future public trajectory: the acting team later leads a non-pass trick |
 | `teammate_finish` | Terminal winner position; masked for landlord samples |
-| `spring_probability` | Terminal spring flag, or a replay-derived legacy spring label |
+| `spring_probability` | Terminal spring or anti-spring flag, or a replay-derived legacy equivalent |
 
 `Episode.label_strategy_auxiliary` creates these training-only labels after a
 trajectory ends. They are never model inputs. Each `loss.lambda_*` weight is an
