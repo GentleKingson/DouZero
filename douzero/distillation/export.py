@@ -42,6 +42,11 @@ def build_public_example_input(
             if bundle.strategy_features is None
             else bundle.strategy_features.detach().cpu()
         ),
+        "style_features": (
+            None
+            if bundle.style_features is None
+            else bundle.style_features.detach().cpu()
+        ),
     }
 
 

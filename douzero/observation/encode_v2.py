@@ -573,6 +573,7 @@ def get_obs_v2(
         three_landlord_cards_revealed=bottom_revealed,
         num_cards_left=num_left,
         legal_actions=infoset.legal_actions,
+        action_history=raw_action_seq,
         phase=phase,
         ruleset_id=rs_id,
         ruleset_version=rs_version,

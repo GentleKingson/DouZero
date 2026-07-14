@@ -76,6 +76,9 @@ model:
   role_embedding_dim: 32
   belief_enabled: false
   human_prior_enabled: false
+  # P11 public action-style conditioning. Disabled is exactly the P10 model.
+  style_enabled: false
+  style_embedding_dim: 64
   # P09 strategy features/heads are opt-in. Feature-group toggles are kept in
   # checkpoint identity for reproducible ablations. The bounded DP falls back
   # deterministically when strategy_node_budget is exhausted.
@@ -164,3 +167,22 @@ distillation:
   lambda_teacher_score: 0.25
   lambda_supervised_win: 1.0
   lambda_supervised_score: 0.5
+
+# P11 policy population. `single` assigns the current policy to every seat;
+# `population` rotates learner-controlled seats and samples opponents once at
+# each game boundary. Only learner-controlled decisions enter replay.
+league:
+  enabled: false
+  mode: single
+  manifest_path: ""
+  match_log_path: ""
+  seed: 0
+  learner_seats_per_game: 1
+  include_random_agent: true
+  include_rule_agent: false
+  snapshot_interval_steps: 0
+  keep_recent: 5
+  milestone_interval: 0
+  keep_top_rated: 3
+  promotion_min_pairs: 1000
+  promotion_min_ci_lower_bound: 0.0

@@ -22,12 +22,13 @@ are constructed separately in :mod:`douzero.belief.labels`.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import numpy as np
 
 from douzero.observation.public import compute_belief_unknown_pool
+from douzero.style.features import STYLE_FEATURE_WIDTH
 
 from .constraints import (
     BELIEF_RANKS,
@@ -130,6 +131,9 @@ class BeliefInput:
     opponent_a_role: str
     opponent_b_role: str
     acting_role: str
+    style_features: np.ndarray = field(
+        default_factory=lambda: np.zeros(STYLE_FEATURE_WIDTH, dtype=np.float32)
+    )
 
     def __post_init__(self) -> None:
         if self.feature_vector.shape != (BELIEF_INPUT_DIM,):
@@ -142,8 +146,13 @@ class BeliefInput:
                 f"unseen_counts must have shape ({NUM_BELIEF_RANKS},), got "
                 f"{self.unseen_counts.shape}"
             )
+        if self.style_features.shape != (STYLE_FEATURE_WIDTH,):
+            raise ValueError(
+                f"style_features must have shape ({STYLE_FEATURE_WIDTH},), got "
+                f"{self.style_features.shape}"
+            )
         # Freeze the arrays so the public input is immutable in spirit.
-        for name in ("feature_vector", "unseen_counts"):
+        for name in ("feature_vector", "unseen_counts", "style_features"):
             arr = getattr(self, name)
             if arr.flags.writeable:
                 arr.setflags(write=False)
@@ -166,6 +175,8 @@ def build_belief_input(public: Any) -> BeliefInput:
     those belong to the landlord). For the landlord the belief pool equals the
     parity pool.
     """
+    from douzero.style.features import build_style_features
+
     acting_role = public.acting_role
     bottom_unplayed = tuple(public.bottom_cards.unplayed)
     bottom_revealed = tuple(public.bottom_cards.revealed)
@@ -222,6 +233,7 @@ def build_belief_input(public: Any) -> BeliefInput:
         opponent_a_role=opp_a,
         opponent_b_role=opp_b,
         acting_role=acting_role,
+        style_features=build_style_features(public),
     )
 
 

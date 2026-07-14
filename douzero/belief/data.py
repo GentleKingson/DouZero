@@ -66,6 +66,17 @@ class BeliefDataset:
             target_allocation_tensor([s.label.allocation for s in self.samples])
         )
 
+    def style_feature_matrix(self) -> np.ndarray:
+        """Return public P11 style statistics for every belief sample."""
+
+        from douzero.style.features import STYLE_FEATURE_WIDTH
+
+        if not self.samples:
+            return np.zeros((0, STYLE_FEATURE_WIDTH), dtype=np.float32)
+        return np.stack(
+            [sample.binput.style_features for sample in self.samples], axis=0
+        ).astype(np.float32)
+
     def legal_mask_tensor(self) -> torch.Tensor:
         """Return ``(N, 15, 5)`` bool legal-count mask."""
         from .constraints import legal_mask
@@ -153,8 +164,9 @@ def iterate_minibatches(
     *,
     shuffle: bool = True,
     rng: random.Random | None = None,
-) -> "Sequence[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]":
-    """Yield ``(features, targets, legal)`` minibatches from a dataset."""
+    include_style: bool = False,
+) -> "Sequence[tuple[torch.Tensor, ...]]":
+    """Yield belief minibatches, optionally with public P11 style features."""
     n = len(dataset)
     if n == 0:
         return []
@@ -165,10 +177,15 @@ def iterate_minibatches(
     feats_all = dataset.feature_matrix()
     targets_all = dataset.target_tensor()
     legal_all = dataset.legal_mask_tensor()
+    style_all = dataset.style_feature_matrix() if include_style else None
     for start in range(0, n, batch_size):
         batch_idx = idx[start:start + batch_size]
         feats = torch.from_numpy(feats_all[batch_idx].astype(np.float32))
         targets = targets_all[batch_idx]
         legal = legal_all[batch_idx]
-        out.append((feats, targets, legal))
+        if style_all is None:
+            out.append((feats, targets, legal))
+        else:
+            styles = torch.from_numpy(style_all[batch_idx].astype(np.float32))
+            out.append((feats, targets, legal, styles))
     return out

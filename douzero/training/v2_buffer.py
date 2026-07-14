@@ -70,6 +70,9 @@ class Transition:
     target_structure_cost: float = float("nan")
     # Index in Episode.action_trace. -1 is accepted for pre-P09/manual tests.
     trace_index: int = -1
+    # P11 provenance. Empty values preserve pre-P11/manual transitions.
+    policy_id: str = ""
+    teammate_policy_id: str | None = None
 
     def has_labels(self) -> bool:
         """Quick NaN check for the label-stamping loop.
@@ -185,6 +188,8 @@ class Episode:
     # P09 trajectory labels use it so spring/finisher targets are not biased by
     # the replay buffer's deliberate omission of trivial decisions.
     action_trace: list[tuple[str, tuple[int, ...]]] = field(default_factory=list)
+    policy_ids_by_seat: dict[str, str] = field(default_factory=dict)
+    learner_controlled_seats: tuple[str, ...] = ()
 
     def label_from_terminal(self) -> None:
         """Apply per-position team-perspective labels to every transition.

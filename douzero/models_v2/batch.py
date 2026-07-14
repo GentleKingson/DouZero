@@ -119,6 +119,7 @@ class ModelInputBundle:
     acting_role: str
     feature_schema_hash: str
     strategy_features: torch.Tensor | None = None
+    style_features: torch.Tensor | None = None
 
     def to(self, device) -> "ModelInputBundle":
         """Move every tensor in the bundle to ``device``. Returns self."""
@@ -132,12 +133,15 @@ class ModelInputBundle:
         self.action_mask = self.action_mask.to(device)
         if self.strategy_features is not None:
             self.strategy_features = self.strategy_features.to(device)
+        if self.style_features is not None:
+            self.style_features = self.style_features.to(device)
         return self
 
 
 def observation_to_model_inputs(
     obs: ObservationV2,
     strategy_config=None,
+    style_enabled: bool = False,
 ) -> ModelInputBundle:
     """Convert an :class:`ObservationV2` into a :class:`ModelInputBundle`.
 
@@ -219,6 +223,12 @@ def observation_to_model_inputs(
             ).astype(np.float32)
         )
 
+    style_features = None
+    if style_enabled:
+        from douzero.style.features import build_style_features
+
+        style_features = torch.from_numpy(build_style_features(obs.public))
+
     return ModelInputBundle(
         state_card_vectors=state_card_vecs,
         state_context_flat=state_flat,
@@ -231,4 +241,5 @@ def observation_to_model_inputs(
         acting_role=obs.public.acting_role,
         feature_schema_hash=obs.feature_schema_hash,
         strategy_features=strategy_features,
+        style_features=style_features,
     )

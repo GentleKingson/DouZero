@@ -229,6 +229,9 @@ class PublicObservation:
     non_pass_action_counts: Mapping[str, int] = field(default_factory=dict)
     last_move: tuple[int, ...] = ()
     last_move_dict: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+    # Complete public card-play sequence. P11 consumes this only behind the
+    # optional style flag; it contains no player identity or hidden cards.
+    action_history: tuple[tuple[int, ...], ...] = ()
     bottom_cards: PublicBottomCards = field(
         default_factory=lambda: PublicBottomCards((), (), True)
     )
@@ -317,6 +320,7 @@ def build_public_observation(
     three_landlord_cards_revealed=None,
     num_cards_left: dict[str, int],
     legal_actions,
+    action_history=None,
     phase: str = "playing",
     ruleset_id: str = "legacy",
     ruleset_version: str = "legacy-v1",
@@ -378,6 +382,9 @@ def build_public_observation(
     last_move_d = {
         k: _safe_tuple(v) for k, v in (last_move_dict or {}).items()
     }
+    action_history_t = tuple(
+        _safe_tuple(action) for action in (action_history or ())
+    )
     num_left = {k: int(v) for k, v in (num_cards_left or {}).items()}
     bidding_hist_t = tuple(
         (str(pos), int(val)) for pos, val in (bidding_history or ())
@@ -400,6 +407,7 @@ def build_public_observation(
         non_pass_action_counts=action_counts,
         last_move=last_move_t,
         last_move_dict=last_move_d,
+        action_history=action_history_t,
         bottom_cards=bottom,
         num_cards_left=num_left,
         bidding_history=bidding_hist_t,

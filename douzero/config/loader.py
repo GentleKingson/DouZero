@@ -20,6 +20,7 @@ from douzero.config.schemas import (
     DistillationConfig,
     DecisionPolicyConfig,
     LossConfig,
+    LeagueConfig,
     ModelConfig,
     OptimizerConfig,
     TrainingConfig,
@@ -86,17 +87,18 @@ def load_legacy_config() -> TrainingConfig:
 # --------------------------------------------------------------------------- #
 def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     """Construct a TrainingConfig from a raw mapping, validating keys."""
-    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy", "model", "bc", "distillation")}
+    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy", "model", "bc", "distillation", "league")}
     valid_opt_names = {f.name for f in fields(OptimizerConfig)}
     valid_loss_names = {f.name for f in fields(LossConfig)}
     valid_decision_names = {f.name for f in fields(DecisionPolicyConfig)}
     valid_model_names = {f.name for f in fields(ModelConfig)}
     valid_bc_names = {f.name for f in fields(BCConfig)}
     valid_distillation_names = {f.name for f in fields(DistillationConfig)}
+    valid_league_names = {f.name for f in fields(LeagueConfig)}
 
     # 'optimizer', 'loss', 'decision_policy', 'model', 'bc', and 'rules' are
     # valid top-level keys (handled separately).
-    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "model", "bc", "distillation", "rules"}
+    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "model", "bc", "distillation", "league", "rules"}
     if unknown_top:
         raise ValueError(f"Unknown config keys: {sorted(unknown_top)}")
 
@@ -146,6 +148,13 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
         raise ValueError(
             f"Unknown distillation config keys: {sorted(unknown_distillation)}"
         )
+
+    league_raw = raw.get("league", {})
+    if not isinstance(league_raw, Mapping):
+        raise TypeError("'league' must be a mapping")
+    unknown_league = set(league_raw.keys()) - valid_league_names
+    if unknown_league:
+        raise ValueError(f"Unknown league config keys: {sorted(unknown_league)}")
 
     # P06 r6: unify top-level ``model_version`` and nested ``model.version``
     # into a single source of truth. Without this, a YAML like
@@ -198,6 +207,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
         kwargs["bc"] = BCConfig(**dict(bc_raw))
     if distillation_raw:
         kwargs["distillation"] = DistillationConfig(**dict(distillation_raw))
+    if league_raw:
+        kwargs["league"] = LeagueConfig(**dict(league_raw))
     cfg = TrainingConfig(**kwargs)
     _validate_types(cfg)
     _validate_legacy_only_versions(cfg)
@@ -231,6 +242,7 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "version": str, "hidden_size": int, "history_encoder": str,
     "history_layers": int, "history_heads": int, "role_embedding_dim": int,
     "belief_enabled": bool, "human_prior_enabled": bool,
+    "style_enabled": bool, "style_embedding_dim": int,
     "strategy_features_enabled": bool, "strategy_hand_enabled": bool,
     "strategy_structure_enabled": bool, "strategy_control_enabled": bool,
     "strategy_cooperation_enabled": bool, "strategy_risk_enabled": bool,
@@ -304,6 +316,7 @@ def _validate_types(cfg: TrainingConfig) -> None:
             "version", "hidden_size", "history_encoder", "history_layers",
             "history_heads", "role_embedding_dim", "belief_enabled",
             "human_prior_enabled",
+            "style_enabled", "style_embedding_dim",
             "strategy_features_enabled", "strategy_hand_enabled",
             "strategy_structure_enabled", "strategy_control_enabled",
             "strategy_cooperation_enabled", "strategy_risk_enabled",

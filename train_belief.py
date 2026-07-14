@@ -57,6 +57,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--learning_rate", type=float, default=1e-3)
     p.add_argument("--hidden_size", type=int, default=128)
     p.add_argument("--num_layers", type=int, default=2)
+    p.add_argument("--style_enabled", action="store_true",
+                   help="condition the belief model on public P11 action style")
+    p.add_argument("--style_embedding_dim", type=int, default=32)
     p.add_argument("--lambda_count_reg", type=float, default=0.0)
     p.add_argument("--lambda_entropy_reg", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
@@ -72,6 +75,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = BeliefConfig(
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
+        style_enabled=args.style_enabled,
+        style_embedding_dim=args.style_embedding_dim,
     )
     model = BeliefModel(config)
     optimizer = torch.optim.RMSprop(
@@ -91,14 +96,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     frames_seen = 0
     for epoch in range(args.epochs):
         batches = iterate_minibatches(
-            dataset, args.batch_size, shuffle=True, rng=rng
+            dataset,
+            args.batch_size,
+            shuffle=True,
+            rng=rng,
+            include_style=args.style_enabled,
         )
         epoch_loss = 0.0
         epoch_ce = 0.0
         nb = 0
-        for feats, targets, legal in batches:
+        for batch in batches:
+            if args.style_enabled:
+                feats, targets, legal, style_features = batch
+            else:
+                feats, targets, legal = batch
+                style_features = None
             optimizer.zero_grad()
-            logits = model._forward_logits(feats)
+            logits = model._forward_logits(feats, style_features)
             comps = belief_loss(
                 logits, targets, legal,
                 lambda_count_reg=args.lambda_count_reg,
@@ -144,6 +158,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "lambda_count_reg": args.lambda_count_reg,
             "lambda_entropy_reg": args.lambda_entropy_reg,
             "seed": args.seed,
+            "style_enabled": args.style_enabled,
+            "style_embedding_dim": args.style_embedding_dim,
         },
     )
     print(f"[train_belief] saved checkpoint to {out_path}", file=sys.stderr)

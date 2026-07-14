@@ -72,6 +72,8 @@ class BeliefConfig:
     hidden_size: int = 128
     num_layers: int = 2
     dropout: float = 0.0
+    style_enabled: bool = False
+    style_embedding_dim: int = 32
     #: Identity version; bump when the compatibility-dict field set changes.
     IDENTITY_VERSION: ClassVar[int] = 1
 
@@ -82,9 +84,21 @@ class BeliefConfig:
             raise ValueError(f"num_layers must be >= 1, got {self.num_layers}")
         if not (0.0 <= self.dropout < 1.0):
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+        if not isinstance(self.style_enabled, bool):
+            raise TypeError(
+                f"style_enabled must be bool, got {type(self.style_enabled).__name__}"
+            )
+        if (
+            isinstance(self.style_embedding_dim, bool)
+            or not isinstance(self.style_embedding_dim, int)
+            or self.style_embedding_dim <= 0
+        ):
+            raise ValueError(
+                f"style_embedding_dim must be positive, got {self.style_embedding_dim}"
+            )
 
     def compatibility_dict(self) -> dict:
-        return {
+        compatibility = {
             "hidden_size": self.hidden_size,
             "num_layers": self.num_layers,
             "dropout": self.dropout,
@@ -92,6 +106,19 @@ class BeliefConfig:
             "num_belief_ranks": NUM_BELIEF_RANKS,
             "num_count_slots": NUM_COUNT_SLOTS,
         }
+        if self.style_enabled:
+            from douzero.style.features import (
+                STYLE_FEATURE_VERSION,
+                STYLE_LAYOUT_HASH,
+            )
+
+            compatibility.update({
+                "style_enabled": True,
+                "style_embedding_dim": self.style_embedding_dim,
+                "style_feature_version": STYLE_FEATURE_VERSION,
+                "style_layout_hash": STYLE_LAYOUT_HASH,
+            })
+        return compatibility
 
     def stable_hash(self) -> str:
         """SHA-256 of the compatibility dict (the checkpoint identity axis)."""
@@ -172,8 +199,18 @@ class BeliefModel(nn.Module):
     def __init__(self, config: BeliefConfig | None = None) -> None:
         super().__init__()
         self.config = config or BeliefConfig()
+        self.style_encoder: nn.Module | None = None
+        encoder_input_dim = BELIEF_INPUT_DIM
+        if self.config.style_enabled:
+            from douzero.style.encoder import StyleEncoder
+
+            self.style_encoder = StyleEncoder(
+                output_dim=self.config.style_embedding_dim,
+                hidden_dim=self.config.style_embedding_dim,
+            )
+            encoder_input_dim += self.config.style_embedding_dim
         self.encoder = _build_mlp(
-            BELIEF_INPUT_DIM,
+            encoder_input_dim,
             self.config.hidden_size,
             self.config.num_layers,
             self.config.dropout,
@@ -184,12 +221,30 @@ class BeliefModel(nn.Module):
     # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
-    def _forward_logits(self, feature_matrix: torch.Tensor) -> torch.Tensor:
+    def _forward_logits(
+        self,
+        feature_matrix: torch.Tensor,
+        style_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Encode a ``(B, BELIEF_INPUT_DIM)`` matrix to ``(B, 15, 5)`` logits."""
         if feature_matrix.shape[-1] != BELIEF_INPUT_DIM:
             raise ValueError(
                 f"feature matrix last dim {feature_matrix.shape[-1]} != "
                 f"BELIEF_INPUT_DIM {BELIEF_INPUT_DIM}"
+            )
+        if self.style_encoder is not None:
+            if style_features is None:
+                raise ValueError(
+                    "style_features are required by a style-enabled BeliefModel"
+                )
+            style_features = style_features.to(
+                device=feature_matrix.device, dtype=feature_matrix.dtype
+            )
+            encoded_style = self.style_encoder(style_features)
+            feature_matrix = torch.cat([feature_matrix, encoded_style], dim=-1)
+        elif style_features is not None:
+            raise ValueError(
+                "style_features were passed to a style-disabled BeliefModel"
             )
         h = self.encoder(feature_matrix)
         flat = self.head(h)
@@ -226,6 +281,13 @@ class BeliefModel(nn.Module):
         feature_matrix = torch.as_tensor(
             feats_np, device=param.device, dtype=param.dtype
         )
+        style_matrix = None
+        if self.config.style_enabled:
+            style_matrix = torch.as_tensor(
+                np.stack([inp.style_features for inp in inputs], axis=0),
+                device=param.device,
+                dtype=param.dtype,
+            )
         unseen = np.stack(
             [inp.unseen_counts for inp in inputs], axis=0
         ).astype(np.int64)  # (B, 15)
@@ -237,7 +299,7 @@ class BeliefModel(nn.Module):
         )  # (B,)
         roles = [inp.opponent_a_role for inp in inputs]
 
-        logits = self._forward_logits(feature_matrix)
+        logits = self._forward_logits(feature_matrix, style_matrix)
         legal = torch.as_tensor(legal_np, device=logits.device).bool()
         masked = logits.masked_fill(~legal, _MASK_LOGIT)
         factor_probs = torch.softmax(masked, dim=-1)

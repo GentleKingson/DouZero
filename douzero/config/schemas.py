@@ -264,6 +264,58 @@ class DistillationConfig:
                 )
 
 
+@dataclass(frozen=True)
+class LeagueConfig:
+    """P11 population self-play, snapshot retention, and promotion settings."""
+
+    enabled: bool = False
+    mode: str = "single"  # single | population
+    manifest_path: str = ""
+    match_log_path: str = ""
+    seed: int = 0
+    learner_seats_per_game: int = 1
+    include_random_agent: bool = True
+    include_rule_agent: bool = False
+    snapshot_interval_steps: int = 0
+    keep_recent: int = 5
+    milestone_interval: int = 0
+    keep_top_rated: int = 3
+    promotion_min_pairs: int = 1000
+    promotion_min_ci_lower_bound: float = 0.0
+
+    def __post_init__(self) -> None:
+        import math
+
+        if not isinstance(self.enabled, bool):
+            raise TypeError("LeagueConfig.enabled must be bool")
+        for name in ("manifest_path", "match_log_path", "mode"):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError(f"LeagueConfig.{name} must be str")
+        for name in ("include_random_agent", "include_rule_agent"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"LeagueConfig.{name} must be bool")
+        if self.mode not in ("single", "population"):
+            raise ValueError(
+                f"LeagueConfig.mode must be 'single' or 'population', got {self.mode!r}"
+            )
+        for name in (
+            "seed", "snapshot_interval_steps", "keep_recent",
+            "milestone_interval", "keep_top_rated", "promotion_min_pairs",
+            "learner_seats_per_game",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"LeagueConfig.{name} must be a non-negative int")
+        if self.learner_seats_per_game not in (1, 2, 3):
+            raise ValueError("LeagueConfig.learner_seats_per_game must be 1, 2, or 3")
+        if self.promotion_min_pairs < 1:
+            raise ValueError("LeagueConfig.promotion_min_pairs must be positive")
+        if not math.isfinite(self.promotion_min_ci_lower_bound):
+            raise ValueError(
+                "LeagueConfig.promotion_min_ci_lower_bound must be finite"
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Model architecture (P05 widens to ``v2``; referenced by TrainingConfig)
 # --------------------------------------------------------------------------- #
@@ -302,6 +354,8 @@ class ModelConfig:
     # (P09 attaches more; P05 keeps the structural skeleton).
     belief_enabled: bool = False
     human_prior_enabled: bool = False
+    style_enabled: bool = False
+    style_embedding_dim: int = 64
     strategy_features_enabled: bool = False
     strategy_hand_enabled: bool = True
     strategy_structure_enabled: bool = True
@@ -371,6 +425,8 @@ class TrainingConfig:
     bc: BCConfig = field(default_factory=BCConfig)
     # P10: opt-in and consumed only by the dedicated distillation tools.
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
+    # P11: disabled by default; legacy actor/learner semantics are untouched.
+    league: LeagueConfig = field(default_factory=LeagueConfig)
 
 
 # --------------------------------------------------------------------------- #
