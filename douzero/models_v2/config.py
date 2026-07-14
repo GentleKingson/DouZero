@@ -62,6 +62,17 @@ class ModelV2Config:
     # Auxiliary heads (P05 keeps the skeleton; heads wired in P07/P09).
     belief_enabled: bool = False
     human_prior_enabled: bool = False
+    # P09 public tactical features and auxiliary heads. Every option defaults
+    # off at the architecture boundary, preserving P08 checkpoints/behaviour.
+    strategy_features_enabled: bool = False
+    strategy_hand_enabled: bool = True
+    strategy_structure_enabled: bool = True
+    strategy_control_enabled: bool = True
+    strategy_cooperation_enabled: bool = True
+    strategy_risk_enabled: bool = True
+    strategy_aux_enabled: bool = False
+    strategy_node_budget: int = 500
+    strategy_time_budget_ms: int = 0
     # Score-head stability: outputs are clamped to a finite range so a wild
     # initialization cannot produce Inf that poisons the multi-objective loss.
     score_clamp: float = 32.0
@@ -118,18 +129,35 @@ class ModelV2Config:
                 f"score_target_transform must be 'raw' or 'signed_log', "
                 f"got {self.score_target_transform!r}"
             )
+        if self.strategy_aux_enabled and not self.strategy_features_enabled:
+            raise ValueError(
+                "strategy_aux_enabled requires strategy_features_enabled=True"
+            )
+        if isinstance(self.strategy_node_budget, bool) or self.strategy_node_budget <= 0:
+            raise ValueError(
+                f"strategy_node_budget must be a positive int, got "
+                f"{self.strategy_node_budget!r}"
+            )
+        if (
+            isinstance(self.strategy_time_budget_ms, bool)
+            or self.strategy_time_budget_ms < 0
+        ):
+            raise ValueError(
+                f"strategy_time_budget_ms must be a non-negative int, got "
+                f"{self.strategy_time_budget_ms!r}"
+            )
 
     # ------------------------------------------------------------------ #
     # Canonical identity (blocker #2 fix)
     # ------------------------------------------------------------------ #
     #: The current identity version. Increment when the compatibility-dict
     #: field set changes. Version 1 = P05 (no ``score_target_transform``);
-    #: version 2 = P06 r5+ (adds ``score_target_transform``). The checkpoint
-    #: loader uses this to migrate P05 checkpoints forward.
+    #: version 2 = P06-P08 (adds ``score_target_transform``); version 3 = P09
+    #: (adds the optional strategy architecture and ablation identity).
     #: Declared as ClassVar so the dataclass machinery does not treat it
     #: as an instance field (otherwise ``ModelV2Config(IDENTITY_VERSION=999)``
     #: would create a meaningless state).
-    IDENTITY_VERSION: ClassVar[int] = 2
+    IDENTITY_VERSION: ClassVar[int] = 3
 
     def compatibility_dict(self) -> dict:
         """Return the architecture-identity subset of this config.
@@ -160,6 +188,15 @@ class ModelV2Config:
             "mlp_dropout": self.mlp_dropout,
             "belief_enabled": self.belief_enabled,
             "human_prior_enabled": self.human_prior_enabled,
+            "strategy_features_enabled": self.strategy_features_enabled,
+            "strategy_hand_enabled": self.strategy_hand_enabled,
+            "strategy_structure_enabled": self.strategy_structure_enabled,
+            "strategy_control_enabled": self.strategy_control_enabled,
+            "strategy_cooperation_enabled": self.strategy_cooperation_enabled,
+            "strategy_risk_enabled": self.strategy_risk_enabled,
+            "strategy_aux_enabled": self.strategy_aux_enabled,
+            "strategy_node_budget": self.strategy_node_budget,
+            "strategy_time_budget_ms": self.strategy_time_budget_ms,
             "score_clamp": self.score_clamp,
             "score_target_transform": self.score_target_transform,
             "nan_guard": self.nan_guard,
@@ -191,6 +228,31 @@ class ModelV2Config:
             "nan_guard": self.nan_guard,
         }
 
+    def compatibility_dict_v2(self) -> dict:
+        """P06-P08 compatibility identity, before P09 strategy fields.
+
+        A version-2 checkpoint can migrate only into a strategy-disabled
+        runtime.  The loader enforces that condition before comparing this
+        hash, so old public policies remain usable without pretending they
+        contain strategy parameters.
+        """
+
+        return {
+            "hidden_size": self.hidden_size,
+            "history_encoder": self.history_encoder,
+            "history_layers": self.history_layers,
+            "history_heads": self.history_heads,
+            "history_dropout": self.history_dropout,
+            "role_embedding_dim": self.role_embedding_dim,
+            "mlp_layers": self.mlp_layers,
+            "mlp_dropout": self.mlp_dropout,
+            "belief_enabled": self.belief_enabled,
+            "human_prior_enabled": self.human_prior_enabled,
+            "score_clamp": self.score_clamp,
+            "score_target_transform": self.score_target_transform,
+            "nan_guard": self.nan_guard,
+        }
+
     def stable_hash(self) -> str:
         """A SHA-256 hex digest of :meth:`compatibility_dict`.
 
@@ -212,6 +274,12 @@ class ModelV2Config:
         payload = json.dumps(self.compatibility_dict_v1(), sort_keys=True, default=str)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    def stable_hash_v2(self) -> str:
+        """SHA-256 of the P06-P08 compatibility field set."""
+
+        payload = json.dumps(self.compatibility_dict_v2(), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     @classmethod
     def from_model_config(cls, model_config) -> "ModelV2Config":
         """Build a :class:`ModelV2Config` from a :class:`ModelConfig`.
@@ -224,7 +292,11 @@ class ModelV2Config:
         kwargs: dict[str, object] = {}
         for name in ("hidden_size", "history_encoder", "history_layers",
                      "history_heads", "role_embedding_dim", "belief_enabled",
-                     "human_prior_enabled"):
+                     "human_prior_enabled", "strategy_features_enabled",
+                     "strategy_hand_enabled", "strategy_structure_enabled",
+                     "strategy_control_enabled", "strategy_cooperation_enabled",
+                     "strategy_risk_enabled", "strategy_aux_enabled",
+                     "strategy_node_budget", "strategy_time_budget_ms"):
             if hasattr(model_config, name):
                 kwargs[name] = getattr(model_config, name)
         return cls(**kwargs)

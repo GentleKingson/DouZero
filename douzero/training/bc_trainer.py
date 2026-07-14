@@ -411,7 +411,9 @@ class BCTrainer:
         # try/finally so the model is restored to eval() even on a raise.
         try:
             for s in batch:
-                bundle = observation_to_model_inputs(s.obs)
+                bundle = observation_to_model_inputs(
+                    s.obs, self.model.strategy_feature_config()
+                )
                 belief_features = self._compute_belief_feature(s.obs)
                 out = self.model(
                     bundle.state_card_vectors,
@@ -424,6 +426,7 @@ class BCTrainer:
                     bundle.action_mask,
                     bundle.acting_role,
                     belief_features=belief_features,
+                    strategy_features=bundle.strategy_features,
                 )
                 if out.prior_logit is None:
                     raise BCTrainerError(
@@ -469,7 +472,9 @@ class BCTrainer:
         hits = 0
         n = 0
         for s in samples:
-            bundle = observation_to_model_inputs(s.obs)
+            bundle = observation_to_model_inputs(
+                s.obs, self.model.strategy_feature_config()
+            )
             belief_features = self._compute_belief_feature(s.obs)
             out = self.model(
                 bundle.state_card_vectors,
@@ -482,6 +487,7 @@ class BCTrainer:
                 bundle.action_mask,
                 bundle.acting_role,
                 belief_features=belief_features,
+                strategy_features=bundle.strategy_features,
             )
             if out.prior_logit is None:
                 raise BCTrainerError(

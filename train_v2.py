@@ -247,6 +247,11 @@ def _build_loss_config(cfg):
         lambda_score=cfg.loss.lambda_score,
         lambda_uncertainty=cfg.loss.lambda_uncertainty,
         lambda_bc=cfg.loss.lambda_bc,
+        lambda_min_turns=cfg.loss.lambda_min_turns,
+        lambda_regain_initiative=cfg.loss.lambda_regain_initiative,
+        lambda_teammate_finish=cfg.loss.lambda_teammate_finish,
+        lambda_spring=cfg.loss.lambda_spring,
+        lambda_structure=cfg.loss.lambda_structure,
         score_delta=cfg.loss.score_delta,
         score_target_transform=cfg.loss.score_target_transform,
         score_clamp=cfg.loss.score_clamp,
@@ -263,6 +268,7 @@ def _build_decision_config(cfg):
         abs_tol=cfg.decision_policy.abs_tol,
         rel_tol=cfg.decision_policy.rel_tol,
         risk_penalty=cfg.decision_policy.risk_penalty,
+        prior_alpha=cfg.decision_policy.prior_alpha,
     )
 
 

@@ -116,6 +116,11 @@ class LossConfig:
     #: cross-entropy over the legal-action list on human BC samples. Requires a
     #: model built with ``human_prior_enabled=True`` and a BC sample source.
     lambda_bc: float = 0.0
+    lambda_min_turns: float = 0.0
+    lambda_regain_initiative: float = 0.0
+    lambda_teammate_finish: float = 0.0
+    lambda_spring: float = 0.0
+    lambda_structure: float = 0.0
     score_delta: float = 1.0
     score_target_transform: str = SCORE_TARGET_RAW
     #: The head clamp magnitude. The raw target is clamped to
@@ -130,6 +135,11 @@ class LossConfig:
             ("lambda_score", self.lambda_score),
             ("lambda_uncertainty", self.lambda_uncertainty),
             ("lambda_bc", self.lambda_bc),
+            ("lambda_min_turns", self.lambda_min_turns),
+            ("lambda_regain_initiative", self.lambda_regain_initiative),
+            ("lambda_teammate_finish", self.lambda_teammate_finish),
+            ("lambda_spring", self.lambda_spring),
+            ("lambda_structure", self.lambda_structure),
         ):
             _validate_nonneg_weight(name, value)
         if self.score_delta <= 0.0 or not math.isfinite(self.score_delta):
@@ -149,6 +159,11 @@ class LossConfig:
             "lambda_score": float(self.lambda_score),
             "lambda_uncertainty": float(self.lambda_uncertainty),
             "lambda_bc": float(self.lambda_bc),
+            "lambda_min_turns": float(self.lambda_min_turns),
+            "lambda_regain_initiative": float(self.lambda_regain_initiative),
+            "lambda_teammate_finish": float(self.lambda_teammate_finish),
+            "lambda_spring": float(self.lambda_spring),
+            "lambda_structure": float(self.lambda_structure),
             "score_delta": float(self.score_delta),
             "score_target_transform": str(self.score_target_transform),
             "score_clamp": float(self.score_clamp),

@@ -150,3 +150,40 @@ class PriorHead(nn.Module):
                 f"{self.hidden_size}"
             )
         return self.prior_head(fused)
+
+
+class StrategyAuxiliaryHeads(nn.Module):
+    """Five optional public-strategy auxiliary predictions (P09).
+
+    Regression heads use ``softplus`` because turns/costs are non-negative;
+    probability targets remain logits so the loss can use stable BCE-with-
+    logits.  Every head scores the current legal-action rows.
+    """
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        if hidden_size <= 0:
+            raise ValueError(f"hidden_size must be positive, got {hidden_size}")
+        self.hidden_size = hidden_size
+        self.min_turns_after = nn.Linear(hidden_size, 1)
+        self.regain_initiative = nn.Linear(hidden_size, 1)
+        self.teammate_finish = nn.Linear(hidden_size, 1)
+        self.spring_probability = nn.Linear(hidden_size, 1)
+        self.structure_cost = nn.Linear(hidden_size, 1)
+
+    def forward(self, fused: torch.Tensor) -> dict[str, torch.Tensor]:
+        if fused.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"fused trailing dim {fused.shape[-1]} != hidden_size {self.hidden_size}"
+            )
+        return {
+            "min_turns_after": torch.nn.functional.softplus(
+                self.min_turns_after(fused)
+            ),
+            "regain_initiative_logit": self.regain_initiative(fused),
+            "teammate_finish_logit": self.teammate_finish(fused),
+            "spring_probability_logit": self.spring_probability(fused),
+            "structure_cost": torch.nn.functional.softplus(
+                self.structure_cost(fused)
+            ),
+        }
