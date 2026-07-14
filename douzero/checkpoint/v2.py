@@ -8,7 +8,7 @@ sidecar format.
 
 Identity contract (bug #3 fix — the critical correctness property)
 ------------------------------------------------------------------
-A V2 checkpoint is bound to FIVE identity axes, and every load validates ALL
+A V2 checkpoint is bound to SIX identity axes, and every load validates ALL
 of them against RUNTIME-SUPPLIED expectations (never against the checkpoint's
 own self-reported values — a forged or corrupted checkpoint could otherwise
 self-attest compatibility):
@@ -31,6 +31,8 @@ self-attest compatibility):
 5. ``checkpoint_kind`` — ``training_checkpoint`` vs ``public_policy``. A
    training bundle is not directly deployable as a public-policy sidecar and
    vice versa.
+6. ``model_access == "public"`` — a P10 privileged teacher is training-only
+   and cannot be loaded by either V2 public checkpoint path.
 
 Save-side closure: :func:`save_v2_checkpoint` does NOT accept a self-reported
 identity. It derives the schema/config hash from the model itself, requires

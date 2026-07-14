@@ -145,3 +145,22 @@ bc:
   schedule: constant
   schedule_steps: 0
   schedule_floor: 0.0
+
+# P10 privileged-teacher/public-student distillation. Disabled by default so
+# the P06-P09 trainer and every deployment path remain unchanged. Enable only
+# in the dedicated ``python -m douzero.distillation.train_teacher`` and
+# ``python -m douzero.distillation.distill_student`` workflows.
+distillation:
+  enabled: false
+  teacher_checkpoint: ""
+  dataset_path: ""
+  cache_path: ""
+  batch_size: 32
+  distillation_temperature: 2.0
+  top_k: 4
+  lambda_kl: 1.0
+  lambda_rank: 0.25
+  lambda_teacher_win: 0.5
+  lambda_teacher_score: 0.25
+  lambda_supervised_win: 1.0
+  lambda_supervised_score: 0.5

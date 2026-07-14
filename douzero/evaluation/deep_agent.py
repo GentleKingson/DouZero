@@ -128,13 +128,12 @@ class DeepAgentV2:
     Imperfect-information boundary (the most important safety property):
 
     - :meth:`act_v2` accepts ONLY an :class:`ObservationV2`. Passing a
-      :class:`~douzero.observation.privileged.PrivilegedObservation raises
-      :class:`TypeError` BEFORE any model call. This is the canonical type
-      guard required by the P03/P05 acceptance criteria.
-    - This class imports the V2 model and the V2 observation *public* modules.
-      It MUST NOT import :mod:`douzero.observation.privileged` except to perform
-      the isinstance rejection (the import is local to :meth:`act_v2` so the
-      production import graph never depends on the privileged module).
+      privileged container raises :class:`TypeError` BEFORE any model call.
+      The public ``kind`` discriminator provides the guard without importing
+      the training-only privileged module.
+    - This class imports only V2 public observation modules. The rejection uses
+      the public ``kind`` discriminator before the strict ``ObservationV2``
+      type check, so the production import graph has no privileged dependency.
     - The model itself only ever sees the tensor blocks of the observation; it
       has no field for hidden hands.
 
@@ -330,17 +329,15 @@ class DeepAgentV2:
     def act_v2(self, obs):
         """Select an action from an :class:`ObservationV2`.
 
-        This is the type-guarded public entry point. A
-        :class:`PrivilegedObservation` is rejected by type before any model
-        call. Returns the selected legal action (a tuple of card ints).
+        This is the type-guarded public entry point. A privileged container is
+        rejected by its ``kind`` discriminator before any model call. Returns
+        the selected legal action (a tuple of card ints).
         """
-        # LOCAL import of the privileged module: used ONLY for the isinstance
-        # rejection. It is not imported at module top level so the production
-        # import graph never depends on the privileged module.
-        from douzero.observation.privileged import PrivilegedObservation
         from douzero.observation.encode_v2 import ObservationV2
 
-        if isinstance(obs, PrivilegedObservation):
+        if getattr(obs, "kind", None) == "privileged" or (
+            isinstance(obs, dict) and obs.get("kind") == "privileged"
+        ):
             raise TypeError(
                 "DeepAgentV2.act_v2 received a PrivilegedObservation. "
                 "Production act() must accept public data only; privileged "

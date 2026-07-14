@@ -65,6 +65,14 @@ None beyond the upstream `kwai/DouZero` dependencies (`torch`, `rlcard`,
 than Parquet to avoid adding `pyarrow`/`pandas` as runtime dependencies.
 P09 likewise adds no dependency.
 
+## P10 — privileged teacher distillation
+
+No third-party implementation was consulted or copied. The privileged branch,
+canonical legal-action alignment, temperature KL, pairwise ranking loss,
+offline tensor bundle, strict cache identity, and checkpoint access guard were
+implemented independently with this repository's existing Observation V2 and
+PyTorch primitives. P10 adds no runtime dependency.
+
 ## Conclusion
 
 No GPL-licensed, license-unverified, or otherwise-incompatible code has been

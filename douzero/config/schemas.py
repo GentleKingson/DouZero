@@ -182,6 +182,88 @@ class BCConfig:
             )
 
 
+@dataclass(frozen=True)
+class DistillationConfig:
+    """P10 privileged-teacher/public-student distillation settings.
+
+    ``enabled=False`` is the compatibility default. The legacy trainer and
+    deployment agent never consume this block; the dedicated P10 training
+    entry points do.
+    """
+
+    enabled: bool = False
+    teacher_checkpoint: str = ""
+    dataset_path: str = ""
+    cache_path: str = ""
+    batch_size: int = 32
+    distillation_temperature: float = 2.0
+    top_k: int = 4
+    lambda_kl: float = 1.0
+    lambda_rank: float = 0.25
+    lambda_teacher_win: float = 0.5
+    lambda_teacher_score: float = 0.25
+    lambda_supervised_win: float = 1.0
+    lambda_supervised_score: float = 0.5
+
+    def __post_init__(self) -> None:
+        import math
+
+        if not isinstance(self.enabled, bool):
+            raise TypeError(
+                f"DistillationConfig.enabled must be bool, got "
+                f"{type(self.enabled).__name__}"
+            )
+        for name in ("teacher_checkpoint", "dataset_path", "cache_path"):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError(
+                    f"DistillationConfig.{name} must be str, got "
+                    f"{type(getattr(self, name)).__name__}"
+                )
+        if (
+            isinstance(self.batch_size, bool)
+            or not isinstance(self.batch_size, int)
+            or self.batch_size < 1
+        ):
+            raise ValueError(
+                f"DistillationConfig.batch_size must be a positive int, "
+                f"got {self.batch_size!r}"
+            )
+        if (
+            isinstance(self.distillation_temperature, bool)
+            or not isinstance(self.distillation_temperature, (int, float))
+            or not math.isfinite(self.distillation_temperature)
+            or self.distillation_temperature <= 0.0
+        ):
+            raise ValueError(
+                f"DistillationConfig.distillation_temperature must be positive "
+                f"finite, got {self.distillation_temperature}"
+            )
+        if (
+            isinstance(self.top_k, bool)
+            or not isinstance(self.top_k, int)
+            or self.top_k < 1
+        ):
+            raise ValueError(
+                f"DistillationConfig.top_k must be a positive int, got {self.top_k!r}"
+            )
+        for name in (
+            "lambda_kl", "lambda_rank", "lambda_teacher_win",
+            "lambda_teacher_score", "lambda_supervised_win",
+            "lambda_supervised_score",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0.0
+            ):
+                raise ValueError(
+                    f"DistillationConfig.{name} must be non-negative finite, "
+                    f"got {value}"
+                )
+
+
 # --------------------------------------------------------------------------- #
 # Model architecture (P05 widens to ``v2``; referenced by TrainingConfig)
 # --------------------------------------------------------------------------- #
@@ -287,6 +369,8 @@ class TrainingConfig:
     # pre-P08 path (BC disabled). Consumed by pretrain_bc.py and the optional
     # BC auxiliary loss hook in the V2 trainer.
     bc: BCConfig = field(default_factory=BCConfig)
+    # P10: opt-in and consumed only by the dedicated distillation tools.
+    distillation: DistillationConfig = field(default_factory=DistillationConfig)
 
 
 # --------------------------------------------------------------------------- #

@@ -27,6 +27,7 @@ from douzero.config.loader import (
 )
 from douzero.config.schemas import (
     CheckpointConfig,
+    DistillationConfig,
     EvaluationConfig,
     ModelConfig,
     OptimizerConfig,
@@ -37,6 +38,7 @@ from douzero.config.schemas import (
 
 __all__ = [
     "CheckpointConfig",
+    "DistillationConfig",
     "EvaluationConfig",
     "LegacyConfig",
     "ModelConfig",

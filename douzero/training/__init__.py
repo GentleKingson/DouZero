@@ -44,6 +44,7 @@ from douzero.training.losses import (
     SCORE_TARGET_SIGNED_LOG,
     bce_win_loss,
     conditional_score_huber_loss,
+    resolve_score_target,
     uncertainty_nll,
 )
 from douzero.training.decision_policy import (
@@ -84,6 +85,7 @@ __all__ = [
     "SCORE_TARGET_SIGNED_LOG",
     "bce_win_loss",
     "conditional_score_huber_loss",
+    "resolve_score_target",
     "uncertainty_nll",
     "DecisionConfig",
     "select_action",

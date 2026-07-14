@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import ClassVar
 
 HISTORY_ENCODER_TRANSFORMER = "transformer"
@@ -312,3 +312,16 @@ class ModelV2Config:
             if hasattr(model_config, name):
                 kwargs[name] = getattr(model_config, name)
         return cls(**kwargs)
+
+    @classmethod
+    def from_training_config(cls, training_config) -> "ModelV2Config":
+        """Build the architecture plus score semantics from repository config."""
+
+        if training_config is None:
+            return cls()
+        base = cls.from_model_config(training_config.model)
+        return replace(
+            base,
+            score_clamp=training_config.loss.score_clamp,
+            score_target_transform=training_config.loss.score_target_transform,
+        )

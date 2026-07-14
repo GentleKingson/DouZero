@@ -33,6 +33,9 @@ from douzero.checkpoint.io import (
 from douzero.checkpoint.manifest import (
     CHECKPOINT_KINDS,
     CURRENT_SCHEMA_VERSION,
+    MODEL_ACCESS_CLASSES,
+    MODEL_ACCESS_PRIVILEGED,
+    MODEL_ACCESS_PUBLIC,
     CheckpointManifest,
     build_manifest,
 )
@@ -47,6 +50,9 @@ from douzero.checkpoint.v2 import (
 __all__ = [
     "CHECKPOINT_KINDS",
     "CURRENT_SCHEMA_VERSION",
+    "MODEL_ACCESS_CLASSES",
+    "MODEL_ACCESS_PRIVILEGED",
+    "MODEL_ACCESS_PUBLIC",
     "CheckpointCompatibilityError",
     "CheckpointManifest",
     "build_manifest",

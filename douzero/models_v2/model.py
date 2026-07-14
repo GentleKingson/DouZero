@@ -95,6 +95,8 @@ class ModelV2(nn.Module):
         ``configs/enhanced.yaml``.
     """
 
+    model_access = "public"
+
     def __init__(
         self,
         schema: FeatureSchemaManifest,
