@@ -309,8 +309,9 @@ def _build_curriculum(cfg):
     cc = cfg.curriculum
     ruleset = RuleSet.legacy()
     coach = None
+    coach_manifest = None
     if cc.mode != "true_random":
-        coach, _manifest = load_coach_checkpoint(
+        coach, coach_manifest = load_coach_checkpoint(
             cc.coach_checkpoint,
             expected_ruleset_hash=ruleset.stable_hash(),
             expected_policy_version=cc.policy_version,
@@ -345,6 +346,12 @@ def _build_curriculum(cfg):
         ruleset=ruleset,
         policy_version=cc.policy_version,
         coach=coach,
+        coach_policy_step=(
+            coach_manifest["policy_step"] if coach_manifest is not None else None
+        ),
+        max_coach_age_steps=(
+            cc.max_coach_age_steps if coach_manifest is not None else None
+        ),
         mode=cc.mode,
         schedule=schedule,
         hard_role=cc.hard_role,

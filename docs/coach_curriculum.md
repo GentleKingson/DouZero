@@ -66,15 +66,19 @@ unmeasured calibration or win-rate result is shipped with this change.
 The early, middle, and late phase proportions are configuration fields. Every
 phase must satisfy `min_true_random_ratio`; the default late phase returns to
 90 percent true-random deals. This fixed real-deal floor prevents permanent
-distribution collapse without claiming an approximate importance weight.
+distribution collapse without claiming an approximate importance weight. It
+is a lower bound on the configured sampling probability, not a guarantee that
+every finite observed window reaches the same empirical ratio.
 Fixed `balanced` and `hard_for_role` modes also mix in the configured minimum
 true-random ratio; guided-only sampling is deliberately not a production mode.
 
 Every sampled opening can be written to the audit JSONL stream. Each row
 contains the configured proportions, selected strategy and its probability,
 predicted landlord win probability, opening ID, phase/progress, and cumulative
-actual counts/distribution. The training distribution can therefore be
-reconstructed without retaining model tensors in the log.
+actual counts/distribution. Guided records also contain the current policy
+step, coach checkpoint step, and computed coach age. The training distribution
+and freshness decision can therefore be reconstructed without retaining model
+tensors in the log.
 
 ## Configuration
 
@@ -88,8 +92,12 @@ Guided startup is fail-closed across three identities: RuleSet hash, exact
 `policy_version`, and checkpoint age. `policy_step - checkpoint.policy_step`
 must be between zero and `max_coach_age_steps`, inclusive. A checkpoint from a
 different policy, a future step, or an older step is rejected before an
-opening can be sampled. `max_label_age_steps` is the separate freshness window
-used when refitting a coach from outcome labels.
+opening can be sampled. The same age check runs again before every episode,
+using the effective optimizer step frozen for that episode. If training moves
+beyond the configured age window, collection fails before any further coach
+inference rather than silently continuing guided sampling. This applies to
+ordinary and population self-play. `max_label_age_steps` is the separate
+freshness window used when refitting a coach from outcome labels.
 
 Final evaluation must continue to use `evaluate.py` and its ordinary random
 or fixed paired deal data. The evaluation package contains no coach sampler

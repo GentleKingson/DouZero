@@ -479,7 +479,10 @@ class V2Trainer:
         if self.opening_sampler is not None:
             denominator = max(1, self.config.max_episodes - 1)
             progress = min(1.0, self._curriculum_game_index / denominator)
-            opening, sampling_record = self.opening_sampler.sample(progress=progress)
+            opening, sampling_record = self.opening_sampler.sample(
+                progress=progress,
+                current_policy_step=policy_step_at_start,
+            )
             self._curriculum_game_index += 1
             strategy = sampling_record.selected_strategy
             self.stats.opening_strategy_counts[strategy] = (

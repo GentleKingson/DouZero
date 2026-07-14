@@ -97,8 +97,12 @@ checkpoint, enforce a configurable true-random sample floor in every phase,
 and can write policy-versioned outcome labels plus reconstructable sampling
 audit JSONL. Evaluation ignores the block and never imports the coach sampler.
 Coach loading also requires an exact `policy_version` match and enforces
-`max_coach_age_steps`; per-game labels freeze the effective optimizer step at
-episode start. `max_label_age_steps` independently controls refit data age.
+`max_coach_age_steps` both at startup and before every episode; training fails
+closed before coach inference if the checkpoint becomes stale. The
+true-random floor constrains configured sampling probability rather than every
+finite window's empirical ratio. Per-game labels freeze the effective
+optimizer step at episode start. `max_label_age_steps` independently controls
+refit data age.
 See `configs/enhanced.yaml` and `docs/coach_curriculum.md`.
 
 ## Boolean flags and `--no-<flag>` overrides

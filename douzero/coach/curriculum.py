@@ -112,6 +112,9 @@ class SamplingRecord:
     strategy_probability: float
     predicted_landlord_win: float | None
     policy_version: str
+    current_policy_step: int | None
+    coach_policy_step: int | None
+    coach_age_steps: int | None
     ruleset_hash: str
     cumulative_counts: dict[str, int]
     cumulative_distribution: dict[str, float]
@@ -147,6 +150,8 @@ class OpeningSampler:
         ruleset: RuleSet | None = None,
         policy_version: str,
         coach: CoachPredictor | None = None,
+        coach_policy_step: int | None = None,
+        max_coach_age_steps: int | None = None,
         mode: str = MIXTURE,
         schedule: CurriculumSchedule | None = None,
         hard_role: str = "landlord",
@@ -170,9 +175,20 @@ class OpeningSampler:
             raise ValueError("seed must be a non-negative int")
         if mode in GUIDED_MODES | {MIXTURE} and coach is None:
             raise ValueError(f"sampling mode {mode!r} requires a coach")
+        if coach is not None:
+            for name, value in (
+                ("coach_policy_step", coach_policy_step),
+                ("max_coach_age_steps", max_coach_age_steps),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"{name} must be a non-negative int when coach is set")
+        elif coach_policy_step is not None or max_coach_age_steps is not None:
+            raise ValueError("coach freshness provenance requires a coach")
         self.ruleset = ruleset or RuleSet.legacy()
         self.policy_version = policy_version
         self.coach = coach
+        self.coach_policy_step = coach_policy_step
+        self.max_coach_age_steps = max_coach_age_steps
         self.mode = mode
         self.schedule = schedule or CurriculumSchedule()
         self.hard_role = hard_role
@@ -182,9 +198,15 @@ class OpeningSampler:
         self.counts: Counter[str] = Counter()
         self.sample_index = 0
 
-    def sample(self, *, progress: float = 0.0) -> tuple[OpeningRecord, SamplingRecord]:
+    def sample(
+        self,
+        *,
+        progress: float = 0.0,
+        current_policy_step: int | None = None,
+    ) -> tuple[OpeningRecord, SamplingRecord]:
         """Select one opening and return it with complete audit provenance."""
 
+        coach_age_steps = self._validate_coach_freshness(current_policy_step)
         phase = self.schedule.phase(progress)
         if self.mode == MIXTURE:
             proportions = self.schedule.proportions(progress)
@@ -240,6 +262,9 @@ class OpeningSampler:
             strategy_probability=strategy_probability,
             predicted_landlord_win=probability,
             policy_version=self.policy_version,
+            current_policy_step=current_policy_step,
+            coach_policy_step=self.coach_policy_step,
+            coach_age_steps=coach_age_steps,
             ruleset_hash=self.ruleset.stable_hash(),
             cumulative_counts=cumulative_counts,
             cumulative_distribution={
@@ -250,6 +275,31 @@ class OpeningSampler:
         if self.logger is not None:
             self.logger.append(record)
         return opening, record
+
+    def _validate_coach_freshness(
+        self, current_policy_step: int | None
+    ) -> int | None:
+        if current_policy_step is not None and (
+            isinstance(current_policy_step, bool)
+            or not isinstance(current_policy_step, int)
+            or current_policy_step < 0
+        ):
+            raise ValueError("current_policy_step must be a non-negative int")
+        if self.coach is None:
+            return None
+        if current_policy_step is None:
+            raise ValueError("current_policy_step is required when coach is set")
+
+        # These are guaranteed by __init__; keeping the guard explicit makes
+        # this method fail closed if a sampler is restored incorrectly.
+        if self.coach_policy_step is None or self.max_coach_age_steps is None:
+            raise RuntimeError("coach freshness provenance is missing")
+        age = current_policy_step - self.coach_policy_step
+        if age < 0:
+            raise ValueError("coach checkpoint is future-dated")
+        if age > self.max_coach_age_steps:
+            raise ValueError("coach checkpoint became stale during training")
+        return age
 
     def _weighted_strategy(self, proportions: Mapping[str, float]) -> str:
         value = self.rng.random()
