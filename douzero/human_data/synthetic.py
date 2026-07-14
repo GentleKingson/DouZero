@@ -25,9 +25,9 @@ import numpy as np
 
 from .schema import (
     ACTION_ROLES,
-    HUMAN_RECORD_SCHEMA_VERSION,
     HumanGameRecord,
 )
+from .identifiers import make_internal_game_id
 
 #: Ruleset identity for synthetic records. The legacy card-play env
 #: (``Env("adp")``, ruleset=None = legacy) is the only collection mode in P08.
@@ -154,7 +154,7 @@ def generate_synthetic_record(
     np.random.seed(seed)
     deal, actions, result = _play_random_game(np_rng, max_steps=max_steps)
     return HumanGameRecord(
-        game_id=game_id,
+        game_id=make_internal_game_id(game_id),
         ruleset_id=_SYNTHETIC_RULESET_ID,
         ruleset_version=_SYNTHETIC_RULESET_VERSION,
         ruleset_hash=_legacy_ruleset_hash(),

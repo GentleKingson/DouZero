@@ -36,6 +36,8 @@ from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from .privacy import assert_no_forbidden as _assert_no_forbidden_privacy
+from .privacy import assert_valid_source_metadata
+from .identifiers import is_canonical_game_id
 
 # --------------------------------------------------------------------------- #
 # Canonical version stamps
@@ -47,7 +49,7 @@ CANONICAL_FORMAT_VERSION: int = 1
 
 #: The per-record schema version. Bumped whenever a field is added, removed, or
 #: its semantic changes. The loader rejects a mismatch rather than guessing.
-HUMAN_RECORD_SCHEMA_VERSION: int = 1
+HUMAN_RECORD_SCHEMA_VERSION: int = 2
 
 #: Kind stamp identifying a human-game record as privileged training data. A
 #: deployment guard can reject any object/dict carrying this kind without
@@ -192,13 +194,21 @@ class HumanGameRecord:
                 f"schema_version {self.schema_version!r} != supported "
                 f"{HUMAN_RECORD_SCHEMA_VERSION!r}"
             )
-        # Identity strings must be non-empty. Round 6: PII-scan ALL identity
-        # fields (game_id + ruleset_id + ruleset_version) and validate
+        # Canonical game IDs are opaque values created internally or by keyed
+        # HMAC.  Raw platform IDs are rejected at the record boundary.
+        if not is_canonical_game_id(self.game_id):
+            raise RecordValidationError(
+                "game_id must be an opaque canonical ID in the form "
+                "'dzg_' plus 64 lowercase hex characters; map external IDs "
+                "with pseudonymize_external_game_id() before construction"
+            )
+
+        # Other identity strings must be non-empty. Round 6: PII-scan
+        # ruleset identity fields and validate
         # ruleset_hash is a 64-char hex string (structural format constraint
         # that inherently blocks PII). The tightened phone pattern (requires +
         # or separators) avoids false positives on short enum strings.
         for name, val in (
-            ("game_id", self.game_id),
             ("ruleset_id", self.ruleset_id),
             ("ruleset_version", self.ruleset_version),
         ):
@@ -454,14 +464,10 @@ class HumanGameRecord:
             except ValueError as exc:
                 raise RecordValidationError(str(exc)) from exc
 
-        # Blocker 2 (round 4): fail-closed privacy scan on source_metadata at
-        # the canonical record boundary. This catches PII/credentials that
-        # bypassed ingest (e.g. a direct record_from_dict / JSONL load) so they
-        # can never reach validation, BC sampling, or training.
+        # Fail closed with a flat provenance allowlist.  Pattern blacklists are
+        # retained only as defense in depth for the allowed scalar values.
         try:
-            _assert_no_forbidden_privacy(
-                dict(self.source_metadata), label="source_metadata"
-            )
+            assert_valid_source_metadata(dict(self.source_metadata))
         except ValueError as exc:
             raise RecordValidationError(str(exc)) from exc
 

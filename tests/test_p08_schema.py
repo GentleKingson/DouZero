@@ -13,6 +13,8 @@ from douzero.human_data import (
     HUMAN_RECORD_SCHEMA_VERSION,
     HumanGameRecord,
     RecordValidationError,
+    make_internal_game_id,
+    pseudonymize_external_game_id,
     read_jsonl,
     record_from_dict,
     record_from_jsonl_line,
@@ -28,13 +30,17 @@ from douzero.human_data.adapters import (
 # --------------------------------------------------------------------------- #
 # Minimal-record factory
 # --------------------------------------------------------------------------- #
+def _gid(label: str) -> str:
+    return make_internal_game_id(label)
+
+
 def _minimal_payload(*, game_id: str = "g1") -> dict:
     rs = RuleSet.legacy()
     return {
         "format_version": CANONICAL_FORMAT_VERSION,
         "schema_version": HUMAN_RECORD_SCHEMA_VERSION,
         "kind": HUMAN_RECORD_KIND,
-        "game_id": game_id,
+        "game_id": _gid(game_id),
         "ruleset_id": rs.ruleset_id,
         "ruleset_version": rs.ruleset_version,
         "ruleset_hash": rs.stable_hash(),
@@ -64,7 +70,7 @@ def _minimal_payload(*, game_id: str = "g1") -> dict:
 class TestSchemaConstruction:
     def test_minimal_record_constructs_and_stamps_kind(self):
         rec = record_from_dict(_minimal_payload())
-        assert rec.game_id == "g1"
+        assert rec.game_id == _gid("g1")
         assert rec.kind == HUMAN_RECORD_KIND
         assert rec.format_version == CANONICAL_FORMAT_VERSION
         assert rec.schema_version == HUMAN_RECORD_SCHEMA_VERSION
@@ -168,7 +174,7 @@ class TestSerialization:
         assert n == 3
         loaded = list(read_jsonl(path))
         assert len(loaded) == 3
-        assert [r.game_id for r in loaded] == ["g0", "g1", "g2"]
+        assert [r.game_id for r in loaded] == [_gid("g0"), _gid("g1"), _gid("g2")]
         assert loaded[0].to_dict() == recs[0].to_dict()
 
 
@@ -186,7 +192,7 @@ class TestAdapters:
         assert "user_id" not in cleaned
         assert "email" not in cleaned
         assert cleaned["source"] == "x"
-        assert cleaned["keep"] == 1
+        assert "keep" not in cleaned
 
     def test_audit_drops_credential_like_keys(self):
         cleaned = audit_source_metadata(
@@ -205,21 +211,17 @@ class TestAdapters:
         )
         assert cleaned == {"source": "ok"}
 
-    def test_audit_recurses_into_nested_mappings(self):
-        """Blocker 4: a credential hidden inside a nested mapping is dropped."""
+    def test_audit_drops_nested_extension_mappings(self):
         cleaned = audit_source_metadata(
             {"profile": {"email": "a@b.c", "name": "ok"}, "source": "s"}
         )
-        assert "email" not in cleaned["profile"]
-        assert cleaned["profile"]["name"] == "ok"
-        assert cleaned["source"] == "s"
+        assert cleaned == {"source": "s"}
 
-    def test_audit_recurses_into_lists(self):
+    def test_audit_drops_list_extension_fields(self):
         cleaned = audit_source_metadata(
             {"players": [{"user_id": 1, "seat": 0}], "source": "s"}
         )
-        assert "user_id" not in cleaned["players"][0]
-        assert cleaned["players"][0] == {"seat": 0}
+        assert cleaned == {"source": "s"}
 
     def test_audit_drops_credential_like_values(self):
         """Blocker 4: a credential-looking string value is dropped even when
@@ -283,21 +285,17 @@ class TestAdapters:
         )
         assert "note" not in cleaned
 
-    def test_audit_recurses_into_tuple(self):
-        """A tuple of dicts is recursed into (Blocker 2: tuples bypassed)."""
+    def test_audit_drops_tuple_extension_fields(self):
         cleaned = audit_source_metadata(
             {"players": ({"user_email": "a@b.c", "seat": 0},), "source": "s"}
         )
-        # tuple -> list; the forbidden key is dropped.
-        assert isinstance(cleaned["players"], list)
-        assert "user_email" not in cleaned["players"][0]
-        assert cleaned["players"][0] == {"seat": 0}
+        assert cleaned == {"source": "s"}
 
-    def test_audit_recurses_into_set(self):
+    def test_audit_drops_set_extension_fields(self):
         cleaned = audit_source_metadata(
             {"tags": {"x", "user_id"}, "source": "s"}
         )
-        assert isinstance(cleaned["tags"], list)
+        assert cleaned == {"source": "s"}
 
     def test_assert_raises_on_pii_value(self):
         with pytest.raises(RecordValidationError):
@@ -309,33 +307,31 @@ class TestAdapters:
                 {"items": ({"email": "a@b.c"},)}
             )
 
-    def test_record_normalizes_tuple_metadata_to_list(self):
-        """HumanGameRecord converts tuple/set in source_metadata to list at
-        construction so json.dumps never silently leaks a tuple's contents."""
+    def test_record_rejects_nested_metadata(self):
         from douzero.env.rules import RuleSet
 
         rs = RuleSet.legacy()
-        rec = HumanGameRecord(
-            game_id="g-tuple",
-            ruleset_id=rs.ruleset_id,
-            ruleset_version=rs.ruleset_version,
-            ruleset_hash=rs.stable_hash(),
-            seats=("landlord", "landlord_down", "landlord_up"),
-            initial_hands={
-                "landlord": [3, 3, 4, 4],
-                "landlord_up": [5, 5, 6, 6],
-                "landlord_down": [7, 7, 8, 8],
-                "three_landlord_cards": [3, 4, 5],
-            },
-            bottom_cards=[3, 4, 5],
-            action_history=(("landlord", (3, 3)),),
-            final_result={"winner_team": "landlord", "winner_position": "landlord"},
-            source_metadata={"items": (1, 2, 3)},
-        )
-        # The tuple was normalized to a list, then deep-frozen to a tuple
-        # (immutable) so post-construction mutation cannot inject PII.
-        assert rec.source_metadata["items"] == (1, 2, 3)
-        assert isinstance(rec.source_metadata["items"], tuple)
+        with pytest.raises(RecordValidationError, match="unknown key"):
+            HumanGameRecord(
+                game_id=_gid("g-tuple"),
+                ruleset_id=rs.ruleset_id,
+                ruleset_version=rs.ruleset_version,
+                ruleset_hash=rs.stable_hash(),
+                seats=("landlord", "landlord_down", "landlord_up"),
+                initial_hands={
+                    "landlord": [3, 3, 4, 4],
+                    "landlord_up": [5, 5, 6, 6],
+                    "landlord_down": [7, 7, 8, 8],
+                    "three_landlord_cards": [3, 4, 5],
+                },
+                bottom_cards=[3, 4, 5],
+                action_history=(("landlord", (3, 3)),),
+                final_result={
+                    "winner_team": "landlord",
+                    "winner_position": "landlord",
+                },
+                source_metadata={"items": (1, 2, 3)},
+            )
 
     def test_record_rejects_non_json_metadata_type(self):
         from douzero.env.rules import RuleSet
@@ -343,7 +339,7 @@ class TestAdapters:
         rs = RuleSet.legacy()
         with pytest.raises(RecordValidationError):
             HumanGameRecord(
-                game_id="g-bad",
+                game_id=_gid("g-bad"),
                 ruleset_id=rs.ruleset_id,
                 ruleset_version=rs.ruleset_version,
                 ruleset_hash=rs.stable_hash(),
@@ -369,7 +365,7 @@ class TestAdapters:
         rs = RuleSet.legacy()
         with pytest.raises(RecordValidationError):
             HumanGameRecord(
-                game_id="g-pii",
+                game_id=_gid("g-pii"),
                 ruleset_id=rs.ruleset_id,
                 ruleset_version=rs.ruleset_version,
                 ruleset_hash=rs.stable_hash(),
@@ -391,7 +387,7 @@ class TestAdapters:
         rs = RuleSet.legacy()
         with pytest.raises(RecordValidationError):
             HumanGameRecord(
-                game_id="g-fr-pii",
+                game_id=_gid("g-fr-pii"),
                 ruleset_id=rs.ruleset_id,
                 ruleset_version=rs.ruleset_version,
                 ruleset_hash=rs.stable_hash(),
@@ -415,7 +411,7 @@ class TestAdapters:
         rs = RuleSet.legacy()
         with pytest.raises(RecordValidationError, match="unknown keys"):
             HumanGameRecord(
-                game_id="g-fr-ext",
+                game_id=_gid("g-fr-ext"),
                 ruleset_id=rs.ruleset_id,
                 ruleset_version=rs.ruleset_version,
                 ruleset_hash=rs.stable_hash(),
@@ -439,7 +435,7 @@ class TestAdapters:
         rs = RuleSet.legacy()
         with pytest.raises(RecordValidationError):
             HumanGameRecord(
-                game_id="g-ts-pii",
+                game_id=_gid("g-ts-pii"),
                 ruleset_id=rs.ruleset_id,
                 ruleset_version=rs.ruleset_version,
                 ruleset_hash=rs.stable_hash(),
@@ -461,7 +457,7 @@ class TestAdapters:
         rs = RuleSet.legacy()
         with pytest.raises(RecordValidationError, match="YYYY-MM"):
             HumanGameRecord(
-                game_id="g-ts-bad",
+                game_id=_gid("g-ts-bad"),
                 ruleset_id=rs.ruleset_id,
                 ruleset_version=rs.ruleset_version,
                 ruleset_hash=rs.stable_hash(),
@@ -483,7 +479,7 @@ class TestAdapters:
         rs = RuleSet.legacy()
         for ts in ("", "2026-07"):
             rec = HumanGameRecord(
-                game_id=f"g-ts-{ts}",
+                game_id=_gid(f"g-ts-{ts}"),
                 ruleset_id=rs.ruleset_id,
                 ruleset_version=rs.ruleset_version,
                 ruleset_hash=rs.stable_hash(),
@@ -506,7 +502,7 @@ class TestAdapters:
         rs = RuleSet.legacy()
         with pytest.raises(RecordValidationError, match="must be a string"):
             HumanGameRecord(
-                game_id="g-key",
+                game_id=_gid("g-key"),
                 ruleset_id=rs.ruleset_id,
                 ruleset_version=rs.ruleset_version,
                 ruleset_hash=rs.stable_hash(),
@@ -548,7 +544,7 @@ class TestAdapters:
 
         rs = RuleSet.legacy()
         args = dict(
-            game_id="g-test",
+            game_id=_gid("g-test"),
             ruleset_id=rs.ruleset_id,
             ruleset_version=rs.ruleset_version,
             ruleset_hash=rs.stable_hash(),
@@ -610,27 +606,55 @@ class TestAdapters:
         """set/frozenset have non-deterministic iteration order and are rejected."""
         with pytest.raises(RecordValidationError, match="set"):
             HumanGameRecord(**self._base_record_args(
-                source_metadata={"tags": {"x", "y"}},
+                source_metadata={"batch_id": {"x", "y"}},
             ))
 
     def test_metadata_nan_float_rejected(self):
         with pytest.raises(RecordValidationError, match="non-finite"):
             HumanGameRecord(**self._base_record_args(
-                source_metadata={"score": float("nan")},
+                source_metadata={"batch_id": float("nan")},
             ))
 
-    def test_post_construction_nested_metadata_mutation_raises(self):
-        """Round 5 Blocker 1.3: deep-freeze prevents post-construction PII
-        injection into nested metadata."""
+    def test_post_construction_metadata_mutation_raises(self):
         rec = HumanGameRecord(**self._base_record_args(
-            source_metadata={"nested": {"safe": 1}}
+            source_metadata={"source": "test"}
         ))
-        # Top-level is read-only.
         with pytest.raises(TypeError):
             rec.source_metadata["new"] = "x"
-        # Nested dict is ALSO read-only (deep freeze).
-        with pytest.raises(TypeError):
-            rec.source_metadata["nested"]["contact"] = "alice@example.com"
+
+    def test_source_metadata_allowlist_rejects_common_identifiers(self):
+        for metadata in (
+            {"display_name": "Alice Smith"},
+            {"address": "123 Main Street"},
+            {"player_code": "platform-user-9384"},
+            {"profile": {"nickname": "alice"}},
+        ):
+            with pytest.raises(RecordValidationError, match="unknown key"):
+                HumanGameRecord(**self._base_record_args(source_metadata=metadata))
+
+    def test_source_metadata_rejects_ipv6_and_url_query_identifier(self):
+        for source in (
+            "2001:db8::1",
+            "https://example.test/export?player_id=123",
+        ):
+            with pytest.raises(RecordValidationError):
+                HumanGameRecord(**self._base_record_args(
+                    source_metadata={"source": source}
+                ))
+
+    def test_external_game_id_hmac_is_deterministic_and_opaque(self):
+        key = b"k" * 32
+        first = pseudonymize_external_game_id("Alice-Smith-game-001", project_key=key)
+        second = pseudonymize_external_game_id("Alice-Smith-game-001", project_key=key)
+        assert first == second
+        assert "Alice" not in first
+        HumanGameRecord(**self._base_record_args(game_id=first))
+
+    def test_name_shaped_raw_game_id_rejected(self):
+        with pytest.raises(RecordValidationError, match="game_id"):
+            HumanGameRecord(**self._base_record_args(
+                game_id="Alice-Smith-game-001"
+            ))
 
     def test_to_jsonl_line_rejects_nan(self):
         """Round 5 Blocker 2: allow_nan=False ensures NaN/Inf cannot be

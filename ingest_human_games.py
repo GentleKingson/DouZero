@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import sys
 from typing import Any, Iterator, Mapping, Sequence
@@ -82,6 +83,14 @@ def _load_adapter(dotted: str) -> Adapter:
         raise SystemExit(
             f"adapter {attr!r} not found in module {module_name!r}: {exc}"
         )
+    if inspect.isclass(adapter):
+        try:
+            adapter = adapter()
+        except TypeError as exc:
+            raise SystemExit(
+                "adapter classes must have a zero-argument constructor; "
+                "use an adapter function that closes over configuration"
+            ) from exc
     if not callable(adapter):
         raise SystemExit(f"adapter {dotted!r} is not callable")
     return adapter  # type: ignore[return-value]

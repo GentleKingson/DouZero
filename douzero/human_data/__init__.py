@@ -49,6 +49,11 @@ from .schema import (
     read_jsonl,
     write_jsonl,
 )
+from .identifiers import (
+    is_canonical_game_id,
+    make_internal_game_id,
+    pseudonymize_external_game_id,
+)
 from .validate import assert_legacy_ruleset
 
 __all__ = [
@@ -66,4 +71,7 @@ __all__ = [
     "read_jsonl",
     "write_jsonl",
     "assert_legacy_ruleset",
+    "is_canonical_game_id",
+    "make_internal_game_id",
+    "pseudonymize_external_game_id",
 ]

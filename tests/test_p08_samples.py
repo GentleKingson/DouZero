@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from douzero.human_data import HumanGameRecord
@@ -133,10 +135,10 @@ class TestBuildBCSamples:
         # Explicit stop_on_error=False + with_report: bad record quarantined.
         report = build_bc_samples_with_report([good, bad])
         assert isinstance(report, BatchSampleReport)
-        assert all(s.game_id == "good" for s in report.samples)
+        assert all(s.game_id == good.game_id for s in report.samples)
         assert len(report.samples) > 0
         assert len(report.quarantined) == 1
-        assert report.quarantined[0][0] == "bad"
+        assert report.quarantined[0][0] == bad.game_id
 
     def test_batch_stop_on_error(self):
         bad = generate_synthetic_record("bad2", seed=9)
@@ -284,6 +286,48 @@ class TestWeights:
             WeightConfig(skill_weight_clip=0)
         with pytest.raises(WeightError):
             WeightConfig(rule_mismatch_action="bogus")
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(WeightError, match="finite"):
+                WeightConfig(skill_weight_clip=value)
+            with pytest.raises(WeightError, match="finite"):
+                WeightConfig(integrity_default=value)
+            with pytest.raises(WeightError, match="finite"):
+                WeightConfig(rule_match_default=value)
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("skill_weight", float("nan")),
+            ("integrity_weight", float("inf")),
+            ("action_advantage", float("-inf")),
+        ],
+    )
+    def test_non_finite_weight_signal_rejected(self, field, value):
+        kwargs = {field: value}
+        with pytest.raises(WeightError, match="finite"):
+            compute_sample_weight(**kwargs)
+
+    def test_normalization_never_breaks_clip(self):
+        cfg = WeightConfig(skill_weight_clip=10.0, normalize_to_mean=True)
+        weights = compute_sample_weights(
+            skill_weights=[10.0] + [0.0] * 99,
+            config=cfg,
+        )
+        assert all(math.isfinite(weight) for weight in weights)
+        assert all(0.0 <= weight <= cfg.skill_weight_clip for weight in weights)
+        # Zeros are intentional exclusions and must not be revived merely to
+        # force an infeasible mean-one total.
+        assert weights == [10.0] + [0.0] * 99
+
+    def test_capped_normalization_preserves_feasible_total(self):
+        cfg = WeightConfig(skill_weight_clip=2.0, normalize_to_mean=True)
+        weights = compute_sample_weights(
+            skill_weights=[100.0, 1.0, 1.0, 1.0],
+            config=cfg,
+        )
+        assert all(math.isfinite(weight) for weight in weights)
+        assert all(0.0 <= weight <= cfg.skill_weight_clip for weight in weights)
+        assert sum(weights) == pytest.approx(len(weights))
 
 
 # --------------------------------------------------------------------------- #

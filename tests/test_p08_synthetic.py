@@ -5,7 +5,12 @@ from __future__ import annotations
 import pytest
 
 from douzero.env.rules import RuleSet
-from douzero.human_data import HumanGameRecord, read_jsonl, write_jsonl
+from douzero.human_data import (
+    HumanGameRecord,
+    make_internal_game_id,
+    read_jsonl,
+    write_jsonl,
+)
 from douzero.human_data.synthetic import (
     generate_synthetic_record,
     generate_synthetic_records,
@@ -16,7 +21,7 @@ class TestSyntheticGenerator:
     def test_single_record_is_well_formed(self):
         rec = generate_synthetic_record("syn-001", seed=42)
         assert isinstance(rec, HumanGameRecord)
-        assert rec.game_id == "syn-001"
+        assert rec.game_id == make_internal_game_id("syn-001")
         assert rec.ruleset_id == "legacy"
         assert rec.ruleset_hash == RuleSet.legacy().stable_hash()
         # Legacy cardplay conservation: 20 + 17 + 17 hands, 3 bottom cards.

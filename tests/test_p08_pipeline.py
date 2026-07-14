@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from douzero.human_data import HumanGameRecord, write_jsonl
+from douzero.human_data import HumanGameRecord, make_internal_game_id, write_jsonl
 from douzero.human_data.ingest import (
     IngestError,
     dedupe_by_game_id,
@@ -195,7 +195,7 @@ class TestIngest:
 
         def adapter(raw):
             return HumanGameRecord(
-                game_id=raw["game_id"],
+                game_id=make_internal_game_id(raw["game_id"]),
                 ruleset_id=rec.ruleset_id,
                 ruleset_version=rec.ruleset_version,
                 ruleset_hash=rec.ruleset_hash,
@@ -217,7 +217,7 @@ class TestIngest:
 
         def adapter(raw):
             return HumanGameRecord(
-                game_id=raw["game_id"],
+                game_id=make_internal_game_id(raw["game_id"]),
                 ruleset_id=rec.ruleset_id,
                 ruleset_version=rec.ruleset_version,
                 ruleset_hash=rec.ruleset_hash,
@@ -229,7 +229,7 @@ class TestIngest:
             )
 
         out = ingest_record({"game_id": "ing-2"}, adapter)
-        assert out.game_id == "ing-2"
+        assert out.game_id == make_internal_game_id("ing-2")
 
     def test_dedupe_by_game_id_keeps_first(self):
         a = generate_synthetic_record("dup", seed=1)
@@ -243,7 +243,7 @@ class TestIngest:
 
         def adapter(raw):
             return HumanGameRecord(
-                game_id=raw["id"],
+                game_id=make_internal_game_id(raw["id"]),
                 ruleset_id=base.ruleset_id,
                 ruleset_version=base.ruleset_version,
                 ruleset_hash=base.ruleset_hash,
@@ -256,7 +256,9 @@ class TestIngest:
 
         raws = [{"id": "c"}, {"id": "a"}, {"id": "b"}, {"id": "a"}]
         out = ingest_batch(raws, adapter)
-        assert [r.game_id for r in out] == ["a", "b", "c"]
+        assert [r.game_id for r in out] == sorted(
+            make_internal_game_id(label) for label in ("a", "b", "c")
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -402,4 +404,4 @@ class TestQuarantineContract:
             lines = [l for l in fh.read().splitlines() if l.strip()]
         assert len(lines) == 1
         entry = _json.loads(lines[0])
-        assert entry["game_id"] == "pre-bad"
+        assert entry["game_id"] == make_internal_game_id("pre-bad")

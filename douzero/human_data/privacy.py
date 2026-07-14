@@ -1,11 +1,8 @@
 """Privacy detection for the human-game pipeline (P08).
 
-Centralizes the forbidden-key and sensitive-value detection so it can be applied
-at BOTH the ingest boundary (:mod:`douzero.human_data.adapters`) AND the
-canonical record boundary (:mod:`douzero.human_data.schema`). Moving the scan
-to the record boundary (Blocker 2, round 4) means a record constructed directly
-via ``record_from_dict`` — bypassing ingest — is still audited before it can
-reach validation, BC sampling, or training.
+Canonical ``source_metadata`` uses a strict flat allowlist at both the ingest
+and record boundaries. Pattern detection remains defense in depth for other
+fixed-schema string fields such as timestamps and scoring results.
 
 AGENTS.md: "Do not store personal identifiers or credentials." This module is
 the single source of truth for what counts as a personal identifier or
@@ -15,8 +12,26 @@ both forbidden KEY substrings and sensitive VALUE patterns (credentials + PII).
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from typing import Any, Iterator, Mapping
+
+
+SOURCE_METADATA_ALLOWED_KEYS: frozenset[str] = frozenset({
+    "source",
+    "license",
+    "dataset_version",
+    "batch_id",
+    "collection_method",
+})
+
+_SOURCE_METADATA_PATTERNS: dict[str, re.Pattern[str]] = {
+    "source": re.compile(r"^[a-z0-9][a-z0-9._/-]{0,63}$"),
+    "license": re.compile(r"^[A-Za-z0-9][A-Za-z0-9 .+_()/-]{0,127}$"),
+    "dataset_version": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"),
+    "batch_id": re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"),
+    "collection_method": re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$"),
+}
 
 
 # Forbidden KEY substrings — a key is rejected if its lowercased form CONTAINS
@@ -57,6 +72,7 @@ PII_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",       # IPv4
         r"\+\d[\d\s\-().]{7,}\d",                         # phone: +1-555-...
         r"\d{3}[-.\s]\d{3}[-.\s]\d{4}",                  # phone: 555-123-4567
+        r"https?://[^\s?]+\?[^\s]*(?:id|user|player|account)=",  # URL query ID
     )
 )
 
@@ -80,10 +96,56 @@ def value_is_sensitive(value: Any) -> bool:
     v = value.strip()
     if not v:
         return False
-    return (
+    if (
         any(p.search(v) for p in CREDENTIAL_VALUE_PATTERNS)
         or any(p.search(v) for p in PII_VALUE_PATTERNS)
-    )
+    ):
+        return True
+    try:
+        ipaddress.ip_address(v.strip("[]"))
+    except ValueError:
+        return False
+    return True
+
+
+def assert_valid_source_metadata(metadata: Mapping[str, Any]) -> None:
+    """Validate the canonical, flat provenance allowlist.
+
+    Metadata is intentionally not an extension bag.  Unknown or nested fields
+    are rejected because their semantics cannot prove that they are free of
+    player identifiers.
+    """
+    if not isinstance(metadata, Mapping):
+        raise ValueError(
+            f"source_metadata must be a mapping, got {type(metadata).__name__}"
+        )
+    for key in metadata:
+        if not isinstance(key, str):
+            raise ValueError(
+                f"source_metadata key {key!r} must be a string, got "
+                f"{type(key).__name__}"
+            )
+    unknown = set(metadata) - SOURCE_METADATA_ALLOWED_KEYS
+    if unknown:
+        unknown_display = sorted(repr(key) for key in unknown)
+        raise ValueError(
+            f"source_metadata has unknown key(s) {unknown_display!r}; allowed "
+            f"keys are {sorted(SOURCE_METADATA_ALLOWED_KEYS)!r}"
+        )
+    for key, value in metadata.items():
+        if not isinstance(value, str):
+            raise ValueError(
+                f"source_metadata[{key!r}] must be a string, got "
+                f"{type(value).__name__}"
+            )
+        if _SOURCE_METADATA_PATTERNS[key].fullmatch(value) is None:
+            raise ValueError(
+                f"source_metadata[{key!r}] has an invalid length or character set"
+            )
+        if value_is_sensitive(value):
+            raise ValueError(
+                f"source_metadata[{key!r}] carries a sensitive value"
+            )
 
 
 def scan_for_forbidden(
@@ -128,48 +190,14 @@ def assert_no_forbidden(obj: Any, label: str = "object") -> None:
 
 
 def sanitize_mapping(metadata: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a recursively sanitized copy of ``metadata``.
-
-    Drops forbidden keys and sensitive values, recurses into all container
-    types (tuple/set -> list). The output is JSON-safe.
-    """
-    return _sanitize_mapping(metadata)
-
-
-class _DropSentinel:
-    __slots__ = ()
-
-
-_DROP = _DropSentinel()
-
-
-def _sanitize_mapping(obj: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only valid fields from the flat provenance allowlist."""
     out: dict[str, Any] = {}
-    for key, value in obj.items():
-        if isinstance(key, str) and key_is_forbidden(key):
+    for key, value in metadata.items():
+        if key not in SOURCE_METADATA_ALLOWED_KEYS:
             continue
-        sanitized = _sanitize_value(value)
-        if sanitized is _DROP:
+        try:
+            assert_valid_source_metadata({key: value})
+        except ValueError:
             continue
-        out[key] = sanitized
+        out[key] = value
     return out
-
-
-def _sanitize_sequence(obj: "list | tuple | set | frozenset") -> list:
-    out: list = []
-    for item in obj:
-        sanitized = _sanitize_value(item)
-        if sanitized is _DROP:
-            continue
-        out.append(sanitized)
-    return out
-
-
-def _sanitize_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return _sanitize_mapping(value)
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return _sanitize_sequence(value)
-    if value_is_sensitive(value):
-        return _DROP
-    return value

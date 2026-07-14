@@ -161,5 +161,5 @@ class TestTrainV2BCConfig:
             lines = [l for l in fh.read().splitlines() if l.strip()]
         assert len(lines) == 1
         entry = json.loads(lines[0])
-        assert entry["game_id"] == "e2e-bad"
+        assert entry["game_id"] == bad.game_id
         assert entry["stage"] in ("replay_validation", "bc_sampling")

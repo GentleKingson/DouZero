@@ -45,7 +45,7 @@ pickle's arbitrary-code-execution risk. Fields:
 
 | Field | Purpose |
 |-------|---------|
-| `game_id` | Stable unique id (split + dedupe key) |
+| `game_id` | Opaque `dzg_<64-hex-digest>` id (split + dedupe key) |
 | `ruleset_id` / `ruleset_version` / `ruleset_hash` | Rule identity the game was played under |
 | `seats` | Ordered role tuple the `action_history` positions refer to |
 | `initial_hands` | The true deal (**privileged**); legacy 4-key card_play_data |
@@ -151,6 +151,23 @@ python validate_human_games.py --input /tmp/games.jsonl --output /tmp/valid
 python pretrain_bc.py --data /tmp/valid.jsonl --save_dir /tmp/bc_prior
 ```
 
+The CLI accepts a function, a callable instance, or a callable class with a
+zero-argument constructor. A class that needs configuration must be exposed as
+an adapter function that closes over configuration or as a preconfigured
+callable instance.
+
+Adapters must map every raw platform game identifier before constructing a
+record:
+
+```python
+from douzero.human_data import pseudonymize_external_game_id
+
+game_id = pseudonymize_external_game_id(
+    raw["platform_game_id"],
+    project_key=project_key,  # load from secret storage; never write to JSONL
+)
+```
+
 ## Configuration (`configs/enhanced.yaml`)
 
 The BC auxiliary loss is enabled **iff** `loss.lambda_bc > 0` (single source of
@@ -187,10 +204,14 @@ bc:                            # BC-specific settings (no enabled/lambda_bc here
 
 - Adapters MUST NOT reach the network or perform scraping/automation. They
   consume already-acquired, authorized files only.
-- [`audit_source_metadata`](../douzero/human_data/adapters.py) drops forbidden
-  keys (`user_id`, `email`, `token`, `cookie`, …) and
-  [`assert_no_forbidden_metadata`](../douzero/human_data/adapters.py) rejects a
-  record that leaks one past the adapter.
+- `source_metadata` is a flat allowlist: `source`, `license`,
+  `dataset_version`, `batch_id`, and `collection_method`. Each value has a
+  bounded type, length, and character set. Unknown/nested fields are dropped by
+  [`audit_source_metadata`](../douzero/human_data/adapters.py) and rejected at
+  the canonical record boundary.
+- Canonical schema v2 rejects raw external game IDs. Existing draft schema-v1
+  JSONL must be re-ingested from the authorized source with keyed HMAC IDs;
+  there is deliberately no converter that would copy old raw IDs forward.
 - Deletion: removing a record from the canonical JSONL and re-running
   `validate_human_games.py` fully removes it from the pipeline (records are
   never copied elsewhere).

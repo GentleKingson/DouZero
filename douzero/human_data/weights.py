@@ -8,7 +8,9 @@ listwise cross-entropy. AGENTS.md:
 
 The weight is multiplicative but **clipped** to ``[0, skill_weight_clip]`` so a
 single high-skill outlier cannot dominate a batch, and then optionally
-**normalized** so the batch's weights sum to the batch size (mean-preserving).
+**normalized** toward mean one with capped-simplex water filling.  Zero-weight
+samples remain zero; if their removal makes mean one infeasible under the cap,
+the largest feasible total is used.
 
 All weights are non-negative; a zero weight drops the sample (e.g. a
 ruleset-mismatched record). The computation is pure and deterministic so a
@@ -17,6 +19,7 @@ fixed dataset yields a fixed weight vector.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -28,9 +31,9 @@ class WeightError(ValueError):
 class WeightConfig:
     """Configuration for :func:`compute_sample_weights`.
 
-    ``skill_weight_clip`` caps the raw multiplicative weight before
-    normalization, preventing a single high-skill / high-integrity sample from
-    dominating a minibatch. ``rule_mismatch_action`` controls what happens when
+    ``skill_weight_clip`` is an absolute cap before and after normalization,
+    preventing a single high-skill / high-integrity sample from dominating a
+    minibatch. ``rule_mismatch_action`` controls what happens when
     a sample's record ruleset does not match the target:
 
     - ``"zero"`` (default): weight set to 0 (the sample is dropped).
@@ -51,6 +54,10 @@ class WeightConfig:
                 "skill_weight_clip must be a number, got "
                 f"{type(self.skill_weight_clip).__name__}"
             )
+        if not math.isfinite(float(self.skill_weight_clip)):
+            raise WeightError(
+                f"skill_weight_clip must be finite, got {self.skill_weight_clip}"
+            )
         if self.skill_weight_clip <= 0:
             raise WeightError(
                 f"skill_weight_clip must be positive, got {self.skill_weight_clip}"
@@ -67,6 +74,8 @@ class WeightConfig:
                 raise WeightError(
                     f"{name} must be a number, got {type(val_v).__name__}"
                 )
+            if not math.isfinite(float(val_v)):
+                raise WeightError(f"{name} must be finite, got {val_v}")
             if not 0.0 <= val_v:
                 raise WeightError(
                     f"{name} must be non-negative, got {val_v}"
@@ -92,21 +101,26 @@ def compute_sample_weight(
     ``[0, skill_weight_clip]``.
     """
     cfg = config or WeightConfig()
-    if not 0.0 <= skill_weight:
+    skill = _finite_number("skill_weight", skill_weight)
+    integrity = _finite_number("integrity_weight", integrity_weight)
+    advantage = _finite_number("action_advantage", action_advantage)
+    if skill < 0.0:
         raise WeightError(f"skill_weight must be non-negative, got {skill_weight}")
-    if not 0.0 <= integrity_weight:
+    if integrity < 0.0:
+        raise WeightError(f"integrity_weight must be non-negative, got {integrity_weight}")
+    if not isinstance(rule_match, bool):
         raise WeightError(
-            f"integrity_weight must be non-negative, got {integrity_weight}"
+            f"rule_match must be a bool, got {type(rule_match).__name__}"
         )
     rule_factor = 1.0
     if not rule_match:
         if cfg.rule_mismatch_action == "zero":
             return 0.0
         rule_factor = cfg.rule_match_default
-    advantage_factor = 1.0 + max(0.0, float(action_advantage))
+    advantage_factor = 1.0 + max(0.0, advantage)
     raw = (
-        float(skill_weight)
-        * float(integrity_weight)
+        skill
+        * integrity
         * float(rule_factor)
         * float(advantage_factor)
     )
@@ -127,14 +141,18 @@ def compute_sample_weights(
 
     All optional sequences default to "all ones / all True". They must be the
     same length as ``skill_weights``. When ``config.normalize_to_mean`` is True
-    the clipped weights are rescaled so they sum to ``len(weights)`` (mean 1.0),
-    preserving the relative emphasis while keeping the batch magnitude stable.
+    the clipped weights are water-filled toward a sum of ``len(weights)`` while
+    preserving the absolute cap. Zero weights are not revived; consequently an
+    extremely sparse vector may have a smaller, maximum-feasible sum.
     """
     cfg = config or WeightConfig()
     n = len(skill_weights)
-    integrity_weights = integrity_weights or [cfg.integrity_default] * n
-    rule_matches = rule_matches or [True] * n
-    action_advantages = action_advantages or [0.0] * n
+    if integrity_weights is None:
+        integrity_weights = [cfg.integrity_default] * n
+    if rule_matches is None:
+        rule_matches = [True] * n
+    if action_advantages is None:
+        action_advantages = [0.0] * n
     if not (
         len(integrity_weights) == n
         and len(rule_matches) == n
@@ -158,13 +176,51 @@ def compute_sample_weights(
     if not cfg.normalize_to_mean or n == 0:
         return clipped
 
-    total = sum(clipped)
-    if total <= 0.0:
+    if not any(w > 0.0 for w in clipped):
         # All-zero weights: return as-is (the caller will see a zero-loss
         # batch; do not divide by zero).
         return clipped
-    scale = n / total
-    return [w * scale for w in clipped]
+    return _normalize_with_cap(clipped, float(cfg.skill_weight_clip))
+
+
+def _finite_number(name: str, value: object) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise WeightError(f"{name} must be a number, got {type(value).__name__}")
+    result = float(value)
+    if not math.isfinite(result):
+        raise WeightError(f"{name} must be finite, got {value}")
+    return result
+
+
+def _normalize_with_cap(weights: list[float], cap: float) -> list[float]:
+    """Water-fill positive weights without exceeding ``cap``.
+
+    Zero weights remain zero so a rejected ruleset sample is never revived by
+    normalization.  When too few positive samples exist to reach mean one
+    under the cap, the largest feasible total is used instead.
+    """
+    result = [0.0] * len(weights)
+    active = [i for i, weight in enumerate(weights) if weight > 0.0]
+    target = min(float(len(weights)), float(len(active)) * cap)
+    remaining = target
+
+    while active:
+        active_total = sum(weights[i] for i in active)
+        scale = remaining / active_total
+        newly_capped = [i for i in active if weights[i] * scale >= cap]
+        if not newly_capped:
+            for i in active:
+                result[i] = weights[i] * scale
+            break
+        for i in newly_capped:
+            result[i] = cap
+        remaining -= cap * len(newly_capped)
+        capped_set = set(newly_capped)
+        active = [i for i in active if i not in capped_set]
+        if remaining <= 0.0:
+            break
+
+    return result
 
 
 # --------------------------------------------------------------------------- #
