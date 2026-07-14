@@ -30,13 +30,20 @@ Farmers share one utility in minimax. Terminal scores call the canonical rule
 engine, including bids, bombs, rocket, spring, anti-spring, and multiplier
 caps. The transposition identity contains all hands, actor, move-to-beat,
 leader, pass count, action counts, bid, bombs, rocket, and ruleset hash.
+Nonterminal score estimates use the same canonical multiplier helper as
+terminal scoring, including the landlord/farmer 2:1 score units, bids,
+independent bomb/rocket multipliers, and caps. They intentionally do not guess
+future spring or anti-spring outcomes.
 
 ## Budgets and Fallback
 
 `max_nodes`, `max_rollouts`, and `max_milliseconds` are hard cooperative
-limits. Move generation also checks the deadline. Exhausting any limit returns
-the base-policy action, rather than a partially searched result. A zero budget
-therefore gives the same action as search-off mode.
+limits. Search-only belief inference starts after the wall-clock budget, and
+move generation also checks the deadline. Root candidates are already legal,
+so sampled roots apply them without an unbudgeted second legality expansion.
+Exhausting any limit returns the base-policy action, rather than a partially
+searched result. A zero budget therefore gives the same action as search-off
+mode.
 
 The structured `SearchLog` records the base and searched actions, aggregate
 candidate values, sample/node/rollout counts, elapsed time, timeout status, and
@@ -62,6 +69,11 @@ search:
 Enabling search in `DeepAgentV2` requires a P07 `BeliefModel`, even when the
 value model itself does not fuse belief features. This fail-closed rule ensures
 there is no alternative route for true hidden hands.
+
+`GameEnv.get_infoset()` carries the public bid, independent bomb and rocket
+counts, non-pass action counts, bidding history/order, phase, and current
+multiplier. Consequently `DeepAgentV2.act(infoset)` preserves standard and
+custom scoring state without requiring callers to reconstruct keyword args.
 
 ## Benchmark
 

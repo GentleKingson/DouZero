@@ -438,6 +438,7 @@ class DeepAgentV2:
         # Single legal action: short-circuit without inference (matches the
         # legacy DeepAgent behaviour and avoids a degenerate forward).
         if len(legal_actions) == 1:
+            self.last_search_log = None
             return legal_actions[0]
 
         return self._select_from_observation(obs)
@@ -457,6 +458,7 @@ class DeepAgentV2:
         ``DeepAgent.act`` returns the infoset's list, and this path matches.
         """
         if len(infoset.legal_actions) == 1:
+            self.last_search_log = None
             return infoset.legal_actions[0]
         from douzero.observation.encode_v2 import get_obs_v2
 
@@ -501,9 +503,7 @@ class DeepAgentV2:
         belief_features = None
         belief_output = None
         belief_enabled = bool(getattr(self.model.config, "belief_enabled", False))
-        if self.belief_model is not None and (
-            belief_enabled or self.search_config.enabled
-        ):
+        if self.belief_model is not None and belief_enabled:
             from douzero.belief import build_belief_input
             from douzero.belief.model import belief_features_from_probs
 
@@ -543,6 +543,23 @@ class DeepAgentV2:
         idx = select_action(out, self.decision_config)
         if self.search_config.enabled:
             from douzero.search.belief_rollout import BeliefSearch
+            from douzero.search.budget import SearchBudget
+
+            search_budget = SearchBudget(self.search_config)
+            has_budget = all((
+                self.search_config.max_nodes > 0,
+                self.search_config.max_rollouts > 0,
+                self.search_config.max_milliseconds > 0,
+            ))
+            # A belief-enabled base policy already paid for its posterior
+            # above. Search-only belief inference is P13 incremental work, so
+            # run it after the budget starts and include it in SearchLog time.
+            if belief_output is None and has_budget:
+                from douzero.belief import build_belief_input
+
+                binput = build_belief_input(obs.public)
+                with torch.inference_mode():
+                    belief_output = self.belief_model([binput])
 
             decision = BeliefSearch(self.search_config, self.ruleset).select(
                 observation=obs,
@@ -550,6 +567,7 @@ class DeepAgentV2:
                 base_action_index=idx,
                 belief_model=self.belief_model,
                 belief_output=belief_output,
+                budget=search_budget,
             )
             idx = decision.action_index
             self.last_search_log = decision.log

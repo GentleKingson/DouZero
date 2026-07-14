@@ -158,6 +158,7 @@ class BeliefSearch:
         base_action_index: int,
         belief_model: BeliefModel,
         belief_output: BeliefOutput | None = None,
+        budget: SearchBudget | None = None,
     ) -> SearchDecision:
         """Search top-k actions and fail closed to the base action on limits."""
         if getattr(getattr(observation, "public", None), "kind", None) != "public":
@@ -166,7 +167,10 @@ class BeliefSearch:
             )
         legal_actions = observation.actions.legal_actions
         base_action = tuple(legal_actions[base_action_index])
-        budget = SearchBudget(self.config)
+        if budget is None:
+            budget = SearchBudget(self.config)
+        elif budget.config != self.config:
+            raise ValueError("external SearchBudget config does not match search config")
         if not self.config.enabled:
             return self._fallback(base_action_index, base_action, budget, "disabled")
         if (
@@ -210,7 +214,7 @@ class BeliefSearch:
                 outcomes: list[SolveValue] = []
                 for root in sampled_states:
                     budget.start_rollout()
-                    child = root.apply(candidate.action)
+                    child = root.apply(candidate.action, validate=False)
                     outcomes.append(self._evaluate(child, _team(root.acting_role), budget))
                 win = np.asarray([value.win_probability for value in outcomes])
                 scores = np.asarray([value.expected_score for value in outcomes])

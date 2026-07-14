@@ -10,7 +10,7 @@ from typing import Mapping
 from douzero.env import move_detector as md
 from douzero.env.game import GameEnv
 from douzero.env.rules import PLAYER_POSITIONS, RuleSet
-from douzero.env.scoring import compute_game_result
+from douzero.env.scoring import compute_game_result, compute_team_score_magnitude
 from douzero.observation.seats import next_seat, previous_seat
 
 from .budget import SearchBudget
@@ -210,11 +210,14 @@ class SearchGameState:
             advantage = -advantage
         probability = 1.0 / (1.0 + math.exp(-advantage / 2.0))
         signed = 2.0 * probability - 1.0
-        base = self.ruleset.base_score
-        multiplier = self.ruleset.bomb_multiplier ** self.bomb_count
-        if self.rocket_count:
-            multiplier *= self.ruleset.rocket_multiplier
-        return SolveValue(probability, signed * base * multiplier)
+        magnitude = compute_team_score_magnitude(
+            team=root_team,
+            bomb_count=self.bomb_count,
+            rocket_count=self.rocket_count,
+            bid_value=self.bid_value,
+            ruleset=self.ruleset,
+        )
+        return SolveValue(probability, signed * magnitude)
 
 
 class EndgameSolver:

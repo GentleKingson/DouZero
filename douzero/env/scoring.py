@@ -233,6 +233,111 @@ def detect_spring_from_action_counts(
     return spring, anti_spring
 
 
+def _score_scale(
+    *,
+    bomb_count: int,
+    rocket_count: int,
+    bid_value: int,
+    spring: bool,
+    anti_spring: bool,
+    ruleset: RuleSet,
+) -> tuple[int, int, dict[str, int]]:
+    """Return ``(base_times_multiplier, multiplier, breakdown)``.
+
+    This is the single multiplier implementation used by terminal scoring and
+    P13's nonterminal score heuristic. A nonterminal caller passes both spring
+    flags as false because their outcome is not known yet.
+    """
+    breakdown: dict[str, int] = {}
+    if ruleset.ruleset_id == "legacy":
+        total_bomb_num = bomb_count + rocket_count
+        multiplier = ruleset.bomb_multiplier ** total_bomb_num
+        breakdown["bomb_count"] = total_bomb_num
+        breakdown["multiplier"] = multiplier
+        return ruleset.base_score * multiplier, multiplier, breakdown
+
+    bid_component = 1
+    if ruleset.bid_multiplier and bid_value > 0:
+        bid_component = bid_value
+        breakdown["bid"] = bid_value
+
+    event_multiplier = 1
+    if bomb_count > 0:
+        bomb_component = ruleset.bomb_multiplier ** bomb_count
+        breakdown["bomb"] = bomb_component
+        event_multiplier *= bomb_component
+    if rocket_count > 0:
+        rocket_component = ruleset.rocket_multiplier
+        breakdown["rocket"] = rocket_component
+        event_multiplier *= rocket_component
+    if spring:
+        breakdown["spring"] = ruleset.spring_multiplier
+        event_multiplier *= ruleset.spring_multiplier
+    if anti_spring:
+        breakdown["anti_spring"] = ruleset.anti_spring_multiplier
+        event_multiplier *= ruleset.anti_spring_multiplier
+    breakdown["event_multiplier"] = event_multiplier
+
+    uncapped = bid_component * event_multiplier
+    breakdown["uncapped_total_multiplier"] = uncapped
+    multiplier = uncapped
+    if ruleset.max_multiplier is not None and multiplier > ruleset.max_multiplier:
+        breakdown["max_multiplier_cap"] = ruleset.max_multiplier
+        multiplier = ruleset.max_multiplier
+    breakdown["total_multiplier"] = multiplier
+    return ruleset.base_score * multiplier, multiplier, breakdown
+
+
+def compute_team_score_magnitude(
+    *,
+    team: str,
+    bomb_count: int,
+    rocket_count: int,
+    bid_value: int,
+    ruleset: RuleSet,
+    spring: bool = False,
+    anti_spring: bool = False,
+) -> int:
+    """Return the positive score magnitude for one team under the ruleset.
+
+    The landlord/farmer unit ratio matches :func:`compute_game_result` exactly.
+    This helper is suitable for nonterminal estimates when spring flags are
+    left false, and for terminal-equivalent checks when they are known.
+    """
+    if team not in ("landlord", "farmer"):
+        raise ValueError("team must be 'landlord' or 'farmer'")
+    total, _multiplier, _breakdown = _score_scale(
+        bomb_count=bomb_count,
+        rocket_count=rocket_count,
+        bid_value=bid_value,
+        spring=spring,
+        anti_spring=anti_spring,
+        ruleset=ruleset,
+    )
+    if ruleset.ruleset_id == "legacy":
+        return total if team == "landlord" else total // 2
+    return 2 * total if team == "landlord" else total
+
+
+def compute_current_multiplier(
+    *,
+    bomb_count: int,
+    rocket_count: int,
+    bid_value: int,
+    ruleset: RuleSet,
+) -> int:
+    """Return the public multiplier so far, excluding unresolved springs."""
+    _total, multiplier, _breakdown = _score_scale(
+        bomb_count=bomb_count,
+        rocket_count=rocket_count,
+        bid_value=bid_value,
+        spring=False,
+        anti_spring=False,
+        ruleset=ruleset,
+    )
+    return multiplier
+
+
 def compute_game_result(
     *,
     played_cards: dict[str, list[int]],
@@ -280,20 +385,17 @@ def compute_game_result(
             played_cards, winner_position, ruleset
         )
 
-    # Compute the multiplier and scores.
-    breakdown: dict[str, int] = {}
     is_landlord_win = winner_team == "landlord"
+    total, total_multiplier, breakdown = _score_scale(
+        bomb_count=bomb_count,
+        rocket_count=rocket_count,
+        bid_value=bid_value,
+        spring=spring,
+        anti_spring=anti_spring,
+        ruleset=ruleset,
+    )
 
     if ruleset.ruleset_id == "legacy":
-        # Legacy: bomb_num = bomb_count + rocket_count (rocket is counted as
-        # a bomb in game.py). Effective multiplier = 2 ** (bomb_count +
-        # rocket_count). No spring, no bid, base_score=2.
-        total_bomb_num = bomb_count + rocket_count
-        effective_multiplier = ruleset.bomb_multiplier ** total_bomb_num
-        breakdown["bomb_count"] = total_bomb_num
-        breakdown["multiplier"] = effective_multiplier
-
-        total = ruleset.base_score * effective_multiplier
         # Legacy: landlord wins/loses 2 * multiplier, farmer wins/loses
         # 1 * multiplier (opposite sign).
         # base_score=2, so landlord_score = ±2 * 2**bomb_num, which is
@@ -314,56 +416,13 @@ def compute_game_result(
             spring=False,
             anti_spring=False,
             multiplier_breakdown=breakdown,
-            total_multiplier=effective_multiplier,
+            total_multiplier=total_multiplier,
             landlord_score=landlord_score,
             farmer_score=farmer_score,
             ruleset_id=ruleset.ruleset_id,
             ruleset_version=ruleset.ruleset_version,
             ruleset_hash=ruleset.stable_hash(),
         )
-
-    # Standard scoring.
-    # The total multiplier = bid_component × event_multiplier.
-    # bid_component = bid_value (if bid_multiplier is enabled, else 1).
-    # event_multiplier = bomb × rocket × spring × anti_spring.
-    # max_multiplier caps the TOTAL multiplier (including bid), not just events.
-    bid_component = 1
-    if ruleset.bid_multiplier and bid_value > 0:
-        bid_component = bid_value
-        breakdown["bid"] = bid_value
-
-    event_multiplier = 1
-    if bomb_count > 0:
-        bomb_component = ruleset.bomb_multiplier ** bomb_count
-        breakdown["bomb"] = bomb_component
-        event_multiplier *= bomb_component
-    if rocket_count > 0:
-        rocket_component = ruleset.rocket_multiplier
-        breakdown["rocket"] = rocket_component
-        event_multiplier *= rocket_component
-    if spring:
-        spring_component = ruleset.spring_multiplier
-        breakdown["spring"] = spring_component
-        event_multiplier *= spring_component
-    if anti_spring:
-        anti_component = ruleset.anti_spring_multiplier
-        breakdown["anti_spring"] = anti_component
-        event_multiplier *= anti_component
-
-    breakdown["event_multiplier"] = event_multiplier
-
-    # Total multiplier = bid_component × event_multiplier.
-    uncapped_total_multiplier = bid_component * event_multiplier
-    breakdown["uncapped_total_multiplier"] = uncapped_total_multiplier
-
-    total_multiplier = uncapped_total_multiplier
-    if ruleset.max_multiplier is not None and total_multiplier > ruleset.max_multiplier:
-        breakdown["max_multiplier_cap"] = ruleset.max_multiplier
-        total_multiplier = ruleset.max_multiplier
-
-    breakdown["total_multiplier"] = total_multiplier
-
-    total = ruleset.base_score * total_multiplier
 
     # Standard: landlord wins/loses 2*total, each farmer wins/loses 1*total
     # (opposite sign). Score conservation: landlord + 2*farmer == 0.
