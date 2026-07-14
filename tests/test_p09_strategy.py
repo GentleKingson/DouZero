@@ -15,18 +15,28 @@ from douzero.models_v2.output import ModelOutput
 from douzero.observation.encode_v2 import get_obs_v2
 from douzero.observation.schema import build_v2_schema
 from douzero.strategy import (
+    STRATEGY_FEATURE_LAYOUT_HASH,
     STRATEGY_FEATURE_NAMES,
+    STRATEGY_FEATURE_VERSION,
     StrategyFeatureConfig,
     action_structure_cost,
     build_strategy_feature_matrix,
     hand_decomposition,
+    strategy_feature_layout_hash,
 )
 from douzero.strategy.auxiliary import strategy_auxiliary_loss
 from douzero.training.decision_policy import DecisionConfig, select_action
 from douzero.training.losses import LossConfig
 
 
-def _public(*, role="landlord_down", teammate_left=1, landlord_left=10):
+def _public(
+    *,
+    role="landlord_down",
+    teammate_left=1,
+    landlord_left=10,
+    landlord_played=(),
+    landlord_action_count=0,
+):
     hand = (3, 4, 5, 17, 20, 30)
     return SimpleNamespace(
         acting_role=role,
@@ -37,7 +47,16 @@ def _public(*, role="landlord_down", teammate_left=1, landlord_left=10):
             "landlord_down": 6 if role != "landlord_down" else len(hand),
             "landlord_up": teammate_left,
         },
-        played_cards={"landlord": (), "landlord_down": (), "landlord_up": ()},
+        played_cards={
+            "landlord": tuple(landlord_played),
+            "landlord_down": (),
+            "landlord_up": (),
+        },
+        non_pass_action_counts={
+            "landlord": landlord_action_count,
+            "landlord_down": 0,
+            "landlord_up": 0,
+        },
         last_move=(4,),
         last_move_dict={"landlord": (), "landlord_down": (), "landlord_up": (4,)},
     )
@@ -75,6 +94,51 @@ class TestHandDecomposition:
     def test_rejects_more_than_twenty_cards(self):
         with pytest.raises(ValueError, match="at most 20"):
             hand_decomposition([3] * 21)
+
+    def test_fake_clock_timeout_is_deterministic_and_uses_fixed_fallback(self):
+        class TickClock:
+            def __init__(self):
+                self.value = 0.0
+
+            def __call__(self):
+                self.value += 0.001
+                return self.value
+
+        hand = [3, 3, 3, 4, 4, 5, 6, 7, 9, 10, 12, 14, 17, 20, 30]
+        first = hand_decomposition(
+            hand, node_budget=10_000, time_budget_ms=3, clock=TickClock()
+        )
+        second = hand_decomposition(
+            hand, node_budget=10_000, time_budget_ms=3, clock=TickClock()
+        )
+        assert first == second
+        assert first.fallback_used and not first.exact
+        # Fixed fallback: one legal rank group per turn, with the rocket as one.
+        assert first.min_turns == len(set(hand)) - 1
+
+    def test_budget_aware_move_generation_preserves_legal_moves(self):
+        from douzero.env.move_generator import MovesGener
+
+        hand = [3, 3, 3, 4, 4, 4, 5, 6, 7, 8, 9]
+        plain = MovesGener(hand).gen_moves()
+        checked = MovesGener(hand, budget_check=lambda: None).gen_moves()
+        assert plain == checked
+
+    def test_nonzero_time_budget_is_not_process_cached(self, monkeypatch):
+        import douzero.strategy.features as strategy_features
+
+        calls = []
+        original = strategy_features.hand_decomposition
+
+        def counted(*args, **kwargs):
+            calls.append((args, kwargs))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(strategy_features, "hand_decomposition", counted)
+        config = StrategyFeatureConfig(node_budget=50, time_budget_ms=1)
+        strategy_features._decomposition((3, 4, 5), config)
+        strategy_features._decomposition((3, 4, 5), config)
+        assert len(calls) == 2
 
 
 class TestStructureCost:
@@ -132,6 +196,56 @@ class TestFeatureMatrix:
             risk_enabled=False,
         )
         assert np.count_nonzero(build_strategy_feature_matrix(_public(), cfg)) == 0
+
+    @pytest.mark.parametrize(
+        "played_cards",
+        [
+            (3, 3),
+            (3, 4, 5, 6, 7),
+            (3, 3, 3, 4, 4, 4, 5, 6),
+        ],
+    )
+    def test_anti_spring_risk_counts_actions_not_cards(self, played_cards):
+        features = build_strategy_feature_matrix(
+            _public(
+                landlord_left=4,
+                landlord_played=played_cards,
+                landlord_action_count=1,
+            ),
+            StrategyFeatureConfig(hand_enabled=False),
+        )
+        index = STRATEGY_FEATURE_NAMES.index("spring_risk")
+        assert np.all(features[:, index] == 1.0)
+
+    def test_layout_hash_binds_order_version_and_normalization(self):
+        assert len(STRATEGY_FEATURE_LAYOUT_HASH) == 64
+        assert strategy_feature_layout_hash() == STRATEGY_FEATURE_LAYOUT_HASH
+        assert strategy_feature_layout_hash(
+            names=tuple(reversed(STRATEGY_FEATURE_NAMES))
+        ) != STRATEGY_FEATURE_LAYOUT_HASH
+        assert strategy_feature_layout_hash(
+            version=STRATEGY_FEATURE_VERSION + "_changed"
+        ) != STRATEGY_FEATURE_LAYOUT_HASH
+
+    def test_public_observation_derives_non_pass_action_counts(self):
+        from douzero.env.env import Env
+
+        env = Env("adp")
+        env.reset()
+        pair = next(
+            action
+            for action in env.infoset.legal_actions
+            if len(action) == 2 and action[0] == action[1]
+        )
+        env.step(pair)
+
+        observation = get_obs_v2(env.infoset).public
+        assert len(observation.played_cards["landlord"]) == 2
+        assert observation.non_pass_action_counts == {
+            "landlord": 1,
+            "landlord_down": 0,
+            "landlord_up": 0,
+        }
 
 
 class TestModelStrategyWiring:
@@ -210,6 +324,7 @@ class TestModelStrategyWiring:
         }
         targets = {
             "min_turns_after": torch.tensor([1.0, 2.0, 3.0]),
+            "min_turns_exact_mask": torch.tensor([1.0, 1.0, 1.0]),
             "regain_initiative": torch.tensor([0.0, 1.0, 0.0]),
             "teammate_finish": torch.tensor([0.0, 1.0, 0.0]),
             "teammate_finish_mask": torch.tensor([0.0, 1.0, 1.0]),
@@ -230,6 +345,32 @@ class TestModelStrategyWiring:
         loss.total.backward()
         assert all(value.grad is not None for value in predictions.values())
 
+    def test_inexact_min_turn_target_is_masked(self):
+        predictions = {
+            "min_turns_after": torch.tensor([[100.0]], requires_grad=True),
+            "regain_initiative_logit": torch.zeros(1, 1, requires_grad=True),
+            "teammate_finish_logit": torch.zeros(1, 1, requires_grad=True),
+            "spring_probability_logit": torch.zeros(1, 1, requires_grad=True),
+            "structure_cost": torch.zeros(1, 1, requires_grad=True),
+        }
+        targets = {
+            "min_turns_after": torch.tensor([1.0]),
+            "min_turns_exact_mask": torch.tensor([0.0]),
+            "regain_initiative": torch.tensor([0.0]),
+            "teammate_finish": torch.tensor([0.0]),
+            "teammate_finish_mask": torch.tensor([0.0]),
+            "spring_probability": torch.tensor([0.0]),
+            "structure_cost": torch.tensor([0.0]),
+        }
+        loss = strategy_auxiliary_loss(
+            predictions,
+            targets,
+            LossConfig(lambda_win=0.0, lambda_score=0.0, lambda_min_turns=1.0),
+        )
+        assert loss.min_turns_after == 0.0
+        loss.total.backward()
+        assert predictions["min_turns_after"].grad.item() == 0.0
+
     def test_v2_trainer_updates_auxiliary_heads(self, seed_factory):
         from douzero.training.v2_trainer import TrainerConfig, V2Trainer
 
@@ -246,7 +387,7 @@ class TestModelStrategyWiring:
                 nan_guard=True,
             ),
         )
-        before = model.strategy_aux_heads.min_turns_after.weight.detach().clone()
+        before = model.strategy_aux_heads.structure_cost.weight.detach().clone()
         trainer = V2Trainer(
             model,
             loss_config=LossConfig(
@@ -271,7 +412,7 @@ class TestModelStrategyWiring:
             ),
         )
         stats = trainer.train()
-        after = model.strategy_aux_heads.min_turns_after.weight.detach()
+        after = model.strategy_aux_heads.structure_cost.weight.detach()
         assert stats.optimizer_steps == 1
         assert "aux_loss_total" in stats.last_loss
         assert not torch.equal(before, after)
@@ -345,6 +486,42 @@ class TestModelStrategyWiring:
         clone.load_state_dict(state, strict=True)
         for key, value in model.state_dict().items():
             assert torch.equal(value, clone.state_dict()[key])
+
+    def test_same_width_strategy_version_drift_rejects_checkpoint(
+        self, tmp_path, monkeypatch
+    ):
+        from douzero.checkpoint import load_v2_checkpoint, save_v2_checkpoint
+        from douzero.checkpoint.io import CheckpointCompatibilityError
+        from douzero.env.rules import RuleSet
+        import douzero.strategy.features as strategy_features
+
+        cfg = ModelV2Config(
+            hidden_size=16,
+            history_encoder="lstm",
+            history_layers=1,
+            strategy_features_enabled=True,
+        )
+        model = ModelV2(build_v2_schema(), cfg)
+        path = str(tmp_path / "strategy_v1.tar")
+        ruleset = RuleSet.legacy()
+        save_v2_checkpoint(path, model, ruleset=ruleset)
+        old_hash = cfg.stable_hash()
+
+        # Width and parameter shapes stay unchanged; only semantic version
+        # changes. The config identity must still reject the old checkpoint.
+        monkeypatch.setattr(
+            strategy_features, "STRATEGY_FEATURE_VERSION", "strategy_v2"
+        )
+        new_hash = cfg.stable_hash()
+        assert old_hash != new_hash
+        with pytest.raises(CheckpointCompatibilityError, match="model_config_hash"):
+            load_v2_checkpoint(
+                path,
+                expected_schema_hash=model.schema.stable_hash(),
+                expected_model_config_hash=new_hash,
+                expected_ruleset=ruleset,
+                runtime_model_config=cfg,
+            )
 
 
 class TestUncertaintyGatedPrior:

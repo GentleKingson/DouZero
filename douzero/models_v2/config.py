@@ -177,6 +177,16 @@ class ModelV2Config:
         config hash is the missing second identity axis alongside the feature
         schema hash.
         """
+        strategy_version = None
+        strategy_layout_hash = None
+        if self.strategy_features_enabled:
+            from douzero.strategy.features import (
+                STRATEGY_FEATURE_LAYOUT_HASH,
+                STRATEGY_FEATURE_VERSION,
+            )
+
+            strategy_version = STRATEGY_FEATURE_VERSION
+            strategy_layout_hash = STRATEGY_FEATURE_LAYOUT_HASH
         return {
             "hidden_size": self.hidden_size,
             "history_encoder": self.history_encoder,
@@ -197,6 +207,8 @@ class ModelV2Config:
             "strategy_aux_enabled": self.strategy_aux_enabled,
             "strategy_node_budget": self.strategy_node_budget,
             "strategy_time_budget_ms": self.strategy_time_budget_ms,
+            "strategy_feature_version": strategy_version,
+            "strategy_feature_layout_hash": strategy_layout_hash,
             "score_clamp": self.score_clamp,
             "score_target_transform": self.score_target_transform,
             "nan_guard": self.nan_guard,

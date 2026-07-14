@@ -27,8 +27,10 @@ layout. It contains five independently ablatable groups:
 - **Hand decomposition:** bounded minimum turns before/after the action,
   delta, and exactness. `hand_decomposition` uses memoized DP for hands up to
   20 cards. A node budget is the deterministic primary bound; an optional time
-  budget is available for latency caps. Either timeout returns the same legal,
-  deterministic greedy upper bound rather than a partial search value.
+  budget is cooperatively checked at DP and candidate-enumeration boundaries.
+  Either timeout returns a fixed O(n), legal rank-group upper bound rather than
+  re-entering the combinatorial generator. Non-zero time-budget outcomes are
+  never stored in the process-wide LRU cache.
 - **Structure:** single/pair/triple/straight/serial-pair/airplane/bomb deltas,
   bomb break, rocket split, high-control-card use, and total structure cost.
 - **Control:** initiative proxy, move control strength, and blocking features
@@ -36,10 +38,14 @@ layout. It contains five independently ablatable groups:
 - **Farmer cooperation:** teammate/landlord cards left, teammate suppression,
   a one-card teammate feed signal, and explicit `landlord_up` versus
   `landlord_down` columns.
-- **Risk:** spring-risk and bomb opportunity-cost proxies.
+- **Risk:** spring-risk and bomb opportunity-cost proxies. Spring risk uses the
+  public per-role non-pass action counts, never the number of cards played.
 
 Disabled groups keep their columns as zeros so an ablation does not silently
-change the tensor width. These are learned inputs, not hard-coded policy rules.
+change the tensor width. `strategy_v1`, the ordered names, normalization
+divisors, and formula-semantics revision produce a stable layout hash that is
+part of the Model V2 checkpoint identity. These are learned inputs, not
+hard-coded policy rules.
 
 ## Auxiliary labels and losses
 
@@ -49,7 +55,7 @@ action. Label provenance is explicit:
 
 | Target | Source |
 |---|---|
-| `min_turns_after` | Direct bounded decomposition of the acting hand after the selected action |
+| `min_turns_after` | Exact bounded decomposition of the acting hand after the selected action; fallback upper bounds are masked out |
 | `structure_cost` | Direct deterministic structure calculation |
 | `regain_initiative` | Future public trajectory: the acting team later leads a non-pass trick |
 | `teammate_finish` | Terminal winner position; masked for landlord samples |
@@ -58,7 +64,8 @@ action. Label provenance is explicit:
 `Episode.label_strategy_auxiliary` creates these training-only labels after a
 trajectory ends. They are never model inputs. Each `loss.lambda_*` weight is an
 independent ablation switch; all default to zero. Active terms are logged as
-`aux_*` diagnostics by `V2Trainer`.
+`aux_*` diagnostics by `V2Trainer`. `target_min_turns_exact_mask` prevents a
+budget fallback from being treated as an exact regression label.
 
 ## Uncertainty-gated prior
 
@@ -102,8 +109,9 @@ decision_policy:
 Synthetic/unit coverage validates determinism, budgets, known tactical hands,
 all roles, gradients, masks, and checkpoint compatibility. Real human-data
 effects, playing strength, GPU throughput, and latency percentiles are **not
-measured** in P09. The default 500-node bound is a conservative CPU latency
-guard, not a claim that it is an optimal strength/latency setting.
+measured** in P09. The default 500-node bound limits DP state expansion; callers
+that require a wall-clock constraint must also set `strategy_time_budget_ms`.
+Neither default is a claim that it is an optimal strength/latency setting.
 
 Rollback requires only disabling the P09 model/loss/decision fields or loading
 a P06-P08 checkpoint under a strategy-disabled `ModelV2Config`. No rule,

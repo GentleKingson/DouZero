@@ -281,6 +281,8 @@ def _build_model_cfg(cfg):
     supervised. The remaining architecture knobs come from the ``model:``
     block when present (P06 r5).
     """
+    from dataclasses import replace
+
     from douzero.models_v2.config import ModelV2Config
 
     if cfg is None:
@@ -290,12 +292,10 @@ def _build_model_cfg(cfg):
     # actually drive model construction. Then overlay the loss-identity
     # fields (score_clamp, score_target_transform).
     base = ModelV2Config.from_model_config(cfg.model)
-    return ModelV2Config(
-        **{
-            **base.compatibility_dict(),
-            "score_clamp": cfg.loss.score_clamp,
-            "score_target_transform": cfg.loss.score_target_transform,
-        }
+    return replace(
+        base,
+        score_clamp=cfg.loss.score_clamp,
+        score_target_transform=cfg.loss.score_target_transform,
     )
 
 

@@ -5,7 +5,12 @@ describes actions that the rule engine has already declared legal.
 """
 
 from .config import STRATEGY_FEATURE_VERSION, StrategyFeatureConfig
-from .features import STRATEGY_FEATURE_NAMES, build_strategy_feature_matrix
+from .features import (
+    STRATEGY_FEATURE_LAYOUT_HASH,
+    STRATEGY_FEATURE_NAMES,
+    build_strategy_feature_matrix,
+    strategy_feature_layout_hash,
+)
 from .hand_decomposition import DecompositionResult, hand_decomposition
 from .structure import ActionStructureCost, action_structure_cost
 
@@ -13,9 +18,11 @@ __all__ = [
     "ActionStructureCost",
     "DecompositionResult",
     "STRATEGY_FEATURE_NAMES",
+    "STRATEGY_FEATURE_LAYOUT_HASH",
     "STRATEGY_FEATURE_VERSION",
     "StrategyFeatureConfig",
     "action_structure_cost",
     "build_strategy_feature_matrix",
     "hand_decomposition",
+    "strategy_feature_layout_hash",
 ]

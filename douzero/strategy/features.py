@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from functools import lru_cache
 
 import numpy as np
@@ -9,7 +11,7 @@ import numpy as np
 from douzero.env.move_detector import get_move_type
 from douzero.env.utils import TYPE_0_PASS, TYPE_1_SINGLE, TYPE_4_BOMB, TYPE_5_KING_BOMB
 
-from .config import StrategyFeatureConfig
+from .config import STRATEGY_FEATURE_VERSION, StrategyFeatureConfig
 from .hand_decomposition import hand_decomposition
 from .structure import action_structure_cost
 
@@ -25,6 +27,44 @@ STRATEGY_FEATURE_NAMES: tuple[str, ...] = (
 )
 STRATEGY_FEATURE_WIDTH: int = len(STRATEGY_FEATURE_NAMES)
 
+# Raw-value divisors applied by the v1 layout. Binary/probability features use
+# 1.0. These values participate in the layout hash so a same-width scaling
+# change cannot silently reinterpret checkpoint weights.
+STRATEGY_FEATURE_NORMALIZATION_DIVISORS: tuple[float, ...] = (
+    20.0, 20.0, 20.0, 1.0,
+    4.0, 4.0, 4.0, 8.0, 6.0, 4.0, 2.0, 1.0, 1.0, 4.0, 12.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    20.0, 20.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0,
+)
+
+
+def strategy_feature_layout_hash(
+    *,
+    version: str = STRATEGY_FEATURE_VERSION,
+    names: tuple[str, ...] = STRATEGY_FEATURE_NAMES,
+    normalization_divisors: tuple[float, ...] = STRATEGY_FEATURE_NORMALIZATION_DIVISORS,
+) -> str:
+    """Return the stable semantic identity of the strategy feature layout."""
+
+    if len(names) != len(normalization_divisors):
+        raise ValueError(
+            "strategy feature names and normalization divisors must have equal length"
+        )
+    payload = {
+        "version": version,
+        "names": list(names),
+        "normalization_divisors": list(normalization_divisors),
+        # Bump this tag for semantic/formula changes not captured by names or
+        # divisors (for example, a different definition of spring risk).
+        "formula_semantics": "p09_strategy_v1",
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+STRATEGY_FEATURE_LAYOUT_HASH: str = strategy_feature_layout_hash()
+
 
 def _team(role: str) -> str:
     return "landlord" if role == "landlord" else "farmer"
@@ -39,12 +79,21 @@ def _teammate(role: str) -> str | None:
 
 
 @lru_cache(maxsize=131_072)
-def _cached_decomposition(
-    hand: tuple[int, ...], node_budget: int, time_budget_ms: int
-):
-    return hand_decomposition(
-        hand, node_budget=node_budget, time_budget_ms=time_budget_ms
-    )
+def _cached_node_decomposition(hand: tuple[int, ...], node_budget: int):
+    return hand_decomposition(hand, node_budget=node_budget, time_budget_ms=0)
+
+
+def _decomposition(hand: tuple[int, ...], cfg: StrategyFeatureConfig):
+    # Wall-clock outcomes depend on runtime scheduling; never pin an exact vs
+    # fallback result in the process-wide LRU. Node-only search is deterministic
+    # and safe to cache.
+    if cfg.time_budget_ms > 0:
+        return hand_decomposition(
+            hand,
+            node_budget=cfg.node_budget,
+            time_budget_ms=cfg.time_budget_ms,
+        )
+    return _cached_node_decomposition(hand, cfg.node_budget)
 
 
 def _safe_norm(value: float, scale: float) -> float:
@@ -64,9 +113,10 @@ def _control_strength(move: tuple[int, ...]) -> float:
 
 
 def _spring_risk(public) -> float:
-    landlord_plays = len(public.played_cards.get("landlord", ()))
-    farmer_plays = len(public.played_cards.get("landlord_up", ())) + len(
-        public.played_cards.get("landlord_down", ())
+    action_counts = public.non_pass_action_counts
+    landlord_plays = action_counts.get("landlord", 0)
+    farmer_plays = action_counts.get("landlord_up", 0) + action_counts.get(
+        "landlord_down", 0
     )
     if public.acting_role == "landlord":
         return float(farmer_plays == 0 and public.num_cards_left.get("landlord", 0) <= 6)
@@ -83,8 +133,8 @@ def _feature_row(public, move: tuple[int, ...], cfg: StrategyFeatureConfig) -> l
     row = [0.0] * STRATEGY_FEATURE_WIDTH
 
     if cfg.hand_enabled:
-        before = _cached_decomposition(hand, cfg.node_budget, cfg.time_budget_ms)
-        after = _cached_decomposition(remaining_key, cfg.node_budget, cfg.time_budget_ms)
+        before = _decomposition(hand, cfg)
+        after = _decomposition(remaining_key, cfg)
         row[0:4] = [
             _safe_norm(before.min_turns, 20.0),
             _safe_norm(after.min_turns, 20.0),

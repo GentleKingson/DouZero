@@ -36,6 +36,22 @@ def _masked_bce(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor)
         logits.reshape(-1)[selected], targets.float().reshape(-1)[selected]
     )
 
+
+def _masked_huber(
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    selected = mask.bool().reshape(-1)
+    if not bool(selected.any()):
+        return predictions.sum() * 0.0
+    return huber_loss(
+        predictions.reshape(-1)[selected],
+        targets.float().reshape(-1)[selected],
+        delta=1.0,
+    )
+
+
 def strategy_auxiliary_loss(
     predictions: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
@@ -57,10 +73,10 @@ def strategy_auxiliary_loss(
     if missing:
         raise ValueError(f"missing strategy auxiliary predictions: {sorted(missing)}")
     all_mask = torch.ones_like(targets["min_turns_after"], dtype=torch.bool)
-    min_turns = huber_loss(
-        predictions["min_turns_after"].reshape(-1),
-        targets["min_turns_after"].float().reshape(-1),
-        delta=1.0,
+    min_turns = _masked_huber(
+        predictions["min_turns_after"],
+        targets["min_turns_after"],
+        targets["min_turns_exact_mask"],
     )
     regain = _masked_bce(
         predictions["regain_initiative_logit"], targets["regain_initiative"], all_mask

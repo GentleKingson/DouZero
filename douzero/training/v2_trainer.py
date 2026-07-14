@@ -655,7 +655,8 @@ class V2Trainer:
                 from douzero.strategy.auxiliary import strategy_auxiliary_loss
 
                 target_names = (
-                    "min_turns_after", "regain_initiative", "teammate_finish",
+                    "min_turns_after", "min_turns_exact_mask",
+                    "regain_initiative", "teammate_finish",
                     "teammate_finish_mask", "spring_probability", "structure_cost",
                 )
                 targets = {

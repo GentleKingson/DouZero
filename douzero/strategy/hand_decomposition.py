@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
+from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Callable
 
 from douzero.env.move_detector import get_move_type
 from douzero.env.move_generator import MovesGener
@@ -25,6 +27,26 @@ class _BudgetExceeded(RuntimeError):
     pass
 
 
+@dataclass
+class _SearchBudget:
+    """Shared cooperative node/deadline budget for one decomposition call."""
+
+    node_limit: int
+    deadline: float | None
+    clock: Callable[[], float]
+    nodes: int = 0
+
+    def check_deadline(self) -> None:
+        if self.deadline is not None and self.clock() >= self.deadline:
+            raise _BudgetExceeded
+
+    def visit_node(self) -> None:
+        self.check_deadline()
+        self.nodes += 1
+        if self.nodes > self.node_limit:
+            raise _BudgetExceeded
+
+
 def _canonical_cards(cards) -> tuple[int, ...]:
     out = tuple(sorted(int(card) for card in cards))
     if len(out) > 20:
@@ -32,14 +54,17 @@ def _canonical_cards(cards) -> tuple[int, ...]:
     return out
 
 
-@lru_cache(maxsize=131_072)
-def _candidate_moves(hand: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
-    """Return unique non-pass legal moves in stable best-first order."""
-
+def _generate_candidate_moves(
+    hand: tuple[int, ...], budget: _SearchBudget | None
+) -> tuple[tuple[int, ...], ...]:
+    """Generate stable legal moves, cooperatively checking ``budget``."""
     if not hand:
         return ()
     unique: set[tuple[int, ...]] = set()
-    for move in MovesGener(list(hand)).gen_moves():
+    check = budget.check_deadline if budget is not None else None
+    for move in MovesGener(list(hand), budget_check=check).gen_moves():
+        if budget is not None:
+            budget.check_deadline()
         key = tuple(sorted(move))
         move_type = get_move_type(list(key))["type"]
         if move_type not in (TYPE_0_PASS, TYPE_15_WRONG):
@@ -50,7 +75,19 @@ def _candidate_moves(hand: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
         bomb_penalty = int(move_type in (TYPE_4_BOMB, TYPE_5_KING_BOMB))
         return (bomb_penalty, -len(move), move)
 
-    return tuple(sorted(unique, key=order_key))
+    if budget is not None:
+        budget.check_deadline()
+    ordered = tuple(sorted(unique, key=order_key))
+    if budget is not None:
+        budget.check_deadline()
+    return ordered
+
+
+@lru_cache(maxsize=131_072)
+def _candidate_moves_cached(hand: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+    """Cache only searches without a wall-clock budget."""
+
+    return _generate_candidate_moves(hand, None)
 
 
 def _subtract(hand: tuple[int, ...], move: tuple[int, ...]) -> tuple[int, ...]:
@@ -60,18 +97,18 @@ def _subtract(hand: tuple[int, ...], move: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(remaining)
 
 
-@lru_cache(maxsize=131_072)
-def _heuristic_turns(hand: tuple[int, ...]) -> int:
-    """Deterministic legal-play upper bound used after any budget timeout."""
+def _linear_turn_upper_bound(hand: tuple[int, ...]) -> int:
+    """O(n) legal upper bound that never enumerates compound moves.
 
-    turns = 0
-    remaining = hand
-    while remaining:
-        moves = _candidate_moves(remaining)
-        if not moves:  # Defensive: every non-empty hand has a single-card move.
-            return turns + len(remaining)
-        remaining = _subtract(remaining, moves[0])
-        turns += 1
+    Each rank group is a legal single/pair/triple/bomb.  When both jokers are
+    present they form one rocket instead of two singles.  The result is not a
+    strength heuristic; it is a fixed-cost, deterministic timeout fallback.
+    """
+
+    counts = Counter(hand)
+    turns = len(counts)
+    if counts.get(20, 0) == 1 and counts.get(30, 0) == 1:
+        turns -= 1
     return turns
 
 
@@ -80,14 +117,21 @@ def hand_decomposition(
     *,
     node_budget: int = 500,
     time_budget_ms: int = 0,
+    clock: Callable[[], float] | None = None,
 ) -> DecompositionResult:
     """Compute minimum turns, or a deterministic legal upper bound on timeout.
 
     The exact solver is memoized dynamic programming over remaining-hand
     tuples.  ``node_budget`` is the deterministic primary bound.  An optional
-    wall-clock bound is available for latency-sensitive deployment; if either
-    bound fires, the returned value is the same deterministic greedy upper
-    bound for the original hand, rather than a partially explored result.
+    cooperative wall-clock deadline is available for latency-sensitive
+    deployment and is checked inside every combinatorial enumeration loop as
+    well as at DP state boundaries. Overrun is limited to the small fixed-cost
+    primitive between adjacent checks rather than a complete state expansion.
+    If either bound fires, the fallback is an O(n), deterministic legal upper
+    bound and never calls the combinatorial move generator again.
+
+    ``clock`` is injectable for deterministic deadline tests. Results from a
+    non-zero time budget are intentionally not stored in a permanent cache.
     """
 
     hand = _canonical_cards(cards)
@@ -98,24 +142,28 @@ def hand_decomposition(
     if not hand:
         return DecompositionResult(0, True, 1, False)
 
+    active_clock = clock or time.monotonic
     deadline = (
-        time.monotonic() + float(time_budget_ms) / 1000.0
+        active_clock() + float(time_budget_ms) / 1000.0
         if time_budget_ms > 0
         else None
     )
-    nodes = 0
+    budget = _SearchBudget(node_budget, deadline, active_clock)
     memo: dict[tuple[int, ...], int] = {(): 0}
 
     def solve(state: tuple[int, ...]) -> int:
-        nonlocal nodes
         cached = memo.get(state)
         if cached is not None:
             return cached
-        nodes += 1
-        if nodes > node_budget or (deadline is not None and time.monotonic() >= deadline):
-            raise _BudgetExceeded
-        best = _heuristic_turns(state)
-        for move in _candidate_moves(state):
+        budget.visit_node()
+        best = _linear_turn_upper_bound(state)
+        moves = (
+            _candidate_moves_cached(state)
+            if deadline is None
+            else _generate_candidate_moves(state, budget)
+        )
+        for move in moves:
+            budget.check_deadline()
             if len(move) == len(state):
                 best = 1
                 break
@@ -128,5 +176,7 @@ def hand_decomposition(
     try:
         result = solve(hand)
     except _BudgetExceeded:
-        return DecompositionResult(_heuristic_turns(hand), False, nodes, True)
-    return DecompositionResult(result, True, nodes, False)
+        return DecompositionResult(
+            _linear_turn_upper_bound(hand), False, budget.nodes, True
+        )
+    return DecompositionResult(result, True, budget.nodes, False)

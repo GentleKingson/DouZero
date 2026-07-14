@@ -62,6 +62,7 @@ class Transition:
     target_score: float = float("nan")
     target_log_score: float = float("nan")
     target_min_turns_after: float = float("nan")
+    target_min_turns_exact_mask: float = float("nan")
     target_regain_initiative: float = float("nan")
     target_teammate_finish: float = float("nan")
     target_teammate_finish_mask: float = float("nan")
@@ -154,6 +155,7 @@ class Transition:
             )
         aux_values = (
             self.target_min_turns_after,
+            self.target_min_turns_exact_mask,
             self.target_regain_initiative,
             self.target_teammate_finish,
             self.target_teammate_finish_mask,
@@ -164,7 +166,7 @@ class Transition:
             if not all(math.isfinite(value) for value in aux_values):
                 raise ValueError("Transition strategy auxiliary labels are partially populated")
             for name in (
-                "target_regain_initiative", "target_teammate_finish",
+                "target_min_turns_exact_mask", "target_regain_initiative", "target_teammate_finish",
                 "target_teammate_finish_mask", "target_spring_probability",
             ):
                 if getattr(self, name) not in (0.0, 1.0):
@@ -248,6 +250,7 @@ class Episode:
                 time_budget_ms=time_budget_ms,
             )
             transition.target_min_turns_after = float(decomposition.min_turns)
+            transition.target_min_turns_exact_mask = float(decomposition.exact)
             transition.target_structure_cost = action_structure_cost(
                 transition.obs.public.my_handcards, action
             ).total
@@ -302,6 +305,7 @@ class Minibatch:
     target_score: torch.Tensor  # (B,) float
     target_log_score: torch.Tensor  # (B,) float
     target_min_turns_after: torch.Tensor | None = None
+    target_min_turns_exact_mask: torch.Tensor | None = None
     target_regain_initiative: torch.Tensor | None = None
     target_teammate_finish: torch.Tensor | None = None
     target_teammate_finish_mask: torch.Tensor | None = None
@@ -332,7 +336,8 @@ class Minibatch:
             "target_log_score": b_log,
         }
         for name in (
-            "target_min_turns_after", "target_regain_initiative",
+            "target_min_turns_after", "target_min_turns_exact_mask",
+            "target_regain_initiative",
             "target_teammate_finish", "target_teammate_finish_mask",
             "target_spring_probability", "target_structure_cost",
         ):
@@ -435,6 +440,7 @@ class V2ReplayBuffer:
                 [p.target_log_score for p in picks], dtype=torch.float32
             ),
             target_min_turns_after=aux_tensor("target_min_turns_after"),
+            target_min_turns_exact_mask=aux_tensor("target_min_turns_exact_mask"),
             target_regain_initiative=aux_tensor("target_regain_initiative"),
             target_teammate_finish=aux_tensor("target_teammate_finish"),
             target_teammate_finish_mask=aux_tensor("target_teammate_finish_mask"),
