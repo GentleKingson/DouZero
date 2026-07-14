@@ -71,6 +71,7 @@ class LossConfig:
     lambda_win: float = 0.0
     lambda_score: float = 0.0
     lambda_uncertainty: float = 0.0
+    lambda_bc: float = 0.0  # P08: listwise BC auxiliary weight (default off)
     score_delta: float = 1.0
     score_target_transform: str = "raw"  # "raw" | "signed_log"
     score_clamp: float = 32.0
@@ -92,6 +93,87 @@ class DecisionPolicyConfig:
     abs_tol: float = 0.0
     rel_tol: float = 0.0
     risk_penalty: float = 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Behaviour cloning (P08 human-data prior)
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class BCConfig:
+    """Human-data behaviour-cloning configuration (P08).
+
+    SINGLE SOURCE OF TRUTH (Blocker 3): the BC auxiliary loss is enabled **iff**
+    ``loss.lambda_bc > 0``. This block carries only the BC-specific settings
+    (data path, temperature, label smoothing, weight schedule). There is no
+    separate ``enabled`` flag or duplicate ``lambda_bc`` here — both were
+    removed because they could silently disagree with ``loss.lambda_bc`` and
+    leave BC off when the user thought it was on.
+
+    ``schedule`` selects how ``loss.lambda_bc`` evolves over RL training (the
+    BC pretraining path itself ignores it and uses the pretrain_bc.py CLI
+    weight):
+
+    - ``"constant"`` (default): the weight is fixed.
+    - ``"linear_decay"``: the weight linearly decays to ``schedule_floor``
+      over ``schedule_steps`` (but is NOT forced below the floor); the default
+      floor keeps a residual prior so the model never fully forgets the human
+      signal.
+    """
+
+    data_path: str = ""  # validated canonical JSONL (human games)
+    temperature: float = 1.0
+    label_smoothing: float = 0.0
+    skill_weight_clip: float = 10.0
+    schedule: str = "constant"  # "constant" | "linear_decay"
+    schedule_steps: int = 0
+    schedule_floor: float = 0.0
+
+    def __post_init__(self) -> None:
+        import math
+
+        # Blocker: label_smoothing must be finite and in [0, 1) — values >= 1
+        # silently corrupt the listwise loss (negative target probs), and
+        # NaN/Inf propagate. Validate at the config boundary so a bad YAML
+        # fails at load, not silently mid-training.
+        if isinstance(self.label_smoothing, bool) or not isinstance(
+            self.label_smoothing, (int, float)
+        ):
+            raise ValueError(
+                f"BCConfig.label_smoothing must be a number, got "
+                f"{type(self.label_smoothing).__name__}"
+            )
+        if not math.isfinite(self.label_smoothing):
+            raise ValueError(
+                f"BCConfig.label_smoothing must be finite, got {self.label_smoothing}"
+            )
+        if not 0.0 <= self.label_smoothing < 1.0:
+            raise ValueError(
+                f"BCConfig.label_smoothing must be in [0, 1), got {self.label_smoothing}"
+            )
+        if not math.isfinite(self.temperature) or self.temperature <= 0.0:
+            raise ValueError(
+                f"BCConfig.temperature must be positive finite, got {self.temperature}"
+            )
+        if not math.isfinite(self.skill_weight_clip) or self.skill_weight_clip <= 0.0:
+            raise ValueError(
+                f"BCConfig.skill_weight_clip must be positive finite, "
+                f"got {self.skill_weight_clip}"
+            )
+        if not isinstance(self.schedule_steps, int) or isinstance(
+            self.schedule_steps, bool
+        ) or self.schedule_steps < 0:
+            raise ValueError(
+                f"BCConfig.schedule_steps must be a non-negative int, "
+                f"got {self.schedule_steps}"
+            )
+        if (
+            not math.isfinite(self.schedule_floor)
+            or self.schedule_floor < 0.0
+        ):
+            raise ValueError(
+                f"BCConfig.schedule_floor must be non-negative finite, "
+                f"got {self.schedule_floor}"
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +268,10 @@ class TrainingConfig:
     # P06 r5: V2 model architecture block. The legacy train.py path ignores
     # this; train_v2.py reads it via ModelV2Config.from_model_config().
     model: ModelConfig = field(default_factory=ModelConfig)
+    # P08: behaviour-cloning prior configuration. Defaults preserve the
+    # pre-P08 path (BC disabled). Consumed by pretrain_bc.py and the optional
+    # BC auxiliary loss hook in the V2 trainer.
+    bc: BCConfig = field(default_factory=BCConfig)
 
 
 # --------------------------------------------------------------------------- #

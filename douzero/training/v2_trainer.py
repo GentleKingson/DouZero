@@ -210,6 +210,10 @@ class V2Trainer:
         decision_config: DecisionConfig | None = None,
         config: TrainerConfig | None = None,
         belief_model=None,
+        bc_aux_samples=None,
+        bc_schedule=None,
+        bc_temperature: float = 1.0,
+        bc_label_smoothing: float = 0.0,
     ) -> None:
         _legacy_only(ruleset)
         loss_cfg = loss_config or LossConfig()
@@ -273,6 +277,50 @@ class V2Trainer:
                 p.requires_grad_(False)
             belief_model.eval()
         self.belief_model = belief_model
+        # P08: optional listwise BC auxiliary loss. When the BC schedule's base
+        # lambda is > 0 the trainer adds ``effective_lambda(t) * L_BC`` to the
+        # multi-objective RL loss at each optimizer step, where L_BC is the
+        # listwise cross-entropy over the legal-action list on a minibatch of
+        # human BC samples. This is the combined RL+BC path (task 11). A model
+        # without a prior head, or missing BC samples, is rejected when the
+        # base lambda is > 0.
+        from douzero.training.bc_loss import BCSchedule
+
+        base_lambda = float(getattr(loss_cfg, "lambda_bc", 0.0))
+        if bc_schedule is not None:
+            self.bc_schedule = bc_schedule
+        else:
+            # Default: a constant schedule at the loss config's lambda_bc.
+            self.bc_schedule = BCSchedule(base_lambda=base_lambda)
+        self.bc_aux_samples = list(bc_aux_samples) if bc_aux_samples is not None else []
+        # Blocker 3: temperature + label_smoothing actually reach listwise_bc_loss
+        # in the RL+BC path (previously ignored, so bc.temperature/label_smoothing
+        # in the YAML had no effect on the auxiliary term).
+        self.bc_temperature = float(bc_temperature)
+        self.bc_label_smoothing = float(bc_label_smoothing)
+        if self.bc_schedule.base_lambda > 0:
+            if getattr(self.model.config, "human_prior_enabled", False) is not True:
+                raise ValueError(
+                    "BC lambda_bc > 0 requires a value model built with "
+                    "human_prior_enabled=True (no prior head found). The "
+                    "BC auxiliary loss trains the prior head."
+                )
+            if not self.bc_aux_samples:
+                raise ValueError(
+                    "BC lambda_bc > 0 requires bc_aux_samples (the validated "
+                    "human BC dataset). Pass bc_aux_samples= to V2Trainer, or "
+                    "set lambda_bc=0 to disable the BC aux term."
+                )
+        elif self.bc_aux_samples:
+            # BC samples supplied but lambda_bc=0 -> they are unused. Warn
+            # rather than silently ignoring, so a misconfigured run is visible.
+            import warnings
+
+            warnings.warn(
+                "bc_aux_samples were supplied but lambda_bc == 0; "
+                "the BC auxiliary loss is disabled and the samples are unused.",
+                stacklevel=2,
+            )
         self.loss_fn = MultiObjectiveLoss(loss_cfg)
         self.decision_config = decision_config or DecisionConfig()
         self.config = config or TrainerConfig()
@@ -407,6 +455,60 @@ class V2Trainer:
         # device/dtype and the value loss updates only belief_proj.
         return torch.from_numpy(feat_np).detach()
 
+    def _compute_bc_aux_loss(self):
+        """Sample a BC minibatch and return the averaged listwise BC loss.
+
+        P08 task 11 (RL + BC combination). Forwards each sampled BC sample's
+        PUBLIC observation through the model's prior head and computes the
+        listwise cross-entropy over its legal-action list against the recorded
+        human action index. The returned :class:`~douzero.training.bc_loss.BCLossComponents`
+        carries the gradient; the caller scales it by ``lambda_bc`` and adds
+        it to the RL loss before ``backward()``.
+        """
+        from douzero.training.bc_loss import average_bc_losses, listwise_bc_loss
+
+        bs = self.config.batch_size
+        # Sample with replacement when the BC dataset is smaller than the
+        # batch (common in smoke tests); the loss is still an unbiased estimate.
+        idxs = [self.rng.randrange(len(self.bc_aux_samples)) for _ in range(bs)]
+        per_decision = []
+        for i in idxs:
+            s = self.bc_aux_samples[i]
+            bundle = observation_to_model_inputs(s.obs)
+            # P08 Blocker 1: compute the frozen belief features for this BC
+            # sample when the value model is belief-enabled. A belief-enabled
+            # model FAILS CLOSED at forward when belief_features are omitted,
+            # so without this the P07+P08 combo would crash at every optimizer
+            # step. The features come from the PUBLIC observation only.
+            belief_features = self._compute_belief_feature(s.obs)
+            out = self.model(
+                bundle.state_card_vectors,
+                bundle.state_context_flat,
+                bundle.context_card_vectors,
+                bundle.context_flat,
+                bundle.history_tokens,
+                bundle.history_key_padding_mask,
+                bundle.action_features,
+                bundle.action_mask,
+                bundle.acting_role,
+                belief_features=belief_features,
+            )
+            if out.prior_logit is None:
+                raise RuntimeError(
+                    "BC auxiliary loss requested but the model produced no "
+                    "prior_logit (the prior head disappeared mid-training)."
+                )
+            loss, hit = listwise_bc_loss(
+                out.prior_logit,
+                out.action_mask,
+                s.human_action_index,
+                weight=s.sample_weight,
+                temperature=self.bc_temperature,
+                label_smoothing=self.bc_label_smoothing,
+            )
+            per_decision.append((loss, hit))
+        return average_bc_losses(per_decision)
+
     def _choose_action_index(self, obs) -> int:
         """Epsilon-greedy action selection over the model's valid actions."""
         if self.config.exp_epsilon > 0.0 and self.rng.random() < self.config.exp_epsilon:
@@ -494,17 +596,45 @@ class V2Trainer:
                 win_logit, score_if_win, score_if_loss, batch_labels
             )
 
+            # P08: optional listwise BC auxiliary term. When lambda_bc > 0 the
+            # trainer samples a minibatch of human BC samples, forwards each
+            # through the prior head, and adds the (weighted, averaged) listwise
+            # cross-entropy scaled by lambda_bc to the RL loss. Both terms
+            # contribute gradients in a single backward pass.
+            total_loss = components.total
+            # P08 Blocker 1: the BC auxiliary weight follows the configured
+            # schedule (constant or linear_decay with a floor), evaluated at
+            # the CURRENT optimizer step so the weight evolves as configured.
+            eff_lambda = self.bc_schedule.effective_lambda(
+                self.stats.optimizer_steps
+            )
+            bc_diag: dict[str, float] = {}
+            if eff_lambda > 0.0:
+                bc_term = self._compute_bc_aux_loss()
+                total_loss = total_loss + eff_lambda * bc_term.total
+                # Non-blocking (round 4): record BC diagnostics for logging so
+                # schedule effects / BC collapse / weight imbalance are visible.
+                bc_diag = {
+                    "bc_cross_entropy": bc_term.cross_entropy,
+                    "bc_top1_accuracy": (
+                        bc_term.top1_correct / bc_term.num_decisions
+                        if bc_term.num_decisions > 0 else 0.0
+                    ),
+                    "bc_effective_lambda": eff_lambda,
+                    "bc_num_decisions": bc_term.num_decisions,
+                }
+
             # Fail-closed: a non-finite loss means something is wrong.
-            if not torch.isfinite(components.total):
+            if not torch.isfinite(total_loss):
                 raise FloatingPointError(
                     f"V2Trainer encountered a non-finite loss "
-                    f"({float(components.total.item())!r}); refusing to take an "
+                    f"({float(total_loss.item())!r}); refusing to take an "
                     f"optimizer step. Check the head clamp, the target clamp, "
                     f"and the input encoding."
                 )
 
             self.optimizer.zero_grad()
-            components.total.backward()
+            total_loss.backward()
             # error_if_nonfinite=True so a NaN/Inf gradient raises loudly
             # here instead of silently corrupting the optimizer state.
             grad_norm = nn.utils.clip_grad_norm_(
@@ -514,7 +644,14 @@ class V2Trainer:
             )
             self.optimizer.step()
             self.stats.optimizer_steps += 1
-            self.stats.last_loss = components.as_log_dict()
+            # Merge BC diagnostics into the last_loss log dict when active.
+            loss_log = components.as_log_dict()
+            if bc_diag:
+                loss_log.update(bc_diag)
+                # Round 6 suggestion: loss_total must reflect the ACTUAL total
+                # that was back-propagated (RL + BC), not just the RL part.
+                loss_log["loss_total"] = float(total_loss.detach().item())
+            self.stats.last_loss = loss_log
             self.stats.grad_norm_last_step = float(grad_norm.detach().float().item())
             # p_win distribution diagnostics.
             with torch.no_grad():

@@ -40,6 +40,12 @@ class ModelOutput:
     p_win: torch.Tensor
     score_mean: torch.Tensor
     action_mask: torch.Tensor
+    # P08: optional listwise policy-prior logits over the N legal actions. This
+    # head is only present when ``ModelV2`` is built with
+    # ``human_prior_enabled=True``; it is ``None`` otherwise (so a prior-
+    # disabled checkpoint produces an output without a dummy tensor, and a
+    # ``pure_prior`` decision mode fails loudly when the head is absent).
+    prior_logit: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         n = self.win_logit.shape[0]
@@ -69,6 +75,15 @@ class ModelOutput:
             raise ValueError(
                 f"action_mask must be bool, got {self.action_mask.dtype}"
             )
+        # P08: validate the optional prior head shape when present. Require
+        # EXACTLY 2D (N, 1) — a (N, 2, 1) tensor would pass a trailing-dim-only
+        # check but is semantically wrong (round 5 non-blocking hardening).
+        if self.prior_logit is not None:
+            if self.prior_logit.ndim != 2 or self.prior_logit.shape != (n, 1):
+                raise ValueError(
+                    f"prior_logit must have shape ({n}, 1), got "
+                    f"{tuple(self.prior_logit.shape)}"
+                )
 
     @property
     def num_actions(self) -> int:
@@ -91,3 +106,26 @@ class ModelOutput:
     def argmax_win(self) -> int:
         """Index of the highest-win-probability VALID action."""
         return int(torch.argmax(self.selected_win_logit()).item())
+
+    def selected_prior_logit(self) -> torch.Tensor:
+        """Return ``prior_logit`` squeezed to ``(N,)`` with padded rows -inf.
+
+        For argmax-over-actions selection under the ``pure_prior`` decision mode
+        (P08 ablation). Raises ``ValueError`` if the prior head is absent
+        (``prior_logit is None``) — a prior-driven decision requires a model
+        built with ``human_prior_enabled=True``.
+        """
+        if self.prior_logit is None:
+            raise ValueError(
+                "pure_prior selection requires a model built with "
+                "human_prior_enabled=True; this ModelOutput has no prior head."
+            )
+        if not bool(self.action_mask.any()):
+            raise ValueError("cannot select from zero valid actions")
+        masked = self.prior_logit.squeeze(-1).clone()
+        masked[~self.action_mask] = float("-inf")
+        return masked
+
+    def argmax_prior(self) -> int:
+        """Index of the highest-prior-logit VALID action (P08 ablation)."""
+        return int(torch.argmax(self.selected_prior_logit()).item())

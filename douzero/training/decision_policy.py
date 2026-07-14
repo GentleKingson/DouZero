@@ -43,13 +43,16 @@ from douzero.models_v2.output import ModelOutput
 
 #: Canonical decision mode names. ``win`` and ``score`` are kept as aliases
 #: for the P05 ``decision_mode`` values so the DeepAgentV2 validator stays
-#: backward-compatible.
+#: backward-compatible. ``pure_prior`` is the P08 ablation mode that selects the
+#: highest human-play prior logit (requires a model built with
+#: ``human_prior_enabled=True``).
 SUPPORTED_DECISION_MODES: tuple[str, ...] = (
     "pure_win",
     "pure_score",
     "win_then_score",
     "score_then_win",
     "risk_aware",
+    "pure_prior",
     # P05 aliases (kept for backward compatibility with the existing
     # DeepAgentV2 ``decision_mode`` argument).
     "win",
@@ -66,6 +69,7 @@ _ALIAS_MAP: dict[str, str] = {
     "win_then_score": "win_then_score",
     "score_then_win": "score_then_win",
     "risk_aware": "risk_aware",
+    "pure_prior": "pure_prior",
 }
 
 
@@ -219,4 +223,9 @@ def select_action(
         penalty = win_unc + 0.5 * norm_spread
         risk_adjusted = score_mean - config.risk_penalty * penalty
         return _argmax_masked(risk_adjusted, mask)
+    if config.mode == "pure_prior":
+        # P08 ablation: select the highest human-play prior logit. Requires a
+        # model built with human_prior_enabled=True (a prior head); the helper
+        # raises ValueError when prior_logit is None.
+        return output.argmax_prior()
     raise ValueError(f"unhandled decision mode {config.mode!r}")  # pragma: no cover

@@ -234,6 +234,9 @@ def _build_loss_config(cfg):
     back to 1.0, silently breaking the "λ=0 disables" contract. When no
     YAML config is provided we fall back to the V2 multi-objective default
     (``LossConfig()``).
+
+    P08 Blocker 1: ``lambda_bc`` is now threaded through so the YAML
+    ``loss.lambda_bc`` actually drives the BC auxiliary term.
     """
     from douzero.training import LossConfig
 
@@ -243,6 +246,7 @@ def _build_loss_config(cfg):
         lambda_win=cfg.loss.lambda_win,
         lambda_score=cfg.loss.lambda_score,
         lambda_uncertainty=cfg.loss.lambda_uncertainty,
+        lambda_bc=cfg.loss.lambda_bc,
         score_delta=cfg.loss.score_delta,
         score_target_transform=cfg.loss.score_target_transform,
         score_clamp=cfg.loss.score_clamp,
@@ -414,6 +418,123 @@ def main() -> None:
             expected_feature_version="v2",
         )
 
+    # P08 Blocker 1: build the BC auxiliary samples + schedule when the YAML
+    # enables RL+BC. This wires bc.data_path -> BCSamples -> V2Trainer's
+    # bc_aux_samples, and bc.schedule -> BCSchedule, so the YAML config
+    # ACTUALLY drives the BC auxiliary term end-to-end (not just the
+    # programmatic interface tested in isolation).
+    import sys  # noqa: F811 — local import keeps the BC block self-contained
+
+    bc_aux_samples = None
+    bc_schedule = None
+    bc_cfg = getattr(yaml_cfg, "bc", None) if yaml_cfg is not None else None
+    # The model must have a prior head when lambda_bc > 0; if the YAML sets
+    # lambda_bc > 0 but forgot human_prior_enabled, fail fast with a precise
+    # error rather than letting the trainer reject it later.
+    if loss_cfg.lambda_bc > 0:
+        if not getattr(model_cfg, "human_prior_enabled", False):
+            raise ValueError(
+                "loss.lambda_bc > 0 requires model.human_prior_enabled=true. "
+                "The BC auxiliary loss trains the prior head, which the model "
+                "does not have under the current config."
+            )
+        from douzero.training.bc_loss import BCSchedule
+
+        if bc_cfg is None:
+            raise ValueError(
+                "loss.lambda_bc > 0 requires a bc: config block "
+                "(bc.data_path at minimum)."
+            )
+        if not bc_cfg.data_path:
+            raise ValueError(
+                "loss.lambda_bc > 0 requires bc.data_path (a validated "
+                "canonical JSONL of human games). Run ingest_human_games.py "
+                "+ validate_human_games.py first."
+            )
+        # Load + validate + sample the human data ONCE at startup (Blocker 2:
+        # the ruleset identity is verified inside build_bc_samples).
+        from douzero.human_data.sample import build_bc_samples_with_report
+        from douzero.human_data.schema import read_jsonl
+        from douzero.human_data.validate import validate_record
+        from douzero.human_data.weights import WeightConfig, apply_sample_weights
+
+        # Blocker 1: load + validate + sample with NO silent drops. Records
+        # that fail replay validation are collected into validation_quarantine
+        # and written to a bc_quarantine.jsonl alongside the checkpoint, with
+        # the game_id + reason + error. They are NEVER swallowed by a filter
+        # generator (the earlier `r for r in ... if validate_record(r).ok`
+        # silently dropped them with no trace).
+        bc_records = list(read_jsonl(bc_cfg.data_path))
+        valid_records = []
+        validation_quarantine: list[str] = []
+        import json as _json
+
+        for record in bc_records:
+            result = validate_record(record)
+            if result.ok:
+                valid_records.append(record)
+            else:
+                validation_quarantine.append(
+                    _json.dumps(
+                        {
+                            "game_id": record.game_id,
+                            "stage": "replay_validation",
+                            "reason": result.reason,
+                            "error": result.error,
+                        },
+                        sort_keys=True, ensure_ascii=False,
+                    )
+                )
+        bc_report = build_bc_samples_with_report(valid_records)
+        # Merge the sampling-stage quarantine with the validation-stage one.
+        for game_id, error in bc_report.quarantined:
+            validation_quarantine.append(
+                _json.dumps(
+                    {
+                        "game_id": game_id,
+                        "stage": "bc_sampling",
+                        "reason": "BCSampleError",
+                        "error": error,
+                    },
+                    sort_keys=True, ensure_ascii=False,
+                )
+            )
+        if validation_quarantine:
+            q_path = "bc_quarantine.jsonl"
+            with open(q_path, "w", encoding="utf-8") as fh:
+                for line in validation_quarantine:
+                    fh.write(line)
+                    fh.write("\n")
+            print(
+                f"[train_v2] BC quarantine: {len(validation_quarantine)} "
+                f"records failed validation/sampling -> {q_path} "
+                f"(run validate_human_games.py to quarantine upstream).",
+                file=sys.stderr,
+            )
+        if not bc_report.samples:
+            raise ValueError(
+                f"bc.data_path {bc_cfg.data_path!r} yielded no BC samples "
+                f"({len(validation_quarantine)} quarantined)."
+            )
+        bc_aux_samples = apply_sample_weights(
+            bc_report.samples,
+            config=WeightConfig(
+                skill_weight_clip=bc_cfg.skill_weight_clip
+            ),
+        )
+        bc_schedule = BCSchedule(
+            base_lambda=loss_cfg.lambda_bc,
+            schedule=bc_cfg.schedule,
+            schedule_steps=bc_cfg.schedule_steps,
+            schedule_floor=bc_cfg.schedule_floor,
+        )
+        print(
+            f"[train_v2] BC aux: {len(bc_aux_samples)} samples from "
+            f"{bc_cfg.data_path!r}, schedule={bc_cfg.schedule} "
+            f"lambda_bc={loss_cfg.lambda_bc}",
+            file=sys.stderr,
+        )
+
     trainer = V2Trainer(
         model,
         ruleset=ruleset,
@@ -421,6 +542,10 @@ def main() -> None:
         decision_config=decision_cfg,
         config=trainer_cfg,
         belief_model=belief_model,
+        bc_aux_samples=bc_aux_samples,
+        bc_schedule=bc_schedule,
+        bc_temperature=(bc_cfg.temperature if bc_cfg is not None else 1.0),
+        bc_label_smoothing=(bc_cfg.label_smoothing if bc_cfg is not None else 0.0),
     )
 
     print(

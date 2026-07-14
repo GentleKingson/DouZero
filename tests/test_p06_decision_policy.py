@@ -70,6 +70,23 @@ def test_unknown_mode_rejected():
 def test_all_supported_modes_select_valid_action():
     output = _make_output([0.4, 0.6, 0.5], [-1.0, 0.5, 0.0])
     for mode in SUPPORTED_DECISION_MODES:
+        if mode == "pure_prior":
+            # pure_prior (P08) requires a prior head; the default _make_output
+            # has no prior_logit. Build one with a prior head and verify it
+            # selects a valid action, and separately that a prior-less output
+            # raises (covered in test_p08_prior_and_loss).
+            prior_out = ModelOutput(
+                win_logit=output.win_logit,
+                score_if_win=output.score_if_win,
+                score_if_loss=output.score_if_loss,
+                p_win=output.p_win,
+                score_mean=output.score_mean,
+                action_mask=output.action_mask,
+                prior_logit=torch.tensor([[0.0], [0.7], [0.2]]),
+            )
+            idx = select_action(prior_out, DecisionConfig(mode=mode, risk_penalty=0.1))
+            assert 0 <= idx < 3
+            continue
         cfg = DecisionConfig(mode=mode, risk_penalty=0.1)
         idx = select_action(output, cfg)
         assert 0 <= idx < 3
