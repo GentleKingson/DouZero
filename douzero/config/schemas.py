@@ -72,6 +72,11 @@ class LossConfig:
     lambda_score: float = 0.0
     lambda_uncertainty: float = 0.0
     lambda_bc: float = 0.0  # P08: listwise BC auxiliary weight (default off)
+    lambda_min_turns: float = 0.0
+    lambda_regain_initiative: float = 0.0
+    lambda_teammate_finish: float = 0.0
+    lambda_spring: float = 0.0
+    lambda_structure: float = 0.0
     score_delta: float = 1.0
     score_target_transform: str = "raw"  # "raw" | "signed_log"
     score_clamp: float = 32.0
@@ -93,6 +98,7 @@ class DecisionPolicyConfig:
     abs_tol: float = 0.0
     rel_tol: float = 0.0
     risk_penalty: float = 0.0
+    prior_alpha: float = 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -214,6 +220,15 @@ class ModelConfig:
     # (P09 attaches more; P05 keeps the structural skeleton).
     belief_enabled: bool = False
     human_prior_enabled: bool = False
+    strategy_features_enabled: bool = False
+    strategy_hand_enabled: bool = True
+    strategy_structure_enabled: bool = True
+    strategy_control_enabled: bool = True
+    strategy_cooperation_enabled: bool = True
+    strategy_risk_enabled: bool = True
+    strategy_aux_enabled: bool = False
+    strategy_node_budget: int = 500
+    strategy_time_budget_ms: int = 0
 
 
 # --------------------------------------------------------------------------- #

@@ -346,6 +346,7 @@ deferred to P14.
   into the state trunk; the architecture delta is captured by the existing
   `belief_enabled` identity axis, so belief-disabled checkpoints are
   unaffected.
-- Human prior / auxiliary heads (P08/P09): `human_prior_enabled` is carried but
-  no prior head is attached yet.
+- Human prior / auxiliary heads: P08 attaches the optional listwise prior;
+  P09 attaches versioned public strategy inputs and five optional auxiliary
+  heads. See `human_data_and_bc.md` and `strategy_features.md`.
 - AMP / DDP / `torch.compile` (P14).

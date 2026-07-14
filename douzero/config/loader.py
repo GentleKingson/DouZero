@@ -208,12 +208,21 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     # P06 multi-objective loss + decision-policy nested fields.
     "lambda_win": float, "lambda_score": float,
     "lambda_uncertainty": float, "score_delta": float,
+    "lambda_bc": float, "lambda_min_turns": float,
+    "lambda_regain_initiative": float, "lambda_teammate_finish": float,
+    "lambda_spring": float, "lambda_structure": float,
     "score_target_transform": str, "score_clamp": float,
     "mode": str, "abs_tol": float, "rel_tol": float, "risk_penalty": float,
+    "prior_alpha": float,
     # P06 r5: V2 model architecture nested fields.
     "version": str, "hidden_size": int, "history_encoder": str,
     "history_layers": int, "history_heads": int, "role_embedding_dim": int,
     "belief_enabled": bool, "human_prior_enabled": bool,
+    "strategy_features_enabled": bool, "strategy_hand_enabled": bool,
+    "strategy_structure_enabled": bool, "strategy_control_enabled": bool,
+    "strategy_cooperation_enabled": bool, "strategy_risk_enabled": bool,
+    "strategy_aux_enabled": bool, "strategy_node_budget": int,
+    "strategy_time_budget_ms": int,
     # P08: behaviour-cloning nested fields. (Blocker 3: ``enabled`` and
     # ``lambda_bc`` were removed from BCConfig — ``loss.lambda_bc`` is the sole
     # enable condition / weight, so they are no longer valid bc: keys.)
@@ -262,17 +271,24 @@ def _validate_types(cfg: TrainingConfig) -> None:
             _check_field(name, getattr(cfg.optimizer, name), "optimizer")
         elif name in {
             "lambda_win", "lambda_score", "lambda_uncertainty", "lambda_bc",
+            "lambda_min_turns", "lambda_regain_initiative",
+            "lambda_teammate_finish", "lambda_spring", "lambda_structure",
             "score_delta", "score_clamp",
         }:
             _check_field(name, getattr(cfg.loss, name), "loss")
         elif name == "score_target_transform":
             _check_field(name, getattr(cfg.loss, name), "loss")
-        elif name in {"mode", "abs_tol", "rel_tol", "risk_penalty"}:
+        elif name in {"mode", "abs_tol", "rel_tol", "risk_penalty", "prior_alpha"}:
             _check_field(name, getattr(cfg.decision_policy, name), "decision_policy")
         elif name in {
             "version", "hidden_size", "history_encoder", "history_layers",
             "history_heads", "role_embedding_dim", "belief_enabled",
             "human_prior_enabled",
+            "strategy_features_enabled", "strategy_hand_enabled",
+            "strategy_structure_enabled", "strategy_control_enabled",
+            "strategy_cooperation_enabled", "strategy_risk_enabled",
+            "strategy_aux_enabled", "strategy_node_budget",
+            "strategy_time_budget_ms",
         }:
             _check_field(name, getattr(cfg.model, name), "model")
         elif name in {

@@ -58,6 +58,7 @@ douzero/observation/
 | `my_handcards` | the acting player's hand |
 | `other_handcards` | the public unseen pool (swap-invariant; equals the legacy `other_hand_cards` union) |
 | `played_cards` | cumulative played cards per role |
+| `non_pass_action_counts` | cumulative public non-pass card-play action counts per role (the spring/anti-spring authority) |
 | `last_move`, `last_move_dict` | the move to beat + per-role last move |
 | `bottom_cards` | revealed bottom cards, their unplayed subset, owner (`landlord`) |
 | `num_cards_left` | per-role remaining-card count |

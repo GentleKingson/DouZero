@@ -465,7 +465,9 @@ class DeepAgentV2:
     def _select_from_observation(self, obs):
         from douzero.models_v2.batch import observation_to_model_inputs
 
-        bundle = observation_to_model_inputs(obs)
+        bundle = observation_to_model_inputs(
+            obs, self.model.strategy_feature_config()
+        )
         if torch.cuda.is_available():
             bundle.to("cuda")
         # P07: when the value model is belief-enabled, compute the constrained
@@ -501,6 +503,7 @@ class DeepAgentV2:
                 bundle.action_mask,
                 bundle.acting_role,
                 belief_features=belief_features,
+                strategy_features=bundle.strategy_features,
             )
         # P06 r1: route through the unified decision policy using the FULL
         # DecisionConfig (carrying abs_tol / rel_tol / risk_penalty), not a

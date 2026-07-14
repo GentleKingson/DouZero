@@ -247,6 +247,11 @@ def _build_loss_config(cfg):
         lambda_score=cfg.loss.lambda_score,
         lambda_uncertainty=cfg.loss.lambda_uncertainty,
         lambda_bc=cfg.loss.lambda_bc,
+        lambda_min_turns=cfg.loss.lambda_min_turns,
+        lambda_regain_initiative=cfg.loss.lambda_regain_initiative,
+        lambda_teammate_finish=cfg.loss.lambda_teammate_finish,
+        lambda_spring=cfg.loss.lambda_spring,
+        lambda_structure=cfg.loss.lambda_structure,
         score_delta=cfg.loss.score_delta,
         score_target_transform=cfg.loss.score_target_transform,
         score_clamp=cfg.loss.score_clamp,
@@ -263,6 +268,7 @@ def _build_decision_config(cfg):
         abs_tol=cfg.decision_policy.abs_tol,
         rel_tol=cfg.decision_policy.rel_tol,
         risk_penalty=cfg.decision_policy.risk_penalty,
+        prior_alpha=cfg.decision_policy.prior_alpha,
     )
 
 
@@ -275,6 +281,8 @@ def _build_model_cfg(cfg):
     supervised. The remaining architecture knobs come from the ``model:``
     block when present (P06 r5).
     """
+    from dataclasses import replace
+
     from douzero.models_v2.config import ModelV2Config
 
     if cfg is None:
@@ -284,12 +292,10 @@ def _build_model_cfg(cfg):
     # actually drive model construction. Then overlay the loss-identity
     # fields (score_clamp, score_target_transform).
     base = ModelV2Config.from_model_config(cfg.model)
-    return ModelV2Config(
-        **{
-            **base.compatibility_dict(),
-            "score_clamp": cfg.loss.score_clamp,
-            "score_target_transform": cfg.loss.score_target_transform,
-        }
+    return replace(
+        base,
+        score_clamp=cfg.loss.score_clamp,
+        score_target_transform=cfg.loss.score_target_transform,
     )
 
 

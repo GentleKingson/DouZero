@@ -43,17 +43,29 @@ class ActionEncoder(nn.Module):
         Output embedding width.
     """
 
-    def __init__(self, action_width: int, hidden_size: int) -> None:
+    def __init__(
+        self,
+        action_width: int,
+        hidden_size: int,
+        strategy_width: int = 0,
+    ) -> None:
         super().__init__()
         if action_width <= 0:
             raise ValueError(f"action_width must be positive, got {action_width}")
         if hidden_size <= 0:
             raise ValueError(f"hidden_size must be positive, got {hidden_size}")
+        if strategy_width < 0:
+            raise ValueError(f"strategy_width must be non-negative, got {strategy_width}")
         self.action_width = action_width
         self.hidden_size = hidden_size
-        self.proj = nn.Linear(action_width, hidden_size)
+        self.strategy_width = strategy_width
+        self.proj = nn.Linear(action_width + strategy_width, hidden_size)
 
-    def forward(self, action_features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        action_features: torch.Tensor,
+        strategy_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Embed a batch of action feature rows.
 
         Parameters
@@ -76,4 +88,31 @@ class ActionEncoder(nn.Module):
                 f"action_features trailing dim {action_features.shape[-1]} != "
                 f"action_width {self.action_width}"
             )
-        return self.proj(action_features.float())
+        if self.strategy_width == 0:
+            if strategy_features is not None:
+                raise ValueError(
+                    "strategy_features were passed to a strategy-disabled ActionEncoder"
+                )
+            combined = action_features.float()
+        else:
+            if strategy_features is None:
+                raise ValueError(
+                    "strategy_features are required by a strategy-enabled ActionEncoder"
+                )
+            expected = (action_features.shape[0], self.strategy_width)
+            if tuple(strategy_features.shape) != expected:
+                raise ValueError(
+                    f"strategy_features must have shape {expected}, got "
+                    f"{tuple(strategy_features.shape)}"
+                )
+            combined = torch.cat(
+                [
+                    action_features.float(),
+                    strategy_features.to(
+                        device=action_features.device,
+                        dtype=torch.float32,
+                    ),
+                ],
+                dim=-1,
+            )
+        return self.proj(combined)

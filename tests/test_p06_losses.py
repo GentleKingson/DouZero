@@ -272,6 +272,8 @@ def test_loss_config_to_dict_roundtrip_keys():
     d = cfg.to_dict()
     assert set(d.keys()) == {
         "lambda_win", "lambda_score", "lambda_uncertainty", "lambda_bc",
+        "lambda_min_turns", "lambda_regain_initiative",
+        "lambda_teammate_finish", "lambda_spring", "lambda_structure",
         "score_delta", "score_target_transform", "score_clamp",
     }
 

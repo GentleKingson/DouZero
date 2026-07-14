@@ -76,6 +76,18 @@ model:
   role_embedding_dim: 32
   belief_enabled: false
   human_prior_enabled: false
+  # P09 strategy features/heads are opt-in. Feature-group toggles are kept in
+  # checkpoint identity for reproducible ablations. The bounded DP falls back
+  # deterministically when strategy_node_budget is exhausted.
+  strategy_features_enabled: false
+  strategy_hand_enabled: true
+  strategy_structure_enabled: true
+  strategy_control_enabled: true
+  strategy_cooperation_enabled: true
+  strategy_risk_enabled: true
+  strategy_aux_enabled: false
+  strategy_node_budget: 500
+  strategy_time_budget_ms: 0
 
 # P06 multi-objective loss. These are the V2 trainer defaults: BCE win head
 # (weight 1.0) + masked Huber conditional score heads (weight 0.5). The
@@ -90,6 +102,13 @@ loss:
   lambda_win: 1.0
   lambda_score: 0.5
   lambda_uncertainty: 0.0
+  # P09 auxiliary objectives. Each is independently ablatable and all default
+  # off; non-zero values require model.strategy_aux_enabled: true.
+  lambda_min_turns: 0.0
+  lambda_regain_initiative: 0.0
+  lambda_teammate_finish: 0.0
+  lambda_spring: 0.0
+  lambda_structure: 0.0
   score_delta: 1.0
   score_target_transform: raw
   score_clamp: 32.0
@@ -105,6 +124,8 @@ decision_policy:
   abs_tol: 0.0
   rel_tol: 0.0
   risk_penalty: 0.0
+  # Used only by mode: uncertainty_gated_prior. alpha=0 is exactly pure_score.
+  prior_alpha: 0.0
 
 # P08 human-data behaviour-cloning prior. The BC auxiliary loss is enabled iff
 # loss.lambda_bc > 0 (single source of truth — there is no separate bc.enabled

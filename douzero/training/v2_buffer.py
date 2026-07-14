@@ -61,6 +61,15 @@ class Transition:
     target_win: float = float("nan")
     target_score: float = float("nan")
     target_log_score: float = float("nan")
+    target_min_turns_after: float = float("nan")
+    target_min_turns_exact_mask: float = float("nan")
+    target_regain_initiative: float = float("nan")
+    target_teammate_finish: float = float("nan")
+    target_teammate_finish_mask: float = float("nan")
+    target_spring_probability: float = float("nan")
+    target_structure_cost: float = float("nan")
+    # Index in Episode.action_trace. -1 is accepted for pre-P09/manual tests.
+    trace_index: int = -1
 
     def has_labels(self) -> bool:
         """Quick NaN check for the label-stamping loop.
@@ -121,6 +130,10 @@ class Transition:
                 f"Transition.action_index must be int, got "
                 f"{type(self.action_index).__name__}: {self.action_index!r}"
             )
+        if isinstance(self.trace_index, bool) or not isinstance(self.trace_index, int):
+            raise TypeError("Transition.trace_index must be int")
+        if self.trace_index < -1:
+            raise ValueError("Transition.trace_index must be -1 or non-negative")
         n_actions = len(self.obs.actions.legal_actions)
         if not (0 <= self.action_index < n_actions):
             raise ValueError(
@@ -140,6 +153,26 @@ class Transition:
             raise ValueError(
                 f"Transition.target_win must be 0.0 or 1.0, got {self.target_win!r}"
             )
+        aux_values = (
+            self.target_min_turns_after,
+            self.target_min_turns_exact_mask,
+            self.target_regain_initiative,
+            self.target_teammate_finish,
+            self.target_teammate_finish_mask,
+            self.target_spring_probability,
+            self.target_structure_cost,
+        )
+        if any(math.isfinite(value) for value in aux_values):
+            if not all(math.isfinite(value) for value in aux_values):
+                raise ValueError("Transition strategy auxiliary labels are partially populated")
+            for name in (
+                "target_min_turns_exact_mask", "target_regain_initiative", "target_teammate_finish",
+                "target_teammate_finish_mask", "target_spring_probability",
+            ):
+                if getattr(self, name) not in (0.0, 1.0):
+                    raise ValueError(f"Transition.{name} must be binary")
+            if self.target_min_turns_after < 0 or self.target_structure_cost < 0:
+                raise ValueError("strategy regression labels must be non-negative")
 
 
 @dataclass
@@ -148,6 +181,10 @@ class Episode:
 
     transitions: list[Transition] = field(default_factory=list)
     terminal_result: dict = field(default_factory=dict)
+    # Complete public action trace, including forced single-action decisions.
+    # P09 trajectory labels use it so spring/finisher targets are not biased by
+    # the replay buffer's deliberate omission of trivial decisions.
+    action_trace: list[tuple[str, tuple[int, ...]]] = field(default_factory=list)
 
     def label_from_terminal(self) -> None:
         """Apply per-position team-perspective labels to every transition.
@@ -168,6 +205,95 @@ class Episode:
             tr.target_score = float(labels["target_score"])
             tr.target_log_score = float(labels["target_log_score"])
 
+    def label_strategy_auxiliary(self, *, node_budget: int, time_budget_ms: int) -> None:
+        """Stamp direct and future-trajectory P09 targets on every transition."""
+
+        from douzero.strategy.hand_decomposition import hand_decomposition
+        from douzero.strategy.structure import action_structure_cost
+
+        winner_position = str(self.terminal_result.get("winner_position", ""))
+        winner_team = str(self.terminal_result.get("winner_team", ""))
+        if winner_position in ("", "farmer") and self.action_trace:
+            winner_position = self.action_trace[-1][0]
+        ruleset_id = str(self.terminal_result.get("ruleset_id", ""))
+        if ruleset_id != "legacy" and (
+            "spring" in self.terminal_result
+            or "anti_spring" in self.terminal_result
+        ):
+            spring = float(
+                bool(self.terminal_result.get("spring", False))
+                or bool(self.terminal_result.get("anti_spring", False))
+            )
+        else:
+            non_pass_by_role = {role: 0 for role in _VALID_POSITIONS}
+            trace = self.action_trace or [
+                (
+                    transition.position,
+                    transition.obs.actions.legal_actions[transition.action_index],
+                )
+                for transition in self.transitions
+            ]
+            for position, action in trace:
+                if action:
+                    non_pass_by_role[position] += 1
+            spring = float(
+                (winner_team == "landlord" and non_pass_by_role["landlord_up"] == 0
+                 and non_pass_by_role["landlord_down"] == 0)
+                or (winner_team == "farmer" and non_pass_by_role["landlord"] <= 1)
+            )
+
+        def team(role: str) -> str:
+            return "landlord" if role == "landlord" else "farmer"
+
+        for index, transition in enumerate(self.transitions):
+            action = transition.obs.actions.legal_actions[transition.action_index]
+            remaining = list(transition.obs.public.my_handcards)
+            for card in action:
+                remaining.remove(card)
+            decomposition = hand_decomposition(
+                remaining,
+                node_budget=node_budget,
+                time_budget_ms=time_budget_ms,
+            )
+            transition.target_min_turns_after = float(decomposition.min_turns)
+            transition.target_min_turns_exact_mask = float(decomposition.exact)
+            transition.target_structure_cost = action_structure_cost(
+                transition.obs.public.my_handcards, action
+            ).total
+            transition.target_spring_probability = spring
+            transition.target_teammate_finish_mask = float(
+                transition.position != "landlord"
+            )
+            transition.target_teammate_finish = float(
+                transition.position != "landlord"
+                and winner_team == "farmer"
+                and winner_position not in ("", transition.position)
+            )
+            transition.target_regain_initiative = 0.0
+            if transition.trace_index >= 0 and self.action_trace:
+                for trace_index in range(transition.trace_index + 1, len(self.action_trace)):
+                    future_position, future_action = self.action_trace[trace_index]
+                    prior_two_passed = (
+                        trace_index >= 2
+                        and not self.action_trace[trace_index - 1][1]
+                        and not self.action_trace[trace_index - 2][1]
+                    )
+                    if (
+                        future_action
+                        and prior_two_passed
+                        and team(future_position) == team(transition.position)
+                    ):
+                        transition.target_regain_initiative = 1.0
+                        break
+            else:
+                for future in self.transitions[index + 1:]:
+                    if team(future.position) != team(transition.position):
+                        continue
+                    future_action = future.obs.actions.legal_actions[future.action_index]
+                    if future_action and not future.obs.public.last_move:
+                        transition.target_regain_initiative = 1.0
+                        break
+
 
 @dataclass
 class Minibatch:
@@ -184,6 +310,13 @@ class Minibatch:
     target_win: torch.Tensor  # (B,) float
     target_score: torch.Tensor  # (B,) float
     target_log_score: torch.Tensor  # (B,) float
+    target_min_turns_after: torch.Tensor | None = None
+    target_min_turns_exact_mask: torch.Tensor | None = None
+    target_regain_initiative: torch.Tensor | None = None
+    target_teammate_finish: torch.Tensor | None = None
+    target_teammate_finish_mask: torch.Tensor | None = None
+    target_spring_probability: torch.Tensor | None = None
+    target_structure_cost: torch.Tensor | None = None
 
     @property
     def batch_size(self) -> int:
@@ -208,6 +341,15 @@ class Minibatch:
             "target_score": b_score,
             "target_log_score": b_log,
         }
+        for name in (
+            "target_min_turns_after", "target_min_turns_exact_mask",
+            "target_regain_initiative",
+            "target_teammate_finish", "target_teammate_finish_mask",
+            "target_spring_probability", "target_structure_cost",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                lengths[name] = int(value.shape[0])
         if len(set(lengths.values())) != 1:
             raise ValueError(
                 f"Minibatch batch lengths disagree: {lengths}"
@@ -287,6 +429,10 @@ class V2ReplayBuffer:
         for ep in self._episodes:
             flat.extend(ep.transitions)
         picks = rng.sample(flat, batch_size)
+        has_aux = all(math.isfinite(p.target_min_turns_after) for p in picks)
+        aux_tensor = lambda name: torch.tensor(
+            [getattr(p, name) for p in picks], dtype=torch.float32
+        ) if has_aux else None
         minibatch = Minibatch(
             observations=[p.obs for p in picks],
             action_indices=torch.tensor(
@@ -299,6 +445,13 @@ class V2ReplayBuffer:
             target_log_score=torch.tensor(
                 [p.target_log_score for p in picks], dtype=torch.float32
             ),
+            target_min_turns_after=aux_tensor("target_min_turns_after"),
+            target_min_turns_exact_mask=aux_tensor("target_min_turns_exact_mask"),
+            target_regain_initiative=aux_tensor("target_regain_initiative"),
+            target_teammate_finish=aux_tensor("target_teammate_finish"),
+            target_teammate_finish_mask=aux_tensor("target_teammate_finish_mask"),
+            target_spring_probability=aux_tensor("target_spring_probability"),
+            target_structure_cost=aux_tensor("target_structure_cost"),
         )
         minibatch.validate()
         return minibatch

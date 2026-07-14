@@ -63,9 +63,9 @@ def _build_v2_model(**cfg_kwargs):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("bad_version", [0, 3, 999, "2", True, False, "absent"])
+@pytest.mark.parametrize("bad_version", [0, 4, 999, "2", True, False, "absent"])
 def test_unknown_identity_version_rejected(tmp_path, bad_version):
-    """Identity versions other than absent/1/2 are rejected (fail-closed).
+    """Identity versions other than absent/1/2/3 are rejected (fail-closed).
 
     ``"absent"`` is in the list to verify the absent-key path is treated as
     version 1 (P05 migration), NOT rejected — it should succeed under raw.
@@ -152,8 +152,8 @@ def test_identity_version_1_treated_as_p05(tmp_path):
     assert isinstance(state_dict, dict)
 
 
-def test_identity_version_2_strict_match(tmp_path):
-    """Identity version 2 with matching hash loads."""
+def test_current_identity_version_strict_match(tmp_path):
+    """The current identity version with matching hash loads."""
     from douzero.checkpoint import load_v2_checkpoint, save_v2_checkpoint
     from douzero.checkpoint.v2 import _MODEL_CONFIG_IDENTITY_VERSION_KEY
     from douzero.env.rules import RuleSet
@@ -163,9 +163,9 @@ def test_identity_version_2_strict_match(tmp_path):
     ruleset = RuleSet.legacy()
     save_v2_checkpoint(path, model, ruleset=ruleset)
 
-    # Identity version 2 is already stamped by save_v2_checkpoint.
+    # The current identity version is stamped by save_v2_checkpoint.
     bundle = torch.load(path, weights_only=False)
-    assert bundle[_MODEL_CONFIG_IDENTITY_VERSION_KEY] == 2
+    assert bundle[_MODEL_CONFIG_IDENTITY_VERSION_KEY] == 3
     torch.save(bundle, path)
 
     state_dict, _ = load_v2_checkpoint(
@@ -347,7 +347,7 @@ def test_identity_version_is_classvar_not_instance_field():
     assert "IDENTITY_VERSION" not in field_names, (
         "IDENTITY_VERSION should be ClassVar, not a dataclass field"
     )
-    assert ModelV2Config.IDENTITY_VERSION == 2
+    assert ModelV2Config.IDENTITY_VERSION == 3
 
 
 def test_identity_version_not_constructable():

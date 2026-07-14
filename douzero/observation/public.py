@@ -223,6 +223,10 @@ class PublicObservation:
     my_handcards: tuple[int, ...] = ()
     other_handcards: tuple[int, ...] = ()  # public unseen pool (swap-invariant)
     played_cards: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+    # Public count of non-pass card-play actions per role. Unlike
+    # ``played_cards`` this counts moves, not card quantity, and is the
+    # authoritative public input for spring/anti-spring features.
+    non_pass_action_counts: Mapping[str, int] = field(default_factory=dict)
     last_move: tuple[int, ...] = ()
     last_move_dict: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     bottom_cards: PublicBottomCards = field(
@@ -248,6 +252,11 @@ class PublicObservation:
                            MappingProxyType(dict(self.seat_context)))
         object.__setattr__(self, "played_cards",
                            MappingProxyType(dict(self.played_cards)))
+        object.__setattr__(
+            self,
+            "non_pass_action_counts",
+            MappingProxyType(dict(self.non_pass_action_counts)),
+        )
         object.__setattr__(self, "last_move_dict",
                            MappingProxyType(dict(self.last_move_dict)))
         object.__setattr__(self, "num_cards_left",
@@ -278,6 +287,7 @@ class PublicObservation:
             "my_handcards": list(self.my_handcards),
             "other_handcards": list(self.other_handcards),
             "played_cards": {k: list(v) for k, v in self.played_cards.items()},
+            "non_pass_action_counts": dict(self.non_pass_action_counts),
             "last_move": list(self.last_move),
             "last_move_dict": {k: list(v) for k, v in self.last_move_dict.items()},
             "bottom_cards": self.bottom_cards.to_dict(),
@@ -300,6 +310,7 @@ def build_public_observation(
     my_handcards,
     other_handcards,
     played_cards: dict[str, list[int]],
+    non_pass_action_counts: dict[str, int] | None = None,
     last_move,
     last_move_dict: dict[str, list[int]],
     three_landlord_cards,
@@ -356,6 +367,10 @@ def build_public_observation(
         role: _safe_tuple(cards)
         for role, cards in (played_cards or {}).items()
     }
+    action_counts = {
+        role: int(count)
+        for role, count in (non_pass_action_counts or {}).items()
+    }
     legal_tuples = tuple(
         tuple(sorted(int(c) for c in a)) for a in (legal_actions or [])
     )
@@ -382,6 +397,7 @@ def build_public_observation(
         my_handcards=_safe_tuple(my_handcards),
         other_handcards=_safe_tuple(other_handcards),
         played_cards=played_tuples,
+        non_pass_action_counts=action_counts,
         last_move=last_move_t,
         last_move_dict=last_move_d,
         bottom_cards=bottom,

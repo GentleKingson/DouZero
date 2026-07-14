@@ -118,6 +118,7 @@ class ModelInputBundle:
     action_mask: torch.Tensor
     acting_role: str
     feature_schema_hash: str
+    strategy_features: torch.Tensor | None = None
 
     def to(self, device) -> "ModelInputBundle":
         """Move every tensor in the bundle to ``device``. Returns self."""
@@ -129,10 +130,15 @@ class ModelInputBundle:
         self.history_key_padding_mask = self.history_key_padding_mask.to(device)
         self.action_features = self.action_features.to(device)
         self.action_mask = self.action_mask.to(device)
+        if self.strategy_features is not None:
+            self.strategy_features = self.strategy_features.to(device)
         return self
 
 
-def observation_to_model_inputs(obs: ObservationV2) -> ModelInputBundle:
+def observation_to_model_inputs(
+    obs: ObservationV2,
+    strategy_config=None,
+) -> ModelInputBundle:
     """Convert an :class:`ObservationV2` into a :class:`ModelInputBundle`.
 
     This is the canonical bridge from the V2 observation container to the
@@ -203,6 +209,16 @@ def observation_to_model_inputs(obs: ObservationV2) -> ModelInputBundle:
         np.asarray(obs.actions.action_mask).astype(bool)
     )
 
+    strategy_features = None
+    if strategy_config is not None:
+        from douzero.strategy.features import build_strategy_feature_matrix
+
+        strategy_features = torch.from_numpy(
+            np.asarray(
+                build_strategy_feature_matrix(obs.public, strategy_config)
+            ).astype(np.float32)
+        )
+
     return ModelInputBundle(
         state_card_vectors=state_card_vecs,
         state_context_flat=state_flat,
@@ -214,4 +230,5 @@ def observation_to_model_inputs(obs: ObservationV2) -> ModelInputBundle:
         action_mask=action_mask,
         acting_role=obs.public.acting_role,
         feature_schema_hash=obs.feature_schema_hash,
+        strategy_features=strategy_features,
     )

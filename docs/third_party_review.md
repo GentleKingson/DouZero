@@ -33,6 +33,15 @@ was copied.
 | `DouRN` (paper / public behaviour) | research paper | P05 | Residual backbone + per-role evaluation. Implemented independently. | **No** |
 | PyTorch (`torch.autocast`, `GradScaler`, DDP, `torch.compile`) | BSD-style | P14 (future) | Official PyTorch training APIs; used per the upstream docs. | n/a (library usage) |
 
+## P09 — strategy features and cooperation
+
+No third-party strategy implementation was consulted or copied. The bounded
+hand-decomposition search, structure costs, cooperation features, trajectory
+labels, auxiliary heads, and uncertainty gate were implemented independently
+using this repository's Apache-2.0 move generator/detector and standard
+PyTorch loss primitives. In particular, no GPL-licensed or license-unverified
+DouDizhu derivative supplied code or file structure for this phase.
+
 ## P08 — human-game data and listwise BC
 
 No third-party code was copied for the human-game data pipeline or the
@@ -54,6 +63,7 @@ listwise behaviour-cloning prior. Specifically:
 None beyond the upstream `kwai/DouZero` dependencies (`torch`, `rlcard`,
 `GitPython`, `pyyaml`). P08 deliberately uses JSONL (stdlib `json`) rather
 than Parquet to avoid adding `pyarrow`/`pandas` as runtime dependencies.
+P09 likewise adds no dependency.
 
 ## Conclusion
 

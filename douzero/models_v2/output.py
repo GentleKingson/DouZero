@@ -46,6 +46,11 @@ class ModelOutput:
     # disabled checkpoint produces an output without a dummy tensor, and a
     # ``pure_prior`` decision mode fails loudly when the head is absent).
     prior_logit: torch.Tensor | None = None
+    min_turns_after: torch.Tensor | None = None
+    regain_initiative_logit: torch.Tensor | None = None
+    teammate_finish_logit: torch.Tensor | None = None
+    spring_probability_logit: torch.Tensor | None = None
+    structure_cost: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         n = self.win_logit.shape[0]
@@ -84,6 +89,25 @@ class ModelOutput:
                     f"prior_logit must have shape ({n}, 1), got "
                     f"{tuple(self.prior_logit.shape)}"
                 )
+        aux_names = (
+            "min_turns_after",
+            "regain_initiative_logit",
+            "teammate_finish_logit",
+            "spring_probability_logit",
+            "structure_cost",
+        )
+        present = [getattr(self, name) is not None for name in aux_names]
+        if any(present) and not all(present):
+            raise ValueError(
+                "strategy auxiliary outputs must be all present or all absent"
+            )
+        if all(present):
+            for name in aux_names:
+                tensor = getattr(self, name)
+                if tensor.ndim != 2 or tensor.shape != (n, 1):
+                    raise ValueError(
+                        f"{name} must have shape ({n}, 1), got {tuple(tensor.shape)}"
+                    )
 
     @property
     def num_actions(self) -> int:

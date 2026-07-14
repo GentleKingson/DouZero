@@ -67,7 +67,7 @@ from douzero.observation.schema import (
 from .action_encoder import ActionEncoder
 from .config import HISTORY_ENCODER_TRANSFORMER, ModelV2Config, SUPPORTED_ROLES
 from .fusion import StateActionFusion
-from .heads import PriorHead, ValueHeads
+from .heads import PriorHead, StrategyAuxiliaryHeads, ValueHeads
 from .history_encoder import build_history_encoder
 from .output import ModelOutput
 from .state_encoder import StateEncoder
@@ -164,9 +164,15 @@ class ModelV2(nn.Module):
             num_heads=cfg.history_heads,
             dropout=cfg.history_dropout,
         )
+        strategy_width = 0
+        if cfg.strategy_features_enabled:
+            from douzero.strategy.features import STRATEGY_FEATURE_WIDTH
+
+            strategy_width = STRATEGY_FEATURE_WIDTH
         self.action_encoder = ActionEncoder(
             action_width=self._action_width,
             hidden_size=cfg.hidden_size,
+            strategy_width=strategy_width,
         )
         self.fusion = StateActionFusion(
             hidden_size=cfg.hidden_size,
@@ -208,6 +214,12 @@ class ModelV2(nn.Module):
         if cfg.human_prior_enabled:
             self.prior_head = PriorHead(hidden_size=cfg.hidden_size)
 
+        self.strategy_aux_heads: StrategyAuxiliaryHeads | None = None
+        if cfg.strategy_aux_enabled:
+            self.strategy_aux_heads = StrategyAuxiliaryHeads(
+                hidden_size=cfg.hidden_size
+            )
+
         # Cache the role-name -> index map so forward() does no dict lookup.
         self._role_to_index = {role: i for i, role in enumerate(SUPPORTED_ROLES)}
 
@@ -227,6 +239,23 @@ class ModelV2(nn.Module):
                 f"Unknown acting role {role!r}. Supported roles: {SUPPORTED_ROLES}"
             ) from exc
 
+    def strategy_feature_config(self):
+        """Return the public feature config, or ``None`` for the P08 path."""
+
+        if not self.config.strategy_features_enabled:
+            return None
+        from douzero.strategy.config import StrategyFeatureConfig
+
+        return StrategyFeatureConfig(
+            hand_enabled=self.config.strategy_hand_enabled,
+            structure_enabled=self.config.strategy_structure_enabled,
+            control_enabled=self.config.strategy_control_enabled,
+            cooperation_enabled=self.config.strategy_cooperation_enabled,
+            risk_enabled=self.config.strategy_risk_enabled,
+            node_budget=self.config.strategy_node_budget,
+            time_budget_ms=self.config.strategy_time_budget_ms,
+        )
+
     def forward(
         self,
         state_card_vectors: tuple[torch.Tensor, ...],
@@ -241,6 +270,7 @@ class ModelV2(nn.Module):
         belief_features: torch.Tensor | None = None,
         belief_stop_gradient: bool = True,
         allow_missing_belief_features: bool = False,
+        strategy_features: torch.Tensor | None = None,
     ) -> ModelOutput:
         """Run a full forward pass for one decision.
 
@@ -299,6 +329,10 @@ class ModelV2(nn.Module):
             When ``belief_enabled`` and ``belief_features`` is None, the model
             raises by default; set this True only for explicit ablations that
             want the zero-vector baseline.
+        strategy_features:
+            Optional ``(N, STRATEGY_FEATURE_WIDTH)`` public tactical feature
+            matrix. Required exactly when ``strategy_features_enabled`` is
+            true; rejected by the strategy-disabled action encoder.
 
         Returns
         -------
@@ -400,7 +434,7 @@ class ModelV2(nn.Module):
         history_summary = self.history_encoder(history_tokens, history_key_padding_mask)
 
         # --- Encode each action. ---
-        action_embeddings = self.action_encoder(action_features)
+        action_embeddings = self.action_encoder(action_features, strategy_features)
 
         # --- Fuse shared trunk + history + per-action + role. ---
         role_idx = self.role_index(acting_role)
@@ -443,6 +477,19 @@ class ModelV2(nn.Module):
             if self.config.nan_guard:
                 assert_finite(prior_logit, "prior_logit")
 
+        aux_out: dict[str, torch.Tensor | None] = {
+            "min_turns_after": None,
+            "regain_initiative_logit": None,
+            "teammate_finish_logit": None,
+            "spring_probability_logit": None,
+            "structure_cost": None,
+        }
+        if self.strategy_aux_heads is not None:
+            aux_out.update(self.strategy_aux_heads(fused))
+            if self.config.nan_guard:
+                for name, tensor in aux_out.items():
+                    assert_finite(tensor, name)
+
         return ModelOutput(
             win_logit=head_out["win_logit"],
             score_if_win=head_out["score_if_win"],
@@ -451,6 +498,7 @@ class ModelV2(nn.Module):
             score_mean=head_out["score_mean"],
             action_mask=action_mask,
             prior_logit=prior_logit,
+            **aux_out,
         )
 
     # ------------------------------------------------------------------ #
@@ -477,6 +525,8 @@ class ModelV2(nn.Module):
             submodules.append(("belief_proj", self.belief_proj))
         if self.prior_head is not None:
             submodules.append(("prior_head", self.prior_head))
+        if self.strategy_aux_heads is not None:
+            submodules.append(("strategy_aux_heads", self.strategy_aux_heads))
         for name, module in submodules:
             counts[name] = sum(p.numel() for p in module.parameters() if p.requires_grad)
         counts["total"] = sum(counts.values())

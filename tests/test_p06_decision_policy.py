@@ -70,7 +70,7 @@ def test_unknown_mode_rejected():
 def test_all_supported_modes_select_valid_action():
     output = _make_output([0.4, 0.6, 0.5], [-1.0, 0.5, 0.0])
     for mode in SUPPORTED_DECISION_MODES:
-        if mode == "pure_prior":
+        if mode in ("pure_prior", "uncertainty_gated_prior"):
             # pure_prior (P08) requires a prior head; the default _make_output
             # has no prior_logit. Build one with a prior head and verify it
             # selects a valid action, and separately that a prior-less output

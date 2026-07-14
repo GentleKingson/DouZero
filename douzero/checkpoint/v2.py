@@ -113,8 +113,11 @@ def _validate_model_config_hash(
     A V2 bundle carries ``model_config_hash`` and, since P06 r6,
     ``model_config_identity_version``. The validation logic is:
 
-    - **Identity version 2** (current): the bundle's hash must match the
+    - **Identity version 3** (current): the bundle's hash must match the
       runtime's ``stable_hash()`` exactly. No migration.
+    - **Identity version 2** (P06-P08): compare the runtime's
+      ``stable_hash_v2()`` and permit migration only when strategy features
+      and heads remain disabled.
     - **Identity version 1 or absent** (P05 checkpoint): the bundle was saved
       before ``score_target_transform`` entered the compatibility dict. The
       loader computes the runtime's ``stable_hash_v1()`` (the P05 field set)
@@ -125,7 +128,7 @@ def _validate_model_config_hash(
 
       A runtime using ``signed_log`` cannot accept a P05 checkpoint because
       the P05 model's score heads were implicitly on the raw scale.
-    - **Any other value** (0, 3, ``"2"``, ``True``, etc.): rejected.
+    - **Any other value** (0, 4, ``"2"``, ``True``, etc.): rejected.
       Identity version is fail-closed so a corrupted or forged bundle
       cannot bypass the strict v2 check by claiming an unknown version.
       ``bool`` is rejected explicitly because ``True == 1`` in Python.
@@ -143,22 +146,25 @@ def _validate_model_config_hash(
     if isinstance(raw_version, bool):
         raise CheckpointCompatibilityError(
             f"V2 checkpoint at {path!r} has model_config_identity_version="
-            f"{raw_version!r} (bool), expected int 1, 2, or absent. The "
+            f"{raw_version!r} (bool), expected int 1, 2, 3, or absent. The "
             f"identity version is fail-closed against unknown values."
         )
     if raw_version is None or raw_version == 1:
         identity_version = 1
     elif raw_version == 2:
         identity_version = 2
+    elif raw_version == 3:
+        identity_version = 3
     else:
         raise CheckpointCompatibilityError(
             f"V2 checkpoint at {path!r} has unsupported "
             f"model_config_identity_version={raw_version!r}. Supported "
-            f"values are 1 (P05), 2 (P06 r6+), or absent (treated as 1). "
+            f"values are 1 (P05), 2 (P06-P08), 3 (P09+), or absent "
+            f"(treated as 1). "
             f"The identity version is fail-closed against unknown values."
         )
 
-    if identity_version == 2:
+    if identity_version == 3:
         if actual_cfg_hash != expected_model_config_hash:
             raise CheckpointCompatibilityError(
                 f"V2 checkpoint at {path!r} model_config_hash mismatch: "
@@ -167,6 +173,30 @@ def _validate_model_config_hash(
                 f"different ModelV2Config (e.g. history_heads, score_clamp, "
                 f"nan_guard, score_target_transform). Same-shape weights are "
                 f"not enough."
+            )
+        return
+
+    if identity_version == 2:
+        if runtime_model_config is None:
+            raise CheckpointCompatibilityError(
+                f"V2 checkpoint at {path!r} uses identity version 2 but no "
+                f"runtime_model_config was supplied for migration."
+            )
+        if (
+            runtime_model_config.strategy_features_enabled
+            or runtime_model_config.strategy_aux_enabled
+        ):
+            raise CheckpointCompatibilityError(
+                f"V2 checkpoint at {path!r} predates P09 strategy parameters "
+                f"and cannot load into a strategy-enabled runtime. Disable "
+                f"strategy features/heads or use a P09 checkpoint."
+            )
+        v2_hash = runtime_model_config.stable_hash_v2()
+        if actual_cfg_hash != v2_hash:
+            raise CheckpointCompatibilityError(
+                f"V2 checkpoint at {path!r} model_config_hash mismatch "
+                f"(P06-P08 migration): checkpoint has {actual_cfg_hash!r}, "
+                f"runtime v2 hash is {v2_hash!r}."
             )
         return
 
@@ -422,7 +452,7 @@ def save_v2_checkpoint(
         _MODEL_CONFIG_HASH_KEY: str(model_config_hash),
         # P06 r6: stamp the identity version so a future loader knows which
         # compatibility-dict field set produced this hash.
-        _MODEL_CONFIG_IDENTITY_VERSION_KEY: 2,
+        _MODEL_CONFIG_IDENTITY_VERSION_KEY: model.config.IDENTITY_VERSION,
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, path)
@@ -657,7 +687,7 @@ def save_v2_position_weights(
         _SCHEMA_HASH_KEY: str(schema_hash),
         _MODEL_CONFIG_HASH_KEY: str(model_config_hash),
         # P06 r6: stamp the identity version (mirrors save_v2_checkpoint).
-        _MODEL_CONFIG_IDENTITY_VERSION_KEY: 2,
+        _MODEL_CONFIG_IDENTITY_VERSION_KEY: model.config.IDENTITY_VERSION,
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, path)

@@ -53,6 +53,7 @@ SUPPORTED_DECISION_MODES: tuple[str, ...] = (
     "score_then_win",
     "risk_aware",
     "pure_prior",
+    "uncertainty_gated_prior",
     # P05 aliases (kept for backward compatibility with the existing
     # DeepAgentV2 ``decision_mode`` argument).
     "win",
@@ -70,6 +71,7 @@ _ALIAS_MAP: dict[str, str] = {
     "score_then_win": "score_then_win",
     "risk_aware": "risk_aware",
     "pure_prior": "pure_prior",
+    "uncertainty_gated_prior": "uncertainty_gated_prior",
 }
 
 
@@ -94,6 +96,7 @@ class DecisionConfig:
     abs_tol: float = 0.0
     rel_tol: float = 0.0
     risk_penalty: float = 0.0
+    prior_alpha: float = 0.0
 
     def __post_init__(self) -> None:
         # Resolve aliases eagerly so a stored config always carries the
@@ -107,6 +110,10 @@ class DecisionConfig:
             raise ValueError(
                 f"risk_penalty must be non-negative finite, got {self.risk_penalty!r}"
             )
+        if self.prior_alpha < 0.0 or not math.isfinite(self.prior_alpha):
+            raise ValueError(
+                f"prior_alpha must be non-negative finite, got {self.prior_alpha!r}"
+            )
 
     def to_dict(self) -> dict[str, float | str]:
         return {
@@ -114,6 +121,7 @@ class DecisionConfig:
             "abs_tol": float(self.abs_tol),
             "rel_tol": float(self.rel_tol),
             "risk_penalty": float(self.risk_penalty),
+            "prior_alpha": float(self.prior_alpha),
         }
 
 
@@ -171,6 +179,7 @@ def select_action(
     abs_tol: float | None = None,
     rel_tol: float | None = None,
     risk_penalty: float | None = None,
+    prior_alpha: float | None = None,
 ) -> int:
     """Select an action index from a :class:`ModelOutput` per the configured mode.
 
@@ -185,6 +194,7 @@ def select_action(
             abs_tol=abs_tol or 0.0,
             rel_tol=rel_tol or 0.0,
             risk_penalty=risk_penalty or 0.0,
+            prior_alpha=prior_alpha or 0.0,
         )
     else:
         # Overlay explicit keyword overrides.
@@ -192,7 +202,10 @@ def select_action(
         at = config.abs_tol if abs_tol is None else float(abs_tol)
         rt = config.rel_tol if rel_tol is None else float(rel_tol)
         rp = config.risk_penalty if risk_penalty is None else float(risk_penalty)
-        config = DecisionConfig(mode=m, abs_tol=at, rel_tol=rt, risk_penalty=rp)
+        pa = config.prior_alpha if prior_alpha is None else float(prior_alpha)
+        config = DecisionConfig(
+            mode=m, abs_tol=at, rel_tol=rt, risk_penalty=rp, prior_alpha=pa
+        )
 
     mask = output.action_mask
     if not bool(mask.any()):
@@ -228,4 +241,18 @@ def select_action(
         # model built with human_prior_enabled=True (a prior head); the helper
         # raises ValueError when prior_logit is None.
         return output.argmax_prior()
+    if config.mode == "uncertainty_gated_prior":
+        prior = output.selected_prior_logit()
+        valid_prior = prior[mask]
+        mean = valid_prior.mean()
+        std = valid_prior.std(unbiased=False).clamp(min=1e-6)
+        normalized_prior = ((prior - mean) / std).clamp(-3.0, 3.0)
+        # Bernoulli uncertainty is zero at confident endpoints and one at
+        # p=0.5. alpha=0 is exactly pure_score, the default-off guarantee.
+        uncertainty_gate = 4.0 * p_win * (1.0 - p_win)
+        final_score = (
+            score_mean
+            + config.prior_alpha * uncertainty_gate * normalized_prior
+        )
+        return _argmax_masked(final_score, mask)
     raise ValueError(f"unhandled decision mode {config.mode!r}")  # pragma: no cover

@@ -552,12 +552,18 @@ def get_obs_v2(
     other_hand = list(compute_unseen_pool(my_hand, played, bottom_unplayed))
 
     num_left = dict(infoset.num_cards_left_dict or {})
+    raw_action_seq = [list(a) for a in (infoset.card_play_action_seq or [])]
+    non_pass_action_counts = {role: 0 for role in ALL_ROLES}
+    for turn_index, action in enumerate(raw_action_seq):
+        if action:
+            non_pass_action_counts[_actor_at(turn_index)] += 1
 
     public = build_public_observation(
         acting_role=acting_role,
         my_handcards=my_hand,
         other_handcards=other_hand,
         played_cards=played,
+        non_pass_action_counts=non_pass_action_counts,
         last_move=list(infoset.last_move or []),
         last_move_dict={
             role: list((infoset.last_move_dict or {}).get(role, []))
@@ -613,7 +619,6 @@ def get_obs_v2(
 
     # --- History batch ---
     phase_code = _phase_code(phase)
-    raw_action_seq = [list(a) for a in (infoset.card_play_action_seq or [])]
     moves = _reconstruct_history_moves(raw_action_seq, num_left, phase_code)
     history = encode_history(moves, schema)
 

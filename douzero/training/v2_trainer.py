@@ -322,6 +322,18 @@ class V2Trainer:
                 stacklevel=2,
             )
         self.loss_fn = MultiObjectiveLoss(loss_cfg)
+        self.strategy_aux_weight = sum(
+            float(getattr(loss_cfg, name, 0.0))
+            for name in (
+                "lambda_min_turns", "lambda_regain_initiative",
+                "lambda_teammate_finish", "lambda_spring", "lambda_structure",
+            )
+        )
+        if self.strategy_aux_weight > 0 and not self.model.config.strategy_aux_enabled:
+            raise ValueError(
+                "non-zero strategy auxiliary weights require "
+                "model.strategy_aux_enabled=true"
+            )
         self.decision_config = decision_config or DecisionConfig()
         self.config = config or TrainerConfig()
         # P06 r4: reject a "valid but trains nothing" configuration.
@@ -331,6 +343,7 @@ class V2Trainer:
         #     step() can never sample a minibatch and silently skips.
         active_loss = (
             loss_cfg.lambda_win + loss_cfg.lambda_score + loss_cfg.lambda_uncertainty
+            + self.strategy_aux_weight
         )
         if self.config.optimizer_steps > 0 and active_loss == 0:
             raise ValueError(
@@ -420,12 +433,23 @@ class V2Trainer:
                 # Record the decision (single-legal-action steps are not
                 # trained on — there is nothing to learn).
                 episode.transitions.append(
-                    Transition(obs=obs, action_index=action_index, position=position)
+                    Transition(
+                        obs=obs,
+                        action_index=action_index,
+                        position=position,
+                        trace_index=len(episode.action_trace),
+                    )
                 )
+            episode.action_trace.append((position, tuple(sorted(action))))
             _obs_out, _reward, done, info = env.step(action)
             if done:
                 episode.terminal_result = info or {}
                 break
+        if self.strategy_aux_weight > 0:
+            episode.label_strategy_auxiliary(
+                node_budget=self.model.config.strategy_node_budget,
+                time_budget_ms=self.model.config.strategy_time_budget_ms,
+            )
         return episode
 
     def _compute_belief_feature(self, obs) -> "torch.Tensor | None":
@@ -474,7 +498,9 @@ class V2Trainer:
         per_decision = []
         for i in idxs:
             s = self.bc_aux_samples[i]
-            bundle = observation_to_model_inputs(s.obs)
+            bundle = observation_to_model_inputs(
+                s.obs, self.model.strategy_feature_config()
+            )
             # P08 Blocker 1: compute the frozen belief features for this BC
             # sample when the value model is belief-enabled. A belief-enabled
             # model FAILS CLOSED at forward when belief_features are omitted,
@@ -492,6 +518,7 @@ class V2Trainer:
                 bundle.action_mask,
                 bundle.acting_role,
                 belief_features=belief_features,
+                strategy_features=bundle.strategy_features,
             )
             if out.prior_logit is None:
                 raise RuntimeError(
@@ -517,7 +544,9 @@ class V2Trainer:
             return self.rng.choice(valid)
         belief_features = self._compute_belief_feature(obs)
         with torch.inference_mode():
-            bundle = observation_to_model_inputs(obs)
+            bundle = observation_to_model_inputs(
+                obs, self.model.strategy_feature_config()
+            )
             out = self.model(
                 bundle.state_card_vectors,
                 bundle.state_context_flat,
@@ -529,6 +558,7 @@ class V2Trainer:
                 bundle.action_mask,
                 bundle.acting_role,
                 belief_features=belief_features,
+                strategy_features=bundle.strategy_features,
             )
         return select_action(out, self.decision_config)
 
@@ -564,8 +594,17 @@ class V2Trainer:
             gathered_win: list[torch.Tensor] = []
             gathered_siw: list[torch.Tensor] = []
             gathered_sil: list[torch.Tensor] = []
+            gathered_aux: dict[str, list[torch.Tensor]] = {
+                "min_turns_after": [],
+                "regain_initiative_logit": [],
+                "teammate_finish_logit": [],
+                "spring_probability_logit": [],
+                "structure_cost": [],
+            }
             for i, obs in enumerate(batch.observations):
-                bundle = observation_to_model_inputs(obs)
+                bundle = observation_to_model_inputs(
+                    obs, self.model.strategy_feature_config()
+                )
                 belief_features = self._compute_belief_feature(obs)
                 out = self.model(
                     bundle.state_card_vectors,
@@ -578,11 +617,20 @@ class V2Trainer:
                     bundle.action_mask,
                     bundle.acting_role,
                     belief_features=belief_features,
+                    strategy_features=bundle.strategy_features,
                 )
                 idx = int(batch.action_indices[i].item())
                 gathered_win.append(out.win_logit[idx : idx + 1])
                 gathered_siw.append(out.score_if_win[idx : idx + 1])
                 gathered_sil.append(out.score_if_loss[idx : idx + 1])
+                if self.model.config.strategy_aux_enabled:
+                    for name in gathered_aux:
+                        tensor = getattr(out, name)
+                        if tensor is None:
+                            raise RuntimeError(
+                                f"strategy auxiliary head {name!r} disappeared mid-training"
+                            )
+                        gathered_aux[name].append(tensor[idx : idx + 1])
 
             win_logit = torch.cat(gathered_win, dim=0)        # (B, 1)
             score_if_win = torch.cat(gathered_siw, dim=0)    # (B, 1)
@@ -602,6 +650,32 @@ class V2Trainer:
             # cross-entropy scaled by lambda_bc to the RL loss. Both terms
             # contribute gradients in a single backward pass.
             total_loss = components.total
+            aux_diag: dict[str, float] = {}
+            if self.strategy_aux_weight > 0:
+                from douzero.strategy.auxiliary import strategy_auxiliary_loss
+
+                target_names = (
+                    "min_turns_after", "min_turns_exact_mask",
+                    "regain_initiative", "teammate_finish",
+                    "teammate_finish_mask", "spring_probability", "structure_cost",
+                )
+                targets = {
+                    name: getattr(batch, f"target_{name}") for name in target_names
+                }
+                if any(value is None for value in targets.values()):
+                    raise RuntimeError(
+                        "strategy auxiliary training requires trajectory labels; "
+                        "the replay minibatch contains unlabeled transitions"
+                    )
+                aux_predictions = {
+                    name: torch.cat(values, dim=0)
+                    for name, values in gathered_aux.items()
+                }
+                aux_components = strategy_auxiliary_loss(
+                    aux_predictions, targets, self.loss_fn.config
+                )
+                total_loss = total_loss + aux_components.total
+                aux_diag = aux_components.as_log_dict()
             # P08 Blocker 1: the BC auxiliary weight follows the configured
             # schedule (constant or linear_decay with a floor), evaluated at
             # the CURRENT optimizer step so the weight evolves as configured.
@@ -646,8 +720,11 @@ class V2Trainer:
             self.stats.optimizer_steps += 1
             # Merge BC diagnostics into the last_loss log dict when active.
             loss_log = components.as_log_dict()
+            loss_log["loss_total"] = float(total_loss.detach().float().item())
             if bc_diag:
                 loss_log.update(bc_diag)
+            if aux_diag:
+                loss_log.update(aux_diag)
                 # Round 6 suggestion: loss_total must reflect the ACTUAL total
                 # that was back-propagated (RL + BC), not just the RL part.
                 loss_log["loss_total"] = float(total_loss.detach().item())
