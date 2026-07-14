@@ -66,6 +66,22 @@ def test_exact_small_endgame_matches_forced_result():
     assert value.expected_score == 2.0
 
 
+def test_solver_cache_is_scoped_by_root_team():
+    state = _state()
+    cfg = SearchConfig(
+        enabled=True, max_nodes=1000, max_rollouts=1, max_milliseconds=1000
+    )
+    solver = EndgameSolver(SearchBudget(cfg))
+
+    landlord = solver.solve(state, "landlord")
+    farmer = solver.solve(state, "farmer")
+
+    assert landlord.win_probability == 1.0
+    assert landlord.expected_score == 2.0
+    assert farmer.win_probability == 0.0
+    assert farmer.expected_score == -1.0
+
+
 def test_farmer_team_uses_shared_utility_and_passes():
     # landlord cannot beat 4, then landlord_down can shed 5 and win for both
     # farmers. The last move belongs to landlord_up, so the pass context is valid.
@@ -202,6 +218,32 @@ def test_budget_zero_returns_base_without_touching_belief_model():
     assert decision.action_index == 1
     assert decision.log.searched_action == (4,)
     assert decision.log.timed_out
+
+
+def test_timeout_log_retains_generated_sample_count():
+    env = Env("adp")
+    env.reset()
+    obs = get_obs_v2(env.infoset, ruleset=RuleSet.legacy())
+    model = BeliefModel(BeliefConfig(hidden_size=16, num_layers=1))
+    config = SearchConfig(
+        enabled=True,
+        top_k=2,
+        belief_samples=1,
+        rollout_depth=0,
+        endgame_cards_threshold=0,
+        max_nodes=100,
+        max_rollouts=1,
+        max_milliseconds=2000,
+    )
+    decision = BeliefSearch(config, RuleSet.legacy()).select(
+        observation=obs,
+        model_output=_output(len(obs.actions.legal_actions)),
+        base_action_index=0,
+        belief_model=model,
+    )
+    assert decision.log.timed_out
+    assert decision.log.samples == 1
+    assert decision.log.rollouts == 1
 
 
 def test_seeded_search_is_deterministic_and_public_only(monkeypatch):

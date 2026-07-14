@@ -22,20 +22,21 @@ class TranspositionKey:
     ruleset_hash: str
 
 
-T = TypeVar("T")
+K = TypeVar("K")
+V = TypeVar("V")
 
 
-class TranspositionTable(Generic[T]):
+class TranspositionTable(Generic[K, V]):
     """Simple deterministic cache capped to prevent inference memory growth."""
 
     def __init__(self, max_entries: int) -> None:
         self.max_entries = max(0, int(max_entries))
-        self._values: dict[TranspositionKey, T] = {}
+        self._values: dict[K, V] = {}
 
-    def get(self, key: TranspositionKey) -> T | None:
+    def get(self, key: K) -> V | None:
         return self._values.get(key)
 
-    def put(self, key: TranspositionKey, value: T) -> None:
+    def put(self, key: K, value: V) -> None:
         if self.max_entries and len(self._values) < self.max_entries:
             self._values[key] = value
 

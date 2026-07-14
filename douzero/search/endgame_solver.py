@@ -225,9 +225,9 @@ class EndgameSolver:
 
     def __init__(self, budget: SearchBudget) -> None:
         self.budget = budget
-        self.table: TranspositionTable[SolveValue] = TranspositionTable(
-            budget.config.max_nodes
-        )
+        self.table: TranspositionTable[
+            tuple[str, TranspositionKey], SolveValue
+        ] = TranspositionTable(budget.config.max_nodes)
 
     def solve(self, state: SearchGameState, root_team: str) -> SolveValue:
         if root_team not in ("landlord", "farmer"):
@@ -238,7 +238,9 @@ class EndgameSolver:
         self.budget.visit_node()
         if state.terminal:
             return state.terminal_value(root_team)
-        key = state.transposition_key()
+        # Values and max/min direction are root-team relative. Scope cache
+        # entries by that perspective while retaining reuse within one team.
+        key = (root_team, state.transposition_key())
         cached = self.table.get(key)
         if cached is not None:
             return cached

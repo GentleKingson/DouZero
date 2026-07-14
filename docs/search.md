@@ -30,6 +30,8 @@ Farmers share one utility in minimax. Terminal scores call the canonical rule
 engine, including bids, bombs, rocket, spring, anti-spring, and multiplier
 caps. The transposition identity contains all hands, actor, move-to-beat,
 leader, pass count, action counts, bid, bombs, rocket, and ruleset hash.
+The solver cache additionally scopes every entry by the root team because
+win probability, score, and min/max direction are perspective-dependent.
 Nonterminal score estimates use the same canonical multiplier helper as
 terminal scoring, including the landlord/farmer 2:1 score units, bids,
 independent bomb/rocket multipliers, and caps. They intentionally do not guess
@@ -47,7 +49,9 @@ mode.
 
 The structured `SearchLog` records the base and searched actions, aggregate
 candidate values, sample/node/rollout counts, elapsed time, timeout status, and
-fallback reason. A fixed seed makes sampling and the complete decision stable.
+fallback reason. Timeout fallback retains the number of belief samples already
+generated, so audit counters remain internally consistent. A fixed seed makes
+sampling and the complete decision stable.
 
 ## Configuration
 

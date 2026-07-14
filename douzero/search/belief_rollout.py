@@ -196,11 +196,13 @@ class BeliefSearch:
                 belief_output = belief_model([binput])
         rng = np.random.default_rng(self.config.seed)
 
+        sample_count = 0
         try:
             budget.check()
             allocations = belief_model.sample(
                 belief_output, rng, num_samples=self.config.belief_samples
             )[0]
+            sample_count = len(allocations)
             sampled_states = [
                 state_from_sample(
                     observation.public,
@@ -239,7 +241,14 @@ class BeliefSearch:
             )
             return SearchDecision(selected.index, log)
         except BudgetExceeded as exc:
-            return self._fallback(base_action_index, base_action, budget, str(exc), True)
+            return self._fallback(
+                base_action_index,
+                base_action,
+                budget,
+                str(exc),
+                True,
+                samples=sample_count,
+            )
 
     def _evaluate(
         self, state: SearchGameState, root_team: str, budget: SearchBudget
@@ -282,12 +291,13 @@ class BeliefSearch:
         budget: SearchBudget,
         reason: str,
         timed_out: bool = False,
+        samples: int = 0,
     ) -> SearchDecision:
         return SearchDecision(index, SearchLog(
             base_action=action,
             searched_action=action,
             candidate_values=(),
-            samples=0,
+            samples=samples,
             nodes=budget.nodes,
             rollouts=budget.rollouts,
             elapsed_milliseconds=budget.elapsed_milliseconds,
