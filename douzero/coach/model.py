@@ -196,9 +196,21 @@ def load_coach_checkpoint(
     path: str,
     *,
     expected_ruleset_hash: str,
+    expected_policy_version: str,
+    current_policy_step: int,
+    max_age_steps: int,
     map_location: Any = "cpu",
 ) -> tuple[CoachModel, dict[str, Any]]:
-    """Safely load a coach and validate all independent identity fields."""
+    """Safely load a coach and fail closed on stale policy identity."""
+
+    if not isinstance(expected_policy_version, str) or not expected_policy_version:
+        raise ValueError("expected_policy_version must be a non-empty string")
+    for name, value in (
+        ("current_policy_step", current_policy_step),
+        ("max_age_steps", max_age_steps),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} must be a non-negative int")
 
     bundle = torch.load(path, map_location=map_location, weights_only=True)
     if not isinstance(bundle, dict) or set(bundle) != {
@@ -230,6 +242,24 @@ def load_coach_checkpoint(
         or manifest["policy_step"] < 0
     ):
         raise ValueError("coach policy_step is invalid")
+    if manifest["policy_version"] != expected_policy_version:
+        raise ValueError(
+            "coach checkpoint policy_version does not match curriculum "
+            f"policy_version: checkpoint={manifest['policy_version']!r}, "
+            f"expected={expected_policy_version!r}"
+        )
+    age = current_policy_step - manifest["policy_step"]
+    if age < 0:
+        raise ValueError(
+            "coach checkpoint is future-dated: "
+            f"checkpoint policy_step={manifest['policy_step']}, "
+            f"current policy_step={current_policy_step}"
+        )
+    if age > max_age_steps:
+        raise ValueError(
+            "coach checkpoint is stale: "
+            f"age={age} exceeds max_age_steps={max_age_steps}"
+        )
     if not isinstance(manifest["calibration"], dict):
         raise TypeError("coach calibration metadata must be a dict")
     if not isinstance(bundle["coach_config"], dict):

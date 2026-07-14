@@ -328,6 +328,7 @@ class CurriculumConfig:
     audit_log_path: str = ""
     policy_version: str = "current"
     policy_step: int = 0
+    max_coach_age_steps: int = 100000
     max_label_age_steps: int = 100000
     seed: int = 0
     candidate_pool_size: int = 16
@@ -362,7 +363,9 @@ class CurriculumConfig:
             raise ValueError("CurriculumConfig.hard_role must be landlord or farmer")
         if not self.policy_version:
             raise ValueError("CurriculumConfig.policy_version must be non-empty")
-        for name in ("policy_step", "max_label_age_steps", "seed"):
+        for name in (
+            "policy_step", "max_coach_age_steps", "max_label_age_steps", "seed"
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"CurriculumConfig.{name} must be a non-negative int")

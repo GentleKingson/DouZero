@@ -18,6 +18,13 @@ future or older-than-configured labels. A live curriculum therefore produces
 fresh labels continuously; callers should periodically refit the coach from
 that filtered window and publish a new independent coach checkpoint.
 
+In the single-process V2 trainer, `policy_step` is the optimizer-update index.
+The configured value is the update index at resume/startup; each successful
+optimizer step increments the effective value by one. The trainer freezes
+`policy_version_at_start` and `policy_step_at_start` before sampling each
+opening and stores them on the `Episode`. Terminal coach labels use only this
+snapshot, never the trainer's mutable terminal-time counters.
+
 The repository provides that refit path directly:
 
 ```bash
@@ -76,6 +83,13 @@ For guided modes, set `enabled: true`, provide `coach_checkpoint`, and choose
 optional `labels_path` and `audit_log_path` outputs. `train_v2.py` loads and
 validates the coach before starting collection. `true_random` mode needs no
 coach checkpoint and can be used to exercise deterministic opening replay.
+
+Guided startup is fail-closed across three identities: RuleSet hash, exact
+`policy_version`, and checkpoint age. `policy_step - checkpoint.policy_step`
+must be between zero and `max_coach_age_steps`, inclusive. A checkpoint from a
+different policy, a future step, or an older step is rejected before an
+opening can be sampled. `max_label_age_steps` is the separate freshness window
+used when refitting a coach from outcome labels.
 
 Final evaluation must continue to use `evaluate.py` and its ordinary random
 or fixed paired deal data. The evaluation package contains no coach sampler

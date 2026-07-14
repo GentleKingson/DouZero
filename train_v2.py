@@ -313,6 +313,9 @@ def _build_curriculum(cfg):
         coach, _manifest = load_coach_checkpoint(
             cc.coach_checkpoint,
             expected_ruleset_hash=ruleset.stable_hash(),
+            expected_policy_version=cc.policy_version,
+            current_policy_step=cc.policy_step,
+            max_age_steps=cc.max_coach_age_steps,
         )
     schedule = CurriculumSchedule(
         early_until=cc.early_until,

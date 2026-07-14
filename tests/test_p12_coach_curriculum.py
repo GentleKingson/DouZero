@@ -246,14 +246,63 @@ def test_coach_training_checkpoint_and_calibration(tmp_path):
         calibration=metrics,
     )
     restored, manifest = load_coach_checkpoint(
-        str(path), expected_ruleset_hash=ruleset_hash
+        str(path),
+        expected_ruleset_hash=ruleset_hash,
+        expected_policy_version="policy-train",
+        current_policy_step=20,
+        max_age_steps=0,
     )
     assert manifest["policy_version"] == "policy-train"
     assert restored.predict(labels[0].opening, "policy-train") == pytest.approx(
         model.predict(labels[0].opening, "policy-train")
     )
     with pytest.raises(ValueError, match="ruleset_hash mismatch"):
-        load_coach_checkpoint(str(path), expected_ruleset_hash="wrong")
+        load_coach_checkpoint(
+            str(path),
+            expected_ruleset_hash="wrong",
+            expected_policy_version="policy-train",
+            current_policy_step=20,
+            max_age_steps=0,
+        )
+
+
+def test_coach_checkpoint_rejects_policy_mismatch_stale_and_future(tmp_path):
+    model = CoachModel(CoachModelConfig(hidden_size=8))
+    path = tmp_path / "identity-coach.pt"
+    ruleset_hash = RuleSet.legacy().stable_hash()
+    save_coach_checkpoint(
+        str(path),
+        model,
+        policy_version="policy-a",
+        policy_step=100,
+        ruleset_hash=ruleset_hash,
+    )
+
+    common = {"expected_ruleset_hash": ruleset_hash, "map_location": "cpu"}
+    with pytest.raises(ValueError, match="policy_version does not match"):
+        load_coach_checkpoint(
+            str(path),
+            expected_policy_version="policy-b",
+            current_policy_step=100,
+            max_age_steps=0,
+            **common,
+        )
+    with pytest.raises(ValueError, match="stale"):
+        load_coach_checkpoint(
+            str(path),
+            expected_policy_version="policy-a",
+            current_policy_step=111,
+            max_age_steps=10,
+            **common,
+        )
+    with pytest.raises(ValueError, match="future-dated"):
+        load_coach_checkpoint(
+            str(path),
+            expected_policy_version="policy-a",
+            current_policy_step=99,
+            max_age_steps=10,
+            **common,
+        )
 
 
 def test_v2_trainer_records_sampled_opening_label(tmp_path):
@@ -290,15 +339,70 @@ def test_v2_trainer_records_sampled_opening_label(tmp_path):
         policy_step=42,
     )
     trainer.collect_episodes(1)
+    first_episode = trainer.buffer._episodes[-1]
+    assert first_episode.policy_version_at_start == "policy-live"
+    assert first_episode.policy_step_at_start == 42
+    assert trainer.step() is not None
+    assert trainer.stats.optimizer_steps == 1
+    trainer.collect_episodes(1)
+    second_episode = trainer.buffer._episodes[-1]
+    assert second_episode.policy_version_at_start == "policy-live"
+    assert second_episode.policy_step_at_start == 43
     labels = store.load_fresh(
-        policy_version="policy-live", current_policy_step=42, max_age_steps=0
+        policy_version="policy-live", current_policy_step=43, max_age_steps=1
+    )
+    assert [label.policy_step for label in labels] == [42, 43]
+    assert trainer.stats.opening_strategy_counts == {TRUE_RANDOM: 2}
+
+
+def test_coach_label_uses_episode_start_identity_not_terminal_state(tmp_path):
+    from douzero.models_v2 import ModelV2, ModelV2Config
+    from douzero.observation import build_v2_schema
+    from douzero.training.v2_buffer import Episode
+    from douzero.training.v2_trainer import TrainerConfig, V2Trainer
+
+    model = ModelV2(
+        build_v2_schema(),
+        ModelV2Config(
+            hidden_size=8,
+            history_encoder="lstm",
+            history_layers=1,
+            history_heads=1,
+        ),
+    )
+    store = CoachLabelStore(str(tmp_path / "start-identity.jsonl"))
+    sampler = OpeningSampler(
+        policy_version="policy-start", mode=TRUE_RANDOM, seed=5
+    )
+    trainer = V2Trainer(
+        model,
+        config=TrainerConfig(optimizer_steps=0),
+        opening_sampler=sampler,
+        coach_label_store=store,
+        policy_version="policy-start",
+        policy_step=100,
+    )
+    opening = random_opening(random.Random(8))
+    episode = Episode(
+        terminal_result=_terminal(),
+        policy_version_at_start="policy-start",
+        policy_step_at_start=107,
+    )
+    trainer.stats.optimizer_steps = 999
+    trainer._record_coach_label(opening, episode)
+    labels = store.load_fresh(
+        policy_version="policy-start",
+        current_policy_step=107,
+        max_age_steps=0,
     )
     assert len(labels) == 1
-    assert trainer.stats.opening_strategy_counts == {TRUE_RANDOM: 1}
+    assert labels[0].policy_step == 107
 
 
 def test_curriculum_defaults_off_and_evaluation_has_no_coach_import():
-    assert not load_config("configs/enhanced.yaml").curriculum.enabled
+    enhanced = load_config("configs/enhanced.yaml").curriculum
+    assert not enhanced.enabled
+    assert enhanced.max_coach_age_steps == 100000
     assert not load_config("configs/legacy.yaml").curriculum.enabled
     root = Path(__file__).resolve().parents[1]
     evaluation_sources = [root / "evaluate.py", *sorted((root / "douzero/evaluation").glob("*.py"))]

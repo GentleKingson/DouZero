@@ -87,7 +87,14 @@ class PopulationEpisodeRunner:
         self.max_steps = max_steps
         self.logger = logger
 
-    def run(self, game_index: int, *, opening=None) -> tuple[Episode, MatchupRecord]:
+    def run(
+        self,
+        game_index: int,
+        *,
+        opening=None,
+        policy_version_at_start: str = "",
+        policy_step_at_start: int = -1,
+    ) -> tuple[Episode, MatchupRecord]:
         """Run one game, optionally from a validated P12 training opening."""
 
         bundle = self.pool.sample_bundle(game_index)
@@ -98,6 +105,8 @@ class PopulationEpisodeRunner:
         episode = Episode(
             policy_ids_by_seat=dict(bundle.policy_ids_by_seat),
             learner_controlled_seats=bundle.learner_controlled_seats,
+            policy_version_at_start=policy_version_at_start,
+            policy_step_at_start=policy_step_at_start,
         )
         for _ in range(self.max_steps):
             bundle.assert_unchanged(expected_bundle_hash)

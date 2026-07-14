@@ -398,6 +398,14 @@ class V2Trainer:
         self.coach_label_store = coach_label_store
         self.policy_version = policy_version
         self.policy_step = policy_step
+        if opening_sampler is not None:
+            sampler_policy_version = getattr(opening_sampler, "policy_version", None)
+            if sampler_policy_version != policy_version:
+                raise ValueError(
+                    "opening_sampler.policy_version must match V2Trainer "
+                    f"policy_version: sampler={sampler_policy_version!r}, "
+                    f"trainer={policy_version!r}"
+                )
         self._curriculum_game_index = 0
         self._opening_prediction_sum = 0.0
         self._opening_prediction_count = 0
@@ -459,6 +467,13 @@ class V2Trainer:
 
     def _run_one_episode(self) -> Episode:
         """Play one game to terminal, recording decisions and labels."""
+        # Freeze identity before sampling the opening. The single-process V2
+        # trainer cannot optimize during a game, so this exactly identifies
+        # the weights that generated the full trajectory. Keeping it on the
+        # Episode also remains correct if collection and optimization are
+        # interleaved between games.
+        policy_version_at_start = self.policy_version
+        policy_step_at_start = self.policy_step + self.stats.optimizer_steps
         opening = None
         sampling_record = None
         if self.opening_sampler is not None:
@@ -478,7 +493,10 @@ class V2Trainer:
                 )
         if self.population_runner is not None:
             episode, _record = self.population_runner.run(
-                self._league_game_index, opening=opening
+                self._league_game_index,
+                opening=opening,
+                policy_version_at_start=policy_version_at_start,
+                policy_step_at_start=policy_step_at_start,
             )
             self._league_game_index += 1
             if self.strategy_aux_weight > 0:
@@ -490,7 +508,10 @@ class V2Trainer:
             return episode
         env = Env(objective="adp", ruleset=self.ruleset)
         env.reset(opening=opening)
-        episode = Episode()
+        episode = Episode(
+            policy_version_at_start=policy_version_at_start,
+            policy_step_at_start=policy_step_at_start,
+        )
         steps = 0
         while True:
             # P06 r2: use an explicit raise, not assert — ``python -O`` strips
@@ -542,11 +563,16 @@ class V2Trainer:
             return
         from douzero.coach import CoachLabel
 
+        if not episode.policy_version_at_start or episode.policy_step_at_start < 0:
+            raise RuntimeError(
+                "sampled episode is missing its policy identity at start"
+            )
+
         self.coach_label_store.append(CoachLabel.from_terminal(
             opening,
             episode.terminal_result,
-            policy_version=self.policy_version,
-            policy_step=self.policy_step,
+            policy_version=episode.policy_version_at_start,
+            policy_step=episode.policy_step_at_start,
         ))
 
     def _compute_belief_feature(self, obs) -> "torch.Tensor | None":

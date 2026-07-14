@@ -199,6 +199,9 @@ curriculum:
   audit_log_path: ""
   policy_version: current
   policy_step: 0
+  # Reject future coach checkpoints and checkpoints older than this many
+  # optimizer updates. Label freshness below is a separate refit-data window.
+  max_coach_age_steps: 100000
   max_label_age_steps: 100000
   seed: 0
   candidate_pool_size: 16
