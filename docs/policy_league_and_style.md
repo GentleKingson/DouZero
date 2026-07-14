@@ -80,7 +80,9 @@ three-role bundles at `snapshot_root/policies/<policy_id>/<role>.ckpt`; path
 traversal, outside-root paths, symlinks, directories, and policy-ID/path
 mismatches are rejected. All roles are staged and fsynced before one atomic
 directory rename, so a failed writer cannot partially overwrite a registered
-bundle.
+bundle. `register_complete()` is only an orphan-recovery operation: an identical
+repeat is idempotent, while an existing policy ID with any different metadata
+is rejected rather than relabelled.
 
 Retention first atomically removes policies from the active manifest and adds
 `pending_deletes` tombstones. It then deletes only manager-owned regular files

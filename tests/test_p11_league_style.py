@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -594,6 +595,89 @@ def test_snapshot_registers_only_complete_files_and_preserves_pinned(tmp_path):
         Path(path).read_bytes() == b"checkpoint"
         for path in entry.checkpoint_paths_by_role.values()
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("model_config_hash", "relabelled-model-config"),
+        ("style_layout_hash", STYLE_LAYOUT_HASH),
+        ("checkpoint_kind", "public_policy"),
+    ),
+)
+def test_registered_snapshot_identity_cannot_be_relabelled(
+    tmp_path, field, value
+):
+    manager = SnapshotManager(
+        str(tmp_path / "league.json"),
+        snapshot_root=str(tmp_path / "snapshots"),
+    )
+    entry = _entry(
+        "snapshot-100",
+        tags=("pinned",),
+        paths=manager.checkpoint_paths("snapshot-100"),
+    )
+    manifest = manager.write_and_register(
+        entry,
+        {
+            role: (lambda path: Path(path).write_bytes(b"checkpoint"))
+            for role in ALL_ROLES
+        },
+        make_primary=True,
+    )
+    registered = manifest.get(entry.policy_id)
+
+    with pytest.raises(FileExistsError, match="different metadata"):
+        manager.register_complete(replace(registered, **{field: value}))
+
+    assert manager.load() == manifest
+    assert all(
+        Path(path).read_bytes() == b"checkpoint"
+        for path in entry.checkpoint_paths_by_role.values()
+    )
+
+
+def test_identical_snapshot_registration_is_idempotent(tmp_path):
+    manager = SnapshotManager(
+        str(tmp_path / "league.json"),
+        snapshot_root=str(tmp_path / "snapshots"),
+    )
+    entry = _entry(
+        "snapshot-100",
+        paths=manager.checkpoint_paths("snapshot-100"),
+    )
+    first = manager.write_and_register(
+        entry,
+        {
+            role: (lambda path: Path(path).write_bytes(b"checkpoint"))
+            for role in ALL_ROLES
+        },
+        make_primary=True,
+    )
+    second = manager.register_complete(entry, make_primary=True)
+    assert second == first
+    assert second.generation == first.generation
+
+
+def test_complete_orphan_bundle_can_be_registered(tmp_path):
+    manager = SnapshotManager(
+        str(tmp_path / "league.json"),
+        snapshot_root=str(tmp_path / "snapshots"),
+    )
+    entry = _entry(
+        "orphan-100",
+        paths=manager.checkpoint_paths("orphan-100"),
+    )
+    for raw_path in entry.checkpoint_paths_by_role.values():
+        path = Path(raw_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"complete-orphan")
+
+    recovered = manager.register_complete(entry, make_primary=True)
+    registered = recovered.get(entry.policy_id)
+    assert registered.checkpoint_paths_by_role == entry.checkpoint_paths_by_role
+    assert "managed-snapshot" in registered.tags
+    assert recovered.primary_policy_id == entry.policy_id
 
 
 def test_retention_refuses_paths_outside_snapshot_root(tmp_path):

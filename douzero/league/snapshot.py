@@ -144,7 +144,19 @@ class SnapshotManager:
                 tags=tuple(dict.fromkeys(entry.tags + (_MANAGED_TAG,))),
             )
         self._validate_managed_entry(managed, require_files=True)
-        manifest = self.load().upsert(managed, make_primary=make_primary)
+        manifest = self.load()
+        try:
+            existing = manifest.get(managed.policy_id)
+        except KeyError:
+            existing = None
+        if existing is not None:
+            if existing != managed:
+                raise FileExistsError(
+                    f"immutable snapshot policy_id {managed.policy_id!r} is "
+                    "already registered with different metadata"
+                )
+            return manifest
+        manifest = manifest.upsert(managed, make_primary=make_primary)
         manifest.save(self.manifest_path)
         return self.apply_retention(manifest)
 
