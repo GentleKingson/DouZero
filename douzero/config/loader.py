@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 from douzero.config.schemas import (
     BCConfig,
+    DistillationConfig,
     DecisionPolicyConfig,
     LossConfig,
     ModelConfig,
@@ -85,16 +86,17 @@ def load_legacy_config() -> TrainingConfig:
 # --------------------------------------------------------------------------- #
 def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     """Construct a TrainingConfig from a raw mapping, validating keys."""
-    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy", "model", "bc")}
+    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy", "model", "bc", "distillation")}
     valid_opt_names = {f.name for f in fields(OptimizerConfig)}
     valid_loss_names = {f.name for f in fields(LossConfig)}
     valid_decision_names = {f.name for f in fields(DecisionPolicyConfig)}
     valid_model_names = {f.name for f in fields(ModelConfig)}
     valid_bc_names = {f.name for f in fields(BCConfig)}
+    valid_distillation_names = {f.name for f in fields(DistillationConfig)}
 
     # 'optimizer', 'loss', 'decision_policy', 'model', 'bc', and 'rules' are
     # valid top-level keys (handled separately).
-    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "model", "bc", "rules"}
+    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "model", "bc", "distillation", "rules"}
     if unknown_top:
         raise ValueError(f"Unknown config keys: {sorted(unknown_top)}")
 
@@ -135,6 +137,15 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     unknown_bc = set(bc_raw.keys()) - valid_bc_names
     if unknown_bc:
         raise ValueError(f"Unknown bc config keys: {sorted(unknown_bc)}")
+
+    distillation_raw = raw.get("distillation", {})
+    if not isinstance(distillation_raw, Mapping):
+        raise TypeError("'distillation' must be a mapping")
+    unknown_distillation = set(distillation_raw.keys()) - valid_distillation_names
+    if unknown_distillation:
+        raise ValueError(
+            f"Unknown distillation config keys: {sorted(unknown_distillation)}"
+        )
 
     # P06 r6: unify top-level ``model_version`` and nested ``model.version``
     # into a single source of truth. Without this, a YAML like
@@ -185,6 +196,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
         kwargs["model"] = ModelConfig(**dict(model_raw))
     if bc_raw:
         kwargs["bc"] = BCConfig(**dict(bc_raw))
+    if distillation_raw:
+        kwargs["distillation"] = DistillationConfig(**dict(distillation_raw))
     cfg = TrainingConfig(**kwargs)
     _validate_types(cfg)
     _validate_legacy_only_versions(cfg)
@@ -230,6 +243,13 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "temperature": float, "label_smoothing": float,
     "skill_weight_clip": float, "schedule": str,
     "schedule_steps": int, "schedule_floor": float,
+    # P10: privileged-teacher distillation block.
+    "enabled": bool, "teacher_checkpoint": str, "dataset_path": str,
+    "cache_path": str, "top_k": int, "lambda_kl": float,
+    "distillation_temperature": float,
+    "lambda_rank": float, "lambda_teacher_win": float,
+    "lambda_teacher_score": float, "lambda_supervised_win": float,
+    "lambda_supervised_score": float,
 }
 
 
@@ -296,6 +316,13 @@ def _validate_types(cfg: TrainingConfig) -> None:
             "skill_weight_clip", "schedule", "schedule_steps", "schedule_floor",
         }:
             _check_field(name, getattr(cfg.bc, name), "bc")
+        elif name in {
+            "enabled", "teacher_checkpoint", "dataset_path", "cache_path",
+            "distillation_temperature", "top_k", "lambda_kl", "lambda_rank", "lambda_teacher_win",
+            "lambda_teacher_score", "lambda_supervised_win",
+            "lambda_supervised_score",
+        }:
+            _check_field(name, getattr(cfg.distillation, name), "distillation")
         elif hasattr(cfg, name):
             _check_field(name, getattr(cfg, name), "training")
 

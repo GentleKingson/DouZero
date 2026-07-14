@@ -22,6 +22,10 @@ from typing import Any
 # compatibility is checked via `feature_version` / `ruleset_id` / `model_version`.
 CURRENT_SCHEMA_VERSION = 1
 
+MODEL_ACCESS_PUBLIC = "public"
+MODEL_ACCESS_PRIVILEGED = "privileged"
+MODEL_ACCESS_CLASSES = frozenset({MODEL_ACCESS_PUBLIC, MODEL_ACCESS_PRIVILEGED})
+
 # The set of supported checkpoint kinds. ``position_weights`` is the per-position
 # eval sidecar (DeepAgent); ``training_checkpoint`` is the full model.tar bundle.
 # ``privileged_teacher`` / ``public_policy`` are reserved for P10/P16 and are
@@ -60,6 +64,7 @@ class CheckpointManifest:
     frames: int
     position_frames: dict[str, int]
     created_at: str  # ISO-8601 UTC
+    model_access: str = MODEL_ACCESS_PUBLIC
 
     def to_dict(self) -> dict[str, Any]:
         """Return a plain-dict serialization (for torch.save with weights_only)."""
@@ -78,6 +83,7 @@ class CheckpointManifest:
             "frames": self.frames,
             "position_frames": dict(self.position_frames),
             "created_at": self.created_at,
+            "model_access": self.model_access,
         }
 
     @classmethod
@@ -97,6 +103,7 @@ class CheckpointManifest:
             # Legacy ruleset hash (computed from RuleSet.legacy()).
             from douzero.env.rules import RuleSet
             d_copy["ruleset_hash"] = RuleSet.legacy().stable_hash()
+        d_copy.setdefault("model_access", MODEL_ACCESS_PUBLIC)
         return cls(**d_copy)
 
 
@@ -120,6 +127,11 @@ def build_manifest(
             f"Unknown checkpoint_kind {checkpoint_kind!r}; expected one of "
             f"{sorted(CHECKPOINT_KINDS)}"
         )
+    model_access = (
+        MODEL_ACCESS_PRIVILEGED
+        if checkpoint_kind == "privileged_teacher"
+        else MODEL_ACCESS_PUBLIC
+    )
 
     env = environment_info()
 
@@ -172,4 +184,5 @@ def build_manifest(
         frames=int(frames),
         position_frames={k: int(v) for k, v in position_frames.items()},
         created_at=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
+        model_access=model_access,
     )

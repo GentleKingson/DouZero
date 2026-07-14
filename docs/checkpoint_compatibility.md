@@ -43,6 +43,7 @@ Two checkpoint formats coexist:
 | `feature_version` | observation feature version (`legacy` in P01; `v2` in P03) |
 | `ruleset_id` | rule set (`legacy` in P01; `standard` in P02) |
 | `checkpoint_kind` | one of `training_checkpoint` / `position_weights` / `privileged_teacher` / `public_policy` |
+| `model_access` | `public` for ordinary/deployment models or `privileged` for a P10 training-only teacher; absent legacy fields default to `public` |
 | `git_sha` | commit SHA, or `"unknown"` (always a string, never None) |
 | `python_version` | interpreter version at save time |
 | `torch_version` | torch version at save time (native `str`, not `TorchVersion`) |
@@ -56,9 +57,9 @@ Two checkpoint formats coexist:
 
 - **manifest present + compatible** → returns `(bundle, manifest)`.
 - **manifest present + incompatible** → raises `CheckpointCompatibilityError`
-  with the offending field and expected/actual values. **Five fields are
+  with the offending field and expected/actual values. The core fields
   checked**: `schema_version`, `model_version`, `feature_version`,
-  `ruleset_id`, and `checkpoint_kind`. There is **no** permissive fallback — a
+  `ruleset_id`, `checkpoint_kind`, and `model_access`. There is **no** permissive fallback — a
   mismatch on any one always raises.
 - **manifest absent (legacy pre-P01 checkpoint)** → delegates to
   `load_legacy_model_tar`, returns `(bundle, manifest=None)`. No version
@@ -98,8 +99,8 @@ keys and shapes do **not** match the legacy models, so a legacy `.ckpt`
 
 P05 adds V2-aware checkpoint helpers in `douzero/checkpoint/v2.py`. Both the
 full bundle and the deployment sidecar are **manifest-bearing** and bound to
-the same FIVE identity axes (model_version, feature_schema_hash,
-model_config_hash, ruleset id/version/hash, checkpoint_kind):
+the same identity axes (model_version, feature_schema_hash,
+model_config_hash, ruleset id/version/hash, checkpoint_kind, model_access):
 
 - `save_v2_checkpoint(path, model, *, ruleset, ...)` — writes the full
   `model_v2.tar` bundle. The model identity (feature schema hash +
@@ -111,7 +112,7 @@ model_config_hash, ruleset id/version/hash, checkpoint_kind):
   onto the manifest, supporting custom rule families. The default call (no
   overrides) always produces a loadable file.
 - `load_v2_checkpoint(path, *, expected_schema_hash, expected_model_config_hash,
-  expected_ruleset, ...)` — reads a V2 bundle and validates ALL FIVE identity
+  expected_ruleset, ...)` — reads a V2 bundle and validates all identity
   axes against RUNTIME-supplied expectations (never the manifest's self-reported
   values). Every expected value is a required argument. Raises
   `CheckpointCompatibilityError` on any mismatch, including an attempt to load a
@@ -131,6 +132,15 @@ validator, so a V2 bundle cannot be silently loaded as legacy.
 
 Training is still legacy-only (the `dmc.py` gate rejects `model_version='v2'`
 for training until P06); see `docs/model_v2.md` for the deployment path.
+
+## P10 privileged teacher checkpoints
+
+P10 uses a dedicated `privileged_teacher` bundle with
+`model_access=privileged`. Only `load_teacher_checkpoint` accepts this pair;
+the legacy loader and V2 public-policy loader reject it. Public student export
+uses `public_policy` plus `model_access=public`, and the export function accepts
+only `ModelV2`. Older manifests have no access field and are interpreted as
+public, preserving their existing load behavior.
 
 ## Security: weights_only by default
 

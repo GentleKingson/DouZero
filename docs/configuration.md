@@ -80,6 +80,15 @@ See `configs/standard.yaml` and `docs/rules_and_scoring.md` for details.
 precise error. Standard mode is available for environment testing and
 end-to-end evaluation via `evaluate.py --ruleset standard`.
 
+### Distillation block
+
+P10 adds an optional `distillation:` block for the dedicated privileged
+teacher and public student commands. `enabled` defaults to `false`; the legacy
+trainer, `train_v2.py`, and deployment agents do not consume the teacher path.
+The block carries offline dataset/cache paths, temperature/top-k settings, and
+separate weights for KL, ranking, teacher regression, and retained terminal
+supervision. See `configs/enhanced.yaml` and `docs/distillation.md`.
+
 ## Boolean flags and `--no-<flag>` overrides
 
 The four boolean flags (`--actor_device_cpu`, `--load_model`,

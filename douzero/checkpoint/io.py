@@ -35,6 +35,9 @@ from douzero.checkpoint.compat import _resolve_map_location, load_legacy_model_t
 from douzero.checkpoint.manifest import (
     CHECKPOINT_KINDS,
     CURRENT_SCHEMA_VERSION,
+    MODEL_ACCESS_CLASSES,
+    MODEL_ACCESS_PRIVILEGED,
+    MODEL_ACCESS_PUBLIC,
     CheckpointManifest,
     build_manifest,
 )
@@ -154,6 +157,7 @@ def _validate_manifest(
     path: str,
     expected_ruleset_version: str | None = None,
     expected_ruleset_hash: str | None = None,
+    expected_model_access: str | None = None,
 ) -> None:
     """Validate all version/identity fields; raise on any mismatch.
 
@@ -164,6 +168,25 @@ def _validate_manifest(
     runtime still passes.
     """
     ctx = f"Checkpoint at {path} (git_sha={manifest.git_sha}, frames={manifest.frames})"
+
+    if manifest.model_access not in MODEL_ACCESS_CLASSES:
+        raise CheckpointCompatibilityError(
+            f"Checkpoint model_access has unknown value {manifest.model_access!r}; "
+            f"expected one of {sorted(MODEL_ACCESS_CLASSES)}. {ctx}"
+        )
+    if expected_model_access is None:
+        expected_model_access = (
+            MODEL_ACCESS_PRIVILEGED
+            if expected_checkpoint_kind == "privileged_teacher"
+            else MODEL_ACCESS_PUBLIC
+        )
+    if manifest.model_access != expected_model_access:
+        raise CheckpointCompatibilityError(
+            f"Checkpoint model_access mismatch: checkpoint has "
+            f"{manifest.model_access!r}, runtime expects {expected_model_access!r}. "
+            f"Privileged models are training-only and cannot be loaded as public "
+            f"policies. {ctx}"
+        )
 
     if manifest.schema_version != expected_schema_version:
         raise CheckpointCompatibilityError(
