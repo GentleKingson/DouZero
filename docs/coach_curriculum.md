@@ -1,0 +1,104 @@
+# Coach-Guided Opening Curriculum (P12)
+
+P12 adds an opt-in, training-only opening curriculum. It does not alter the
+legacy environment default, deployment agents, or evaluation deal selection.
+The implementation lives in `douzero.coach`; no evaluation module imports it.
+
+## Data and model boundaries
+
+`OpeningRecord` stores a complete 54-card deck, bidding order, RuleSet,
+bidding result/candidate landlord, and initial public metadata. The full deck
+is privileged training data. `Env.reset(opening=...)` converts it into the
+normal validated deal and never attaches it to an infoset or observation.
+
+Each completed sampled game may append a `CoachLabel` to a separate JSONL
+store. Labels contain the exact `policy_version` and numeric `policy_step`.
+`CoachLabelStore.load_fresh` accepts only matching policy versions and rejects
+future or older-than-configured labels. A live curriculum therefore produces
+fresh labels continuously; callers should periodically refit the coach from
+that filtered window and publish a new independent coach checkpoint.
+
+In the single-process V2 trainer, `policy_step` is the optimizer-update index.
+The configured value is the update index at resume/startup; each successful
+optimizer step increments the effective value by one. The trainer freezes
+`policy_version_at_start` and `policy_step_at_start` before sampling each
+opening and stores them on the `Episode`. Terminal coach labels use only this
+snapshot, never the trainer's mutable terminal-time counters.
+
+The repository provides that refit path directly:
+
+```bash
+python train_coach.py \
+  --labels artifacts/coach/labels.jsonl \
+  --output artifacts/coach/coach.pt \
+  --policy_version policy-120000 \
+  --current_policy_step 120000 \
+  --max_label_age_steps 20000
+```
+
+The command rejects mixed RuleSet identities, uses a stable content-addressed
+holdout when enough labels exist, reports measured calibration, and writes the
+new checkpoint atomically.
+
+`CoachModel` predicts landlord win probability from an opening plus a stable
+encoding of the policy version. Its checkpoint is separate from value, belief,
+teacher, and league checkpoints. The manifest pins:
+
+- coach model and feature versions;
+- architecture hash;
+- policy version and step used for labels;
+- RuleSet hash;
+- measured calibration metrics, when supplied.
+
+`calibration_metrics` reports Brier score and expected calibration error. No
+unmeasured calibration or win-rate result is shipped with this change.
+
+## Sampling modes
+
+- `true_random`: one uniformly shuffled complete deck.
+- `balanced`: among a configured candidate pool, choose the coach prediction
+  nearest landlord win probability 0.5.
+- `hard_for_role`: choose the lowest landlord probability for landlord
+  training, or the highest for farmer training.
+- `mixture`: sample one of the three strategies from the active curriculum
+  phase.
+
+The early, middle, and late phase proportions are configuration fields. Every
+phase must satisfy `min_true_random_ratio`; the default late phase returns to
+90 percent true-random deals. This fixed real-deal floor prevents permanent
+distribution collapse without claiming an approximate importance weight. It
+is a lower bound on the configured sampling probability, not a guarantee that
+every finite observed window reaches the same empirical ratio.
+Fixed `balanced` and `hard_for_role` modes also mix in the configured minimum
+true-random ratio; guided-only sampling is deliberately not a production mode.
+
+Every sampled opening can be written to the audit JSONL stream. Each row
+contains the configured proportions, selected strategy and its probability,
+predicted landlord win probability, opening ID, phase/progress, and cumulative
+actual counts/distribution. Guided records also contain the current policy
+step, coach checkpoint step, and computed coach age. The training distribution
+and freshness decision can therefore be reconstructed without retaining model
+tensors in the log.
+
+## Configuration
+
+The `curriculum:` block in `configs/enhanced.yaml` is disabled by default.
+For guided modes, set `enabled: true`, provide `coach_checkpoint`, and choose
+optional `labels_path` and `audit_log_path` outputs. `train_v2.py` loads and
+validates the coach before starting collection. `true_random` mode needs no
+coach checkpoint and can be used to exercise deterministic opening replay.
+
+Guided startup is fail-closed across three identities: RuleSet hash, exact
+`policy_version`, and checkpoint age. `policy_step - checkpoint.policy_step`
+must be between zero and `max_coach_age_steps`, inclusive. A checkpoint from a
+different policy, a future step, or an older step is rejected before an
+opening can be sampled. The same age check runs again before every episode,
+using the effective optimizer step frozen for that episode. If training moves
+beyond the configured age window, collection fails before any further coach
+inference rather than silently continuing guided sampling. This applies to
+ordinary and population self-play. `max_label_age_steps` is the separate
+freshness window used when refitting a coach from outcome labels.
+
+Final evaluation must continue to use `evaluate.py` and its ordinary random
+or fixed paired deal data. The evaluation package contains no coach sampler
+import and cannot enable this curriculum.

@@ -123,14 +123,18 @@ def test_serialize_round_trip():
     # Rebuild from the serialized dict, reconstructing the nested dataclasses.
     from douzero.config.schemas import (
         BCConfig,
+        CurriculumConfig,
         DecisionPolicyConfig,
-            DistillationConfig,
-            LeagueConfig,
+        DistillationConfig,
+        LeagueConfig,
         LossConfig,
         ModelConfig,
     )
 
-    drop = {"optimizer", "loss", "decision_policy", "model", "bc", "distillation", "league"}
+    drop = {
+        "optimizer", "loss", "decision_policy", "model", "bc",
+        "distillation", "league", "curriculum",
+    }
     rebuilt = TrainingConfig(
         **{k: v for k, v in d.items() if k not in drop},
         optimizer=OptimizerConfig(**d["optimizer"]),
@@ -140,6 +144,7 @@ def test_serialize_round_trip():
         bc=BCConfig(**d["bc"]),
         distillation=DistillationConfig(**d["distillation"]),
         league=LeagueConfig(**d["league"]),
+        curriculum=CurriculumConfig(**d["curriculum"]),
     )
     assert rebuilt == cfg
 

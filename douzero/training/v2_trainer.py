@@ -159,6 +159,8 @@ class TrainerStats:
     p_win_mean: float = float("nan")
     p_win_std: float = float("nan")
     score_mean_avg: float = float("nan")
+    opening_strategy_counts: dict[str, int] = field(default_factory=dict)
+    opening_predicted_win_mean: float = float("nan")
 
 
 def _legacy_only(ruleset: RuleSet | None) -> None:
@@ -217,6 +219,10 @@ class V2Trainer:
         policy_pool=None,
         opponent_selectors=None,
         matchup_logger=None,
+        opening_sampler=None,
+        coach_label_store=None,
+        policy_version: str = "current",
+        policy_step: int = 0,
     ) -> None:
         _legacy_only(ruleset)
         loss_cfg = loss_config or LossConfig()
@@ -379,8 +385,30 @@ class V2Trainer:
         else:
             self.rng = random.Random(self.config.rng_seed)
         self.stats = TrainerStats(
-            episodes_per_team={"landlord": 0, "farmer": 0}
+            episodes_per_team={"landlord": 0, "farmer": 0},
+            opening_strategy_counts={},
         )
+        if coach_label_store is not None and opening_sampler is None:
+            raise ValueError("coach_label_store requires an opening_sampler")
+        if not isinstance(policy_version, str) or not policy_version:
+            raise ValueError("policy_version must be a non-empty string")
+        if isinstance(policy_step, bool) or not isinstance(policy_step, int) or policy_step < 0:
+            raise ValueError("policy_step must be a non-negative int")
+        self.opening_sampler = opening_sampler
+        self.coach_label_store = coach_label_store
+        self.policy_version = policy_version
+        self.policy_step = policy_step
+        if opening_sampler is not None:
+            sampler_policy_version = getattr(opening_sampler, "policy_version", None)
+            if sampler_policy_version != policy_version:
+                raise ValueError(
+                    "opening_sampler.policy_version must match V2Trainer "
+                    f"policy_version: sampler={sampler_policy_version!r}, "
+                    f"trainer={policy_version!r}"
+                )
+        self._curriculum_game_index = 0
+        self._opening_prediction_sum = 0.0
+        self._opening_prediction_count = 0
         # P06 r3: put the model in eval mode for self-play collection.
         # ``inference_mode`` in _choose_action_index only disables autograd;
         # it does NOT switch Dropout / BatchNorm behaviour, so without
@@ -439,18 +467,54 @@ class V2Trainer:
 
     def _run_one_episode(self) -> Episode:
         """Play one game to terminal, recording decisions and labels."""
+        # Freeze identity before sampling the opening. The single-process V2
+        # trainer cannot optimize during a game, so this exactly identifies
+        # the weights that generated the full trajectory. Keeping it on the
+        # Episode also remains correct if collection and optimization are
+        # interleaved between games.
+        policy_version_at_start = self.policy_version
+        policy_step_at_start = self.policy_step + self.stats.optimizer_steps
+        opening = None
+        sampling_record = None
+        if self.opening_sampler is not None:
+            denominator = max(1, self.config.max_episodes - 1)
+            progress = min(1.0, self._curriculum_game_index / denominator)
+            opening, sampling_record = self.opening_sampler.sample(
+                progress=progress,
+                current_policy_step=policy_step_at_start,
+            )
+            self._curriculum_game_index += 1
+            strategy = sampling_record.selected_strategy
+            self.stats.opening_strategy_counts[strategy] = (
+                self.stats.opening_strategy_counts.get(strategy, 0) + 1
+            )
+            if sampling_record.predicted_landlord_win is not None:
+                self._opening_prediction_sum += sampling_record.predicted_landlord_win
+                self._opening_prediction_count += 1
+                self.stats.opening_predicted_win_mean = (
+                    self._opening_prediction_sum / self._opening_prediction_count
+                )
         if self.population_runner is not None:
-            episode, _record = self.population_runner.run(self._league_game_index)
+            episode, _record = self.population_runner.run(
+                self._league_game_index,
+                opening=opening,
+                policy_version_at_start=policy_version_at_start,
+                policy_step_at_start=policy_step_at_start,
+            )
             self._league_game_index += 1
             if self.strategy_aux_weight > 0:
                 episode.label_strategy_auxiliary(
                     node_budget=self.model.config.strategy_node_budget,
                     time_budget_ms=self.model.config.strategy_time_budget_ms,
                 )
+            self._record_coach_label(opening, episode)
             return episode
         env = Env(objective="adp", ruleset=self.ruleset)
-        env.reset()
-        episode = Episode()
+        env.reset(opening=opening)
+        episode = Episode(
+            policy_version_at_start=policy_version_at_start,
+            policy_step_at_start=policy_step_at_start,
+        )
         steps = 0
         while True:
             # P06 r2: use an explicit raise, not assert — ``python -O`` strips
@@ -492,7 +556,27 @@ class V2Trainer:
                 node_budget=self.model.config.strategy_node_budget,
                 time_budget_ms=self.model.config.strategy_time_budget_ms,
             )
+        self._record_coach_label(opening, episode)
         return episode
+
+    def _record_coach_label(self, opening, episode: Episode) -> None:
+        """Append a policy-versioned label after a sampled game completes."""
+
+        if opening is None or self.coach_label_store is None:
+            return
+        from douzero.coach import CoachLabel
+
+        if not episode.policy_version_at_start or episode.policy_step_at_start < 0:
+            raise RuntimeError(
+                "sampled episode is missing its policy identity at start"
+            )
+
+        self.coach_label_store.append(CoachLabel.from_terminal(
+            opening,
+            episode.terminal_result,
+            policy_version=episode.policy_version_at_start,
+            policy_step=episode.policy_step_at_start,
+        ))
 
     def _compute_belief_feature(self, obs) -> "torch.Tensor | None":
         """Compute the (frozen) belief posterior feature for one observation.

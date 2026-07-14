@@ -27,6 +27,7 @@ from douzero.config.loader import (
 )
 from douzero.config.schemas import (
     CheckpointConfig,
+    CurriculumConfig,
     DistillationConfig,
     EvaluationConfig,
     LeagueConfig,
@@ -39,6 +40,7 @@ from douzero.config.schemas import (
 
 __all__ = [
     "CheckpointConfig",
+    "CurriculumConfig",
     "DistillationConfig",
     "EvaluationConfig",
     "LegacyConfig",

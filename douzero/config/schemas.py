@@ -317,6 +317,94 @@ class LeagueConfig:
             )
 
 
+@dataclass(frozen=True)
+class CurriculumConfig:
+    """P12 coach-guided opening curriculum, disabled by default."""
+
+    enabled: bool = False
+    mode: str = "mixture"
+    coach_checkpoint: str = ""
+    labels_path: str = ""
+    audit_log_path: str = ""
+    policy_version: str = "current"
+    policy_step: int = 0
+    max_coach_age_steps: int = 100000
+    max_label_age_steps: int = 100000
+    seed: int = 0
+    candidate_pool_size: int = 16
+    hard_role: str = "landlord"
+    early_until: float = 0.30
+    mid_until: float = 0.70
+    min_true_random_ratio: float = 0.20
+    early_true_random: float = 0.20
+    early_balanced: float = 0.70
+    early_hard_for_role: float = 0.10
+    middle_true_random: float = 0.50
+    middle_balanced: float = 0.30
+    middle_hard_for_role: float = 0.20
+    late_true_random: float = 0.90
+    late_balanced: float = 0.05
+    late_hard_for_role: float = 0.05
+
+    def __post_init__(self) -> None:
+        import math
+
+        if not isinstance(self.enabled, bool):
+            raise TypeError("CurriculumConfig.enabled must be bool")
+        for name in (
+            "mode", "coach_checkpoint", "labels_path", "audit_log_path",
+            "policy_version", "hard_role",
+        ):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError(f"CurriculumConfig.{name} must be str")
+        if self.mode not in ("true_random", "balanced", "hard_for_role", "mixture"):
+            raise ValueError("CurriculumConfig.mode is unsupported")
+        if self.hard_role not in ("landlord", "farmer"):
+            raise ValueError("CurriculumConfig.hard_role must be landlord or farmer")
+        if not self.policy_version:
+            raise ValueError("CurriculumConfig.policy_version must be non-empty")
+        for name in (
+            "policy_step", "max_coach_age_steps", "max_label_age_steps", "seed"
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"CurriculumConfig.{name} must be a non-negative int")
+        if (
+            isinstance(self.candidate_pool_size, bool)
+            or not isinstance(self.candidate_pool_size, int)
+            or self.candidate_pool_size < 1
+        ):
+            raise ValueError("CurriculumConfig.candidate_pool_size must be positive")
+        if not 0.0 <= self.early_until < self.mid_until <= 1.0:
+            raise ValueError("curriculum phase boundaries must satisfy 0 <= early < mid <= 1")
+        if not 0.0 <= self.min_true_random_ratio <= 1.0:
+            raise ValueError("min_true_random_ratio must be in [0, 1]")
+        phases = {
+            "early": (
+                self.early_true_random, self.early_balanced, self.early_hard_for_role
+            ),
+            "middle": (
+                self.middle_true_random, self.middle_balanced, self.middle_hard_for_role
+            ),
+            "late": (
+                self.late_true_random, self.late_balanced, self.late_hard_for_role
+            ),
+        }
+        for name, values in phases.items():
+            if any(not math.isfinite(value) or value < 0.0 for value in values):
+                raise ValueError(f"{name} curriculum proportions must be non-negative finite")
+            if abs(sum(values) - 1.0) > 1e-9:
+                raise ValueError(f"{name} curriculum proportions must sum to 1.0")
+            if values[0] < self.min_true_random_ratio:
+                raise ValueError(
+                    f"{name}_true_random is below min_true_random_ratio"
+                )
+        if self.enabled and self.mode != "true_random" and not self.coach_checkpoint:
+            raise ValueError(
+                "guided curriculum modes require curriculum.coach_checkpoint"
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Model architecture (P05 widens to ``v2``; referenced by TrainingConfig)
 # --------------------------------------------------------------------------- #
@@ -428,6 +516,8 @@ class TrainingConfig:
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
     # P11: disabled by default; legacy actor/learner semantics are untouched.
     league: LeagueConfig = field(default_factory=LeagueConfig)
+    # P12: training-only coach sampler. Evaluation never imports this block.
+    curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
 
 
 # --------------------------------------------------------------------------- #

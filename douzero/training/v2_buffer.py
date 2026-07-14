@@ -190,6 +190,10 @@ class Episode:
     action_trace: list[tuple[str, tuple[int, ...]]] = field(default_factory=list)
     policy_ids_by_seat: dict[str, str] = field(default_factory=dict)
     learner_controlled_seats: tuple[str, ...] = ()
+    # P12 policy identity frozen before the opening is sampled. Coach labels
+    # must use this snapshot rather than mutable trainer counters at terminal.
+    policy_version_at_start: str = ""
+    policy_step_at_start: int = -1
 
     def label_from_terminal(self) -> None:
         """Apply per-position team-perspective labels to every transition.

@@ -15,11 +15,13 @@ print('numpy', numpy.__version__)"
 
 echo
 echo "=== compileall ==="
-python -m compileall -q douzero train.py evaluate.py generate_eval_data.py train_belief.py evaluate_belief.py
+python -m compileall -q douzero train.py train_v2.py train_coach.py evaluate.py generate_eval_data.py train_belief.py evaluate_belief.py
 
 echo
 echo "=== CLI --help ==="
 python train.py --help >/dev/null
+python train_v2.py --help >/dev/null
+python train_coach.py --help >/dev/null
 python evaluate.py --help >/dev/null
 python generate_eval_data.py --help >/dev/null
 python train_belief.py --help >/dev/null
