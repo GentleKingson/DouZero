@@ -195,6 +195,7 @@ class DistillationConfig:
     teacher_checkpoint: str = ""
     dataset_path: str = ""
     cache_path: str = ""
+    batch_size: int = 32
     distillation_temperature: float = 2.0
     top_k: int = 4
     lambda_kl: float = 1.0
@@ -218,6 +219,15 @@ class DistillationConfig:
                     f"DistillationConfig.{name} must be str, got "
                     f"{type(getattr(self, name)).__name__}"
                 )
+        if (
+            isinstance(self.batch_size, bool)
+            or not isinstance(self.batch_size, int)
+            or self.batch_size < 1
+        ):
+            raise ValueError(
+                f"DistillationConfig.batch_size must be a positive int, "
+                f"got {self.batch_size!r}"
+            )
         if (
             isinstance(self.distillation_temperature, bool)
             or not isinstance(self.distillation_temperature, (int, float))

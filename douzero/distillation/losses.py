@@ -9,6 +9,13 @@ import torch
 import torch.nn.functional as F
 
 from douzero.models_v2.output import ModelOutput
+from douzero.training.losses import (
+    SCORE_TARGET_RAW,
+    SCORE_TARGET_SIGNED_LOG,
+    bce_win_loss,
+    conditional_score_huber_loss,
+    resolve_score_target,
+)
 
 from .teacher_model import ActionKey, TeacherOutput
 
@@ -27,6 +34,9 @@ class DistillationLossConfig:
     lambda_teacher_score: float = 0.25
     lambda_supervised_win: float = 1.0
     lambda_supervised_score: float = 0.5
+    score_delta: float = 1.0
+    score_target_transform: str = SCORE_TARGET_RAW
+    score_clamp: float = 32.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -61,21 +71,50 @@ class DistillationLossConfig:
                 or value < 0.0
             ):
                 raise ValueError(f"{name} must be non-negative finite, got {value}")
+        if (
+            isinstance(self.score_delta, bool)
+            or not isinstance(self.score_delta, (int, float))
+            or not math.isfinite(self.score_delta)
+            or self.score_delta <= 0.0
+        ):
+            raise ValueError(f"score_delta must be positive finite, got {self.score_delta}")
+        if self.score_target_transform not in (
+            SCORE_TARGET_RAW,
+            SCORE_TARGET_SIGNED_LOG,
+        ):
+            raise ValueError(
+                "score_target_transform must be 'raw' or 'signed_log', got "
+                f"{self.score_target_transform!r}"
+            )
+        if (
+            isinstance(self.score_clamp, bool)
+            or not isinstance(self.score_clamp, (int, float))
+            or not math.isfinite(self.score_clamp)
+            or self.score_clamp <= 0.0
+        ):
+            raise ValueError(f"score_clamp must be positive finite, got {self.score_clamp}")
 
     @classmethod
     def from_training_config(cls, config) -> "DistillationLossConfig":
         """Bridge the repository YAML DistillationConfig into the loss API."""
 
+        distillation = getattr(config, "distillation", config)
+        loss = getattr(config, "loss", None)
         return cls(
-            enabled=config.enabled,
-            temperature=config.distillation_temperature,
-            top_k=config.top_k,
-            lambda_kl=config.lambda_kl,
-            lambda_rank=config.lambda_rank,
-            lambda_teacher_win=config.lambda_teacher_win,
-            lambda_teacher_score=config.lambda_teacher_score,
-            lambda_supervised_win=config.lambda_supervised_win,
-            lambda_supervised_score=config.lambda_supervised_score,
+            enabled=distillation.enabled,
+            temperature=distillation.distillation_temperature,
+            top_k=distillation.top_k,
+            lambda_kl=distillation.lambda_kl,
+            lambda_rank=distillation.lambda_rank,
+            lambda_teacher_win=distillation.lambda_teacher_win,
+            lambda_teacher_score=distillation.lambda_teacher_score,
+            lambda_supervised_win=distillation.lambda_supervised_win,
+            lambda_supervised_score=distillation.lambda_supervised_score,
+            score_delta=1.0 if loss is None else loss.score_delta,
+            score_target_transform=(
+                SCORE_TARGET_RAW if loss is None else loss.score_target_transform
+            ),
+            score_clamp=32.0 if loss is None else loss.score_clamp,
         )
 
 
@@ -129,6 +168,8 @@ def align_teacher_output(
         action_keys=student_keys,
         win_logit=teacher.win_logit.index_select(0, index),
         p_win=teacher.p_win.index_select(0, index),
+        score_if_win=teacher.score_if_win.index_select(0, index),
+        score_if_loss=teacher.score_if_loss.index_select(0, index),
         expected_score=teacher.expected_score.index_select(0, index),
         action_logits=teacher.action_logits.index_select(0, index),
         action_mask=teacher.action_mask.index_select(0, index),
@@ -203,9 +244,17 @@ def distillation_loss(
         teacher_win = F.mse_loss(
             student.p_win[valid], aligned.p_win.to(device=device)[valid].detach()
         )
-        teacher_score = F.smooth_l1_loss(
-            student.score_mean[valid],
-            aligned.expected_score.to(device=device)[valid].detach(),
+        teacher_score = 0.5 * (
+            F.huber_loss(
+                student.score_if_win[valid],
+                aligned.score_if_win.to(device=device)[valid].detach(),
+                delta=cfg.score_delta,
+            )
+            + F.huber_loss(
+                student.score_if_loss[valid],
+                aligned.score_if_loss.to(device=device)[valid].detach(),
+                delta=cfg.score_delta,
+            )
         )
     elif teacher is not None:
         raise ValueError(
@@ -214,12 +263,21 @@ def distillation_loss(
         )
 
     target_win_tensor = student.win_logit.new_tensor(float(target_win)).reshape(1)
-    target_score_tensor = student.score_mean.new_tensor(float(target_score)).reshape(1)
-    supervised_win = F.binary_cross_entropy_with_logits(
-        student.win_logit[action_index].reshape(1), target_win_tensor
+    raw_target_score = student.score_if_win.new_tensor(float(target_score)).reshape(1)
+    target_score_tensor = resolve_score_target(
+        raw_target_score,
+        score_target_transform=cfg.score_target_transform,
+        score_clamp=cfg.score_clamp,
     )
-    supervised_score = F.smooth_l1_loss(
-        student.score_mean[action_index].reshape(1), target_score_tensor
+    supervised_win = bce_win_loss(
+        student.win_logit[action_index:action_index + 1], target_win_tensor
+    )
+    supervised_score, _, _ = conditional_score_huber_loss(
+        student.score_if_win[action_index:action_index + 1],
+        student.score_if_loss[action_index:action_index + 1],
+        target_score_tensor,
+        target_win_tensor,
+        delta=cfg.score_delta,
     )
     total = (
         cfg.lambda_kl * kl

@@ -27,12 +27,19 @@ class StudentTrainConfig:
 
     learning_rate: float = 1e-4
     max_grad_norm: float = 10.0
+    batch_size: int = 32
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
             raise ValueError("learning_rate must be positive finite")
         if not math.isfinite(self.max_grad_norm) or self.max_grad_norm <= 0.0:
             raise ValueError("max_grad_norm must be positive finite")
+        if (
+            isinstance(self.batch_size, bool)
+            or not isinstance(self.batch_size, int)
+            or self.batch_size < 1
+        ):
+            raise ValueError("batch_size must be a positive int")
 
 
 class StudentDistiller:
@@ -55,6 +62,20 @@ class StudentDistiller:
         self.student = student
         self.loss_config = loss_config or DistillationLossConfig()
         self.train_config = train_config or StudentTrainConfig()
+        if self.loss_config.score_clamp != self.student.config.score_clamp:
+            raise ValueError(
+                "distillation score_clamp must match public Model V2 config: "
+                f"{self.loss_config.score_clamp} != {self.student.config.score_clamp}"
+            )
+        if (
+            self.loss_config.score_target_transform
+            != self.student.config.score_target_transform
+        ):
+            raise ValueError(
+                "distillation score_target_transform must match public Model V2 config: "
+                f"{self.loss_config.score_target_transform!r} != "
+                f"{self.student.config.score_target_transform!r}"
+            )
         if self.loss_config.enabled and teacher is None:
             raise ValueError("enabled distillation requires a TeacherModel")
         if not self.loss_config.enabled and teacher is not None:
@@ -69,6 +90,8 @@ class StudentDistiller:
         self.optimizer = torch.optim.Adam(
             self.student.parameters(), lr=self.train_config.learning_rate
         )
+        self.optimizer_steps_last_epoch = 0
+        self.max_batch_size_last_epoch = 0
 
     def _teacher_output(self, sample: OfflineDistillationSample) -> TeacherOutput | None:
         if self.teacher is None:
@@ -106,14 +129,11 @@ class StudentDistiller:
             config=self.loss_config,
         )
 
-    def train_epoch(self, samples: Iterable[OfflineDistillationSample]) -> float:
-        """Run one optimizer step over the mean loss of a bounded sample set."""
+    def _train_batch(self, samples: list[OfflineDistillationSample]) -> float:
+        """Forward, backpropagate, and release one bounded minibatch graph."""
 
-        self.student.train()
         self.optimizer.zero_grad(set_to_none=True)
         components = [self.loss_for_sample(sample) for sample in samples]
-        if not components:
-            raise ValueError("student distillation requires at least one sample")
         total = torch.stack([component.total for component in components]).mean()
         if not bool(torch.isfinite(total)):
             raise FloatingPointError("student distillation loss is NaN or Inf")
@@ -128,6 +148,39 @@ class StudentDistiller:
             raise FloatingPointError("student gradient norm is NaN or Inf")
         self.optimizer.step()
         return before
+
+    def train_epoch(self, samples: Iterable[OfflineDistillationSample]) -> float:
+        """Train with independent bounded minibatch graphs and optimizer steps."""
+
+        self.student.train()
+        self.optimizer_steps_last_epoch = 0
+        self.max_batch_size_last_epoch = 0
+        weighted_loss = 0.0
+        sample_count = 0
+        batch: list[OfflineDistillationSample] = []
+        for sample in samples:
+            batch.append(sample)
+            if len(batch) < self.train_config.batch_size:
+                continue
+            batch_loss = self._train_batch(batch)
+            weighted_loss += batch_loss * len(batch)
+            sample_count += len(batch)
+            self.optimizer_steps_last_epoch += 1
+            self.max_batch_size_last_epoch = max(
+                self.max_batch_size_last_epoch, len(batch)
+            )
+            batch = []
+        if batch:
+            batch_loss = self._train_batch(batch)
+            weighted_loss += batch_loss * len(batch)
+            sample_count += len(batch)
+            self.optimizer_steps_last_epoch += 1
+            self.max_batch_size_last_epoch = max(
+                self.max_batch_size_last_epoch, len(batch)
+            )
+        if sample_count == 0:
+            raise ValueError("student distillation requires at least one sample")
+        return weighted_loss / sample_count
 
 
 def build_teacher_cache(
@@ -145,6 +198,7 @@ def build_teacher_cache(
             feature_schema_hash=student.schema.stable_hash(),
             ruleset_hash=ruleset_hash,
             teacher_model_sha=state_dict_sha256(teacher),
+            teacher_config_hash=teacher.config_hash(),
         ),
     )
 
@@ -157,6 +211,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, help="Public policy .ckpt")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--batch_size", type=int, default=None)
     return parser
 
 
@@ -184,7 +239,7 @@ def main() -> None:
         raise ValueError("dataset and teacher checkpoint paths are required")
     ruleset = RuleSet.legacy() if cfg.ruleset == "legacy" else RuleSet.standard()
     schema = build_v2_schema()
-    model_cfg = ModelV2Config.from_model_config(cfg.model)
+    model_cfg = ModelV2Config.from_training_config(cfg)
     student = ModelV2(schema, model_cfg)
     teacher = TeacherModel(ModelV2(schema, model_cfg))
     load_teacher_checkpoint(teacher_path, teacher, expected_ruleset=ruleset)
@@ -204,8 +259,15 @@ def main() -> None:
     distiller = StudentDistiller(
         student,
         teacher=teacher,
-        loss_config=DistillationLossConfig.from_training_config(distill_cfg),
-        train_config=StudentTrainConfig(learning_rate=args.learning_rate),
+        loss_config=DistillationLossConfig.from_training_config(cfg),
+        train_config=StudentTrainConfig(
+            learning_rate=args.learning_rate,
+            batch_size=(
+                distill_cfg.batch_size
+                if args.batch_size is None
+                else args.batch_size
+            ),
+        ),
         teacher_cache=cache,
     )
     last_loss = float("nan")

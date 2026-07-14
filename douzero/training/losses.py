@@ -234,6 +234,43 @@ def _signed_log(score: torch.Tensor) -> torch.Tensor:
     return torch.sign(s) * torch.log1p(s.abs())
 
 
+def resolve_score_target(
+    target_score: torch.Tensor,
+    *,
+    score_target_transform: str,
+    score_clamp: float,
+    target_log_score: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Transform and clamp terminal scores to the Model V2 head scale.
+
+    This is the shared target boundary for ordinary V2 training and P10
+    teacher/student training. Callers must not supervise ``score_mean``;
+    the returned value targets the applicable conditional score head.
+    """
+
+    if score_target_transform not in _VALID_SCORE_TRANSFORMS:
+        raise ValueError(
+            f"score_target_transform must be one of {sorted(_VALID_SCORE_TRANSFORMS)}, "
+            f"got {score_target_transform!r}"
+        )
+    if (
+        isinstance(score_clamp, bool)
+        or not isinstance(score_clamp, (int, float))
+        or not math.isfinite(score_clamp)
+        or score_clamp <= 0.0
+    ):
+        raise ValueError(f"score_clamp must be positive and finite, got {score_clamp!r}")
+    if score_target_transform == SCORE_TARGET_SIGNED_LOG:
+        resolved = (
+            target_log_score.float()
+            if target_log_score is not None
+            else _signed_log(target_score)
+        )
+    else:
+        resolved = target_score.float()
+    return resolved.clamp(-float(score_clamp), float(score_clamp))
+
+
 def _select_per_sample(
     score_if_win: torch.Tensor,
     score_if_loss: torch.Tensor,
@@ -444,17 +481,12 @@ class MultiObjectiveLoss(nn.Module):
         very small ``score_clamp`` (e.g. 0.5) is still smaller than
         ``log1p(1.0)≈0.693`` — the smallest common non-zero score.
         """
-        if self.config.score_target_transform == SCORE_TARGET_SIGNED_LOG:
-            pre = batch_labels.get("target_log_score")
-            if pre is not None:
-                resolved = pre.float()
-            else:
-                resolved = _signed_log(batch_labels["target_score"])
-        else:
-            resolved = batch_labels["target_score"].float()
-        # Clamp to the representable range in both modes.
-        sc = float(self.config.score_clamp)
-        return resolved.clamp(-sc, sc)
+        return resolve_score_target(
+            batch_labels["target_score"],
+            score_target_transform=self.config.score_target_transform,
+            score_clamp=self.config.score_clamp,
+            target_log_score=batch_labels.get("target_log_score"),
+        )
 
     def _validate_loss_labels(
         self,

@@ -20,11 +20,18 @@ from douzero.checkpoint.manifest import (
     build_manifest,
 )
 from douzero.env.rules import RuleSet
+from douzero.training.losses import (
+    SCORE_TARGET_RAW,
+    SCORE_TARGET_SIGNED_LOG,
+    bce_win_loss,
+    conditional_score_huber_loss,
+    resolve_score_target,
+)
 
 from .dataset import OfflineDistillationSample, load_offline_dataset
 from .teacher_model import TeacherModel, state_dict_sha256
 
-TEACHER_CHECKPOINT_VERSION = 1
+TEACHER_CHECKPOINT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -36,15 +43,42 @@ class TeacherTrainConfig:
     lambda_policy: float = 1.0
     lambda_win: float = 1.0
     lambda_score: float = 0.5
+    score_delta: float = 1.0
+    score_target_transform: str = SCORE_TARGET_RAW
+    score_clamp: float = 32.0
 
     def __post_init__(self) -> None:
         for name in (
             "learning_rate", "max_grad_norm", "lambda_policy", "lambda_win",
-            "lambda_score",
+            "lambda_score", "score_delta", "score_clamp",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be positive finite, got {value}")
+        if self.score_target_transform not in (
+            SCORE_TARGET_RAW,
+            SCORE_TARGET_SIGNED_LOG,
+        ):
+            raise ValueError(
+                "score_target_transform must be 'raw' or 'signed_log', got "
+                f"{self.score_target_transform!r}"
+            )
+
+    @classmethod
+    def from_training_config(
+        cls,
+        training_config,
+        *,
+        learning_rate: float,
+    ) -> "TeacherTrainConfig":
+        """Use the same score semantics as the ordinary V2 learner."""
+
+        return cls(
+            learning_rate=learning_rate,
+            score_delta=training_config.loss.score_delta,
+            score_target_transform=training_config.loss.score_target_transform,
+            score_clamp=training_config.loss.score_clamp,
+        )
 
 
 def teacher_supervised_loss(
@@ -63,12 +97,21 @@ def teacher_supervised_loss(
     target_index = torch.tensor([index], device=output.action_logits.device)
     policy = F.cross_entropy(output.action_logits.squeeze(-1).unsqueeze(0), target_index)
     target_win = output.win_logit.new_tensor([sample.target_win])
-    win = F.binary_cross_entropy_with_logits(
-        output.win_logit[index].reshape(1), target_win
+    win = bce_win_loss(
+        output.win_logit[index:index + 1], target_win
     )
-    target_score = output.expected_score.new_tensor([sample.target_score])
-    score = F.smooth_l1_loss(
-        output.expected_score[index].reshape(1), target_score
+    raw_target_score = output.score_if_win.new_tensor([sample.target_score])
+    target_score = resolve_score_target(
+        raw_target_score,
+        score_target_transform=config.score_target_transform,
+        score_clamp=config.score_clamp,
+    )
+    score, _, _ = conditional_score_huber_loss(
+        output.score_if_win[index:index + 1],
+        output.score_if_loss[index:index + 1],
+        target_score,
+        target_win,
+        delta=config.score_delta,
     )
     total = (
         config.lambda_policy * policy
@@ -90,6 +133,20 @@ class TeacherTrainer:
     ) -> None:
         self.model = model
         self.config = config or TeacherTrainConfig()
+        if self.config.score_clamp != self.model.public_model.config.score_clamp:
+            raise ValueError(
+                "teacher score_clamp must match public Model V2 config: "
+                f"{self.config.score_clamp} != {self.model.public_model.config.score_clamp}"
+            )
+        if (
+            self.config.score_target_transform
+            != self.model.public_model.config.score_target_transform
+        ):
+            raise ValueError(
+                "teacher score_target_transform must match public Model V2 config: "
+                f"{self.config.score_target_transform!r} != "
+                f"{self.model.public_model.config.score_target_transform!r}"
+            )
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=self.config.learning_rate
         )
@@ -238,7 +295,7 @@ def main() -> None:
         raise ValueError("teacher training requires feature_version=v2 and model_version=v2")
     ruleset = RuleSet.legacy() if cfg.ruleset == "legacy" else RuleSet.standard()
     schema = build_v2_schema()
-    public_cfg = ModelV2Config.from_model_config(cfg.model)
+    public_cfg = ModelV2Config.from_training_config(cfg)
     teacher = TeacherModel(ModelV2(schema, public_cfg))
     dataset = load_offline_dataset(
         args.dataset,
@@ -246,7 +303,10 @@ def main() -> None:
         expected_ruleset_hash=ruleset.stable_hash(),
     )
     trainer = TeacherTrainer(
-        teacher, TeacherTrainConfig(learning_rate=args.learning_rate)
+        teacher,
+        TeacherTrainConfig.from_training_config(
+            cfg, learning_rate=args.learning_rate
+        ),
     )
     last_loss = float("nan")
     for _ in range(args.epochs):

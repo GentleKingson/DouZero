@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import numbers
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +72,10 @@ class OfflineDistillationSample:
             raise ValueError("action_keys must be unique")
         if any(key != tuple(sorted(key)) for key in self.action_keys):
             raise ValueError("action_keys must be canonical sorted tuples")
+        if isinstance(self.action_index, bool) or not isinstance(self.action_index, int):
+            raise TypeError(
+                f"action_index must be an int, got {type(self.action_index).__name__}"
+            )
         if not 0 <= self.action_index < n:
             raise ValueError(
                 f"action_index {self.action_index} outside legal-action range [0, {n})"
@@ -81,6 +87,30 @@ class OfflineDistillationSample:
                 f"acting_role mismatch: public={self.public_inputs.acting_role!r}, "
                 f"privileged={self.privileged_observation.acting_role!r}"
             )
+        if (
+            isinstance(self.target_win, bool)
+            or not isinstance(self.target_win, numbers.Real)
+            or not math.isfinite(float(self.target_win))
+            or float(self.target_win) not in (0.0, 1.0)
+        ):
+            raise ValueError(
+                f"target_win must be finite and exactly 0.0 or 1.0, got "
+                f"{self.target_win!r}"
+            )
+        if (
+            isinstance(self.target_score, bool)
+            or not isinstance(self.target_score, numbers.Real)
+            or not math.isfinite(float(self.target_score))
+        ):
+            raise ValueError(
+                f"target_score must be a finite number, got {self.target_score!r}"
+            )
+        if not isinstance(self.sample_id, str):
+            raise TypeError(
+                f"sample_id must be str, got {type(self.sample_id).__name__}"
+            )
+        object.__setattr__(self, "target_win", float(self.target_win))
+        object.__setattr__(self, "target_score", float(self.target_score))
 
 
 class DistillationDataset(Sequence[OfflineDistillationSample]):
@@ -168,10 +198,10 @@ def _sample_from_dict(raw: dict) -> OfflineDistillationSample:
         public_inputs=_bundle_from_dict(raw["public_inputs"]),
         privileged_observation=privileged,
         action_keys=tuple(tuple(int(card) for card in key) for key in raw["action_keys"]),
-        action_index=int(raw["action_index"]),
-        target_win=float(raw["target_win"]),
-        target_score=float(raw["target_score"]),
-        sample_id=str(raw.get("sample_id", "")),
+        action_index=raw["action_index"],
+        target_win=raw["target_win"],
+        target_score=raw["target_score"],
+        sample_id=raw.get("sample_id", ""),
     )
 
 

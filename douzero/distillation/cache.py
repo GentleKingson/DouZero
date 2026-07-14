@@ -12,7 +12,7 @@ import torch
 from .dataset import OfflineDistillationSample, teacher_observation_hash
 from .teacher_model import TeacherOutput
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -22,10 +22,14 @@ class TeacherCacheIdentity:
     feature_schema_hash: str
     ruleset_hash: str
     teacher_model_sha: str
+    teacher_config_hash: str
     cache_version: int = CACHE_VERSION
 
     def __post_init__(self) -> None:
-        for name in ("feature_schema_hash", "ruleset_hash", "teacher_model_sha"):
+        for name in (
+            "feature_schema_hash", "ruleset_hash", "teacher_model_sha",
+            "teacher_config_hash",
+        ):
             if not getattr(self, name):
                 raise ValueError(f"{name} must be non-empty")
         if self.cache_version != CACHE_VERSION:
@@ -78,6 +82,12 @@ class TeacherCache:
             action_keys=keys,
             win_logit=torch.tensor(raw["win_logit"], dtype=torch.float32).reshape(-1, 1),
             p_win=torch.tensor(raw["p_win"], dtype=torch.float32).reshape(-1, 1),
+            score_if_win=torch.tensor(
+                raw["score_if_win"], dtype=torch.float32
+            ).reshape(-1, 1),
+            score_if_loss=torch.tensor(
+                raw["score_if_loss"], dtype=torch.float32
+            ).reshape(-1, 1),
             expected_score=torch.tensor(
                 raw["expected_score"], dtype=torch.float32
             ).reshape(-1, 1),
@@ -101,6 +111,8 @@ class TeacherCache:
             "action_keys": [list(key) for key in detached.action_keys],
             "win_logit": detached.win_logit.squeeze(-1).tolist(),
             "p_win": detached.p_win.squeeze(-1).tolist(),
+            "score_if_win": detached.score_if_win.squeeze(-1).tolist(),
+            "score_if_loss": detached.score_if_loss.squeeze(-1).tolist(),
             "expected_score": detached.expected_score.squeeze(-1).tolist(),
             "action_logits": detached.action_logits.squeeze(-1).tolist(),
             "action_mask": detached.action_mask.tolist(),

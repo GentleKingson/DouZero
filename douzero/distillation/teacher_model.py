@@ -79,6 +79,8 @@ class TeacherOutput:
     action_keys: tuple[ActionKey, ...]
     win_logit: torch.Tensor
     p_win: torch.Tensor
+    score_if_win: torch.Tensor
+    score_if_loss: torch.Tensor
     expected_score: torch.Tensor
     action_logits: torch.Tensor
     action_mask: torch.Tensor
@@ -91,7 +93,10 @@ class TeacherOutput:
             raise ValueError("TeacherOutput action_keys must be unique")
         if any(key != tuple(sorted(key)) for key in self.action_keys):
             raise ValueError("TeacherOutput action_keys must be canonical sorted tuples")
-        for name in ("win_logit", "p_win", "expected_score", "action_logits"):
+        for name in (
+            "win_logit", "p_win", "score_if_win", "score_if_loss",
+            "expected_score", "action_logits",
+        ):
             tensor = getattr(self, name)
             if tensor.shape != (n, 1):
                 raise ValueError(f"{name} must have shape ({n}, 1), got {tuple(tensor.shape)}")
@@ -110,6 +115,8 @@ class TeacherOutput:
             action_keys=self.action_keys,
             win_logit=self.win_logit.detach().cpu(),
             p_win=self.p_win.detach().cpu(),
+            score_if_win=self.score_if_win.detach().cpu(),
+            score_if_loss=self.score_if_loss.detach().cpu(),
             expected_score=self.expected_score.detach().cpu(),
             action_logits=self.action_logits.detach().cpu(),
             action_mask=self.action_mask.detach().cpu(),
@@ -143,7 +150,7 @@ class TeacherModel(nn.Module):
     """Perfect-information teacher; training-only and never deployable."""
 
     model_access = "privileged"
-    model_version = "teacher-v1"
+    model_version = "teacher-v2"
 
     def __init__(
         self,
@@ -170,7 +177,7 @@ class TeacherModel(nn.Module):
         self.privileged_action_head = nn.Sequential(
             nn.Linear(hidden + action_width, hidden),
             nn.ReLU(),
-            nn.Linear(hidden, 3),
+            nn.Linear(hidden, 4),
         )
 
     @property
@@ -283,10 +290,30 @@ class TeacherModel(nn.Module):
         )
         win_logit = public_output.win_logit + deltas[:, 0:1]
         p_win = torch.sigmoid(win_logit)
-        expected_score = public_output.score_mean + torch.clamp(
-            deltas[:, 1:2],
-            -self.config.score_delta_clamp,
-            self.config.score_delta_clamp,
+        head_clamp = float(self.public_model.config.score_clamp)
+        score_if_win = torch.clamp(
+            public_output.score_if_win
+            + torch.clamp(
+                deltas[:, 1:2],
+                -self.config.score_delta_clamp,
+                self.config.score_delta_clamp,
+            ),
+            -head_clamp,
+            head_clamp,
+        )
+        score_if_loss = torch.clamp(
+            public_output.score_if_loss
+            + torch.clamp(
+                deltas[:, 2:3],
+                -self.config.score_delta_clamp,
+                self.config.score_delta_clamp,
+            ),
+            -head_clamp,
+            head_clamp,
+        )
+        expected_score = (
+            p_win.detach() * score_if_win
+            + (1.0 - p_win.detach()) * score_if_loss
         )
         public_logits = (
             public_output.prior_logit
@@ -297,8 +324,10 @@ class TeacherModel(nn.Module):
             action_keys=keys,
             win_logit=win_logit,
             p_win=p_win,
+            score_if_win=score_if_win,
+            score_if_loss=score_if_loss,
             expected_score=expected_score,
-            action_logits=public_logits + deltas[:, 2:3],
+            action_logits=public_logits + deltas[:, 3:4],
             action_mask=public_output.action_mask,
         )
 

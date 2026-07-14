@@ -245,7 +245,7 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "schedule_steps": int, "schedule_floor": float,
     # P10: privileged-teacher distillation block.
     "enabled": bool, "teacher_checkpoint": str, "dataset_path": str,
-    "cache_path": str, "top_k": int, "lambda_kl": float,
+    "cache_path": str, "batch_size": int, "top_k": int, "lambda_kl": float,
     "distillation_temperature": float,
     "lambda_rank": float, "lambda_teacher_win": float,
     "lambda_teacher_score": float, "lambda_supervised_win": float,
@@ -325,6 +325,10 @@ def _validate_types(cfg: TrainingConfig) -> None:
             _check_field(name, getattr(cfg.distillation, name), "distillation")
         elif hasattr(cfg, name):
             _check_field(name, getattr(cfg, name), "training")
+    # ``batch_size`` exists at both the top-level learner and P10 distillation
+    # scopes, so validate the nested value separately instead of shadowing the
+    # established top-level field in the name-based dispatch above.
+    _check_field("batch_size", cfg.distillation.batch_size, "distillation")
 
 
 # P01 only supports the "legacy" feature/rule/model versions. Later phases
