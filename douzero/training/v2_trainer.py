@@ -392,7 +392,24 @@ class V2Trainer:
         self.population_runner = None
         self._league_game_index = 0
         if policy_pool is not None:
+            from douzero.league.policy_pool import PolicyLoaderContract
             from douzero.league.self_play import PopulationEpisodeRunner
+
+            belief_config_hash = ""
+            if self.belief_model is not None:
+                belief_config_hash = self.belief_model.config.stable_hash()
+            actual_runtime = PolicyLoaderContract.for_v2_runtime(
+                self.model.schema,
+                self.model.config,
+                checkpoint_kind=policy_pool.runtime_loader.checkpoint_kind,
+                loader_name=policy_pool.runtime_loader.loader_name,
+                belief_config_hash=belief_config_hash,
+            )
+            if actual_runtime != policy_pool.runtime_loader:
+                raise ValueError(
+                    "policy pool runtime loader identity does not match the "
+                    "V2Trainer model/schema identity"
+                )
 
             self.population_runner = PopulationEpisodeRunner(
                 policy_pool,

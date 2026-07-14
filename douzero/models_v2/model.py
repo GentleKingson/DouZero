@@ -346,7 +346,7 @@ class ModelV2(nn.Module):
             matrix. Required exactly when ``strategy_features_enabled`` is
             true; rejected by the strategy-disabled action encoder.
         style_features:
-            Optional public opponent-style statistics. Required when the
+            Optional public other-player style statistics. Required when the
             checkpoint was built with ``style_enabled=True`` and rejected
             otherwise. The vector is derived solely from public action history.
 

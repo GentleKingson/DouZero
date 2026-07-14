@@ -271,6 +271,7 @@ class LeagueConfig:
     enabled: bool = False
     mode: str = "single"  # single | population
     manifest_path: str = ""
+    snapshot_root: str = ""
     match_log_path: str = ""
     seed: int = 0
     learner_seats_per_game: int = 1
@@ -288,7 +289,7 @@ class LeagueConfig:
 
         if not isinstance(self.enabled, bool):
             raise TypeError("LeagueConfig.enabled must be bool")
-        for name in ("manifest_path", "match_log_path", "mode"):
+        for name in ("manifest_path", "snapshot_root", "match_log_path", "mode"):
             if not isinstance(getattr(self, name), str):
                 raise TypeError(f"LeagueConfig.{name} must be str")
         for name in ("include_random_agent", "include_rule_agent"):

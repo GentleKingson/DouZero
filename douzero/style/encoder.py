@@ -1,4 +1,4 @@
-"""Trainable encoder for public opponent-style statistics."""
+"""Trainable encoder for public other-player style statistics."""
 
 from __future__ import annotations
 
@@ -7,13 +7,13 @@ from torch import nn
 
 from .features import (
     STYLE_FEATURE_WIDTH,
-    STYLE_NUM_OPPONENTS,
-    STYLE_PER_OPPONENT_WIDTH,
+    STYLE_NUM_OTHER_PLAYERS,
+    STYLE_PER_PLAYER_WIDTH,
 )
 
 
 class StyleEncoder(nn.Module):
-    """Encode two opponent rows with learned unknown/cold-start embeddings."""
+    """Encode two other-player rows with learned cold-start embeddings."""
 
     def __init__(self, output_dim: int, hidden_dim: int | None = None) -> None:
         super().__init__()
@@ -27,16 +27,16 @@ class StyleEncoder(nn.Module):
         if isinstance(hidden, bool) or not isinstance(hidden, int) or hidden <= 0:
             raise ValueError(f"hidden_dim must be positive, got {hidden}")
         self.output_dim = output_dim
-        self.per_opponent = nn.Sequential(
-            nn.Linear(STYLE_PER_OPPONENT_WIDTH, hidden),
+        self.per_player = nn.Sequential(
+            nn.Linear(STYLE_PER_PLAYER_WIDTH, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
         )
         self.unknown_embedding = nn.Parameter(
-            torch.zeros(STYLE_NUM_OPPONENTS, hidden)
+            torch.zeros(STYLE_NUM_OTHER_PLAYERS, hidden)
         )
         self.fusion = nn.Sequential(
-            nn.Linear(STYLE_NUM_OPPONENTS * hidden, output_dim),
+            nn.Linear(STYLE_NUM_OTHER_PLAYERS * hidden, output_dim),
             nn.ReLU(),
             nn.LayerNorm(output_dim),
         )
@@ -50,9 +50,9 @@ class StyleEncoder(nn.Module):
                 f"STYLE_FEATURE_WIDTH {STYLE_FEATURE_WIDTH}"
             )
         rows = features.reshape(
-            *features.shape[:-1], STYLE_NUM_OPPONENTS, STYLE_PER_OPPONENT_WIDTH
+            *features.shape[:-1], STYLE_NUM_OTHER_PLAYERS, STYLE_PER_PLAYER_WIDTH
         )
-        encoded = self.per_opponent(rows)
+        encoded = self.per_player(rows)
         observed = rows[..., :1] > 0.5
         unknown = self.unknown_embedding
         while unknown.ndim < encoded.ndim:

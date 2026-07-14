@@ -62,7 +62,7 @@ class ModelV2Config:
     # Auxiliary heads (P05 keeps the skeleton; heads wired in P07/P09).
     belief_enabled: bool = False
     human_prior_enabled: bool = False
-    # P11 public opponent-style conditioning. Disabled preserves P10 behavior
+    # P11 public other-player style conditioning. Disabled preserves P10 behavior
     # and the existing v3 checkpoint hash exactly.
     style_enabled: bool = False
     style_embedding_dim: int = 64

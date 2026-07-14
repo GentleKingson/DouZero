@@ -1,4 +1,4 @@
-"""Leakage-safe opponent-style statistics derived from public actions only."""
+"""Leakage-safe other-player statistics derived from public actions only."""
 
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ from douzero.env.move_detector import get_move_type
 from douzero.env.utils import TYPE_4_BOMB, TYPE_5_KING_BOMB
 from douzero.observation.seats import ALL_ROLES
 
-STYLE_FEATURE_VERSION = "public-style-v1"
-STYLE_NUM_OPPONENTS = 2
-STYLE_PER_OPPONENT_WIDTH = 8
-STYLE_FEATURE_WIDTH = STYLE_NUM_OPPONENTS * STYLE_PER_OPPONENT_WIDTH
+STYLE_FEATURE_VERSION = "public-other-player-style-v1"
+STYLE_NUM_OTHER_PLAYERS = 2
+STYLE_PER_PLAYER_WIDTH = 8
+STYLE_FEATURE_WIDTH = STYLE_NUM_OTHER_PLAYERS * STYLE_PER_PLAYER_WIDTH
 
 _STYLE_FIELDS = (
     "observed",
@@ -32,7 +32,7 @@ STYLE_LAYOUT_HASH = hashlib.sha256(
     json.dumps(
         {
             "version": STYLE_FEATURE_VERSION,
-            "opponents": STYLE_NUM_OPPONENTS,
+            "other_players": STYLE_NUM_OTHER_PLAYERS,
             "fields": _STYLE_FIELDS,
         },
         sort_keys=True,
@@ -45,7 +45,7 @@ def _history(public: Any) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(sorted(int(card) for card in action)) for action in history)
 
 
-def _opponent_roles(acting_role: str) -> tuple[str, str]:
+def _other_player_roles(acting_role: str) -> tuple[str, str]:
     if acting_role not in ALL_ROLES:
         raise ValueError(
             f"unknown acting_role {acting_role!r}; expected one of {ALL_ROLES}"
@@ -64,7 +64,7 @@ def _role_features(
         if turn_index % len(ALL_ROLES) == role_index
     ]
     if not actions:
-        return np.zeros(STYLE_PER_OPPONENT_WIDTH, dtype=np.float32)
+        return np.zeros(STYLE_PER_PLAYER_WIDTH, dtype=np.float32)
 
     passes = sum(not action for action in actions)
     non_pass = [action for action in actions if action]
@@ -100,19 +100,24 @@ def _role_features(
 
 
 def build_style_features(public: Any) -> np.ndarray:
-    """Return a fixed-width vector for the two opponents of the acting role.
+    """Return a fixed-width vector for the acting role's two other players.
 
     The input is intentionally duck-typed to the public observation surface.
     Only ``acting_role`` and ``action_history`` are read. Hidden hands, player
     identifiers, and persistent account identity are neither accepted nor
-    inferred. An opponent with no observed turn receives an all-zero row; the
+    inferred. For a farmer, one row is the teammate and one is the landlord;
+    rows remain in canonical seat order. A player with no observed turn
+    receives an all-zero row; the
     trainable :class:`~douzero.style.encoder.StyleEncoder` maps that row to a
     learned cold-start embedding.
     """
 
     acting_role = str(public.acting_role)
     history = _history(public)
-    rows = [_role_features(history, role) for role in _opponent_roles(acting_role)]
+    rows = [
+        _role_features(history, role)
+        for role in _other_player_roles(acting_role)
+    ]
     out = np.concatenate(rows).astype(np.float32)
     if out.shape != (STYLE_FEATURE_WIDTH,):
         raise RuntimeError(

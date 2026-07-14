@@ -175,6 +175,7 @@ league:
   enabled: false
   mode: single
   manifest_path: ""
+  snapshot_root: ""
   match_log_path: ""
   seed: 0
   learner_seats_per_game: 1

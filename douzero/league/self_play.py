@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import random
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Mapping
@@ -13,7 +15,7 @@ from douzero.env.rules import RuleSet
 from douzero.observation.encode_v2 import ObservationV2, get_obs_v2
 from douzero.training.v2_buffer import Episode, Transition
 
-from .policy_pool import PolicyBundle, PolicyPool
+from .policy_pool import LoadedPolicySelector, PolicyBundle, PolicyPool
 
 ActionSelector = Callable[[ObservationV2], int]
 
@@ -32,14 +34,25 @@ class MatchupRecord:
 
 
 class MatchupLogger:
+    """Durable JSONL logger restricted to one process and serialized threads."""
+
     def __init__(self, path: str) -> None:
         self.path = Path(path)
+        self._owner_pid = os.getpid()
+        self._lock = threading.Lock()
 
     def append(self, record: MatchupRecord) -> None:
+        if os.getpid() != self._owner_pid:
+            raise RuntimeError(
+                "MatchupLogger is single-process; use one logger process for actors"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as handle:
-            json.dump(asdict(record), handle, sort_keys=True)
-            handle.write("\n")
+        payload = json.dumps(asdict(record), sort_keys=True) + "\n"
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
 
 
 class PopulationEpisodeRunner:
@@ -50,7 +63,7 @@ class PopulationEpisodeRunner:
         pool: PolicyPool,
         current_selector: ActionSelector,
         *,
-        opponent_selectors: Mapping[str, ActionSelector] | None = None,
+        opponent_selectors: Mapping[str, LoadedPolicySelector] | None = None,
         ruleset: RuleSet | None = None,
         max_steps: int = 600,
         logger: MatchupLogger | None = None,
@@ -63,6 +76,13 @@ class PopulationEpisodeRunner:
         self.pool = pool
         self.current_selector = current_selector
         self.opponent_selectors = dict(opponent_selectors or {})
+        for policy_id, selector in self.opponent_selectors.items():
+            if policy_id != selector.policy_id:
+                raise ValueError(
+                    f"opponent selector key {policy_id!r} does not match "
+                    f"selector policy_id {selector.policy_id!r}"
+                )
+            pool.validate_loaded_selector(selector)
         self.ruleset = ruleset
         self.max_steps = max_steps
         self.logger = logger
