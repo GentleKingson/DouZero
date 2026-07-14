@@ -194,6 +194,11 @@ class DeepAgentV2:
         a ``belief_model`` for a belief-disabled value model raises
         ``ValueError``. The belief model reads only ``obs.public`` — never a
         hidden hand — so the imperfect-information boundary is preserved.
+    search_config:
+        Optional :class:`douzero.search.budget.SearchConfig`. Search is
+        default-off. When enabled, a P07 ``belief_model`` is required and the
+        selected top-k actions are evaluated only against DP-sampled hidden
+        allocations. ``last_search_log`` exposes the structured audit record.
     """
 
     def __init__(
@@ -204,6 +209,7 @@ class DeepAgentV2:
         decision_mode=None,
         decision_config=None,
         belief_model=None,
+        search_config=None,
     ):
         from douzero.models_v2.model import ModelV2  # local import: keep the
         # production import graph (evaluation.simulation) free of a hard torch
@@ -284,6 +290,16 @@ class DeepAgentV2:
         self.model = model
         self.ruleset = ruleset
         self.backend = "v2"
+        from douzero.search.budget import SearchConfig
+        if search_config is None:
+            search_config = SearchConfig()
+        if not isinstance(search_config, SearchConfig):
+            raise TypeError(
+                "search_config must be a SearchConfig instance, got "
+                f"{type(search_config).__name__}"
+            )
+        self.search_config = search_config
+        self.last_search_log = None
         # P07 belief deployment wiring (review blocker #2). A belief-enabled
         # value model REQUIRES a BeliefModel at deployment so the constrained
         # posterior features are computed and fused; without it the value model
@@ -298,7 +314,13 @@ class DeepAgentV2:
                 "posterior features. Pass a pretrained BeliefModel via "
                 "belief_model= (load it with load_belief_checkpoint)."
             )
-        if belief_model is not None and not belief_enabled:
+        if search_config.enabled and belief_model is None:
+            raise ValueError(
+                "SearchConfig.enabled=True requires a P07 BeliefModel. Search "
+                "may only create hidden hands through the constrained public "
+                "belief sampler."
+            )
+        if belief_model is not None and not belief_enabled and not search_config.enabled:
             raise ValueError(
                 "A belief_model was supplied but the value model has "
                 "belief_enabled=False. Drop belief_model or rebuild the value "
@@ -416,6 +438,7 @@ class DeepAgentV2:
         # Single legal action: short-circuit without inference (matches the
         # legacy DeepAgent behaviour and avoids a degenerate forward).
         if len(legal_actions) == 1:
+            self.last_search_log = None
             return legal_actions[0]
 
         return self._select_from_observation(obs)
@@ -435,6 +458,7 @@ class DeepAgentV2:
         ``DeepAgent.act`` returns the infoset's list, and this path matches.
         """
         if len(infoset.legal_actions) == 1:
+            self.last_search_log = None
             return infoset.legal_actions[0]
         from douzero.observation.encode_v2 import get_obs_v2
 
@@ -477,19 +501,23 @@ class DeepAgentV2:
         # run under inference_mode (no autograd graph at deployment; the belief
         # model is a frozen feature source).
         belief_features = None
-        if self.belief_model is not None:
+        belief_output = None
+        belief_enabled = bool(getattr(self.model.config, "belief_enabled", False))
+        if self.belief_model is not None and belief_enabled:
             from douzero.belief import build_belief_input
             from douzero.belief.model import belief_features_from_probs
 
             binput = build_belief_input(obs.public)
             with torch.inference_mode():
-                bout = self.belief_model([binput])
-                feat_np = belief_features_from_probs(
-                    bout.constrained_probs,
-                    bout.opponent_a_total,
-                    np.stack([binput.unseen_counts]),
-                )[0]
-            belief_features = torch.from_numpy(feat_np)
+                belief_output = self.belief_model([binput])
+                if belief_enabled:
+                    feat_np = belief_features_from_probs(
+                        belief_output.constrained_probs,
+                        belief_output.opponent_a_total,
+                        np.stack([binput.unseen_counts]),
+                    )[0]
+            if belief_enabled:
+                belief_features = torch.from_numpy(feat_np)
         with torch.inference_mode():
             out = self.model(
                 bundle.state_card_vectors,
@@ -513,6 +541,38 @@ class DeepAgentV2:
         from douzero.training.decision_policy import select_action
 
         idx = select_action(out, self.decision_config)
+        if self.search_config.enabled:
+            from douzero.search.belief_rollout import BeliefSearch
+            from douzero.search.budget import SearchBudget
+
+            search_budget = SearchBudget(self.search_config)
+            has_budget = all((
+                self.search_config.max_nodes > 0,
+                self.search_config.max_rollouts > 0,
+                self.search_config.max_milliseconds > 0,
+            ))
+            # A belief-enabled base policy already paid for its posterior
+            # above. Search-only belief inference is P13 incremental work, so
+            # run it after the budget starts and include it in SearchLog time.
+            if belief_output is None and has_budget:
+                from douzero.belief import build_belief_input
+
+                binput = build_belief_input(obs.public)
+                with torch.inference_mode():
+                    belief_output = self.belief_model([binput])
+
+            decision = BeliefSearch(self.search_config, self.ruleset).select(
+                observation=obs,
+                model_output=out,
+                base_action_index=idx,
+                belief_model=self.belief_model,
+                belief_output=belief_output,
+                budget=search_budget,
+            )
+            idx = decision.action_index
+            self.last_search_log = decision.log
+        else:
+            self.last_search_log = None
         legal_actions = obs.actions.legal_actions
         # The action_mask may include padding rows beyond the real actions;
         # the decision policy respects the mask, so the index is a

@@ -129,11 +129,12 @@ def test_serialize_round_trip():
         LeagueConfig,
         LossConfig,
         ModelConfig,
+        SearchConfig,
     )
 
     drop = {
         "optimizer", "loss", "decision_policy", "model", "bc",
-        "distillation", "league", "curriculum",
+        "distillation", "league", "curriculum", "search",
     }
     rebuilt = TrainingConfig(
         **{k: v for k, v in d.items() if k not in drop},
@@ -145,6 +146,7 @@ def test_serialize_round_trip():
         distillation=DistillationConfig(**d["distillation"]),
         league=LeagueConfig(**d["league"]),
         curriculum=CurriculumConfig(**d["curriculum"]),
+        search=SearchConfig(**d["search"]),
     )
     assert rebuilt == cfg
 

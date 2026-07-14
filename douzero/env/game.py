@@ -231,9 +231,17 @@ class GameEnv(object):
                     self.acting_player_position].player_hand_cards.remove(card)
             self.info_sets[self.acting_player_position].player_hand_cards.sort()
 
-    def get_legal_card_play_actions(self):
+    def get_legal_card_play_actions(self, budget_check=None):
+        """Return legal card-play actions.
+
+        ``budget_check`` is an optional cooperative deadline hook used by the
+        P13 search state. Normal environment callers pass nothing, preserving
+        the legacy action set and ordering exactly.
+        """
         mg = MovesGener(
-            self.info_sets[self.acting_player_position].player_hand_cards)
+            self.info_sets[self.acting_player_position].player_hand_cards,
+            budget_check=budget_check,
+        )
 
         action_sequence = self.card_play_action_seq
 
@@ -365,6 +373,9 @@ class GameEnv(object):
         self._seat_to_role = {}
 
     def get_infoset(self):
+        from douzero.env.scoring import compute_current_multiplier
+
+        active_ruleset = self.ruleset or RuleSet.legacy()
         self.info_sets[
             self.acting_player_position].last_pid = self.last_pid
 
@@ -374,6 +385,27 @@ class GameEnv(object):
 
         self.info_sets[
             self.acting_player_position].bomb_num = self.bomb_num
+        # P13: preserve the canonical public scoring state. ``bomb_num`` stays
+        # for legacy encoders, while the independent counters prevent a rocket
+        # from being reinterpreted as a normal bomb under standard/custom rules.
+        self.info_sets[self.acting_player_position].bomb_count = self.bomb_count
+        self.info_sets[self.acting_player_position].rocket_count = self.rocket_count
+        self.info_sets[self.acting_player_position].bid_value = self.bid_value
+        self.info_sets[self.acting_player_position].action_counts = \
+            dict(self.action_counts)
+        self.info_sets[self.acting_player_position].bidding_history = \
+            list(self.bidding_history)
+        self.info_sets[self.acting_player_position].bidding_order = \
+            list(self.bidding_order)
+        self.info_sets[self.acting_player_position].phase = \
+            self.phase or PHASE_PLAYING
+        self.info_sets[self.acting_player_position].total_multiplier = \
+            compute_current_multiplier(
+                bomb_count=self.bomb_count,
+                rocket_count=self.rocket_count,
+                bid_value=self.bid_value,
+                ruleset=active_ruleset,
+            )
 
         self.info_sets[
             self.acting_player_position].last_move = self.get_last_move()
@@ -754,6 +786,15 @@ class InfoSet(object):
         self.last_pid = None
         # The number of bombs played so far
         self.bomb_num = None
+        # P13: independent public scoring fields used by Observation V2/search.
+        self.bomb_count = None
+        self.rocket_count = None
+        self.bid_value = None
+        self.action_counts = None
+        self.bidding_history = None
+        self.bidding_order = None
+        self.phase = None
+        self.total_multiplier = None
         # P03: the ORIGINAL three public bottom cards (never mutated after
         # reveal). ``three_landlord_cards`` is the current UNPLAYED subset.
         self.three_landlord_cards_revealed = None

@@ -218,3 +218,19 @@ curriculum:
   late_true_random: 0.90
   late_balanced: 0.05
   late_hard_for_role: 0.05
+
+# P13 optional inference search. It consumes only PublicObservation V2 plus
+# hidden-hand samples drawn by the P07 constrained DP. Disabled is exactly the
+# P12 base policy; zero budgets also force the base-action fallback.
+search:
+  enabled: false
+  top_k: 3
+  belief_samples: 8
+  rollout_depth: 12
+  endgame_cards_threshold: 12
+  max_nodes: 20000
+  max_rollouts: 64
+  max_milliseconds: 100
+  risk_penalty: 0.0
+  selection_mode: win_then_score
+  seed: 0

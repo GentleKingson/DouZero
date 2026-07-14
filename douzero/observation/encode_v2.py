@@ -482,13 +482,13 @@ def get_obs_v2(
     ruleset_id: str | None = None,
     ruleset_version: str | None = None,
     ruleset_hash: str | None = None,
-    bid_value: int = 0,
+    bid_value: int | None = None,
     bidding_history=None,
     bidding_order=None,
     bomb_count: int | None = None,
     rocket_count: int | None = None,
-    total_multiplier: int = 1,
-    phase: str = "playing",
+    total_multiplier: int | None = None,
+    phase: str | None = None,
 ) -> ObservationV2:
     """Encode an infoset into a public :class:`ObservationV2`.
 
@@ -535,6 +535,24 @@ def get_obs_v2(
         ruleset, ruleset_id, ruleset_version, ruleset_hash
     )
 
+    if bid_value is None:
+        bid_value = getattr(infoset, "bid_value", None)
+    bid_value = int(bid_value or 0)
+    if bidding_history is None:
+        bidding_history = getattr(infoset, "bidding_history", None)
+    if bidding_order is None:
+        bidding_order = getattr(infoset, "bidding_order", None)
+    if phase is None:
+        phase = getattr(infoset, "phase", None) or "playing"
+    if total_multiplier is None:
+        # Preserve the pre-P13 legacy context exactly (it always carried 1).
+        # Standard/custom rules need the actual public multiplier state.
+        total_multiplier = (
+            1 if rs_id == "legacy"
+            else getattr(infoset, "total_multiplier", None)
+        )
+    total_multiplier = int(total_multiplier or 1)
+
     acting_role = infoset.player_position
     my_hand = list(infoset.player_hand_cards or [])
     played = {
@@ -553,10 +571,31 @@ def get_obs_v2(
 
     num_left = dict(infoset.num_cards_left_dict or {})
     raw_action_seq = [list(a) for a in (infoset.card_play_action_seq or [])]
-    non_pass_action_counts = {role: 0 for role in ALL_ROLES}
-    for turn_index, action in enumerate(raw_action_seq):
-        if action:
-            non_pass_action_counts[_actor_at(turn_index)] += 1
+    carried_action_counts = getattr(infoset, "action_counts", None)
+    if carried_action_counts is not None:
+        non_pass_action_counts = {
+            role: int(carried_action_counts.get(role, 0)) for role in ALL_ROLES
+        }
+    else:
+        non_pass_action_counts = {role: 0 for role in ALL_ROLES}
+        for turn_index, action in enumerate(raw_action_seq):
+            if action:
+                non_pass_action_counts[_actor_at(turn_index)] += 1
+
+    if bomb_count is None:
+        bomb_count = (
+            None if rs_id == "legacy"
+            else getattr(infoset, "bomb_count", None)
+        )
+    if bomb_count is None:
+        bomb_count = infoset.bomb_num
+    if rocket_count is None:
+        rocket_count = (
+            None if rs_id == "legacy"
+            else getattr(infoset, "rocket_count", None)
+        )
+    if rocket_count is None:
+        rocket_count = 0
 
     public = build_public_observation(
         acting_role=acting_role,
@@ -581,8 +620,8 @@ def get_obs_v2(
         bid_value=bid_value,
         bidding_history=bidding_history,
         bidding_order=bidding_order,
-        bomb_count=int(bomb_count if bomb_count is not None else infoset.bomb_num),
-        rocket_count=int(rocket_count if rocket_count is not None else 0),
+        bomb_count=int(bomb_count),
+        rocket_count=int(rocket_count),
         total_multiplier=total_multiplier,
     )
 
