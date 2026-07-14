@@ -292,6 +292,66 @@ def _build_model_cfg(cfg):
     return ModelV2Config.from_training_config(cfg)
 
 
+def _build_curriculum(cfg):
+    """Build the opt-in P12 training sampler without touching evaluation."""
+
+    if cfg is None or not cfg.curriculum.enabled:
+        return None, None, "current", 0
+    from douzero.coach import (
+        CurriculumAuditLogger,
+        CurriculumSchedule,
+        CoachLabelStore,
+        OpeningSampler,
+        load_coach_checkpoint,
+    )
+    from douzero.env.rules import RuleSet
+
+    cc = cfg.curriculum
+    ruleset = RuleSet.legacy()
+    coach = None
+    if cc.mode != "true_random":
+        coach, _manifest = load_coach_checkpoint(
+            cc.coach_checkpoint,
+            expected_ruleset_hash=ruleset.stable_hash(),
+        )
+    schedule = CurriculumSchedule(
+        early_until=cc.early_until,
+        mid_until=cc.mid_until,
+        min_true_random_ratio=cc.min_true_random_ratio,
+        early={
+            "true_random": cc.early_true_random,
+            "balanced": cc.early_balanced,
+            "hard_for_role": cc.early_hard_for_role,
+        },
+        middle={
+            "true_random": cc.middle_true_random,
+            "balanced": cc.middle_balanced,
+            "hard_for_role": cc.middle_hard_for_role,
+        },
+        late={
+            "true_random": cc.late_true_random,
+            "balanced": cc.late_balanced,
+            "hard_for_role": cc.late_hard_for_role,
+        },
+    )
+    audit_logger = (
+        CurriculumAuditLogger(cc.audit_log_path) if cc.audit_log_path else None
+    )
+    label_store = CoachLabelStore(cc.labels_path) if cc.labels_path else None
+    sampler = OpeningSampler(
+        ruleset=ruleset,
+        policy_version=cc.policy_version,
+        coach=coach,
+        mode=cc.mode,
+        schedule=schedule,
+        hard_role=cc.hard_role,
+        candidate_pool_size=cc.candidate_pool_size,
+        seed=cc.seed,
+        logger=audit_logger,
+    )
+    return sampler, label_store, cc.policy_version, cc.policy_step
+
+
 def main() -> None:
     args = _build_parser().parse_args()
 
@@ -390,6 +450,9 @@ def main() -> None:
     ruleset = _resolve_ruleset(yaml_cfg)
     loss_cfg = _build_loss_config(yaml_cfg)
     decision_cfg = _build_decision_config(yaml_cfg)
+    opening_sampler, coach_label_store, policy_version, policy_step = (
+        _build_curriculum(yaml_cfg)
+    )
 
     # P07: load a frozen belief model when the value model is belief-enabled.
     # The checkpoint is validated (ruleset + feature version + architecture
@@ -545,6 +608,10 @@ def main() -> None:
         bc_schedule=bc_schedule,
         bc_temperature=(bc_cfg.temperature if bc_cfg is not None else 1.0),
         bc_label_smoothing=(bc_cfg.label_smoothing if bc_cfg is not None else 0.0),
+        opening_sampler=opening_sampler,
+        coach_label_store=coach_label_store,
+        policy_version=policy_version,
+        policy_step=policy_step,
     )
 
     print(
@@ -567,6 +634,8 @@ def main() -> None:
         f"last_loss={stats.last_loss} "
         f"grad_norm={stats.grad_norm_last_step:.4f} "
         f"p_win_mean={stats.p_win_mean:.4f}"
+        f" opening_strategies={stats.opening_strategy_counts}"
+        f" opening_predicted_win_mean={stats.opening_predicted_win_mean:.4f}"
     )
 
 

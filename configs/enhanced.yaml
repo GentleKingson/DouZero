@@ -187,3 +187,31 @@ league:
   keep_top_rated: 3
   promotion_min_pairs: 1000
   promotion_min_ci_lower_bound: 0.0
+
+# P12 coach-guided opening curriculum. Disabled by default, so existing V2
+# self-play remains true random. Guided modes require a separately trained
+# coach checkpoint; labels and sampling audits are separate JSONL streams.
+curriculum:
+  enabled: false
+  mode: mixture
+  coach_checkpoint: ""
+  labels_path: ""
+  audit_log_path: ""
+  policy_version: current
+  policy_step: 0
+  max_label_age_steps: 100000
+  seed: 0
+  candidate_pool_size: 16
+  hard_role: landlord
+  early_until: 0.30
+  mid_until: 0.70
+  min_true_random_ratio: 0.20
+  early_true_random: 0.20
+  early_balanced: 0.70
+  early_hard_for_role: 0.10
+  middle_true_random: 0.50
+  middle_balanced: 0.30
+  middle_hard_for_role: 0.20
+  late_true_random: 0.90
+  late_balanced: 0.05
+  late_hard_for_role: 0.05

@@ -87,12 +87,14 @@ class PopulationEpisodeRunner:
         self.max_steps = max_steps
         self.logger = logger
 
-    def run(self, game_index: int) -> tuple[Episode, MatchupRecord]:
+    def run(self, game_index: int, *, opening=None) -> tuple[Episode, MatchupRecord]:
+        """Run one game, optionally from a validated P12 training opening."""
+
         bundle = self.pool.sample_bundle(game_index)
         expected_bundle_hash = bundle.bundle_hash
         rng = random.Random(self.pool.config.seed + game_index * 97_409)
         env = Env(objective=self.pool.current.objective, ruleset=self.ruleset)
-        env.reset()
+        env.reset(opening=opening)
         episode = Episode(
             policy_ids_by_seat=dict(bundle.policy_ids_by_seat),
             learner_controlled_seats=bundle.learner_controlled_seats,

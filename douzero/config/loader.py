@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 from douzero.config.schemas import (
     BCConfig,
+    CurriculumConfig,
     DistillationConfig,
     DecisionPolicyConfig,
     LossConfig,
@@ -87,7 +88,7 @@ def load_legacy_config() -> TrainingConfig:
 # --------------------------------------------------------------------------- #
 def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     """Construct a TrainingConfig from a raw mapping, validating keys."""
-    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy", "model", "bc", "distillation", "league")}
+    valid_top = {f.name for f in fields(TrainingConfig) if f.name not in ("optimizer", "loss", "decision_policy", "model", "bc", "distillation", "league", "curriculum")}
     valid_opt_names = {f.name for f in fields(OptimizerConfig)}
     valid_loss_names = {f.name for f in fields(LossConfig)}
     valid_decision_names = {f.name for f in fields(DecisionPolicyConfig)}
@@ -95,10 +96,11 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     valid_bc_names = {f.name for f in fields(BCConfig)}
     valid_distillation_names = {f.name for f in fields(DistillationConfig)}
     valid_league_names = {f.name for f in fields(LeagueConfig)}
+    valid_curriculum_names = {f.name for f in fields(CurriculumConfig)}
 
     # 'optimizer', 'loss', 'decision_policy', 'model', 'bc', and 'rules' are
     # valid top-level keys (handled separately).
-    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "model", "bc", "distillation", "league", "rules"}
+    unknown_top = set(raw.keys()) - valid_top - {"optimizer", "loss", "decision_policy", "model", "bc", "distillation", "league", "curriculum", "rules"}
     if unknown_top:
         raise ValueError(f"Unknown config keys: {sorted(unknown_top)}")
 
@@ -156,6 +158,15 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     if unknown_league:
         raise ValueError(f"Unknown league config keys: {sorted(unknown_league)}")
 
+    curriculum_raw = raw.get("curriculum", {})
+    if not isinstance(curriculum_raw, Mapping):
+        raise TypeError("'curriculum' must be a mapping")
+    unknown_curriculum = set(curriculum_raw.keys()) - valid_curriculum_names
+    if unknown_curriculum:
+        raise ValueError(
+            f"Unknown curriculum config keys: {sorted(unknown_curriculum)}"
+        )
+
     # P06 r6: unify top-level ``model_version`` and nested ``model.version``
     # into a single source of truth. Without this, a YAML like
     # ``model_version: v2`` + ``model: {version: legacy}`` would be accepted,
@@ -209,6 +220,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
         kwargs["distillation"] = DistillationConfig(**dict(distillation_raw))
     if league_raw:
         kwargs["league"] = LeagueConfig(**dict(league_raw))
+    if curriculum_raw:
+        kwargs["curriculum"] = CurriculumConfig(**dict(curriculum_raw))
     cfg = TrainingConfig(**kwargs)
     _validate_types(cfg)
     _validate_legacy_only_versions(cfg)

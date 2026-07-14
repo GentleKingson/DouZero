@@ -72,41 +72,72 @@ class Env:
         # Standard-mode: redeal counter (bounded by ruleset.max_redeals).
         self._redeal_count = 0
 
-    def reset(self):
+    def reset(self, opening=None):
         """
         Every time reset is called, the environment
         will be re-initialized with a new deck of cards.
         This function is usually called when a game is over.
+
+        ``opening`` is an optional training-only P12 ``OpeningRecord``. The
+        default remains the original NumPy shuffle. Passing a record injects
+        only its validated deal into the environment; the full deck is never
+        copied into an observation or infoset.
         """
         self._env.reset()
         self.need_redeal = False
         self._redeal_count = 0
 
-        # Randomly shuffle the deck
-        _deck = deck.copy()
-        np.random.shuffle(_deck)
+        if opening is None:
+            # Original legacy behavior: use the process-global NumPy RNG.
+            _deck = deck.copy()
+            np.random.shuffle(_deck)
+            card_play_data = None
+            bidding_order = None
+        else:
+            from douzero.coach.records import OpeningRecord
+
+            if not isinstance(opening, OpeningRecord):
+                raise TypeError("opening must be an OpeningRecord")
+            expected_id = "standard" if self.ruleset is not None else "legacy"
+            if opening.ruleset_obj.ruleset_id != expected_id:
+                raise ValueError(
+                    f"opening ruleset {opening.ruleset_obj.ruleset_id!r} does not "
+                    f"match environment mode {expected_id!r}"
+                )
+            if (
+                self.ruleset is not None
+                and opening.ruleset_obj.stable_hash() != self.ruleset.stable_hash()
+            ):
+                raise ValueError("opening RuleSet hash does not match the environment")
+            _deck = list(opening.deck)
+            card_play_data = opening.to_card_play_data()
+            bidding_order = list(opening.bidding_order)
 
         if self.ruleset is not None:
             # Standard mode: deal 17+17+17 + 3 bottom cards, enter bidding.
             # Seats are neutral ("0", "1", "2") during bidding.
-            card_play_data = {'landlord': _deck[:17],
-                              'landlord_up': _deck[17:34],
-                              'landlord_down': _deck[34:51],
-                              'three_landlord_cards': _deck[51:54],
-                              }
+            if card_play_data is None:
+                card_play_data = {'landlord': _deck[:17],
+                                  'landlord_up': _deck[17:34],
+                                  'landlord_down': _deck[34:51],
+                                  'three_landlord_cards': _deck[51:54],
+                                  }
             for key in card_play_data:
                 card_play_data[key].sort()
-            self._env.card_play_init_standard(card_play_data)
+            self._env.card_play_init_standard(
+                card_play_data, bidding_order=bidding_order
+            )
             self.bidding_obs = self._env.get_bidding_obs()
             self.infoset = None
             return self.bidding_obs
 
         # Legacy mode (unchanged).
-        card_play_data = {'landlord': _deck[:20],
-                          'landlord_up': _deck[20:37],
-                          'landlord_down': _deck[37:54],
-                          'three_landlord_cards': _deck[17:20],
-                          }
+        if card_play_data is None:
+            card_play_data = {'landlord': _deck[:20],
+                              'landlord_up': _deck[20:37],
+                              'landlord_down': _deck[37:54],
+                              'three_landlord_cards': _deck[17:20],
+                              }
         for key in card_play_data:
             card_play_data[key].sort()
 

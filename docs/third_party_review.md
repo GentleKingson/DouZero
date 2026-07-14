@@ -73,6 +73,16 @@ offline tensor bundle, strict cache identity, and checkpoint access guard were
 implemented independently with this repository's existing Observation V2 and
 PyTorch primitives. P10 adds no runtime dependency.
 
+## P12 — coach-guided opening curriculum
+
+The high-level coach-guided curriculum idea was consulted from the DouZero+
+paper/public description already recorded in the table above. No source code,
+function layout, checkpoint format, or sampler implementation from DouZero+
+or another DouDizhu derivative was copied. Opening records, policy-versioned
+labels, calibration, the enforced real-deal floor, and audit logging were
+implemented independently with Python standard-library and PyTorch APIs. P12
+adds no runtime dependency.
+
 ## Conclusion
 
 No GPL-licensed, license-unverified, or otherwise-incompatible code has been
