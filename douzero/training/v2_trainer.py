@@ -214,6 +214,9 @@ class V2Trainer:
         bc_schedule=None,
         bc_temperature: float = 1.0,
         bc_label_smoothing: float = 0.0,
+        policy_pool=None,
+        opponent_selectors=None,
+        matchup_logger=None,
     ) -> None:
         _legacy_only(ruleset)
         loss_cfg = loss_config or LossConfig()
@@ -386,6 +389,36 @@ class V2Trainer:
         # step() toggles to train() for the optimizer step, then back to
         # eval() after.
         self.model.eval()
+        self.population_runner = None
+        self._league_game_index = 0
+        if policy_pool is not None:
+            from douzero.league.policy_pool import PolicyLoaderContract
+            from douzero.league.self_play import PopulationEpisodeRunner
+
+            belief_config_hash = ""
+            if self.belief_model is not None:
+                belief_config_hash = self.belief_model.config.stable_hash()
+            actual_runtime = PolicyLoaderContract.for_v2_runtime(
+                self.model.schema,
+                self.model.config,
+                checkpoint_kind=policy_pool.runtime_loader.checkpoint_kind,
+                loader_name=policy_pool.runtime_loader.loader_name,
+                belief_config_hash=belief_config_hash,
+            )
+            if actual_runtime != policy_pool.runtime_loader:
+                raise ValueError(
+                    "policy pool runtime loader identity does not match the "
+                    "V2Trainer model/schema identity"
+                )
+
+            self.population_runner = PopulationEpisodeRunner(
+                policy_pool,
+                self._choose_action_index,
+                opponent_selectors=opponent_selectors,
+                ruleset=self.ruleset,
+                max_steps=self.config.max_steps_per_episode,
+                logger=matchup_logger,
+            )
 
     # ------------------------------------------------------------------ #
     # Self-play episode collection
@@ -406,6 +439,15 @@ class V2Trainer:
 
     def _run_one_episode(self) -> Episode:
         """Play one game to terminal, recording decisions and labels."""
+        if self.population_runner is not None:
+            episode, _record = self.population_runner.run(self._league_game_index)
+            self._league_game_index += 1
+            if self.strategy_aux_weight > 0:
+                episode.label_strategy_auxiliary(
+                    node_budget=self.model.config.strategy_node_budget,
+                    time_budget_ms=self.model.config.strategy_time_budget_ms,
+                )
+            return episode
         env = Env(objective="adp", ruleset=self.ruleset)
         env.reset()
         episode = Episode()
@@ -499,7 +541,9 @@ class V2Trainer:
         for i in idxs:
             s = self.bc_aux_samples[i]
             bundle = observation_to_model_inputs(
-                s.obs, self.model.strategy_feature_config()
+                s.obs,
+                self.model.strategy_feature_config(),
+                style_enabled=self.model.config.style_enabled,
             )
             # P08 Blocker 1: compute the frozen belief features for this BC
             # sample when the value model is belief-enabled. A belief-enabled
@@ -519,6 +563,7 @@ class V2Trainer:
                 bundle.acting_role,
                 belief_features=belief_features,
                 strategy_features=bundle.strategy_features,
+                style_features=bundle.style_features,
             )
             if out.prior_logit is None:
                 raise RuntimeError(
@@ -545,7 +590,9 @@ class V2Trainer:
         belief_features = self._compute_belief_feature(obs)
         with torch.inference_mode():
             bundle = observation_to_model_inputs(
-                obs, self.model.strategy_feature_config()
+                obs,
+                self.model.strategy_feature_config(),
+                style_enabled=self.model.config.style_enabled,
             )
             out = self.model(
                 bundle.state_card_vectors,
@@ -559,6 +606,7 @@ class V2Trainer:
                 bundle.acting_role,
                 belief_features=belief_features,
                 strategy_features=bundle.strategy_features,
+                style_features=bundle.style_features,
             )
         return select_action(out, self.decision_config)
 
@@ -603,7 +651,9 @@ class V2Trainer:
             }
             for i, obs in enumerate(batch.observations):
                 bundle = observation_to_model_inputs(
-                    obs, self.model.strategy_feature_config()
+                    obs,
+                    self.model.strategy_feature_config(),
+                    style_enabled=self.model.config.style_enabled,
                 )
                 belief_features = self._compute_belief_feature(obs)
                 out = self.model(
@@ -618,6 +668,7 @@ class V2Trainer:
                     bundle.acting_role,
                     belief_features=belief_features,
                     strategy_features=bundle.strategy_features,
+                    style_features=bundle.style_features,
                 )
                 idx = int(batch.action_indices[i].item())
                 gathered_win.append(out.win_logit[idx : idx + 1])

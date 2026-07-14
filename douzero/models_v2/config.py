@@ -62,6 +62,10 @@ class ModelV2Config:
     # Auxiliary heads (P05 keeps the skeleton; heads wired in P07/P09).
     belief_enabled: bool = False
     human_prior_enabled: bool = False
+    # P11 public other-player style conditioning. Disabled preserves P10 behavior
+    # and the existing v3 checkpoint hash exactly.
+    style_enabled: bool = False
+    style_embedding_dim: int = 64
     # P09 public tactical features and auxiliary heads. Every option defaults
     # off at the architecture boundary, preserving P08 checkpoints/behaviour.
     strategy_features_enabled: bool = False
@@ -133,6 +137,18 @@ class ModelV2Config:
             raise ValueError(
                 "strategy_aux_enabled requires strategy_features_enabled=True"
             )
+        if not isinstance(self.style_enabled, bool):
+            raise TypeError(
+                f"style_enabled must be bool, got {type(self.style_enabled).__name__}"
+            )
+        if (
+            isinstance(self.style_embedding_dim, bool)
+            or not isinstance(self.style_embedding_dim, int)
+            or self.style_embedding_dim <= 0
+        ):
+            raise ValueError(
+                f"style_embedding_dim must be positive, got {self.style_embedding_dim}"
+            )
         if isinstance(self.strategy_node_budget, bool) or self.strategy_node_budget <= 0:
             raise ValueError(
                 f"strategy_node_budget must be a positive int, got "
@@ -187,7 +203,7 @@ class ModelV2Config:
 
             strategy_version = STRATEGY_FEATURE_VERSION
             strategy_layout_hash = STRATEGY_FEATURE_LAYOUT_HASH
-        return {
+        compatibility = {
             "hidden_size": self.hidden_size,
             "history_encoder": self.history_encoder,
             "history_layers": self.history_layers,
@@ -213,6 +229,21 @@ class ModelV2Config:
             "score_target_transform": self.score_target_transform,
             "nan_guard": self.nan_guard,
         }
+        # Conditional fields keep every style-disabled P09/P10 checkpoint
+        # byte-compatible while binding style-enabled weights to their layout.
+        if self.style_enabled:
+            from douzero.style.features import (
+                STYLE_FEATURE_VERSION,
+                STYLE_LAYOUT_HASH,
+            )
+
+            compatibility.update({
+                "style_enabled": True,
+                "style_embedding_dim": self.style_embedding_dim,
+                "style_feature_version": STYLE_FEATURE_VERSION,
+                "style_layout_hash": STYLE_LAYOUT_HASH,
+            })
+        return compatibility
 
     def compatibility_dict_v1(self) -> dict:
         """P05-era compatibility dict (without ``score_target_transform``).
@@ -304,7 +335,8 @@ class ModelV2Config:
         kwargs: dict[str, object] = {}
         for name in ("hidden_size", "history_encoder", "history_layers",
                      "history_heads", "role_embedding_dim", "belief_enabled",
-                     "human_prior_enabled", "strategy_features_enabled",
+                     "human_prior_enabled", "style_enabled", "style_embedding_dim",
+                     "strategy_features_enabled",
                      "strategy_hand_enabled", "strategy_structure_enabled",
                      "strategy_control_enabled", "strategy_cooperation_enabled",
                      "strategy_risk_enabled", "strategy_aux_enabled",

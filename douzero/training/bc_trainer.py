@@ -412,7 +412,9 @@ class BCTrainer:
         try:
             for s in batch:
                 bundle = observation_to_model_inputs(
-                    s.obs, self.model.strategy_feature_config()
+                    s.obs,
+                    self.model.strategy_feature_config(),
+                    style_enabled=self.model.config.style_enabled,
                 )
                 belief_features = self._compute_belief_feature(s.obs)
                 out = self.model(
@@ -427,6 +429,7 @@ class BCTrainer:
                     bundle.acting_role,
                     belief_features=belief_features,
                     strategy_features=bundle.strategy_features,
+                    style_features=bundle.style_features,
                 )
                 if out.prior_logit is None:
                     raise BCTrainerError(
@@ -473,7 +476,9 @@ class BCTrainer:
         n = 0
         for s in samples:
             bundle = observation_to_model_inputs(
-                s.obs, self.model.strategy_feature_config()
+                s.obs,
+                self.model.strategy_feature_config(),
+                style_enabled=self.model.config.style_enabled,
             )
             belief_features = self._compute_belief_feature(s.obs)
             out = self.model(
@@ -488,6 +493,7 @@ class BCTrainer:
                 bundle.acting_role,
                 belief_features=belief_features,
                 strategy_features=bundle.strategy_features,
+                style_features=bundle.style_features,
             )
             if out.prior_logit is None:
                 raise BCTrainerError(

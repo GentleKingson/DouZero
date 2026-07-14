@@ -32,13 +32,20 @@ class DistillationSample:
     target_score: float
     sample_id: str = ""
 
-    def tensorize(self, strategy_config=None) -> "OfflineDistillationSample":
+    def tensorize(
+        self,
+        strategy_config=None,
+        *,
+        style_enabled: bool = False,
+    ) -> "OfflineDistillationSample":
         """Convert the public observation to the offline tensor format."""
 
         keys = canonical_action_keys(self.public_observation.actions.legal_actions)
         return OfflineDistillationSample(
             public_inputs=observation_to_model_inputs(
-                self.public_observation, strategy_config
+                self.public_observation,
+                strategy_config,
+                style_enabled=style_enabled,
             ),
             privileged_observation=self.privileged_observation,
             action_keys=keys,
@@ -148,6 +155,11 @@ def _bundle_to_dict(bundle: ModelInputBundle) -> dict:
             if bundle.strategy_features is None
             else bundle.strategy_features.detach().cpu()
         ),
+        "style_features": (
+            None
+            if bundle.style_features is None
+            else bundle.style_features.detach().cpu()
+        ),
     }
 
 
@@ -164,6 +176,7 @@ def _bundle_from_dict(raw: dict) -> ModelInputBundle:
         acting_role=str(raw["acting_role"]),
         feature_schema_hash=str(raw["feature_schema_hash"]),
         strategy_features=raw.get("strategy_features"),
+        style_features=raw.get("style_features"),
     )
 
 

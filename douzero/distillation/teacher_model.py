@@ -143,6 +143,7 @@ def forward_public_model(model: ModelV2, bundle: ModelInputBundle) -> ModelOutpu
         bundle.action_mask,
         bundle.acting_role,
         strategy_features=bundle.strategy_features,
+        style_features=bundle.style_features,
     )
 
 
@@ -234,7 +235,9 @@ class TeacherModel(nn.Module):
         if isinstance(public_input, ObservationV2):
             keys = canonical_action_keys(public_input.actions.legal_actions)
             bundle = observation_to_model_inputs(
-                public_input, self.public_model.strategy_feature_config()
+                public_input,
+                self.public_model.strategy_feature_config(),
+                style_enabled=self.public_model.config.style_enabled,
             )
         elif isinstance(public_input, ModelInputBundle):
             if action_keys is None:

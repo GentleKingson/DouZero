@@ -124,12 +124,13 @@ def test_serialize_round_trip():
     from douzero.config.schemas import (
         BCConfig,
         DecisionPolicyConfig,
-        DistillationConfig,
+            DistillationConfig,
+            LeagueConfig,
         LossConfig,
         ModelConfig,
     )
 
-    drop = {"optimizer", "loss", "decision_policy", "model", "bc", "distillation"}
+    drop = {"optimizer", "loss", "decision_policy", "model", "bc", "distillation", "league"}
     rebuilt = TrainingConfig(
         **{k: v for k, v in d.items() if k not in drop},
         optimizer=OptimizerConfig(**d["optimizer"]),
@@ -138,6 +139,7 @@ def test_serialize_round_trip():
         model=ModelConfig(**d["model"]),
         bc=BCConfig(**d["bc"]),
         distillation=DistillationConfig(**d["distillation"]),
+        league=LeagueConfig(**d["league"]),
     )
     assert rebuilt == cfg
 

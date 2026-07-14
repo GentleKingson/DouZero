@@ -204,6 +204,15 @@ class ModelV2(nn.Module):
 
             self.belief_proj = nn.Linear(BELIEF_FEATURE_DIM, cfg.hidden_size)
 
+        self.style_encoder: nn.Module | None = None
+        if cfg.style_enabled:
+            from douzero.style.encoder import StyleEncoder
+
+            self.style_encoder = StyleEncoder(
+                output_dim=cfg.hidden_size,
+                hidden_dim=cfg.style_embedding_dim,
+            )
+
         # P08: optional listwise policy-prior head. When ``human_prior_enabled``
         # the model gains a :class:`~douzero.models_v2.heads.PriorHead` that
         # emits one prior logit per legal action, trained by listwise BC. The
@@ -273,6 +282,7 @@ class ModelV2(nn.Module):
         belief_stop_gradient: bool = True,
         allow_missing_belief_features: bool = False,
         strategy_features: torch.Tensor | None = None,
+        style_features: torch.Tensor | None = None,
     ) -> ModelOutput:
         """Run a full forward pass for one decision.
 
@@ -335,6 +345,10 @@ class ModelV2(nn.Module):
             Optional ``(N, STRATEGY_FEATURE_WIDTH)`` public tactical feature
             matrix. Required exactly when ``strategy_features_enabled`` is
             true; rejected by the strategy-disabled action encoder.
+        style_features:
+            Optional public other-player style statistics. Required when the
+            checkpoint was built with ``style_enabled=True`` and rejected
+            otherwise. The vector is derived solely from public action history.
 
         Returns
         -------
@@ -432,6 +446,27 @@ class ModelV2(nn.Module):
             )
         del belief_stop_gradient  # consumed; guard against accidental reuse
 
+        if self.style_encoder is not None:
+            from douzero.style.features import STYLE_FEATURE_WIDTH
+
+            if style_features is None:
+                raise ValueError(
+                    "style_features were not supplied to a style-enabled ModelV2"
+                )
+            if tuple(style_features.shape) != (STYLE_FEATURE_WIDTH,):
+                raise ValueError(
+                    f"style_features must have shape ({STYLE_FEATURE_WIDTH},), "
+                    f"got {tuple(style_features.shape)}"
+                )
+            style_features = style_features.to(
+                device=state_trunk.device, dtype=state_trunk.dtype
+            )
+            state_trunk = state_trunk + self.style_encoder(style_features)
+        elif style_features is not None:
+            raise ValueError(
+                "style_features were passed to a style-disabled ModelV2"
+            )
+
         # --- Encode the history once. ---
         history_summary = self.history_encoder(history_tokens, history_key_padding_mask)
 
@@ -525,6 +560,8 @@ class ModelV2(nn.Module):
         ]
         if self.belief_proj is not None:
             submodules.append(("belief_proj", self.belief_proj))
+        if self.style_encoder is not None:
+            submodules.append(("style_encoder", self.style_encoder))
         if self.prior_head is not None:
             submodules.append(("prior_head", self.prior_head))
         if self.strategy_aux_heads is not None:
