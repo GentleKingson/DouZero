@@ -154,3 +154,7 @@ league:
 
 No data conversion or legacy checkpoint migration is required while P11 is
 disabled. Enabling style requires a newly trained style-enabled checkpoint.
+Any style-enabled checkpoint produced from the unreleased P11 draft must also
+be regenerated because the hardened other-player layout identity and encoder
+parameter names replace the draft opponent-style contract. Released P09/P10
+checkpoints are unaffected.
