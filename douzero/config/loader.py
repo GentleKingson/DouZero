@@ -241,6 +241,7 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
         kwargs["search"] = SearchConfig(**dict(search_raw))
     cfg = TrainingConfig(**kwargs)
     _validate_types(cfg)
+    _validate_training_system(cfg)
     _validate_legacy_only_versions(cfg)
     return cfg
 
@@ -256,6 +257,10 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "disable_checkpoint": bool, "savedir": str, "total_frames": int,
     "exp_epsilon": float, "batch_size": int, "unroll_length": int,
     "num_buffers": int, "num_threads": int, "max_grad_norm": float,
+    "sync_interval_updates": int, "policy_snapshot_slots": int,
+    "amp_enabled": bool, "amp_dtype": str,
+    "amp_fallback_on_nonfinite": bool, "pin_memory": bool,
+    "ddp_enabled": bool, "ddp_backend": str, "compile_model": bool,
     "seed": int, "deterministic": bool, "config": str,
     "feature_version": str, "ruleset": str, "model_version": str,
     "learning_rate": float, "alpha": float, "momentum": float, "epsilon": float,
@@ -374,6 +379,18 @@ def _validate_types(cfg: TrainingConfig) -> None:
     _check_field("batch_size", cfg.distillation.batch_size, "distillation")
 
 
+def _validate_training_system(cfg: TrainingConfig) -> None:
+    """Validate P14 concurrency and precision controls."""
+    if cfg.sync_interval_updates < 1:
+        raise ValueError("sync_interval_updates must be >= 1")
+    if cfg.policy_snapshot_slots < 2:
+        raise ValueError("policy_snapshot_slots must be >= 2")
+    if cfg.amp_dtype not in {"float16", "bfloat16"}:
+        raise ValueError("amp_dtype must be 'float16' or 'bfloat16'")
+    if cfg.ddp_backend not in {"auto", "nccl", "gloo"}:
+        raise ValueError("ddp_backend must be 'auto', 'nccl', or 'gloo'")
+
+
 # P01 only supports the "legacy" feature/rule/model versions. Later phases
 # (P02 rules, P03 observations, P05 model) widen these sets. A YAML or dict
 # config that sets a non-"legacy" value is rejected here so it fails loudly
@@ -430,6 +447,9 @@ _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
     "training_device", "load_model", "disable_checkpoint", "savedir",
     "total_frames", "exp_epsilon", "batch_size", "unroll_length",
     "num_buffers", "num_threads", "max_grad_norm",
+    "sync_interval_updates", "policy_snapshot_slots", "amp_enabled",
+    "amp_dtype", "amp_fallback_on_nonfinite", "pin_memory",
+    "ddp_enabled", "ddp_backend", "compile_model",
     "learning_rate", "alpha", "momentum", "epsilon",
     # P01-added argparse dests (optional; default to legacy values if absent).
     "seed", "deterministic", "config",

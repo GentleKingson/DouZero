@@ -51,6 +51,28 @@ parser.add_argument('--num_threads', default=4, type=int,
 parser.add_argument('--max_grad_norm', default=40., type=float,
                     help='Max norm of gradients')
 
+# P14 system controls. Numerical/performance features are opt-in; the safe
+# versioned actor snapshot path is always used.
+parser.add_argument('--sync_interval_updates', default=1, type=int,
+                    help='Publish actor policy after this many learner updates')
+parser.add_argument('--policy_snapshot_slots', default=2, type=int,
+                    help='Shared immutable actor-policy slots (minimum 2)')
+parser.add_argument('--amp_enabled', action=argparse.BooleanOptionalAction,
+                    default=False, help='Enable learner autocast/GradScaler')
+parser.add_argument('--amp_dtype', choices=['float16', 'bfloat16'],
+                    default='float16', help='AMP autocast dtype')
+parser.add_argument('--amp_fallback_on_nonfinite',
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help='Retry an anomalous AMP step once in float32')
+parser.add_argument('--pin_memory', action=argparse.BooleanOptionalAction,
+                    default=False, help='Pin CPU learner batches before transfer')
+parser.add_argument('--ddp_enabled', action=argparse.BooleanOptionalAction,
+                    default=False, help='Enable torchrun DistributedDataParallel')
+parser.add_argument('--ddp_backend', choices=['auto', 'nccl', 'gloo'],
+                    default='auto', help='DDP process-group backend')
+parser.add_argument('--compile_model', action=argparse.BooleanOptionalAction,
+                    default=False, help='Enable torch.compile after benchmarking')
+
 # Optimizer settings
 parser.add_argument('--learning_rate', default=0.0001, type=float,
                     help='Learning rate')

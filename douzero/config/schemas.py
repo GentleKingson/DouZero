@@ -487,6 +487,19 @@ class TrainingConfig:
     num_threads: int = 4
     max_grad_norm: float = 40.0
 
+    # P14 training-system controls. Defaults preserve the legacy numerical
+    # path; versioned snapshot publication replaces unsafe in-place actor
+    # mutation even when AMP/DDP are disabled.
+    sync_interval_updates: int = 1
+    policy_snapshot_slots: int = 2
+    amp_enabled: bool = False
+    amp_dtype: str = "float16"
+    amp_fallback_on_nonfinite: bool = True
+    pin_memory: bool = False
+    ddp_enabled: bool = False
+    ddp_backend: str = "auto"
+    compile_model: bool = False
+
     # New P01 knobs (carried, not yet enforced; defaults preserve legacy)
     seed: int = 0
     deterministic: bool = False
