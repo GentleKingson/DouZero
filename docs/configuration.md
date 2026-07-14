@@ -105,6 +105,16 @@ optimizer step at episode start. `max_label_age_steps` independently controls
 refit data age.
 See `configs/enhanced.yaml` and `docs/coach_curriculum.md`.
 
+### Search block
+
+P13 adds an optional deployment-only `search:` block. `enabled` defaults to
+`false`; legacy and ordinary V2 selection do not run a belief model or search.
+Pass `cfg.search` to `DeepAgentV2(search_config=...)` together with a P07
+belief model to enable top-k belief rollouts and the small-endgame solver.
+Node, rollout, and millisecond limits are mandatory fallback boundaries; a
+zero limit returns the base-policy action. See `configs/enhanced.yaml` and
+`docs/search.md`.
+
 ## Boolean flags and `--no-<flag>` overrides
 
 The four boolean flags (`--actor_device_cpu`, `--load_model`,

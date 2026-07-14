@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from douzero.search.budget import SearchConfig
+
 
 # --------------------------------------------------------------------------- #
 # Runtime (cross-cutting; P00 had no seed plumbing, P01 adds opt-in defaults)
@@ -518,6 +520,8 @@ class TrainingConfig:
     league: LeagueConfig = field(default_factory=LeagueConfig)
     # P12: training-only coach sampler. Evaluation never imports this block.
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
+    # P13: optional deployment-only belief search. Disabled by default.
+    search: SearchConfig = field(default_factory=SearchConfig)
 
 
 # --------------------------------------------------------------------------- #

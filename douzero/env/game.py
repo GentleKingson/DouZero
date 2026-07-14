@@ -231,9 +231,17 @@ class GameEnv(object):
                     self.acting_player_position].player_hand_cards.remove(card)
             self.info_sets[self.acting_player_position].player_hand_cards.sort()
 
-    def get_legal_card_play_actions(self):
+    def get_legal_card_play_actions(self, budget_check=None):
+        """Return legal card-play actions.
+
+        ``budget_check`` is an optional cooperative deadline hook used by the
+        P13 search state. Normal environment callers pass nothing, preserving
+        the legacy action set and ordering exactly.
+        """
         mg = MovesGener(
-            self.info_sets[self.acting_player_position].player_hand_cards)
+            self.info_sets[self.acting_player_position].player_hand_cards,
+            budget_check=budget_check,
+        )
 
         action_sequence = self.card_play_action_seq
 

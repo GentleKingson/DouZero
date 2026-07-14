@@ -30,6 +30,7 @@ was copied.
 | `kwai/DouZero` | Apache-2.0 | all | The upstream project this repo derives from. Modified under the Apache-2.0 terms; copyright notices preserved in `LICENSE`. | n/a (this is the base) |
 | `RuBP17/AlphaDou` | GPLv3 | P02, P06, P08 | Full bidding + win-probability/expected-score dual objectives; listwise action selection over legal actions. Implemented independently from the published description. | **No** (GPLv3 incompatible with Apache-2.0 distribution) |
 | `DouZero+` (paper / public behaviour) | research paper | P07, P08, P12 | Opponent hidden-card prediction; coach-guided curriculum. Implemented independently; no reference implementation copied. | **No** |
+| Belief-sampling search / imperfect-information game literature | general research concepts | P13 | Public-belief sampling, bounded rollout, and team minimax were implemented independently against DouZero's own rule APIs. No third-party solver code was consulted or copied. | **No** |
 | `DouRN` (paper / public behaviour) | research paper | P05 | Residual backbone + per-role evaluation. Implemented independently. | **No** |
 | PyTorch (`torch.autocast`, `GradScaler`, DDP, `torch.compile`) | BSD-style | P14 (future) | Official PyTorch training APIs; used per the upstream docs. | n/a (library usage) |
 
