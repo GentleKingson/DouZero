@@ -41,6 +41,7 @@ Declared in `pyproject.toml` `[project].dependencies` (and mirrored in
 | Dependency | Why |
 |---|---|
 | `torch` | models, training, evaluation |
+| `numpy` | observation encoding, environment state, and deployment inputs |
 | `rlcard` | the rule-based RLCard baseline agent |
 | `GitPython` | run-metadata stamping in `file_writer.py` (training logging) |
 | `pyyaml` | `--config <yaml>` loading (`douzero.config`) |

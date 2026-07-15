@@ -22,6 +22,9 @@ only when semantics remain provably compatible. Unknown identity versions,
 missing manifests, partial state dictionaries, feature drift, rule drift, and
 privileged teachers are rejected. Re-save a successfully loaded older model as
 a current public sidecar before packaging; never edit manifest hashes by hand.
+P16 release packages additionally bind to the deployment ABI version and exact
+implementation hash. A semantic implementation change requires a new package;
+do not weaken the hash check to reuse an older release artifact.
 
 ## Evaluation Data
 

@@ -37,8 +37,12 @@ model = load_model_package(
 
 The loader rejects checksum changes, unknown manifest fields, wrong feature or
 ruleset identity, wrong model config, missing package versions, unsafe access
-class, bare legacy weights, and incomplete state dictionaries. Checkpoint
-deserialization uses PyTorch's `weights_only=True` path.
+class, bare legacy weights, and incomplete state dictionaries. It also requires
+a known source Git SHA and exact `model_abi_version` plus
+`implementation_hash` match against the installed deployment implementation.
+The inner `weights.pt` sidecar manifest is independently checked against the
+outer package identity. Checkpoint deserialization uses PyTorch's
+`weights_only=True` path.
 
 ## Agent Runtime
 
@@ -47,7 +51,8 @@ deserialization uses PyTorch's `weights_only=True` path.
 search uses its configured seed. `timeout_ms` and runtime exceptions use a
 configured base agent when possible, then a deterministic conservative legal
 move. Identity and privileged-input failures happen before fallback and remain
-hard failures.
+hard failures. Search-enabled agents also reject a package unless its manifest
+explicitly declares `search_compatible=true`.
 
 Decision explanations are disabled by default. When requested they contain
 only action indices and model scores, not hand/card plaintext or personal
@@ -60,7 +65,9 @@ and a boolean valid-action mask. It reloads the artifact, compares all value
 outputs with PyTorch, and always writes an adjacent `.report.json`. Belief,
 strategy, and style feature paths currently report unsupported rather than
 silently exporting a reduced model. Export failure does not invalidate the
-state-dict deployment path.
+state-dict deployment path. Export is written to a same-directory temporary
+file and atomically published only after reload and numerical alignment; failed
+attempts remove temporary and stale target files.
 
 ## Release Gate
 

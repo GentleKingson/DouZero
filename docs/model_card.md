@@ -7,6 +7,7 @@ not constitute evaluation results.
 ## Model Details
 
 - Model/checkpoint version:
+- Model ABI version, implementation hash, and Git SHA:
 - Feature schema version and hash:
 - Ruleset ID and hash:
 - Supported roles:
