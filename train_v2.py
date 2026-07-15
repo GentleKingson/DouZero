@@ -512,7 +512,10 @@ def main() -> None:
             raise RuntimeError("compile_model requires torch.compile")
         model = torch.compile(model, dynamic=True)
     core_model = model
-    model = distributed.wrap(model)
+    amp_enabled = resolve(
+        "amp_enabled", yaml_cfg.amp_enabled if yaml_cfg else None, False
+    )
+    model = distributed.wrap(model, static_graph=not amp_enabled)
     if distributed.enabled:
         # DDP intentionally exposes only Module's API. The trainer also needs
         # immutable model identity/config helpers, so forward them explicitly.
@@ -552,9 +555,7 @@ def main() -> None:
         ),
         max_steps_per_episode=resolve("max_steps_per_episode", None, defaults.max_steps_per_episode),
         device=str(learner_device),
-        amp_enabled=resolve(
-            "amp_enabled", yaml_cfg.amp_enabled if yaml_cfg else None, False
-        ),
+        amp_enabled=amp_enabled,
         amp_dtype=resolve(
             "amp_dtype", yaml_cfg.amp_dtype if yaml_cfg else None, "float16"
         ),

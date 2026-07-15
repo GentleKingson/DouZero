@@ -63,7 +63,9 @@ enter backward or skip the step together. Console summaries are rank-zero only.
 Self-play forwards call the rank-local underlying module, never the DDP wrapper;
 only synchronized optimizer closures enter DDP forward/backward. The wrapper
 uses a static reducer, avoiding the recurring graph traversal cost of
-`find_unused_parameters=True`.
+`find_unused_parameters=True`, for ordinary FP32 training. AMP-enabled runs use
+the dynamic reducer because a globally non-finite loss can abandon a forward
+before backward and then retry it coherently in FP32.
 
 Curriculum/coach-label output and RL+BC validation/quarantine are currently
 rejected under DDP because those modes do not yet have coordinated single-writer
