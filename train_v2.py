@@ -377,6 +377,24 @@ def _build_curriculum(cfg):
     return sampler, label_store, cc.policy_version, cc.policy_step
 
 
+def _validate_ddp_features(cfg, loss_cfg, distributed) -> None:
+    """Reject training modes whose file side effects are not DDP-safe."""
+    if not distributed.enabled:
+        return
+    if cfg is not None and cfg.curriculum.enabled:
+        raise NotImplementedError(
+            "DDP does not support curriculum/coach-label training yet: its "
+            "audit and label stores require a single writer. Disable "
+            "curriculum or run train_v2.py without DDP."
+        )
+    if loss_cfg.lambda_bc > 0:
+        raise NotImplementedError(
+            "DDP does not support RL+BC auxiliary training yet: BC validation "
+            "and quarantine require rank-zero coordination. Set lambda_bc=0 "
+            "or run train_v2.py without DDP."
+        )
+
+
 def main() -> None:
     args = _build_parser().parse_args()
 
@@ -445,6 +463,8 @@ def main() -> None:
     rank_seed = seed + distributed.rank if seed != 0 else 0
     set_global_seed(rank_seed)
     maybe_set_global_deterministic(deterministic)
+    loss_cfg = _build_loss_config(yaml_cfg)
+    _validate_ddp_features(yaml_cfg, loss_cfg, distributed)
 
     # Build the V2 model from the schema + config (honouring score_clamp so
     # the head clamp matches the loss target clamp exactly).
@@ -480,8 +500,8 @@ def main() -> None:
     from douzero.training import V2Trainer
 
     trainer_cfg = TrainerConfig(
-        seed=seed,
-        rng_seed=seed,
+        seed=rank_seed,
+        rng_seed=rank_seed,
         # CLI dest "episodes" maps to TrainerConfig.max_episodes (TrainingConfig
         # has no episodes field; it comes from CLI or the TrainerConfig default).
         max_episodes=resolve("episodes", None, defaults.max_episodes),
@@ -523,7 +543,6 @@ def main() -> None:
     )
 
     ruleset = _resolve_ruleset(yaml_cfg)
-    loss_cfg = _build_loss_config(yaml_cfg)
     decision_cfg = _build_decision_config(yaml_cfg)
     opening_sampler, coach_label_store, policy_version, policy_step = (
         _build_curriculum(yaml_cfg)
@@ -687,6 +706,7 @@ def main() -> None:
         coach_label_store=coach_label_store,
         policy_version=policy_version,
         policy_step=policy_step,
+        distributed_context=distributed,
     )
 
     if distributed.is_rank_zero:

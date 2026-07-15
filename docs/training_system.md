@@ -23,6 +23,12 @@ overwriting an in-flight policy. The next configured publication point retries.
 Each transition records `policy_version`; learner logs report per-role policy
 lag. `sync_interval_updates` controls publication frequency.
 
+Leases carry an actor owner and generation, so duplicate releases cannot steal
+another actor's reader count. After an actor has exited or been terminated, the
+parent reclaims any lease still registered to that actor. Shutdown also sends
+sentinels to both actor free queues and learner full queues before joining every
+learner thread.
+
 ## Mixed precision
 
 `amp_enabled` defaults to false. CUDA uses `torch.autocast` and the current
@@ -30,6 +36,10 @@ lag. `sync_interval_updates` controls publication frequency.
 selects `amp_dtype: bfloat16`; CPU float16 is rejected. Loss and gradient norm
 are checked before every optimizer mutation. An AMP anomaly disables AMP and
 retries once in float32; another anomaly raises `FloatingPointError`.
+Under DDP, loss and gradient finite flags are reduced across ranks before the
+next collective-sensitive action. Any anomaly makes every rank retry together;
+the trainer restores Python, NumPy, Torch, CUDA, and trainer RNG state so the
+retry uses the same BC selections and dropout stream.
 
 Example CUDA legacy learner settings:
 
@@ -42,11 +52,17 @@ pin_memory: true
 
 ## DDP
 
-The V2 entry point accepts one-process-per-device DDP through `torchrun`. Rank
-seeds are distinct, DDP averages gradients, and public replay samples are
-collected independently per rank. The runtime exposes non-overlapping rank
-shards for future dataset-backed training. Side effects and console summaries
-are rank-zero only.
+The V2 entry point accepts one-process-per-device DDP through `torchrun`.
+Explicit nonzero seeds are derived per rank, DDP averages gradients, and public
+replay samples are collected independently per rank. The runtime exposes
+non-overlapping rank shards for future dataset-backed training. Replay
+readiness is reduced across ranks before each optimizer step; all ranks either
+enter backward or skip the step together. Console summaries are rank-zero only.
+
+Curriculum/coach-label output and RL+BC validation/quarantine are currently
+rejected under DDP because those modes do not yet have coordinated single-writer
+side effects. Disable those features for DDP, or run them in one process; the
+entry point fails before opening their output files.
 
 ```bash
 torchrun --standalone --nproc-per-node=2 train_v2.py \

@@ -49,7 +49,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from douzero.runtime import SafeMixedPrecision
+from douzero.runtime import DistributedContext, SafeMixedPrecision
 
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
@@ -232,6 +232,7 @@ class V2Trainer:
         coach_label_store=None,
         policy_version: str = "current",
         policy_step: int = 0,
+        distributed_context: DistributedContext | None = None,
     ) -> None:
         _legacy_only(ruleset)
         loss_cfg = loss_config or LossConfig()
@@ -355,6 +356,12 @@ class V2Trainer:
         self.decision_config = decision_config or DecisionConfig()
         self.config = config or TrainerConfig()
         self.device = torch.device(self.config.device)
+        self.distributed = distributed_context or DistributedContext(enabled=False)
+        if self.distributed.enabled and self.distributed.device != self.device:
+            raise ValueError(
+                "distributed context device does not match TrainerConfig.device: "
+                f"{self.distributed.device} != {self.device}"
+            )
         self.model.to(self.device)
         self.mixed_precision = SafeMixedPrecision(
             self.device,
@@ -709,6 +716,28 @@ class V2Trainer:
     # ------------------------------------------------------------------ #
     # Optimization (fail-closed on non-finite loss / gradient)
     # ------------------------------------------------------------------ #
+    def _capture_retry_rng_state(self):
+        """Capture every RNG source used by the optimizer closure."""
+        return {
+            "trainer": self.rng.getstate(),
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.random.get_rng_state(),
+            "cuda": (
+                torch.cuda.get_rng_state(self.device)
+                if self.device.type == "cuda" else None
+            ),
+        }
+
+    def _restore_retry_rng_state(self, state) -> None:
+        """Replay an AMP fallback with identical BC samples and dropout."""
+        self.rng.setstate(state["trainer"])
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.random.set_rng_state(state["torch"])
+        if state["cuda"] is not None:
+            torch.cuda.set_rng_state(state["cuda"], self.device)
+
     def step(self) -> LossComponents | None:
         """Run one optimizer step on a sampled minibatch.
 
@@ -719,9 +748,12 @@ class V2Trainer:
         An AMP step retries once in float32; a float32 anomaly raises
         :class:`FloatingPointError`.
         """
+        local_batch_ready = len(self.buffer) >= self.config.batch_size
+        if not self.distributed.all_true(local_batch_ready):
+            return None
         batch = self.buffer.sample_minibatch(self.config.batch_size, rng=self.rng)
         if batch is None:
-            return None
+            raise RuntimeError("replay buffer reported ready but returned no minibatch")
 
         # P06 r4: use try/finally so model.eval() + gradient cleanup are
         # guaranteed even when clip_grad_norm_(error_if_nonfinite=True) or
@@ -833,6 +865,9 @@ class V2Trainer:
                 loss_closure, self.optimizer, self.model.parameters(),
                 max_grad_norm=self.config.max_grad_norm,
                 clip_grad_norm=nn.utils.clip_grad_norm_,
+                collective_all_true=self.distributed.all_true,
+                capture_retry_state=self._capture_retry_rng_state,
+                restore_retry_state=self._restore_retry_rng_state,
             )
             if components is None or win_logit is None:
                 raise RuntimeError("optimizer closure did not produce diagnostics")

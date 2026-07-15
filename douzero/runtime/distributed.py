@@ -40,6 +40,23 @@ class DistributedContext:
             kwargs = {"device_ids": [self.local_rank], "output_device": self.local_rank}
         return DistributedDataParallel(model, **kwargs)
 
+    def all_true(self, local_value: bool) -> bool:
+        """Return true only when every learner rank reports true.
+
+        Optimizer-step control flow must agree across ranks before any rank
+        enters DDP backward. The disabled context preserves the same API for
+        single-process callers without initializing a process group.
+        """
+        if not self.enabled:
+            return bool(local_value)
+        flag = torch.tensor(
+            1 if local_value else 0,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        return bool(flag.item())
+
     def close(self) -> None:
         """Destroy the process group when initialized.
 

@@ -47,34 +47,65 @@ class SafeMixedPrecision:
             return nullcontext()
         return torch.autocast(device_type=self.device.type, dtype=self.dtype)
 
-    def step(self, loss_closure: Callable[[], torch.Tensor],
-             optimizer: torch.optim.Optimizer,
-             parameters: Iterable[nn.Parameter], *,
-             max_grad_norm: float,
-             clip_grad_norm: Callable | None = None) -> OptimizerStepResult:
+    def step(
+        self,
+        loss_closure: Callable[[], torch.Tensor],
+        optimizer: torch.optim.Optimizer,
+        parameters: Iterable[nn.Parameter],
+        *,
+        max_grad_norm: float,
+        clip_grad_norm: Callable | None = None,
+        collective_all_true: Callable[[bool], bool] | None = None,
+        capture_retry_state: Callable[[], object] | None = None,
+        restore_retry_state: Callable[[object], None] | None = None,
+    ) -> OptimizerStepResult:
         """Take one finite optimizer step, retrying once in float32 after AMP."""
+        if (capture_retry_state is None) != (restore_retry_state is None):
+            raise ValueError(
+                "capture_retry_state and restore_retry_state must be provided together"
+            )
         params = list(parameters)
         attempted_amp = self.enabled
+        retry_state = (
+            capture_retry_state()
+            if attempted_amp
+            and self.fallback_on_nonfinite
+            and capture_retry_state is not None
+            else None
+        )
         try:
             return self._attempt(loss_closure, optimizer, params,
-                                 max_grad_norm, attempted_amp, clip_grad_norm)
+                                 max_grad_norm, attempted_amp, clip_grad_norm,
+                                 collective_all_true)
         except FloatingPointError:
             if not attempted_amp or not self.fallback_on_nonfinite:
                 raise
             self.enabled = False
             self.fallback_count += 1
             optimizer.zero_grad(set_to_none=True)
+            if restore_retry_state is not None:
+                restore_retry_state(retry_state)
             result = self._attempt(loss_closure, optimizer, params,
-                                   max_grad_norm, False, clip_grad_norm)
+                                   max_grad_norm, False, clip_grad_norm,
+                                   collective_all_true)
             return OptimizerStepResult(result.loss, result.grad_norm, False, True)
 
     def _attempt(self, closure, optimizer, params, max_grad_norm, use_amp,
-                 clip_grad_norm):
+                 clip_grad_norm, collective_all_true):
         optimizer.zero_grad(set_to_none=True)
         with self.autocast(enabled=use_amp):
             loss = closure()
-        if not torch.isfinite(loss.detach()).all():
-            raise FloatingPointError(f"non-finite loss: {loss.detach().float().item()!r}")
+        local_loss_finite = bool(torch.isfinite(loss.detach()).all().item())
+        loss_finite = (
+            collective_all_true(local_loss_finite)
+            if collective_all_true is not None else local_loss_finite
+        )
+        if not loss_finite:
+            detail = (
+                f"non-finite loss: {loss.detach().float().item()!r}"
+                if not local_loss_finite else "non-finite loss on a peer rank"
+            )
+            raise FloatingPointError(detail)
         if self._scaler.is_enabled() and use_amp:
             self._scaler.scale(loss).backward()
             self._scaler.unscale_(optimizer)
@@ -82,10 +113,18 @@ class SafeMixedPrecision:
             loss.backward()
         clip = clip_grad_norm or nn.utils.clip_grad_norm_
         grad_norm = clip(params, max_grad_norm, error_if_nonfinite=False)
-        if not torch.isfinite(grad_norm.detach()).all():
-            raise FloatingPointError(
+        local_grad_finite = bool(torch.isfinite(grad_norm.detach()).all().item())
+        grad_finite = (
+            collective_all_true(local_grad_finite)
+            if collective_all_true is not None else local_grad_finite
+        )
+        if not grad_finite:
+            detail = (
                 f"non-finite gradient norm: {grad_norm.detach().float().item()!r}"
+                if not local_grad_finite
+                else "non-finite gradient norm on a peer rank"
             )
+            raise FloatingPointError(detail)
         if self._scaler.is_enabled() and use_amp:
             self._scaler.step(optimizer)
             self._scaler.update()

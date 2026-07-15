@@ -23,19 +23,28 @@ class PolicyLease(Generic[T]):
     slot: int
     version: int
     model: T
+    owner_id: int
+    generation: int
 
 
 class VersionedPolicyPool(Generic[T]):
     """Shared model slots with atomic publication and episode leases."""
 
-    def __init__(self, models: Iterable[T], *, mp_context) -> None:
+    def __init__(self, models: Iterable[T], *, mp_context,
+                 max_owners: int = 1024) -> None:
         self.models = list(models)
         if len(self.models) < 2:
             raise ValueError("VersionedPolicyPool requires at least two slots")
+        if max_owners < 1:
+            raise ValueError("max_owners must be positive")
         self._lock = mp_context.Lock()
         self._active_slot = mp_context.Value("i", 0, lock=False)
         self._version = mp_context.Value("q", 0, lock=False)
         self._readers = mp_context.Array("i", len(self.models), lock=False)
+        self._owner_slots = mp_context.Array("i", max_owners, lock=False)
+        self._owner_generations = mp_context.Array("q", max_owners, lock=False)
+        for owner in range(max_owners):
+            self._owner_slots[owner] = -1
 
     @property
     def version(self) -> int:
@@ -43,22 +52,69 @@ class VersionedPolicyPool(Generic[T]):
         with self._lock:
             return int(self._version.value)
 
-    def acquire(self) -> PolicyLease[T]:
+    def acquire(self, *, owner_id: int | None = None) -> PolicyLease[T]:
         """Lease the active immutable slot until :meth:`release` is called."""
         with self._lock:
+            if owner_id is None:
+                owner_id = next(
+                    (owner for owner, slot in enumerate(self._owner_slots)
+                     if slot == -1),
+                    None,
+                )
+                if owner_id is None:
+                    raise RuntimeError("no policy lease owner slots are available")
+            if owner_id < 0 or owner_id >= len(self._owner_slots):
+                raise ValueError(f"invalid policy lease owner {owner_id}")
+            if self._owner_slots[owner_id] != -1:
+                raise RuntimeError(
+                    f"policy lease owner {owner_id} already holds a lease"
+                )
             slot = int(self._active_slot.value)
             self._readers[slot] += 1
             version = int(self._version.value)
-        return PolicyLease(slot=slot, version=version, model=self.models[slot])
+            generation = int(self._owner_generations[owner_id]) + 1
+            self._owner_generations[owner_id] = generation
+            self._owner_slots[owner_id] = slot
+        return PolicyLease(
+            slot=slot,
+            version=version,
+            model=self.models[slot],
+            owner_id=owner_id,
+            generation=generation,
+        )
 
     def release(self, lease: PolicyLease[T]) -> None:
         """Release a previously acquired episode lease."""
         with self._lock:
             if lease.slot < 0 or lease.slot >= len(self.models):
                 raise ValueError(f"invalid policy slot {lease.slot}")
+            if lease.owner_id < 0 or lease.owner_id >= len(self._owner_slots):
+                raise ValueError(f"invalid policy lease owner {lease.owner_id}")
+            owner_slot = int(self._owner_slots[lease.owner_id])
+            owner_generation = int(self._owner_generations[lease.owner_id])
+            if owner_slot != lease.slot or owner_generation != lease.generation:
+                raise RuntimeError(
+                    f"policy lease owner {lease.owner_id} does not hold "
+                    f"slot {lease.slot} generation {lease.generation}"
+                )
             if self._readers[lease.slot] <= 0:
-                raise RuntimeError(f"policy slot {lease.slot} is not leased")
+                raise RuntimeError(f"policy slot {lease.slot} reader count is corrupt")
+            self._owner_slots[lease.owner_id] = -1
             self._readers[lease.slot] -= 1
+
+    def recover_owner(self, owner_id: int) -> bool:
+        """Reclaim a lease held by an actor that the parent has reaped."""
+        with self._lock:
+            if owner_id < 0 or owner_id >= len(self._owner_slots):
+                raise ValueError(f"invalid policy lease owner {owner_id}")
+            slot = int(self._owner_slots[owner_id])
+            if slot == -1:
+                return False
+            if self._readers[slot] <= 0:
+                raise RuntimeError(f"policy slot {slot} reader count is corrupt")
+            self._owner_slots[owner_id] = -1
+            self._readers[slot] -= 1
+            return True
 
     def initialize(self, source_models: dict[str, torch.nn.Module]) -> None:
         """Copy the initial learner state into every slot before actors start."""

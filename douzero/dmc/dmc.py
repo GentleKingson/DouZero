@@ -176,13 +176,16 @@ def train(flags):
             model.share_memory()
             model.eval()
             slots.append(model)
-        models[device] = VersionedPolicyPool(slots, mp_context=ctx)
+        models[device] = VersionedPolicyPool(
+            slots, mp_context=ctx, max_owners=flags.num_actors
+        )
 
     # Initialize buffers
     buffers = create_buffers(flags, device_iterator)
    
     # Initialize queues
     actor_processes = []
+    threads = []
     free_queue = {}
     full_queue = {}
         
@@ -287,26 +290,38 @@ def train(flags):
                 args=(i, device, free_queue[device], full_queue[device],
                       models[device], buffers[device], flags, stop_event))
             actor.start()
-            actor_processes.append(actor)
+            actor_processes.append((actor, device, i))
 
-    def stop_actors():
-        """Request actor shutdown and reap every process."""
+    def stop_workers():
+        """Wake blocked workers, reap actors, and join learner threads."""
         stop_event.set()
         for device in device_iterator:
             for position in ['landlord', 'landlord_up', 'landlord_down']:
                 for _ in range(flags.num_actors):
                     free_queue[device][position].put(None)
-        for actor in actor_processes:
+                for _ in range(flags.num_threads):
+                    full_queue[device][position].put(None)
+        for actor, device, actor_id in actor_processes:
             actor.join(timeout=5)
             if actor.is_alive():
                 actor.terminate()
                 actor.join(timeout=5)
+            if actor.is_alive():
+                log.error(
+                    'Actor %i on device %s could not be reaped.', actor_id, device
+                )
+            else:
+                models[device].recover_owner(actor_id)
+        for thread in threads:
+            thread.join()
 
     def batch_and_learn(i, device, position, local_lock, position_lock, lock=threading.Lock()):
         """Thread target for the learning process."""
         nonlocal frames, position_frames, stats
-        while frames < flags.total_frames:
+        while not stop_event.is_set() and frames < flags.total_frames:
             batch = get_batch(free_queue[device][position], full_queue[device][position], buffers[device][position], flags, local_lock)
+            if batch is None:
+                return
             _stats = learn(position, models, learner_model.get_model(position), batch, 
                 optimizers[position], flags, position_lock,
                 amp_controller=amp_controllers[position],
@@ -328,7 +343,6 @@ def train(flags):
             free_queue[device]['landlord_up'].put(m)
             free_queue[device]['landlord_down'].put(m)
 
-    threads = []
     locks = {}
     for device in device_iterator:
         locks[device] = {'landlord': threading.Lock(), 'landlord_up': threading.Lock(), 'landlord_down': threading.Lock()}
@@ -398,17 +412,15 @@ def train(flags):
                      pprint.pformat(stats))
 
     except KeyboardInterrupt:
-        stop_actors()
+        stop_workers()
         plogger.close()
         return 
     except Exception:
-        stop_actors()
+        stop_workers()
         plogger.close()
         raise
     else:
-        for thread in threads:
-            thread.join()
-        stop_actors()
+        stop_workers()
         log.info('Learning finished after %d frames.', frames)
 
     checkpoint(frames)

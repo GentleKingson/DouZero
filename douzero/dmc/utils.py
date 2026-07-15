@@ -47,10 +47,18 @@ def get_batch(free_queue,
     """
     This function will sample a batch from the buffers based
     on the indices received from the full queue. It will also
-    free the indices by sending it to full_queue.
+    free the indices by sending them to ``free_queue``. A ``None`` item is a
+    shutdown sentinel and returns ``None`` to the learner thread.
     """
+    indices = []
     with lock:
-        indices = [full_queue.get() for _ in range(flags.batch_size)]
+        for _ in range(flags.batch_size):
+            index = full_queue.get()
+            if index is None:
+                for acquired in indices:
+                    free_queue.put(acquired)
+                return None
+            indices.append(index)
     batch = {
         key: torch.stack([buffers[key][m] for m in indices], dim=1)
         for key in buffers
@@ -153,7 +161,7 @@ def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
         size = {p: 0 for p in positions}
 
         position, obs, env_output = env.initial()
-        lease = policy_pool.acquire()
+        lease = policy_pool.acquire(owner_id=i)
         model = lease.model
         episode_policy_version = lease.version
 
@@ -185,7 +193,8 @@ def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
             # The environment has already reset, but no inference for the next
             # game has happened. This is the only safe actor policy switch point.
             policy_pool.release(lease)
-            lease = policy_pool.acquire()
+            lease = None
+            lease = policy_pool.acquire(owner_id=i)
             model = lease.model
             episode_policy_version = lease.version
 
