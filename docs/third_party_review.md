@@ -89,3 +89,12 @@ adds no runtime dependency.
 No GPL-licensed, license-unverified, or otherwise-incompatible code has been
 copied into this Apache-2.0 distribution. All consulted ideas are implemented
 independently from papers and public behaviour.
+
+## P16 — release audit
+
+P16 adds no runtime or development dependency. Deployment packaging and
+checksum verification use the Python standard library and existing PyTorch
+APIs. The root `THIRD_PARTY_NOTICES` records every direct runtime dependency,
+the directly imported NumPy dependency, development/build tools, and the
+GPL/unknown-license clean-room decision. No platform account, scraping, or
+anti-detection code exists in the deployment path.

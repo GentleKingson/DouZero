@@ -1,4 +1,5 @@
 torch>=1.6.0
+numpy
 GitPython
 rlcard
 pyyaml

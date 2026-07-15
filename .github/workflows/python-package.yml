@@ -54,13 +54,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: "pip"
 
-      - name: Build wheel and install
+      - name: Build wheel
         run: |
           python -m pip install --upgrade pip build
           python -m build
-          # Install the freshly built wheel (not -e .) to prove the built
-          # distribution is importable in a clean environment.
-          python -m pip install dist/*.whl
+
+      - name: Install wheel in isolated environment
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install --upgrade pip
+          # Install only the built wheel as the requested artifact. Pip resolves
+          # every declared runtime dependency into this otherwise-empty venv.
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install dist/*.whl
 
       - name: Import smoke from installed wheel
         shell: bash
@@ -70,14 +76,15 @@ jobs:
           # resolve to ./douzero instead of the freshly installed wheel, making
           # the smoke test meaningless.
           #
-          # All four top-level packages are imported. douzero.dmc is safe to
+          # Core runtime packages, including deployment, are imported. dmc is safe to
           # import from a plain wheel install: GitPython is declared in
           # install_requires, and file_writer.py imports it lazily inside
           # gather_metadata (so module load no longer requires GitPython).
           cd "$RUNNER_TEMP"
 
-          python - <<'PY'
+          "$RUNNER_TEMP/wheel-venv/bin/python" - <<'PY'
           import os
+          from importlib import metadata
           from pathlib import Path
 
           import douzero
@@ -87,12 +94,21 @@ jobs:
           import douzero.env
           import douzero.evaluation
           import douzero.observation
+          import douzero.deployment
+          import numpy
+
+          from douzero.deployment import model_implementation_hash
 
           workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
           package_path = Path(douzero.__file__).resolve()
 
           assert workspace not in package_path.parents, (
               f"Imported source tree instead of installed wheel: {package_path}"
+          )
+          assert len(model_implementation_hash()) == 64
+          assert any(
+              requirement.lower().startswith("numpy")
+              for requirement in metadata.requires("douzero") or []
           )
 
           print("douzero import OK:", package_path)
@@ -101,4 +117,6 @@ jobs:
           print("douzero.dmc import OK")
           print("douzero.env import OK")
           print("douzero.evaluation import OK")
+          print("douzero.deployment import OK")
+          print("numpy import OK:", numpy.__version__)
           PY

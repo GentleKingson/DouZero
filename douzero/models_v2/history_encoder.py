@@ -169,12 +169,12 @@ class TransformerHistoryEncoder(_HistoryBase):
         # positional embedding so the output stays finite and well-defined.
         valid = (~key_padding_mask).to(encoded.dtype)  # (S,), 1 for real
         denom = valid.sum()
-        if denom.item() == 0.0:
-            # No real history: use the positional embedding of slot 0 as a
-            # deterministic "empty history" token. This keeps the output finite.
-            pooled = embedded[0]
-        else:
-            pooled = (encoded * valid.unsqueeze(-1)).sum(dim=0) / denom
+        # Keep the empty-history branch tensor-native so torch.export can trace
+        # it without guarding on ``Tensor.item()``. clamp_min prevents a zero
+        # divisor; torch.where selects the deterministic empty token exactly
+        # when every position is padding.
+        mean = (encoded * valid.unsqueeze(-1)).sum(dim=0) / denom.clamp_min(1.0)
+        pooled = torch.where(denom > 0, mean, embedded[0])
         return self.out_norm(pooled)
 
 
@@ -227,11 +227,8 @@ class LSTMHistoryEncoder(_HistoryBase):
         # Summary: hidden state at the last valid position. If all padding,
         # fall back to slot 0's output (which is positional-only here).
         valid_counts = valid.squeeze(-1)
-        last_valid = int(valid_counts.sum().item())
-        if last_valid == 0:
-            pooled = out[0]
-        else:
-            pooled = out[last_valid - 1]
+        last_valid_index = (valid_counts.sum().to(torch.long) - 1).clamp_min(0)
+        pooled = out[last_valid_index]
         return self.out_norm(pooled)
 
 

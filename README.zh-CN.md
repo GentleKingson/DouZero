@@ -93,6 +93,12 @@ pip3 install -e .
 ```
 注意，Windows用户只能用CPU来模拟。关于为什么GPU会出问题，详见[Windows下的问题](README.zh-CN.md#Windows下的问题)。但Windows用户仍可以[在本地运行演示](https://github.com/datamllab/rlcard-showdown)。
 
+## 项目文档
+
+- [部署与发布审计](docs/deployment.md)：严格模型包、导出与发布门禁。
+- [迁移与回滚](docs/migration.md)：legacy、factorized 与 V2 兼容及回滚步骤。
+- [模型卡模板](docs/model_card.md)：每次模型发布需要补全的审计信息。
+
 ## 训练
 假定您至少拥有一块可用的GPU，运行
 ```

@@ -1,0 +1,14 @@
+DouZero Third-Party Notices
+===========================
+
+This distribution is derived from kwai/DouZero under Apache-2.0. Runtime
+dependencies are PyTorch (BSD-3-Clause), RLCard (MIT), GitPython
+(BSD-3-Clause), PyYAML (MIT), and NumPy (BSD-3-Clause). Development/build
+dependencies include pytest, pytest-timeout, setuptools, and wheel under their
+respective MIT licenses.
+
+AlphaDou is GPLv3 and was consulted only at the level of public descriptions.
+No AlphaDou source was copied or adapted. DouZero+ and DouRN ideas were
+implemented independently from papers and public behavior. No GPL-licensed,
+unknown-license, or otherwise incompatible code was copied into this project.
+See docs/third_party_review.md in the source distribution for the full audit.

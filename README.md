@@ -104,6 +104,9 @@ Engineering docs live under [`docs/`](docs/):
 - [Configuration](docs/configuration.md) — the typed config system and `--config` YAML support.
 - [Packaging](docs/packaging.md) — Python support policy and dependencies.
 - [Checkpoint compatibility](docs/checkpoint_compatibility.md) — the versioned checkpoint manifest.
+- [Deployment and release audit](docs/deployment.md) — strict model packages, export, and release gates.
+- [Migration and rollback](docs/migration.md) — legacy/factorized/V2 compatibility and rollback steps.
+- [Model card](docs/model_card.md) — required release documentation template.
 
 ## Training
 To use GPU for training, run
