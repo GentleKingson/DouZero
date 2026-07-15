@@ -208,6 +208,21 @@ The following command evaluates DouZero-ADP in Peasants position against RLCard 
 ```
 python3 evaluate.py --landlord rlcard --landlord_up baselines/douzero_ADP/landlord_up.ckpt --landlord_down baselines/douzero_ADP/landlord_down.ckpt
 ```
+
+### Paired Evaluation (P15)
+
+For deal-paired confidence intervals, mirrored landlord/farmer matchups,
+full-game seat rotation, calibration, latency, model matrices, and ablations,
+use `evaluate_paired.py`. A weight-free CPU smoke run is:
+
+```
+python3 evaluate_paired.py --candidate rule --baseline random --num-deals 8
+```
+
+See [the P15 evaluation protocol](docs/evaluation_protocol.md) for the
+statistical unit, output formats, private-holdout interface, and model-matrix
+schema.
+
 By default, our model will be saved in `douzero_checkpoints/douzero` every half an hour. We provide a script to help you identify the most recent checkpoint. Run
 ```
 sh get_most_recent.sh douzero_checkpoints/douzero/
@@ -225,7 +240,6 @@ You may encounter `operation not supported` error if you use a Windows system to
 ## Acknowlegements
 *   The demo is largely based on [RLCard-Showdown](https://github.com/datamllab/rlcard-showdown)
 *   Code implementation is inspired by [TorchBeast](https://github.com/facebookresearch/torchbeast)
-
 
 
 

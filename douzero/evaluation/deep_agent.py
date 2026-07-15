@@ -269,6 +269,9 @@ class DeepAgentV2:
                 )
             self.decision_config = DecisionConfig(mode=canonical_mode(mode))
         self.decision_mode = self.decision_config.mode
+        # P15 instrumentation reads the selected action's calibrated win
+        # probability without changing the public act() return contract.
+        self.last_p_win = None
         # Blocker #3: if the model carries a verified checkpoint ruleset
         # identity (attached by load_v2_model), the agent's RuleSet MUST match
         # it exactly (id + version + hash). This prevents serving a
@@ -439,6 +442,7 @@ class DeepAgentV2:
         # legacy DeepAgent behaviour and avoids a degenerate forward).
         if len(legal_actions) == 1:
             self.last_search_log = None
+            self.last_p_win = None
             return legal_actions[0]
 
         return self._select_from_observation(obs)
@@ -459,6 +463,7 @@ class DeepAgentV2:
         """
         if len(infoset.legal_actions) == 1:
             self.last_search_log = None
+            self.last_p_win = None
             return infoset.legal_actions[0]
         from douzero.observation.encode_v2 import get_obs_v2
 
@@ -585,6 +590,7 @@ class DeepAgentV2:
                 f"{len(legal_actions)}; the observation action block was "
                 f"unexpectedly padded."
             )
+        self.last_p_win = float(out.p_win[idx].detach().cpu().item())
         return legal_actions[idx]
 
 

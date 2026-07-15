@@ -8,6 +8,15 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from douzero.evaluation.protocol import (
+    EVALUATION_PROTOCOL,
+    MIN_PROMOTION_BOOTSTRAP_SAMPLES,
+    OFFICIAL_CONFIDENCE_LEVEL,
+    OFFICIAL_PERMUTATION_HASHES,
+    PROMOTION_ESTIMATOR,
+    PROMOTION_MODE,
+)
+
 
 @dataclass(frozen=True)
 class PromotionEvaluation:
@@ -17,12 +26,29 @@ class PromotionEvaluation:
     estimate: float
     ci_low: float
     ci_high: float
-    evaluator_protocol: str = "p15_paired_v1"
+    evaluator_protocol: str = EVALUATION_PROTOCOL
     deal_set_id: str = ""
+    mode: str = ""
+    confidence_level: float = 0.0
+    bootstrap_samples: int = 0
+    seat_permutation_hash: str = ""
+    estimator: str = ""
 
     def __post_init__(self) -> None:
+        if isinstance(self.paired_games, bool) or not isinstance(
+            self.paired_games, int
+        ):
+            raise TypeError("paired_games must be an integer")
         if self.paired_games < 0:
             raise ValueError("paired_games must be non-negative")
+        if isinstance(self.bootstrap_samples, bool) or not isinstance(
+            self.bootstrap_samples, int
+        ):
+            raise TypeError("bootstrap_samples must be an integer")
+        if self.bootstrap_samples < 0:
+            raise ValueError("bootstrap_samples must be non-negative")
+        if not math.isfinite(self.confidence_level):
+            raise ValueError("confidence_level must be finite")
         if not all(math.isfinite(value) for value in (
             self.estimate, self.ci_low, self.ci_high
         )):
@@ -60,9 +86,27 @@ class PromotionGate:
         self.audit_path = Path(audit_path) if audit_path else None
 
     def decide(self, evaluation: PromotionEvaluation) -> PromotionDecision:
-        if evaluation.evaluator_protocol != "p15_paired_v1":
+        if evaluation.evaluator_protocol != EVALUATION_PROTOCOL:
             promoted = False
             reason = "evaluation did not use the P15 paired protocol"
+        elif evaluation.mode != PROMOTION_MODE:
+            promoted = False
+            reason = "only cardplay_only evaluations are promotion-eligible"
+        elif evaluation.estimator != PROMOTION_ESTIMATOR:
+            promoted = False
+            reason = "evaluation used a non-promotion estimator"
+        elif evaluation.confidence_level != OFFICIAL_CONFIDENCE_LEVEL:
+            promoted = False
+            reason = "evaluation used a non-official confidence level"
+        elif evaluation.bootstrap_samples < MIN_PROMOTION_BOOTSTRAP_SAMPLES:
+            promoted = False
+            reason = "evaluation used too few bootstrap samples"
+        elif (
+            evaluation.seat_permutation_hash
+            != OFFICIAL_PERMUTATION_HASHES[PROMOTION_MODE]
+        ):
+            promoted = False
+            reason = "evaluation used a non-official seat permutation"
         elif evaluation.paired_games < self.min_pairs:
             promoted = False
             reason = "paired sample count is below the configured minimum"

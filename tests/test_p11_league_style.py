@@ -15,6 +15,7 @@ from douzero.belief import BeliefConfig, BeliefModel, build_belief_input
 from douzero.config import load_config
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
+from douzero.evaluation.protocol import OFFICIAL_PERMUTATION_HASHES
 from douzero.league import (
     LeagueManifest,
     LoadedPolicySelector,
@@ -827,15 +828,52 @@ def test_promotion_gate_requires_p15_ci_and_records_threshold(tmp_path):
         min_ci_lower_bound=0.01,
         audit_path=str(tmp_path / "promotion.jsonl"),
     )
+    protocol_fields = {
+        "mode": "cardplay_only",
+        "confidence_level": 0.95,
+        "bootstrap_samples": 2000,
+        "seat_permutation_hash": OFFICIAL_PERMUTATION_HASHES["cardplay_only"],
+        "estimator": "cardplay_win_rate_delta",
+    }
+    incomplete = gate.decide(PromotionEvaluation(
+        "candidate", "main", 200, 0.04, 0.02, 0.06
+    ))
+    assert not incomplete.promoted
     rejected = gate.decide(PromotionEvaluation(
-        "candidate", "main", 200, 0.02, -0.01, 0.05
+        "candidate", "main", 200, 0.02, -0.01, 0.05, **protocol_fields
     ))
     assert not rejected.promoted
     promoted = gate.decide(PromotionEvaluation(
-        "candidate", "main", 200, 0.04, 0.02, 0.06
+        "candidate", "main", 200, 0.04, 0.02, 0.06, **protocol_fields
     ))
     assert promoted.promoted
-    assert (tmp_path / "promotion.jsonl").read_text().count("\n") == 2
+    assert (tmp_path / "promotion.jsonl").read_text().count("\n") == 3
+
+
+def test_promotion_gate_rejects_tampered_p15_protocol_identity():
+    gate = PromotionGate(min_pairs=1, min_ci_lower_bound=0.0)
+    evaluation = PromotionEvaluation(
+        "candidate",
+        "main",
+        100,
+        0.04,
+        0.02,
+        0.06,
+        mode="cardplay_only",
+        confidence_level=0.95,
+        bootstrap_samples=2000,
+        seat_permutation_hash=OFFICIAL_PERMUTATION_HASHES["cardplay_only"],
+        estimator="cardplay_win_rate_delta",
+    )
+    assert gate.decide(evaluation).promoted
+    for tampered in (
+        replace(evaluation, mode="full_game"),
+        replace(evaluation, confidence_level=0.80),
+        replace(evaluation, bootstrap_samples=1),
+        replace(evaluation, seat_permutation_hash="not-official"),
+        replace(evaluation, estimator="full_game_zero_sum_seat_score"),
+    ):
+        assert not gate.decide(tampered).promoted
 
 
 def test_enhanced_config_carries_disabled_p11_defaults():

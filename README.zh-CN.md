@@ -196,6 +196,20 @@ python3 evaluate.py --landlord baselines/douzero_ADP/landlord.ckpt --landlord_up
 ```
 python3 evaluate.py --landlord rlcard --landlord_up baselines/douzero_ADP/landlord_up.ckpt --landlord_down baselines/douzero_ADP/landlord_down.ckpt
 ```
+
+### 配对评测（P15）
+
+需要同牌配对置信区间、地主/农民镜像对局、完整竞叫与座位轮换、校准、
+延迟、模型矩阵和消融实验时，请使用 `evaluate_paired.py`。无需权重的 CPU
+冒烟命令如下：
+
+```
+python3 evaluate_paired.py --candidate rule --baseline random --num-deals 8
+```
+
+统计单位、输出格式、私有留出集接口和模型矩阵格式详见
+[P15 评测协议](docs/evaluation_protocol.md)。
+
 默认情况下，我们的模型会每半小时保存在`douzero_checkpoints/douzero`路径下。我们提供了一个脚本帮助您定位最近一次保存检查点。运行
 ```
 sh get_most_recent.sh douzero_checkpoints/douzero/

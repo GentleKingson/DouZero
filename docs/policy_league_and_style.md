@@ -94,8 +94,11 @@ policy, and all user/pinned policies.
 
 `PromotionGate` accepts only `p15_paired_v1` results. It records the paired
 sample count, estimate, confidence interval, configured thresholds, decision,
-and deal-set identifier. P15 supplies the evaluator; P11 deliberately does not
-substitute unpaired self-play returns for that protocol.
+and deal-set identifier. The gate also requires `cardplay_only`, the official
+seat-permutation hash, 95% confidence, at least 1000 bootstrap samples, and the
+`cardplay_win_rate_delta` estimator. P15 supplies the evaluator; P11
+deliberately does not substitute unpaired self-play returns or descriptive
+`full_game` results for that protocol.
 
 ## Public style encoder
 
