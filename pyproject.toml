@@ -47,6 +47,7 @@ include = ["douzero*"]
 # Ship the bundled legacy.yaml config inside the wheel so load_legacy_config()
 # works from an installed wheel (no repo checkout needed).
 "douzero.config.data" = ["*.yaml"]
+"douzero.deployment" = ["THIRD_PARTY_NOTICES"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"

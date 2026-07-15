@@ -1,3 +1,5 @@
+import time
+
 import torch
 import numpy as np
 
@@ -199,6 +201,21 @@ class DeepAgentV2:
         default-off. When enabled, a P07 ``belief_model`` is required and the
         selected top-k actions are evaluated only against DP-sampled hidden
         allocations. ``last_search_log`` exposes the structured audit record.
+    device:
+        Explicit inference device. Defaults to CUDA when available, otherwise
+        CPU. A requested unavailable CUDA device is rejected.
+    deterministic:
+        Keep deterministic inference settings enabled. The model always runs in
+        eval mode; CUDA additionally disables cuDNN benchmarking.
+    explanations_enabled:
+        Store public score/index explanations in ``last_decision_explanation``.
+        Disabled by default; explanations never contain card plaintext.
+    timeout_ms:
+        Optional post-inference latency deadline. A missed deadline or runtime
+        exception invokes the configured fallback path.
+    fallback_agent:
+        Optional public base agent/callable used before the deterministic
+        conservative legal-action fallback.
     """
 
     def __init__(
@@ -210,6 +227,11 @@ class DeepAgentV2:
         decision_config=None,
         belief_model=None,
         search_config=None,
+        device=None,
+        deterministic=True,
+        explanations_enabled=False,
+        timeout_ms=None,
+        fallback_agent=None,
     ):
         from douzero.models_v2.model import ModelV2  # local import: keep the
         # production import graph (evaluation.simulation) free of a hard torch
@@ -293,6 +315,32 @@ class DeepAgentV2:
         self.model = model
         self.ruleset = ruleset
         self.backend = "v2"
+        if not isinstance(deterministic, bool):
+            raise TypeError("deterministic must be bool")
+        if not isinstance(explanations_enabled, bool):
+            raise TypeError("explanations_enabled must be bool")
+        if timeout_ms is not None and (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, (int, float))
+            or timeout_ms <= 0
+        ):
+            raise ValueError("timeout_ms must be a positive number or None")
+        self.deterministic = deterministic
+        self.explanations_enabled = explanations_enabled
+        self.timeout_ms = float(timeout_ms) if timeout_ms is not None else None
+        self.fallback_agent = fallback_agent
+        self.last_decision_explanation = None
+        target = device
+        if target is None:
+            target = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(target)
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError(
+                f"DeepAgentV2 requested device {self.device}, but CUDA is unavailable"
+            )
+        if self.deterministic and self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
         from douzero.search.budget import SearchConfig
         if search_config is None:
             search_config = SearchConfig()
@@ -342,16 +390,15 @@ class DeepAgentV2:
             ruleset.ruleset_version,
             ruleset.stable_hash(),
         )
-        if torch.cuda.is_available():
-            self.model.cuda()
-            if self.belief_model is not None:
-                self.belief_model.cuda()
+        self.model.to(self.device)
+        if self.belief_model is not None:
+            self.belief_model.to(self.device)
         self.model.eval()
         if self.belief_model is not None:
             self.belief_model.eval()
 
     # --- The canonical public-only entry point ------------------------------ #
-    def act_v2(self, obs):
+    def act_v2(self, obs, *, return_explanation=False):
         """Select an action from an :class:`ObservationV2`.
 
         This is the type-guarded public entry point. A privileged container is
@@ -443,9 +490,50 @@ class DeepAgentV2:
         if len(legal_actions) == 1:
             self.last_search_log = None
             self.last_p_win = None
+            self.last_decision_explanation = (
+                {
+                    "source": "single_legal_action",
+                    "selected_index": 0,
+                    "decision_mode": self.decision_mode,
+                    "elapsed_ms": 0.0,
+                }
+                if self.explanations_enabled or return_explanation
+                else None
+            )
+            if return_explanation:
+                return legal_actions[0], dict(self.last_decision_explanation)
             return legal_actions[0]
 
-        return self._select_from_observation(obs)
+        started = time.monotonic()
+        try:
+            capture_explanation = self.explanations_enabled or return_explanation
+            if capture_explanation:
+                action = self._select_from_observation(
+                    obs, capture_explanation=True
+                )
+            else:
+                # Preserve the long-standing single-argument internal hook used
+                # by evaluation integrations and tests.
+                action = self._select_from_observation(obs)
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            if self.timeout_ms is not None and elapsed_ms > self.timeout_ms:
+                action = self._fallback_action(
+                    obs,
+                    reason=f"timeout ({elapsed_ms:.3f}ms > {self.timeout_ms:.3f}ms)",
+                    capture_explanation=self.explanations_enabled or return_explanation,
+                )
+        except Exception as exc:  # noqa: BLE001 - deployment must fail over
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            action = self._fallback_action(
+                obs,
+                reason=type(exc).__name__,
+                capture_explanation=self.explanations_enabled or return_explanation,
+            )
+        if self.last_decision_explanation is not None:
+            self.last_decision_explanation["elapsed_ms"] = elapsed_ms
+        if return_explanation:
+            return action, dict(self.last_decision_explanation or {})
+        return action
 
     # --- Legacy-compatible entry point (for evaluation.simulation) ---------- #
     def act(self, infoset):
@@ -488,7 +576,7 @@ class DeepAgentV2:
         )
 
     # --- Internal selection ------------------------------------------------- #
-    def _select_from_observation(self, obs):
+    def _select_from_observation(self, obs, *, capture_explanation=False):
         from douzero.models_v2.batch import observation_to_model_inputs
 
         bundle = observation_to_model_inputs(
@@ -496,8 +584,7 @@ class DeepAgentV2:
             self.model.strategy_feature_config(),
             style_enabled=self.model.config.style_enabled,
         )
-        if torch.cuda.is_available():
-            bundle.to("cuda")
+        bundle.to(self.device)
         # P07: when the value model is belief-enabled, compute the constrained
         # belief posterior features from the PUBLIC observation and pass them
         # to the value model. The belief model reads only obs.public (never a
@@ -591,10 +678,61 @@ class DeepAgentV2:
                 f"unexpectedly padded."
             )
         self.last_p_win = float(out.p_win[idx].detach().cpu().item())
+        if capture_explanation:
+            valid = out.action_mask.detach().cpu().bool()
+            self.last_decision_explanation = {
+                "source": "model",
+                "selected_index": int(idx),
+                "decision_mode": self.decision_mode,
+                "p_win": out.p_win.detach().cpu().squeeze(-1)[valid].tolist(),
+                "score_mean": out.score_mean.detach().cpu().squeeze(-1)[valid].tolist(),
+                "search_enabled": bool(self.search_config.enabled),
+            }
+        else:
+            self.last_decision_explanation = None
         return legal_actions[idx]
 
+    def _fallback_action(self, obs, *, reason, capture_explanation=False):
+        """Use a configured base agent, then a deterministic conservative move."""
 
-def load_v2_model(model_path, schema, ruleset, config=None):
+        legal_actions = obs.actions.legal_actions
+        action = None
+        source = "conservative"
+        if self.fallback_agent is not None:
+            try:
+                if hasattr(self.fallback_agent, "act_v2"):
+                    action = self.fallback_agent.act_v2(obs)
+                elif callable(self.fallback_agent):
+                    action = self.fallback_agent(obs)
+                if isinstance(action, tuple) and len(action) == 2 and isinstance(action[1], dict):
+                    action = action[0]
+                if action not in legal_actions:
+                    action = None
+                else:
+                    source = "fallback_agent"
+            except Exception:  # noqa: BLE001 - conservative fallback remains available
+                action = None
+        if action is None:
+            passes = [candidate for candidate in legal_actions if len(candidate) == 0]
+            action = passes[0] if passes else min(
+                legal_actions, key=lambda candidate: (len(candidate), tuple(candidate))
+            )
+        self.last_search_log = None
+        self.last_p_win = None
+        self.last_decision_explanation = (
+            {
+                "source": source,
+                "selected_index": int(legal_actions.index(action)),
+                "decision_mode": self.decision_mode,
+                "fallback_reason": reason,
+            }
+            if capture_explanation
+            else None
+        )
+        return action
+
+
+def load_v2_model(model_path, schema, ruleset, config=None, device="cpu"):
     """Load a :class:`~douzero.models_v2.model.ModelV2` from a V2 sidecar.
 
     The sidecar MUST be a manifest-bearing V2 bundle (written by
@@ -663,6 +801,10 @@ def load_v2_model(model_path, schema, ruleset, config=None):
     # mismatch means the config the caller passed does not match the config the
     # weights were saved under (e.g. a different hidden_size).
     model.load_state_dict(pretrained, strict=True)
+    target = torch.device(device)
+    if target.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError(f"requested device {target}, but CUDA is unavailable")
+    model.to(target)
     model.eval()
 
     # Blocker #3: attach the VERIFIED ruleset identity to the model so a
