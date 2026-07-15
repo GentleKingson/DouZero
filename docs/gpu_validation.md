@@ -19,8 +19,8 @@ break, or eager-versus-compile number is available. CPU tests and short CPU
 rollouts are not substitutes for these measurements.
 
 There are also independent implementation blockers: standard learned-bidding
-training, joint/alternating belief synchronization, and distributed trainer
-checkpoint resume intentionally fail closed under DDP. Therefore NCCL DDP was
+DDP, joint/alternating belief DDP synchronization, and distributed trainer
+checkpoint resume intentionally fail closed. Therefore NCCL DDP was
 not run and must not be described as hardware-ready even on a two-GPU host.
 
 ## Reproducible Entry Point
@@ -59,6 +59,8 @@ decisions/s, total decisions/s, and learner steps/s. The default smoke batch is
 4 (not the YAML's release-training batch of 32), so eight episodes can populate
 both replay buffers. The guarded AMP case deliberately injects one non-finite
 loss and requires the float32 retry to finish with a finite parameter update.
+Training metrics separately audit `redeals` and `max_redeals_exceeded`; a
+redeal-cap forced fallback cannot be hidden inside ordinary bidding counts.
 
 Standard DDP is recorded as `blocked_implementation`; the script does not
 launch `torchrun` for a configuration the trainer rejects by design. Unsupported
@@ -83,14 +85,15 @@ Without both inputs, `belief_frozen.json` and `belief_joint.json` explicitly say
 
 ## Remaining Gate
 
-Checkpoint resume is wired through `--checkpoint_path` and
-`--resume_checkpoint`, but remains **NOT RUN** on this host. Target validation
-must run standard full games, FP32/FP16/BF16 where supported, frozen and joint
+Single-GPU CUDA checkpoint resume remains **NOT RUN** on this host. In
+contrast, fresh single-process CPU standard and joint save/resume smokes pass;
+they are implementation evidence, not CUDA evidence. Target validation must
+run standard full games, FP32/FP16/BF16 where supported, frozen and joint
 belief modes, the controlled non-finite AMP fallback, and strict checkpoint
 resume. The blocked standard/joint DDP graph and distributed checkpoint path
 must be implemented before rank-local seeds and replay, rank-zero-only side
 effects, or clean NCCL shutdown can be empirically accepted. The manual script
-returns nonzero while those blockers remain.
+returns exit 3 while those blockers remain.
 
 `torch.compile` remains disabled by default. It must not be recommended until
 first-compile cost, graph breaks, dynamic legal-action behavior, feature-path

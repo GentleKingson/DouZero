@@ -12,26 +12,39 @@ evidence.
 
 ## Learned Full-Game Code Smoke
 
-The CPU closure trained a four-episode standard V2 smoke checkpoint, converted
-it to a strict public-policy sidecar, and ran the same checkpoint as both sides
-of a two-deal, three-neutral-seat-rotation full-game scenario. Both bundles used
-the manifest-validated learned bidding head. With 2,000 deal-level bootstrap
+On clean commit `b7db29a3856324d65170b49ef32d17be7d3a6996`, the
+CPU closure trained a four-episode standard V2 smoke checkpoint, converted it
+to a strict public-policy sidecar, and ran the same checkpoint as both sides
+of a two-deal, three-neutral-seat-rotation full-game scenario. Both bundles
+used the manifest-validated learned bidding head and current
+`v2-bidding-2` canonical neutral-seat features. With 2,000 deal-level bootstrap
 resamples, candidate-equals-baseline produced the expected zero paired estimate
 and `[0, 0]` interval.
 
 ```bash
 .venv/bin/python evaluate_paired.py --mode full_game \
-  --candidate p17-smoke-a --baseline p17-smoke-b \
-  --model-matrix /tmp/douzero-p17-standard-eval-matrix.json \
+  --candidate v2_full_stack --baseline v2_base \
+  --candidate-bidding learned --baseline-bidding learned \
+  --model-matrix /tmp/douzero-p17-eval/full-matrix.json \
   --num-deals 2 --seed 17 --bootstrap-samples 2000 \
-  --output /tmp/douzero-p17-full-game-smoke
+  --output /tmp/douzero-p17-eval/full-game-equality
 ```
 
 This validates strict learned-bidding loading, full-game state transitions,
-seat rotation, deal-level clustering, and the equality sanity check. Two deals
-are 998 short of the P17 readiness minimum, both sides are identical, and the
-checkpoint is not a release candidate. No playing-strength or target-latency
-claim follows.
+seat rotation, deal-level clustering, and the equality sanity check. The six
+game rows made five bidding-inference calls, had no redeal-cap fallback, and
+collated into the fixed seven-file P17 layout. Readiness was correctly
+`insufficient` because two deals are 998 short of the P17 minimum. Both sides
+are identical and the checkpoint is not a release candidate. No
+playing-strength or target-latency claim follows.
+
+Every serialized paired JSON result now uses `p15-paired-result-v2` and
+requires a full source Git SHA. Its runtime identity binds the protocol,
+ablation, complete scenario/evaluation configuration hash, ruleset hash, and
+candidate/baseline model feature-schema identities, including the learned
+bidding schema. CSV rows and Markdown reports carry the same identity. P17
+collation recomputes the expected identities from the scenario and rejects any
+protocol, mode, ruleset, schema, configuration, or checkpoint mismatch.
 
 ## Model Matrix
 
@@ -40,7 +53,7 @@ claim follows.
 | Legacy WP | Unavailable: weights not supplied | Unavailable |
 | Legacy ADP | Unavailable: weights not supplied | Unavailable |
 | Legacy factorized | Unavailable: weights not supplied | Unavailable |
-| Model V2 base | Unavailable: compatible checkpoint not supplied | Unavailable |
+| Model V2 base | Unavailable: compatible formal checkpoint not supplied | Unavailable: smoke only |
 | V2 multi-objective | Unavailable | Unavailable |
 | V2 + belief frozen | Unavailable | Unavailable |
 | V2 + belief joint | Unavailable | Unavailable |
@@ -50,7 +63,7 @@ claim follows.
 | V2 + population | Unavailable | Unavailable |
 | V2 + coach | Unavailable | Unavailable |
 | V2 + search | Unavailable | Unavailable |
-| V2 full stack | Unavailable | Unavailable |
+| V2 full stack | Unavailable | Unavailable: smoke only |
 
 Full-game availability additionally requires a manifest-validated V2 model
 with a learned bidding head. An external `rule`, `random`, `pass`, or `max`

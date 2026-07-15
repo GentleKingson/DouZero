@@ -22,9 +22,11 @@ empirical-evaluation, target-hardware, and packaging gates.
 ## Training
 
 - Training configuration: `NOT AVAILABLE`
-- Training hardware: `NOT MEASURED`
+- RC training hardware: `NOT AVAILABLE`
+- Implementation smoke hardware: `SINGLE-PROCESS CPU`
 - Standard full-game training duration: `NOT MEASURED`
-- Checkpoint resume validation: `NOT MEASURED`
+- RC checkpoint resume: `NOT MEASURED`
+- Implementation checkpoint resume smoke: `PASS ON SINGLE-PROCESS CPU`
 - Belief mode: `NOT AVAILABLE`
 - Search training/evaluation configuration: `NOT AVAILABLE`
 
@@ -35,8 +37,9 @@ empirical-evaluation, target-hardware, and packaging gates.
 - Authorization/license evidence: `NOT AVAILABLE`
 - Date range and filtering: `NOT AVAILABLE`
 - Personal-identifier handling: the canonical pipeline requires HMAC game IDs,
-  allowlisted provenance, replay validation, and package exclusion; no real
-  dataset was processed during P17 closure.
+  allowlisted provenance, replay validation, and package exclusion. Supported
+  training readers reject missing, tampered, or unverified dataset sidecars;
+  no real dataset was processed during P17 closure.
 
 ## Evaluation
 
@@ -46,7 +49,13 @@ empirical-evaluation, target-hardware, and packaging gates.
 - Eight required ablations: `NOT MEASURED`
 - Brier/NLL/ECE calibration: `NOT MEASURED`
 - Search timeout/fallback behavior: `NOT MEASURED`
-- Belief exact/conservation metrics: `NOT MEASURED`
+- RC belief quality metrics: `NOT MEASURED`
+- Belief conservation correctness: `CPU-TESTED; NOT A QUALITY METRIC`
+
+Paired outputs are accepted for release collation only when their full source
+SHA, ruleset, scenario/configuration, checkpoint, and card-play/bidding feature
+schema identities validate. Short synthetic/equality smokes remain outside the
+RC metrics above.
 
 Random/rule smoke games are excluded from this section because they do not
 measure a trained model's playing strength.
@@ -66,8 +75,13 @@ There is no RC to characterize. Standard full-game learned bidding and joint
 belief training have CPU implementation smokes only; their playing strength,
 target-GPU behavior, and long-run stability are unmeasured. Authorized
 human-data behavior, standard learned-bidding DDP, joint/alternating belief
-DDP, distributed trainer resume, sustained GPU operation, multi-GPU shutdown,
-full ablations, calibration, and release-candidate latency remain unverified.
+DDP synchronization, and distributed trainer resume are **not implemented**
+and fail closed. Sustained GPU operation, multi-GPU shutdown, full ablations,
+calibration, and release-candidate latency are unmeasured. Repository-wide
+provenance is not yet universal across every historical coach/distillation/
+evaluation-data artifact path, so release remains blocked even though the P17
+trainer, belief, canonical-human-data, paired-result, and format-2 package
+paths carry strict identities.
 Package rollback is covered by a known-good fixed-state inference test, but no
 packaged release candidate exists to exercise in production.
 

@@ -16,59 +16,61 @@ is supplied and the entire canary completes.
 
 ## Synthetic Code Smoke
 
-A deterministic synthetic fixture exercised ingest, validation, game-level
-split, BC pretraining, RL+BC, and paired-evaluation code paths. This is only a
-software smoke, not evidence about human behavior or model strength:
+A deterministic fixture exercised canonical serialization, provenance
+verification, replay validation, BC pretraining, RL+BC, and paired-evaluation
+code paths on clean commit
+`b7db29a3856324d65170b49ef32d17be7d3a6996`. The synthetic CLI does **not**
+exercise an external adapter, HMAC pseudonymization, or external deduplication;
+those have unit evidence only. This is software evidence, not evidence about
+human behavior or model strength:
 
 ```bash
 .venv/bin/python ingest_human_games.py --synthetic \
   --num_synthetic 4 --synthetic_seed 17 \
-  --output /tmp/douzero-p17-synthetic-games.jsonl
+  --output /tmp/douzero-p17-human-b7db29a/canonical.jsonl
 .venv/bin/python validate_human_games.py \
-  --input /tmp/douzero-p17-synthetic-games.jsonl \
-  --output /tmp/douzero-p17-synthetic-valid
+  --input /tmp/douzero-p17-human-b7db29a/canonical.jsonl \
+  --output /tmp/douzero-p17-human-b7db29a/validated
 ```
 
 Observed synthetic result: 4 total, 4 valid, 0 quarantined, 0 parse errors.
-All four records use the legacy ruleset and contain no bidding phase. Seats are
-balanced at four records per role; winners are landlord 2, landlord_down 1,
-landlord_up 1 (landlord team 2, farmer team 2). All four IDs are unique and
-match the canonical `dzg_<64 hex>` form. There is no raw platform identity in
-a synthetic fixture, so that check does not substitute for a real adapter
-privacy audit.
+All four records use the legacy ruleset and contain no bidding phase. Both the
+canonical and validated JSONL sidecars verified `lineage_verified=true`, four
+records, the full source SHA above, the strict legacy ruleset hash, and content
+SHA-256
+`042dfd75801da7f3220484800f5f76b9aa45a27de0d9b4086cc5ba445f5fd72b`.
 
-The deterministic complete-game split used seed 17 and produced train 2,
-validation 1, test 1, with zero `game_id` overlap. A one-epoch BC smoke over
-115 decisions completed and wrote a manifest-bearing checkpoint. On the
-single-game test split, the descriptive metrics were:
-
-| Role | Decisions | Top-1 | Top-3 | NLL |
-| --- | ---: | ---: | ---: | ---: |
-| landlord | 10 | 0.400 | 0.700 | 1.7933 |
-| landlord_down | 8 | 0.375 | 0.750 | 1.4841 |
-| landlord_up | 5 | 0.200 | 0.600 | 1.8394 |
-
-These tiny, synthetic holdout values are pipeline diagnostics only. They are
-not a BC quality claim.
+Every supported canonical, validated, and rebuilt JSONL has a sibling
+`<path>.manifest.json`. It carries the dataset/record schema versions, full
+source SHA, configuration-identity hash, ruleset identities, record count,
+dataset SHA-256, privileged access class, and lineage flag, but no game IDs,
+paths, raw identifiers, or secrets. Default validation, `pretrain_bc --data`,
+the `train_v2` BC path, and deletion rebuild reject a missing, tampered, or
+unverified manifest. `--allow-unverified-input` exists only to quarantine
+malformed legacy data; it writes `lineage_verified=false`, which training and
+release readers reject. Rebuild manifests bind the source dataset SHA.
 
 ```bash
 .venv/bin/python pretrain_bc.py \
-  --data /tmp/douzero-p17-synthetic-valid.jsonl \
-  --save_dir /tmp/douzero-p17-bc --save_name synthetic-bc.pt \
+  --data /tmp/douzero-p17-human-b7db29a/validated.jsonl \
+  --save_dir /tmp/douzero-p17-human-b7db29a/bc \
+  --save_name synthetic-bc.pt \
   --epochs 1 --batch_size 4 --val_ratio 0.25 \
   --hidden_size 16 --history_layers 1 --history_heads 1 \
   --history_encoder lstm --seed 17
 
 .venv/bin/python train_v2.py \
-  --config /tmp/douzero-p17-rlbc.yaml --episodes 1 \
+  --config /tmp/douzero-p17-human-b7db29a/rlbc.yaml --episodes 1 \
   --optimizer_steps 1 --batch_size 1 --buffer_capacity 64 \
-  --checkpoint_path /tmp/douzero-p17-rlbc.pt --seed 17
+  --checkpoint_path /tmp/douzero-p17-human-b7db29a/rlbc.pt --seed 17
 ```
 
-The RL+BC command collected 19 card-play transitions, completed one optimizer
-step, changed parameters, and recorded finite total loss 1.4469 plus BC
-cross-entropy 2.6577. The CLI logged only the aggregate 115-sample count and
-did not print the configured dataset path.
+The one-epoch BC smoke produced 115 samples (44 landlord, 35 landlord-down,
+36 landlord-up), validation loss 1.2304 and validation top-1 0.486. Its
+checkpoint configuration binds the input dataset SHA. These tiny synthetic
+values are pipeline diagnostics only, not a BC-quality claim. RL+BC collected
+19 card-play transitions, completed one optimizer step, changed parameters,
+and recorded finite total loss 1.4469 plus BC cross-entropy 2.6577.
 
 After converting the training checkpoints to strict public-policy sidecars,
 the P15 path compared the synthetic BC prior with its untrained initialization
@@ -82,7 +84,10 @@ on four generated deals and 2,000 deal-level bootstrap samples:
   --output /tmp/douzero-p17-bc-before-after
 ```
 
-Observed smoke estimate: +0.1250 with CI [0.0000, 0.3750]. Four synthetic
+Observed current-schema smoke estimate: -0.1250 with CI [-0.5000, 0.2500].
+The result uses `p15-paired-result-v2` and binds the full source SHA, evaluator
+configuration, legacy ruleset, checkpoint identities, and both V2 feature
+schemas. Four synthetic
 deals are far below the 1,000-deal promotion gate; the number is recorded only
 to prove the paired path executed and must not be interpreted as improvement.
 
@@ -91,6 +96,8 @@ to prove the paired path executed and must not be interpreted as improvement.
 The ingest CLI defaults `--input` from `DOUZERO_HUMAN_DATA_PATH` and loads the
 project key from `--hmac-key-file` or
 `DOUZERO_HUMAN_DATA_HMAC_KEY_FILE`. External ingest fails closed without it.
+The HMAC key must contain at least 32 bytes. The dataset configuration identity
+also binds the selected adapter implementation/CLI identity.
 The CLI supplies adapters a redacted pseudonymizer object; adapters return its
 opaque keyed identity attestation with each record. Ingest verifies the
 attestation before writing, so a merely regex-shaped canonical ID is rejected.
@@ -123,17 +130,20 @@ aggregate counts only and never prints the excluded ID or record contents:
 
 Revalidate and regenerate every downstream split/checkpoint from the rebuilt
 file; do not edit an already trained package and call that deletion complete.
+The rebuilt sidecar is regenerated atomically and binds the source dataset
+SHA-256 without disclosing excluded IDs.
 
 ## Canary Gates
 
 | Stage | Status |
 | --- | --- |
 | Authorization and license evidence | Blocked: no dataset |
-| HMAC pseudonymization | Implemented; real run not tested |
-| Canonical ingest and deduplication | Synthetic smoke only |
-| Replay validation and quarantine | Synthetic smoke only |
-| Train/validation/test split and leakage audit | Synthetic smoke only: 2/1/1, zero overlap |
-| BC pretraining and per-role top-k/NLL | Synthetic smoke only; table above |
+| HMAC pseudonymization | Implemented; external unit tests pass, real run not tested |
+| External adapter and deduplication | Unit-tested only; synthetic CLI bypasses this path |
+| Canonical serialization/provenance | Synthetic smoke: 4 records; both manifests verified |
+| Replay validation and quarantine | Synthetic smoke: 4 valid, 0 quarantined |
+| Train/validation/test split and leakage audit | Unit/synthetic tests only; real run not tested |
+| BC pretraining | Synthetic smoke: 115 samples, one epoch |
 | Optional belief labels | Not run |
 | RL+BC short canary | Synthetic smoke only: one finite optimizer step |
 | P15 paired before/after evaluation | Synthetic smoke only: 4 deals, not a strength result |
