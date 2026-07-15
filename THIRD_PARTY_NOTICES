@@ -1,0 +1,37 @@
+DouZero Third-Party Notices
+===========================
+
+This distribution is derived from kwai/DouZero, licensed under Apache-2.0.
+The repository's LICENSE file contains the applicable license text and retained
+copyright notice.
+
+Runtime dependencies
+--------------------
+
+* PyTorch (torch): BSD 3-Clause license.
+  https://github.com/pytorch/pytorch
+* RLCard: MIT license.
+  https://github.com/datamllab/rlcard
+* GitPython: BSD 3-Clause license.
+  https://github.com/gitpython-developers/GitPython
+* PyYAML: MIT license.
+  https://github.com/yaml/pyyaml
+* NumPy (transitive and directly imported): BSD 3-Clause license.
+  https://github.com/numpy/numpy
+
+Development and build dependencies
+----------------------------------
+
+* pytest and pytest-timeout: MIT license.
+* setuptools: MIT license.
+* wheel: MIT license.
+
+Reference-source audit
+----------------------
+
+AlphaDou is GPLv3 and was consulted only at the level of public descriptions.
+No AlphaDou source code was copied or adapted. DouZero+ and DouRN research
+ideas were implemented independently from papers and public behavior. No code
+from GPL-licensed, unknown-license, or otherwise incompatible repositories was
+copied into this Apache-2.0 project. See docs/third_party_review.md for the
+phase-by-phase audit trail.
