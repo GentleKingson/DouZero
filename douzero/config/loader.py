@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 from douzero.config.schemas import (
     BCConfig,
+    BiddingConfig,
     CurriculumConfig,
     DistillationConfig,
     DecisionPolicyConfig,
@@ -90,7 +91,7 @@ def load_legacy_config() -> TrainingConfig:
 def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     """Construct a TrainingConfig from a raw mapping, validating keys."""
     nested_blocks = (
-        "optimizer", "loss", "decision_policy", "model", "bc",
+        "optimizer", "loss", "decision_policy", "model", "bc", "bidding",
         "distillation", "league", "curriculum", "search",
     )
     valid_top = {
@@ -101,6 +102,7 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     valid_decision_names = {f.name for f in fields(DecisionPolicyConfig)}
     valid_model_names = {f.name for f in fields(ModelConfig)}
     valid_bc_names = {f.name for f in fields(BCConfig)}
+    valid_bidding_names = {f.name for f in fields(BiddingConfig)}
     valid_distillation_names = {f.name for f in fields(DistillationConfig)}
     valid_league_names = {f.name for f in fields(LeagueConfig)}
     valid_curriculum_names = {f.name for f in fields(CurriculumConfig)}
@@ -149,6 +151,15 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
     unknown_bc = set(bc_raw.keys()) - valid_bc_names
     if unknown_bc:
         raise ValueError(f"Unknown bc config keys: {sorted(unknown_bc)}")
+
+    bidding_raw = raw.get("bidding", {})
+    if not isinstance(bidding_raw, Mapping):
+        raise TypeError("'bidding' must be a mapping")
+    unknown_bidding = set(bidding_raw.keys()) - valid_bidding_names
+    if unknown_bidding:
+        raise ValueError(
+            f"Unknown bidding config keys: {sorted(unknown_bidding)}"
+        )
 
     distillation_raw = raw.get("distillation", {})
     if not isinstance(distillation_raw, Mapping):
@@ -231,6 +242,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
         kwargs["model"] = ModelConfig(**dict(model_raw))
     if bc_raw:
         kwargs["bc"] = BCConfig(**dict(bc_raw))
+    if bidding_raw:
+        kwargs["bidding"] = BiddingConfig(**dict(bidding_raw))
     if distillation_raw:
         kwargs["distillation"] = DistillationConfig(**dict(distillation_raw))
     if league_raw:
@@ -261,13 +274,18 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "amp_enabled": bool, "amp_dtype": str,
     "amp_fallback_on_nonfinite": bool, "pin_memory": bool,
     "ddp_enabled": bool, "ddp_backend": str, "compile_model": bool,
+    "belief_training_mode": str, "belief_supervised_weight": float,
+    "belief_alternating_interval": int, "belief_supervised_batch_size": int,
+    "belief_supervised_episodes": int,
     "seed": int, "deterministic": bool, "config": str,
     "feature_version": str, "ruleset": str, "model_version": str,
     "learning_rate": float, "alpha": float, "momentum": float, "epsilon": float,
     # P06 multi-objective loss + decision-policy nested fields.
     "lambda_win": float, "lambda_score": float,
     "lambda_uncertainty": float, "score_delta": float,
-    "lambda_bc": float, "lambda_min_turns": float,
+    "lambda_bc": float, "lambda_bid_policy": float, "lambda_bid_win": float,
+    "lambda_bid_score": float, "lambda_bid_regret": float,
+    "lambda_min_turns": float,
     "lambda_regain_initiative": float, "lambda_teammate_finish": float,
     "lambda_spring": float, "lambda_structure": float,
     "score_target_transform": str, "score_clamp": float,
@@ -277,6 +295,8 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "version": str, "hidden_size": int, "history_encoder": str,
     "history_layers": int, "history_heads": int, "role_embedding_dim": int,
     "belief_enabled": bool, "human_prior_enabled": bool,
+    "bidding_enabled": bool, "bidding_hidden_size": int,
+    "bidding_uncertainty_enabled": bool,
     "style_enabled": bool, "style_embedding_dim": int,
     "strategy_features_enabled": bool, "strategy_hand_enabled": bool,
     "strategy_structure_enabled": bool, "strategy_control_enabled": bool,
@@ -287,6 +307,7 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     # ``lambda_bc`` were removed from BCConfig — ``loss.lambda_bc`` is the sole
     # enable condition / weight, so they are no longer valid bc: keys.)
     "data_path": str,
+    "policy": str, "warm_start_policy": str, "learned_probability": float,
     "temperature": float, "label_smoothing": float,
     "skill_weight_clip": float, "schedule": str,
     "schedule_steps": int, "schedule_floor": float,
@@ -338,6 +359,8 @@ def _validate_types(cfg: TrainingConfig) -> None:
             _check_field(name, getattr(cfg.optimizer, name), "optimizer")
         elif name in {
             "lambda_win", "lambda_score", "lambda_uncertainty", "lambda_bc",
+            "lambda_bid_policy", "lambda_bid_win", "lambda_bid_score",
+            "lambda_bid_regret",
             "lambda_min_turns", "lambda_regain_initiative",
             "lambda_teammate_finish", "lambda_spring", "lambda_structure",
             "score_delta", "score_clamp",
@@ -350,7 +373,8 @@ def _validate_types(cfg: TrainingConfig) -> None:
         elif name in {
             "version", "hidden_size", "history_encoder", "history_layers",
             "history_heads", "role_embedding_dim", "belief_enabled",
-            "human_prior_enabled",
+            "human_prior_enabled", "bidding_enabled", "bidding_hidden_size",
+            "bidding_uncertainty_enabled",
             "style_enabled", "style_embedding_dim",
             "strategy_features_enabled", "strategy_hand_enabled",
             "strategy_structure_enabled", "strategy_control_enabled",
@@ -381,6 +405,8 @@ def _validate_types(cfg: TrainingConfig) -> None:
 
 def _validate_training_system(cfg: TrainingConfig) -> None:
     """Validate P14 concurrency and precision controls."""
+    import math
+
     if cfg.sync_interval_updates < 1:
         raise ValueError("sync_interval_updates must be >= 1")
     if cfg.policy_snapshot_slots < 2:
@@ -389,6 +415,21 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         raise ValueError("amp_dtype must be 'float16' or 'bfloat16'")
     if cfg.ddp_backend not in {"auto", "nccl", "gloo"}:
         raise ValueError("ddp_backend must be 'auto', 'nccl', or 'gloo'")
+    if cfg.belief_training_mode not in {"frozen", "joint", "alternating"}:
+        raise ValueError(
+            "belief_training_mode must be 'frozen', 'joint', or 'alternating'"
+        )
+    if (
+        not math.isfinite(cfg.belief_supervised_weight)
+        or cfg.belief_supervised_weight < 0
+    ):
+        raise ValueError("belief_supervised_weight must be non-negative")
+    if cfg.belief_alternating_interval < 1:
+        raise ValueError("belief_alternating_interval must be >= 1")
+    if cfg.belief_supervised_batch_size < 1:
+        raise ValueError("belief_supervised_batch_size must be >= 1")
+    if cfg.belief_supervised_episodes < 0:
+        raise ValueError("belief_supervised_episodes must be non-negative")
 
 
 # P01 only supports the "legacy" feature/rule/model versions. Later phases

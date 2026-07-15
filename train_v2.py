@@ -105,8 +105,65 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to a pretrained belief checkpoint (.pt) for belief-enabled "
         "value models (model.belief_enabled=true). Loaded with "
         "load_belief_checkpoint (ruleset + feature identity validated) and "
-        "passed to V2Trainer as a frozen feature source. REQUIRED when the "
+        "passed to V2Trainer as the belief model. REQUIRED when the "
         "value model has belief_enabled=true; ignored otherwise.",
+    )
+    parser.add_argument(
+        "--belief_training_mode",
+        choices=["frozen", "joint", "alternating"],
+        default=argparse.SUPPRESS,
+        help="Belief/value optimization mode (default: frozen).",
+    )
+    parser.add_argument(
+        "--belief_supervised_weight", type=float, default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--belief_alternating_interval", type=int, default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--belief_supervised_batch_size", type=int, default=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--belief_supervised_episodes",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Synthetic labelled episodes for the supervised joint/alternating term.",
+    )
+    parser.add_argument(
+        "--bidding_policy",
+        choices=["random", "rule", "max", "pass", "learned"],
+        default=argparse.SUPPRESS,
+        help="Standard-mode bidding policy (CLI overrides bidding.policy).",
+    )
+    parser.add_argument(
+        "--bidding_warm_start_policy",
+        choices=["random", "rule", "max", "pass"],
+        default=argparse.SUPPRESS,
+        help="Fallback policy while learned bidding is being phased in.",
+    )
+    parser.add_argument(
+        "--bidding_learned_probability",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Probability of using the learned head when policy=learned.",
+    )
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default=argparse.SUPPRESS,
+        help="Strict resumable trainer checkpoint to restore before collection.",
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=argparse.SUPPRESS,
+        help="Atomically write a resumable trainer checkpoint after training.",
+    )
+    parser.add_argument(
+        "--metrics_path",
+        type=str,
+        default=argparse.SUPPRESS,
+        help="Atomically write sanitized machine-readable training metrics.",
     )
     return parser
 
@@ -127,10 +184,10 @@ def _assert_v2_identity(cfg) -> None:
     legacy identity. This gate fails FAST — before any model/env is built
     — with a precise error.
 
-    The V2 trainer (P06) only supports the legacy card-play-only ruleset
-    and the ADP objective; the standard ruleset requires a bidding driver
-    that is part of P11's league work, and non-ADP objectives are not wired
-    through the multi-objective label path.
+    Both legacy card-play and the standard full-game bidding state machine are
+    supported. Standard mode requires the bidding config, model head, and loss
+    identity to agree; legacy mode rejects those opt-in fields so its parameter
+    graph remains unchanged.
     """
     if cfg is None:
         return
@@ -155,11 +212,22 @@ def _assert_v2_identity(cfg) -> None:
             f"{cfg.model.version!r}. The nested model.version must match "
             f"model_version (enforced by the loader)."
         )
-    if cfg.ruleset != "legacy":
-        raise NotImplementedError(
-            f"train_v2.py (P06) only supports ruleset='legacy' (the card-play-"
-            f"only env); got {cfg.ruleset!r}. Standard mode requires a bidding "
-            f"driver that is part of P11's league work."
+    if cfg.ruleset not in {"legacy", "standard"}:
+        raise ValueError(f"unsupported V2 training ruleset {cfg.ruleset!r}")
+    if cfg.ruleset == "standard":
+        if not cfg.bidding.enabled:
+            raise ValueError(
+                "ruleset='standard' requires bidding.enabled=true; standard "
+                "training cannot bypass the public auction state machine."
+            )
+        if not cfg.model.bidding_enabled:
+            raise ValueError(
+                "ruleset='standard' requires model.bidding_enabled=true."
+            )
+    elif cfg.bidding.enabled or cfg.model.bidding_enabled:
+        raise ValueError(
+            "legacy V2 training requires bidding.enabled=false and "
+            "model.bidding_enabled=false so the legacy graph is unchanged."
         )
     if cfg.objective != "adp":
         raise NotImplementedError(
@@ -220,24 +288,13 @@ def _warn_unsupported_legacy_fields(cfg) -> None:
 
 
 def _resolve_ruleset(cfg):
-    """Resolve the ruleset for the trainer.
-
-    P06's V2Trainer only accepts ``ruleset=None`` (the legacy card-play-only
-    env), because ``Env`` treats ANY non-None ``RuleSet`` as standard mode
-    (entering the bidding phase), and the trainer has no bidding driver.
-    A YAML ``ruleset: standard`` is surfaced to the trainer as
-    ``RuleSet.standard()`` so the trainer's gate raises a precise error
-    rather than silently mis-driving bidding.
-    """
+    """Use ``None`` for byte-compatible legacy play and an explicit standard rule."""
     from douzero.env.rules import RuleSet
 
     if cfg is None:
         return None
     if cfg.ruleset == "standard":
-        # The trainer will reject this at construction with a precise error.
         return RuleSet.standard()
-    # legacy or any other value: return None so Env runs in legacy card-play
-    # mode (no bidding). The trainer accepts None.
     return None
 
 
@@ -262,6 +319,10 @@ def _build_loss_config(cfg):
         lambda_score=cfg.loss.lambda_score,
         lambda_uncertainty=cfg.loss.lambda_uncertainty,
         lambda_bc=cfg.loss.lambda_bc,
+        lambda_bid_policy=cfg.loss.lambda_bid_policy,
+        lambda_bid_win=cfg.loss.lambda_bid_win,
+        lambda_bid_score=cfg.loss.lambda_bid_score,
+        lambda_bid_regret=cfg.loss.lambda_bid_regret,
         lambda_min_turns=cfg.loss.lambda_min_turns,
         lambda_regain_initiative=cfg.loss.lambda_regain_initiative,
         lambda_teammate_finish=cfg.loss.lambda_teammate_finish,
@@ -322,7 +383,7 @@ def _build_curriculum(cfg):
     from douzero.env.rules import RuleSet
 
     cc = cfg.curriculum
-    ruleset = RuleSet.legacy()
+    ruleset = RuleSet.standard() if cfg.ruleset == "standard" else RuleSet.legacy()
     coach = None
     coach_manifest = None
     if cc.mode != "true_random":
@@ -381,6 +442,14 @@ def _validate_ddp_features(cfg, model_cfg, loss_cfg, distributed) -> None:
     """Reject training modes whose file side effects are not DDP-safe."""
     if not distributed.enabled:
         return
+    if bool(getattr(model_cfg, "bidding_enabled", False)) or (
+        cfg is not None and getattr(cfg, "ruleset", "legacy") == "standard"
+    ):
+        raise NotImplementedError(
+            "DDP does not yet support standard learned-bidding training: the "
+            "bid and card-play paths use different parameter sets under the "
+            "current static graph. Run this configuration single-process."
+        )
     if cfg is not None and cfg.curriculum.enabled:
         raise NotImplementedError(
             "DDP does not support curriculum/coach-label training yet: its "
@@ -416,6 +485,91 @@ def _validate_ddp_features(cfg, model_cfg, loss_cfg, distributed) -> None:
             "loss weights are zero. Disable the auxiliary heads or enable an "
             "auxiliary loss."
         )
+
+
+def _build_training_metrics(
+    stats,
+    *,
+    training_wall_seconds: float,
+    device_type: str,
+    peak_memory_bytes: int | None,
+    peak_reserved_memory_bytes: int | None,
+    amp_enabled: bool,
+    amp_dtype: str,
+    amp_fallback_on_nonfinite: bool,
+    compile_enabled: bool,
+    ddp_enabled: bool,
+    world_size: int,
+    parameters_changed: bool | None,
+) -> dict[str, object]:
+    """Build finite, sanitized P17 throughput and memory diagnostics."""
+    elapsed = max(float(training_wall_seconds), 1.0e-12)
+    cardplay = int(stats.transitions_collected)
+    bidding = int(stats.bidding_transitions_collected)
+    decisions = cardplay + bidding
+
+    def per_second(count: int) -> float:
+        return round(float(count) / elapsed, 6)
+
+    def mib(value: int | None) -> float | None:
+        if value is None:
+            return None
+        return round(float(value) / (1024.0 * 1024.0), 3)
+
+    return {
+        "schema_version": "p17-gpu-run-v1",
+        "status": "passed",
+        "device_type": str(device_type),
+        "training_wall_seconds": round(elapsed, 6),
+        "counts": {
+            "episodes": int(stats.episodes_completed),
+            "cardplay_transitions": cardplay,
+            "bidding_decisions": bidding,
+            "total_decisions": decisions,
+            "learner_steps": int(stats.optimizer_steps),
+            "redeals": int(stats.redeals),
+            "belief_supervised_steps": int(stats.belief_supervised_steps),
+        },
+        "metrics": {
+            "peak_memory_mib": mib(peak_memory_bytes),
+            "peak_reserved_memory_mib": mib(peak_reserved_memory_bytes),
+            "cardplay_transitions_per_second": per_second(cardplay),
+            "bidding_decisions_per_second": per_second(bidding),
+            # Samples are replay transitions; decisions include card play and bids.
+            "samples_per_second": per_second(decisions),
+            "decisions_per_second": per_second(decisions),
+            "learner_steps_per_second": per_second(int(stats.optimizer_steps)),
+        },
+        "amp": {
+            "enabled": bool(amp_enabled),
+            "dtype": str(amp_dtype),
+            "fallback_on_nonfinite": bool(amp_fallback_on_nonfinite),
+            "fallback_count": int(stats.amp_fallbacks),
+            "fallback_exercised": bool(stats.amp_fallbacks),
+        },
+        "compile": {"enabled": bool(compile_enabled)},
+        "distributed": {
+            "enabled": bool(ddp_enabled),
+            "world_size": int(world_size),
+        },
+        "parameter_update_observed": parameters_changed,
+        "privacy": "sanitized_no_host_or_device_identifiers",
+    }
+
+
+def _write_metrics_atomic(path: str, payload: dict[str, object]) -> None:
+    """Write a JSON metric artifact without exposing command-line paths."""
+    import json
+    from pathlib import Path
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
 
 
 def main() -> None:
@@ -504,10 +658,26 @@ def main() -> None:
         torch.manual_seed(rank_seed)
     schema = build_v2_schema()
     model = ModelV2(schema, model_cfg).to(learner_device)
+    belief_training_mode = resolve(
+        "belief_training_mode",
+        yaml_cfg.belief_training_mode if yaml_cfg else None,
+        defaults.belief_training_mode,
+    )
     compile_enabled = resolve(
         "compile_model", yaml_cfg.compile_model if yaml_cfg else None, False
     )
     if compile_enabled:
+        if belief_training_mode != "frozen":
+            raise NotImplementedError(
+                "compile_model has not been validated with joint/alternating "
+                "belief training; use frozen mode or eager execution."
+            )
+        if model_cfg.bidding_enabled:
+            raise NotImplementedError(
+                "compile_model is not yet supported for learned bidding: "
+                "torch.compile captures ModelV2.forward, while the auction "
+                "uses the separate forward_bidding contract."
+            )
         if not hasattr(torch, "compile"):
             raise RuntimeError("compile_model requires torch.compile")
         model = torch.compile(model, dynamic=True)
@@ -564,19 +734,61 @@ def main() -> None:
             yaml_cfg.amp_fallback_on_nonfinite if yaml_cfg else None,
             True,
         ),
+        belief_training_mode=belief_training_mode,
+        belief_supervised_weight=resolve(
+            "belief_supervised_weight",
+            yaml_cfg.belief_supervised_weight if yaml_cfg else None,
+            defaults.belief_supervised_weight,
+        ),
+        belief_alternating_interval=resolve(
+            "belief_alternating_interval",
+            yaml_cfg.belief_alternating_interval if yaml_cfg else None,
+            defaults.belief_alternating_interval,
+        ),
+        belief_supervised_batch_size=resolve(
+            "belief_supervised_batch_size",
+            yaml_cfg.belief_supervised_batch_size if yaml_cfg else None,
+            defaults.belief_supervised_batch_size,
+        ),
     )
+    if distributed.enabled and trainer_cfg.belief_training_mode != "frozen":
+        raise NotImplementedError(
+            "DDP does not yet synchronize BeliefModel gradients; use "
+            "belief_training_mode=frozen or run single-process."
+        )
 
     ruleset = _resolve_ruleset(yaml_cfg)
     decision_cfg = _build_decision_config(yaml_cfg)
+    bidding_policy_cfg = None
+    if ruleset is not None:
+        from douzero.training import BiddingPolicyConfig
+
+        yaml_bidding = yaml_cfg.bidding
+        bidding_policy_cfg = BiddingPolicyConfig(
+            policy=resolve(
+                "bidding_policy", yaml_bidding.policy, yaml_bidding.policy
+            ),
+            warm_start_policy=resolve(
+                "bidding_warm_start_policy",
+                yaml_bidding.warm_start_policy,
+                yaml_bidding.warm_start_policy,
+            ),
+            learned_probability=resolve(
+                "bidding_learned_probability",
+                yaml_bidding.learned_probability,
+                yaml_bidding.learned_probability,
+            ),
+        )
     opening_sampler, coach_label_store, policy_version, policy_step = (
         _build_curriculum(yaml_cfg)
     )
 
-    # P07: load a frozen belief model when the value model is belief-enabled.
+    # P17: load the belief model when belief fusion is enabled. Frozen mode
+    # keeps the P07 feature-source behavior; joint/alternating mode makes the
+    # same public-only encoder trainable inside V2Trainer.
     # The checkpoint is validated (ruleset + feature version + architecture
-    # hash) via load_belief_checkpoint; the trainer freezes it and computes the
-    # constrained posterior features at both the collection and optimizer call
-    # sites. Without this a belief_enabled value model fails closed at forward.
+    # hash) via load_belief_checkpoint. Without this a belief-enabled value
+    # model fails closed at forward.
     belief_model = None
     if getattr(model_cfg, "belief_enabled", False):
         belief_ckpt = getattr(args, "belief_checkpoint", None)
@@ -584,8 +796,8 @@ def main() -> None:
             raise ValueError(
                 "The value model has belief_enabled=true but no "
                 "--belief_checkpoint was supplied. A belief-enabled value "
-                "model can only be trained with a frozen pretrained "
-                "BeliefModel. Run train_belief.py first, then pass its "
+                "model requires a pretrained BeliefModel initialization. Run "
+                "train_belief.py first, then pass its "
                 "checkpoint via --belief_checkpoint."
             )
         from douzero.belief.checkpoint import load_belief_checkpoint
@@ -596,6 +808,43 @@ def main() -> None:
                 "douzero.env.rules", fromlist=["RuleSet"]
             ).RuleSet.legacy(),
             expected_feature_version="v2",
+        )
+
+    belief_supervised_episodes = resolve(
+        "belief_supervised_episodes",
+        yaml_cfg.belief_supervised_episodes if yaml_cfg else None,
+        0,
+    )
+    belief_supervised_samples = None
+    if belief_supervised_episodes > 0:
+        if trainer_cfg.belief_training_mode == "frozen":
+            raise ValueError(
+                "belief_supervised_episodes is only valid in joint/alternating mode"
+            )
+        if trainer_cfg.belief_supervised_weight <= 0:
+            raise ValueError(
+                "belief_supervised_episodes requires belief_supervised_weight > 0"
+            )
+        if ruleset is not None:
+            raise NotImplementedError(
+                "synthetic supervised belief collection currently uses the "
+                "legacy card-play fixture. Supply programmatic standard-labelled "
+                "samples instead of relabelling them as standard data."
+            )
+        from douzero.belief.data import collect_random_dataset
+
+        belief_dataset = collect_random_dataset(
+            belief_supervised_episodes,
+            seed=rank_seed,
+            max_steps_per_episode=trainer_cfg.max_steps_per_episode,
+        )
+        belief_supervised_samples = belief_dataset.samples
+        if not belief_supervised_samples:
+            raise RuntimeError("supervised belief collection produced no samples")
+    elif trainer_cfg.belief_supervised_weight > 0:
+        raise ValueError(
+            "belief_supervised_weight > 0 requires --belief_supervised_episodes "
+            "(or the YAML belief_supervised_episodes field) in the CLI path"
         )
 
     # P08 Blocker 1: build the BC auxiliary samples + schedule when the YAML
@@ -693,7 +942,7 @@ def main() -> None:
             )
         if not bc_report.samples:
             raise ValueError(
-                f"bc.data_path {bc_cfg.data_path!r} yielded no BC samples "
+                "configured BC dataset yielded no BC samples "
                 f"({len(validation_quarantine)} quarantined)."
             )
         bc_aux_samples = apply_sample_weights(
@@ -710,7 +959,7 @@ def main() -> None:
         )
         print(
             f"[train_v2] BC aux: {len(bc_aux_samples)} samples from "
-            f"{bc_cfg.data_path!r}, schedule={bc_cfg.schedule} "
+            f"configured dataset, schedule={bc_cfg.schedule} "
             f"lambda_bc={loss_cfg.lambda_bc}",
             file=sys.stderr,
         )
@@ -722,6 +971,7 @@ def main() -> None:
         decision_config=decision_cfg,
         config=trainer_cfg,
         belief_model=belief_model,
+        belief_supervised_samples=belief_supervised_samples,
         bc_aux_samples=bc_aux_samples,
         bc_schedule=bc_schedule,
         bc_temperature=(bc_cfg.temperature if bc_cfg is not None else 1.0),
@@ -730,8 +980,20 @@ def main() -> None:
         coach_label_store=coach_label_store,
         policy_version=policy_version,
         policy_step=policy_step,
+        bidding_policy_config=bidding_policy_cfg,
         distributed_context=distributed,
     )
+
+    resume_checkpoint = getattr(args, "resume_checkpoint", "")
+    output_checkpoint = getattr(args, "checkpoint_path", "")
+    if distributed.enabled and (resume_checkpoint or output_checkpoint):
+        raise NotImplementedError(
+            "trainer checkpoint save/resume is currently single-process only"
+        )
+    if resume_checkpoint:
+        identity = trainer.load_training_checkpoint(resume_checkpoint)
+        if distributed.is_rank_zero:
+            print(f"[train_v2] resumed checkpoint={resume_checkpoint!r} identity={identity}")
 
     if distributed.is_rank_zero:
         print(
@@ -744,16 +1006,68 @@ def main() -> None:
         f"lr={trainer_cfg.learning_rate} "
         f"epsilon={trainer_cfg.exp_epsilon} "
         f"amp={trainer_cfg.amp_enabled}:{trainer_cfg.amp_dtype} "
+        f"belief_mode={trainer_cfg.belief_training_mode} "
         f"ruleset={trainer.ruleset.ruleset_id if trainer.ruleset else 'legacy'}"
         )
+    metrics_path = getattr(args, "metrics_path", "")
+    if learner_device.type == "cuda":
+        torch.cuda.synchronize(learner_device)
+        torch.cuda.reset_peak_memory_stats(learner_device)
+    import time
+
+    training_started = time.perf_counter()
     try:
         stats = trainer.train()
+        if learner_device.type == "cuda":
+            torch.cuda.synchronize(learner_device)
+        training_wall_seconds = time.perf_counter() - training_started
+        peak_memory_bytes = (
+            int(torch.cuda.max_memory_allocated(learner_device))
+            if learner_device.type == "cuda"
+            else None
+        )
+        peak_reserved_memory_bytes = (
+            int(torch.cuda.max_memory_reserved(learner_device))
+            if learner_device.type == "cuda"
+            else None
+        )
+        if output_checkpoint and distributed.is_rank_zero:
+            identity = trainer.save_training_checkpoint(output_checkpoint)
+            print(
+                f"[train_v2] saved checkpoint={output_checkpoint!r} "
+                f"identity={identity}"
+            )
+        if metrics_path and distributed.is_rank_zero:
+            changed = getattr(trainer, "stats_last_run_changed", None)
+            if not isinstance(changed, bool):
+                changed = None
+            _write_metrics_atomic(
+                metrics_path,
+                _build_training_metrics(
+                    stats,
+                    training_wall_seconds=training_wall_seconds,
+                    device_type=learner_device.type,
+                    peak_memory_bytes=peak_memory_bytes,
+                    peak_reserved_memory_bytes=peak_reserved_memory_bytes,
+                    amp_enabled=trainer_cfg.amp_enabled,
+                    amp_dtype=trainer_cfg.amp_dtype,
+                    amp_fallback_on_nonfinite=(
+                        trainer_cfg.amp_fallback_on_nonfinite
+                    ),
+                    compile_enabled=compile_enabled,
+                    ddp_enabled=distributed.enabled,
+                    world_size=distributed.world_size,
+                    parameters_changed=changed,
+                ),
+            )
     finally:
         distributed.close()
     if distributed.is_rank_zero:
         print(
         f"[train_v2] episodes_completed={stats.episodes_completed} "
         f"transitions={stats.transitions_collected} "
+        f"bidding_transitions={stats.bidding_transitions_collected} "
+        f"redeals={stats.redeals} "
         f"optimizer_steps={stats.optimizer_steps} "
         f"parameters_changed={getattr(trainer, 'stats_last_run_changed', 'unknown')} "
         f"last_loss={stats.last_loss} "

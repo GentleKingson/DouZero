@@ -1,0 +1,538 @@
+"""P17 standard full-game training and public learned-bidding closure."""
+
+from __future__ import annotations
+
+import copy
+import random
+from dataclasses import replace
+
+import numpy as np
+import pytest
+import torch
+
+from douzero.checkpoint import (
+    CheckpointCompatibilityError,
+    load_v2_checkpoint,
+    load_v2_position_weights,
+    save_v2_checkpoint,
+    save_v2_position_weights,
+)
+from douzero.coach import CoachLabelStore, OpeningSampler, TRUE_RANDOM
+from douzero.coach.records import CANONICAL_DECK, OpeningRecord
+from douzero.env.env import Env
+from douzero.env.rules import RuleSet
+from douzero.league import (
+    LeagueManifest,
+    PolicyEntry,
+    PolicyLoaderContract,
+    PolicyPool,
+    PolicyPoolConfig,
+    PopulationEpisodeRunner,
+)
+from douzero.models_v2.config import ModelV2Config
+from douzero.models_v2.model import ModelV2
+from douzero.models_v2.output import BiddingModelOutput
+from douzero.observation.bidding import get_bidding_obs_v2
+from douzero.observation.schema import build_v2_schema
+from douzero.training import (
+    BiddingMinibatch,
+    BiddingPolicyConfig,
+    BiddingTransition,
+    LossConfig,
+    TrainerConfig,
+    V2Trainer,
+    bidding_loss,
+    select_bidding_action,
+)
+
+
+def _tiny_config() -> ModelV2Config:
+    return ModelV2Config(
+        hidden_size=16,
+        history_encoder="lstm",
+        history_layers=1,
+        history_heads=1,
+        bidding_enabled=True,
+        bidding_hidden_size=12,
+    )
+
+
+def _opening(order: tuple[str, str, str]) -> OpeningRecord:
+    ruleset = RuleSet.standard()
+    return OpeningRecord(
+        deck=CANONICAL_DECK,
+        bidding_order=order,
+        ruleset=ruleset.to_dict(),
+        landlord_candidate=order[0],
+        public_features={"ruleset_hash": ruleset.stable_hash()},
+    )
+
+
+def _raw_bidding_obs(
+    *,
+    order: tuple[str, str, str] = ("0", "1", "2"),
+    history: tuple[tuple[str, int], ...] = (),
+) -> dict:
+    ruleset = RuleSet.standard()
+    highest = max((bid for _, bid in history), default=0)
+    return {
+        "phase": "bidding",
+        "position": order[len(history)],
+        "my_handcards": list(CANONICAL_DECK[:17]),
+        "current_highest_bid": highest,
+        "bidding_history": list(history),
+        "bidding_order": list(order),
+        "first_bidder": order[0],
+        "legal_bids": [bid for bid in ruleset.bid_values if bid == 0 or bid > highest],
+    }
+
+
+@pytest.mark.parametrize(
+    "order",
+    (("0", "1", "2"), ("1", "2", "0"), ("2", "0", "1")),
+)
+def test_public_bidding_observation_handles_every_first_bidder(order):
+    ruleset = RuleSet.standard()
+    env = Env("adp", ruleset=ruleset)
+    env.reset(opening=_opening(order))
+    seen = []
+    for bid in (0, 1, 2):
+        obs = get_bidding_obs_v2(env.bidding_obs, ruleset=ruleset)
+        seen.append(obs.current_seat)
+        assert obs.first_bidder == order[0]
+        assert obs.current_seat not in {
+            "landlord", "landlord_up", "landlord_down"
+        }
+        _raw, _reward, done, _info = env.step(None, bid_value=bid)
+        assert not done
+    assert tuple(seen) == order
+    assert env.bidding_obs is None
+
+
+def test_bidding_encoder_is_allowlisted_hidden_allocation_invariant_and_strict():
+    ruleset = RuleSet.standard()
+    raw = _raw_bidding_obs(history=(("0", 1),))
+    first = copy.deepcopy(raw)
+    first.update({"other_hands": {"1": [30]}, "bottom_cards": [3, 4, 5]})
+    second = copy.deepcopy(raw)
+    second.update({"other_hands": {"1": [3]}, "bottom_cards": [17, 20, 30]})
+    obs_a = get_bidding_obs_v2(first, ruleset=ruleset, public_style=np.zeros(8))
+    obs_b = get_bidding_obs_v2(second, ruleset=ruleset, public_style=np.zeros(8))
+    assert np.array_equal(obs_a.features, obs_b.features)
+    assert not obs_a.is_privileged
+    assert obs_a.features.flags.writeable is False
+
+    bad = copy.deepcopy(raw)
+    bad["my_handcards"] = bad["my_handcards"][:-1]
+    with pytest.raises(ValueError, match="exactly 17"):
+        get_bidding_obs_v2(bad, ruleset=ruleset)
+    bad = copy.deepcopy(raw)
+    bad["current_highest_bid"] = 3
+    with pytest.raises(ValueError, match="does not match"):
+        get_bidding_obs_v2(bad, ruleset=ruleset)
+    with pytest.raises(ValueError, match="finite"):
+        get_bidding_obs_v2(raw, ruleset=ruleset, public_style=[float("nan")])
+
+
+def test_bidding_head_is_separate_from_card_action_encoder_and_masks_illegal():
+    ruleset = RuleSet.standard()
+    obs = get_bidding_obs_v2(
+        _raw_bidding_obs(history=(("0", 1),)), ruleset=ruleset
+    )
+    model = ModelV2(build_v2_schema(), _tiny_config())
+
+    def card_path_must_not_run(*_args, **_kwargs):
+        raise AssertionError("card ActionEncoder was called by forward_bidding")
+
+    model.action_encoder.forward = card_path_must_not_run
+    output = model.forward_bidding(obs)
+    assert output.bid_logits.shape == (4,)
+    assert output.landlord_win_logit.ndim == 0
+    assert output.expected_landlord_score.ndim == 0
+    assert output.masked_bid_logits()[1].item() == float("-inf")
+    assert output.argmax_bid() in obs.legal_bids
+
+
+def test_masked_listwise_bid_loss_uses_landlord_perspective_and_gradients():
+    ruleset = RuleSet.standard()
+    obs = get_bidding_obs_v2(
+        _raw_bidding_obs(history=(("0", 1),)), ruleset=ruleset
+    )
+    transition = BiddingTransition(obs, 3, "policy-7", "learned")
+    transition.label_from_terminal(
+        {
+            "team_targets": {
+                "landlord": {"target_win": 1.0, "target_score": 8.0}
+            }
+        }
+    )
+    logits = torch.tensor([0.0, 100.0, 1.0, 2.0], requires_grad=True)
+    win = torch.tensor(0.2, requires_grad=True)
+    score = torch.tensor(1.5, requires_grad=True)
+    output = BiddingModelOutput(
+        logits,
+        torch.tensor([True, False, True, True]),
+        win,
+        score,
+    )
+    components = bidding_loss(
+        [output],
+        BiddingMinibatch([transition]),
+        lambda_policy=1.0,
+        lambda_landlord_win=0.5,
+        lambda_landlord_score=0.25,
+    )
+    assert torch.isfinite(components.total)
+    components.total.backward()
+    assert logits.grad is not None and logits.grad[1].item() == 0.0
+    assert win.grad is not None and score.grad is not None
+    assert transition.target_landlord_win == 1.0
+    assert transition.target_landlord_score == 8.0
+
+
+def test_warm_start_bid_is_not_mislabelled_as_learned():
+    obs = get_bidding_obs_v2(_raw_bidding_obs(), ruleset=RuleSet.standard())
+    bid, source = select_bidding_action(
+        obs,
+        BiddingPolicyConfig(
+            policy="learned", warm_start_policy="rule", learned_probability=0.0
+        ),
+        random.Random(4),
+        lambda _obs: 3,
+    )
+    assert bid in obs.legal_bids and source == "rule"
+    bid, source = select_bidding_action(
+        obs,
+        BiddingPolicyConfig(
+            policy="learned", warm_start_policy="rule", learned_probability=1.0
+        ),
+        random.Random(4),
+        lambda _obs: 3,
+    )
+    assert bid == 3 and source == "learned"
+
+
+def test_all_pass_redeal_discards_abandoned_bid_transitions():
+    ruleset = replace(RuleSet.standard(), max_redeals=1)
+    trainer = V2Trainer(
+        ModelV2(build_v2_schema(), _tiny_config()),
+        ruleset=ruleset,
+        loss_config=LossConfig(lambda_bid_policy=1.0),
+        bidding_policy_config=BiddingPolicyConfig(policy="pass"),
+        config=TrainerConfig(
+            max_episodes=0,
+            optimizer_steps=0,
+            batch_size=1,
+            exp_epsilon=1.0,
+            max_steps_per_episode=500,
+            rng_seed=9,
+        ),
+    )
+    episode = trainer._run_one_episode()
+    assert episode.redeal_count == 1
+    assert episode.abandoned_bidding_transitions == 3
+    assert len(episode.bidding_transitions) == 3
+    assert {tr.obs.redeal_count for tr in episode.bidding_transitions} == {1}
+    assert all(tr.source_policy == "pass" for tr in episode.bidding_transitions)
+    trainer.bidding_buffer.add_terminal_deal(
+        episode.bidding_transitions, episode.terminal_result
+    )
+    assert len(trainer.bidding_buffer) == 3
+
+
+def test_standard_population_runner_records_only_learner_policy_decisions():
+    ruleset = RuleSet.standard()
+    model = ModelV2(build_v2_schema(), _tiny_config())
+    contract = PolicyLoaderContract.for_v2_runtime(
+        model.schema,
+        model.config,
+        checkpoint_kind="training_checkpoint",
+    )
+    current = PolicyEntry(
+        policy_id="current-bid-policy",
+        checkpoint_paths_by_role={},
+        model_version="v2",
+        ruleset_hash=ruleset.stable_hash(),
+        feature_schema_hash=model.schema.stable_hash(),
+        model_config_hash=model.config.stable_hash(),
+        model_config_identity_version=model.config.IDENTITY_VERSION,
+        checkpoint_kind="training_checkpoint",
+        objective="adp",
+        created_step=3,
+        tags=("current",),
+    )
+    pool = PolicyPool(
+        LeagueManifest((current,), current.policy_id),
+        current,
+        runtime_loader=contract,
+        runtime_ruleset_hash=ruleset.stable_hash(),
+        config=PolicyPoolConfig(
+            mode="population",
+            seed=31,
+            learner_seats_per_game=1,
+            include_random_agent=True,
+        ),
+    )
+    with pytest.raises(ValueError, match="policy_version must match"):
+        V2Trainer(
+            model,
+            ruleset=ruleset,
+            loss_config=LossConfig(lambda_bid_policy=1.0),
+            bidding_policy_config=BiddingPolicyConfig(policy="max"),
+            config=TrainerConfig(max_episodes=0),
+            policy_pool=pool,
+            policy_version="different-snapshot",
+        )
+    # Canonical bundle slot "landlord" maps to neutral seat 0 before roles
+    # exist. Pick a deterministic game where the learner owns that first bid.
+    game_index = next(
+        index
+        for index in range(100)
+        if pool.sample_bundle(index).learner_controlled_seats == ("landlord",)
+    )
+    runner = PopulationEpisodeRunner(
+        pool,
+        lambda _obs: 0,
+        current_bidding_selector=lambda obs: (max(obs.legal_bids), "learned"),
+        bidding_policy_config=BiddingPolicyConfig(
+            policy="learned", learned_probability=1.0
+        ),
+        ruleset=ruleset,
+    )
+    episode, record = runner.run(
+        game_index,
+        policy_version_at_start=current.policy_id,
+        policy_step_at_start=3,
+    )
+    assert episode.bidding_transitions
+    assert all(
+        transition.policy_version == current.policy_id
+        for transition in episode.bidding_transitions
+    )
+    assert episode.transitions
+    assert {
+        transition.position for transition in episode.transitions
+    }.issubset(set(record.learner_controlled_seats))
+    assert all(
+        transition.policy_id == current.policy_id
+        for transition in episode.transitions
+    )
+    assert record.bid_value in (1, 2, 3)
+    assert record.redeal_count == episode.redeal_count
+    assert record.bidding_transitions == len(episode.bidding_transitions)
+
+
+def test_standard_coach_runner_labels_kept_opening_but_not_redeal(tmp_path):
+    policy_version = "standard-coach-policy"
+    ruleset = RuleSet.standard()
+    store = CoachLabelStore(str(tmp_path / "kept-opening.jsonl"))
+    sampler = OpeningSampler(
+        ruleset=ruleset,
+        policy_version=policy_version,
+        mode=TRUE_RANDOM,
+        seed=41,
+    )
+    trainer = V2Trainer(
+        ModelV2(build_v2_schema(), _tiny_config()),
+        ruleset=ruleset,
+        loss_config=LossConfig(lambda_bid_policy=1.0),
+        bidding_policy_config=BiddingPolicyConfig(policy="max"),
+        config=TrainerConfig(
+            max_episodes=1,
+            optimizer_steps=0,
+            batch_size=1,
+            exp_epsilon=1.0,
+            rng_seed=41,
+        ),
+        opening_sampler=sampler,
+        coach_label_store=store,
+        policy_version=policy_version,
+        policy_step=7,
+    )
+    trainer.collect_episodes(1)
+    labels = store.load_fresh(
+        policy_version=policy_version,
+        current_policy_step=7,
+        max_age_steps=0,
+    )
+    assert len(labels) == 1
+    assert labels[0].opening.ruleset_obj.ruleset_id == "standard"
+    assert labels[0].policy_step == 7
+
+    redeal_ruleset = replace(ruleset, max_redeals=1)
+    redeal_store = CoachLabelStore(str(tmp_path / "redealt-opening.jsonl"))
+    redeal_sampler = OpeningSampler(
+        ruleset=redeal_ruleset,
+        policy_version=policy_version,
+        mode=TRUE_RANDOM,
+        seed=43,
+    )
+    redeal_trainer = V2Trainer(
+        ModelV2(build_v2_schema(), _tiny_config()),
+        ruleset=redeal_ruleset,
+        loss_config=LossConfig(lambda_bid_policy=1.0),
+        bidding_policy_config=BiddingPolicyConfig(policy="pass"),
+        config=TrainerConfig(
+            max_episodes=1,
+            optimizer_steps=0,
+            batch_size=1,
+            exp_epsilon=1.0,
+            rng_seed=43,
+        ),
+        opening_sampler=redeal_sampler,
+        coach_label_store=redeal_store,
+        policy_version=policy_version,
+        policy_step=8,
+    )
+    redeal_trainer.collect_episodes(1)
+    assert redeal_trainer.stats.redeals == 1
+    assert redeal_store.load_fresh(
+        policy_version=policy_version,
+        current_policy_step=8,
+        max_age_steps=0,
+    ) == []
+
+
+def test_standard_training_step_and_strict_resume(tmp_path):
+    torch.manual_seed(12)
+    cfg = _tiny_config()
+    loss = LossConfig(
+        lambda_win=1.0,
+        lambda_score=0.5,
+        lambda_bid_policy=1.0,
+        lambda_bid_win=0.5,
+        lambda_bid_score=0.25,
+    )
+    trainer_cfg = TrainerConfig(
+        max_episodes=1,
+        optimizer_steps=1,
+        batch_size=1,
+        exp_epsilon=1.0,
+        max_steps_per_episode=500,
+        rng_seed=17,
+    )
+    trainer = V2Trainer(
+        ModelV2(build_v2_schema(), cfg),
+        ruleset=RuleSet.standard(),
+        loss_config=loss,
+        bidding_policy_config=BiddingPolicyConfig(policy="max"),
+        config=trainer_cfg,
+    )
+    before = trainer.model.bidding_heads.policy.weight.detach().clone()
+    stats = trainer.train()
+    assert stats.optimizer_steps == 1
+    assert stats.bidding_transitions_collected >= 1
+    assert all(
+        transition.policy_id == "current"
+        for transition in trainer.buffer._episodes[-1].transitions
+    )
+    assert not torch.equal(before, trainer.model.bidding_heads.policy.weight)
+    assert "loss_bid_policy" in stats.last_loss
+
+    checkpoint = tmp_path / "standard-resume.pt"
+    identity = trainer.save_training_checkpoint(str(checkpoint))
+    assert identity["bidding_head_version"]
+    assert len(identity["source_git_sha"]) in (40, 64)
+    restored = V2Trainer(
+        ModelV2(build_v2_schema(), cfg),
+        ruleset=RuleSet.standard(),
+        loss_config=loss,
+        bidding_policy_config=BiddingPolicyConfig(policy="max"),
+        config=trainer_cfg,
+    )
+    restored.load_training_checkpoint(str(checkpoint))
+    assert restored.stats.optimizer_steps == 1
+    assert all(
+        torch.equal(value, restored.model.state_dict()[name])
+        for name, value in trainer.model.state_dict().items()
+    )
+    restored.collect_episodes(1)
+    assert restored.step() is not None
+    assert restored.stats.optimizer_steps == 2
+
+    tampered_bundle = torch.load(checkpoint, weights_only=True)
+    replacement = "f" if identity["source_git_sha"][0] != "f" else "e"
+    tampered_bundle["source_git_sha"] = replacement * len(
+        identity["source_git_sha"]
+    )
+    tampered_checkpoint = tmp_path / "wrong-source-sha.pt"
+    torch.save(tampered_bundle, tampered_checkpoint)
+    with pytest.raises(CheckpointCompatibilityError, match="source_git_sha mismatch"):
+        restored.load_training_checkpoint(str(tampered_checkpoint))
+
+
+def test_v2_checkpoint_carries_and_validates_explicit_bidding_identity(tmp_path):
+    schema = build_v2_schema()
+    cfg = _tiny_config()
+    model = ModelV2(schema, cfg)
+    path = tmp_path / "bidding-model.tar"
+    save_v2_checkpoint(str(path), model, ruleset=RuleSet.standard())
+    bundle = torch.load(path, weights_only=True)
+    assert bundle["bidding_head_version"]
+    assert bundle["bidding_action_schema"] == "score-0-1-2-3-v1"
+    assert bundle["bidding_feature_schema_hash"] == model.bidding_schema.stable_hash()
+    state, _manifest = load_v2_checkpoint(
+        str(path),
+        expected_schema_hash=schema.stable_hash(),
+        expected_model_config_hash=cfg.stable_hash(),
+        expected_ruleset=RuleSet.standard(),
+        runtime_model_config=cfg,
+    )
+    assert set(state) == set(model.state_dict())
+
+    bundle["bidding_action_schema"] = "wrong-action-contract"
+    tampered = tmp_path / "tampered.tar"
+    torch.save(bundle, tampered)
+    with pytest.raises(CheckpointCompatibilityError, match="bidding_action_schema"):
+        load_v2_checkpoint(
+            str(tampered),
+            expected_schema_hash=schema.stable_hash(),
+            expected_model_config_hash=cfg.stable_hash(),
+            expected_ruleset=RuleSet.standard(),
+            runtime_model_config=cfg,
+        )
+
+
+def test_pre_p17_bidding_disabled_default_config_hash_is_pinned():
+    cfg = ModelV2Config()
+    assert cfg.bidding_enabled is False
+    assert cfg.IDENTITY_VERSION == 3
+    assert (
+        cfg.stable_hash()
+        == "c4577d155385c79361280e6529ca42b5d5991095ec3dfe526f7ef5f5365962bb"
+    )
+
+
+def test_pre_p17_bidding_disabled_identity_v3_sidecar_strict_loads(tmp_path):
+    schema = build_v2_schema()
+    cfg = ModelV2Config()
+    model = ModelV2(schema, cfg)
+    current_path = tmp_path / "current-disabled-sidecar.ckpt"
+    save_v2_position_weights(
+        str(current_path), model, ruleset=RuleSet.legacy()
+    )
+    bundle = torch.load(current_path, weights_only=True)
+    assert bundle["model_config_identity_version"] == 3
+
+    # P16 identity-v3 sidecars predate the explicit bidding identity fields.
+    for key in (
+        "bidding_head_version",
+        "bidding_action_schema",
+        "bidding_feature_schema_hash",
+    ):
+        assert bundle.pop(key) == ""
+    historical_path = tmp_path / "pre-p17-disabled-sidecar.ckpt"
+    torch.save(bundle, historical_path)
+
+    state_dict, manifest = load_v2_position_weights(
+        str(historical_path),
+        expected_schema_hash=schema.stable_hash(),
+        expected_model_config_hash=cfg.stable_hash(),
+        expected_ruleset=RuleSet.legacy(),
+        runtime_model_config=cfg,
+        training_device="cpu",
+    )
+    restored = ModelV2(schema, cfg)
+    restored.load_state_dict(state_dict, strict=True)
+    assert manifest.checkpoint_kind == "public_policy"
+    assert set(state_dict) == set(model.state_dict())

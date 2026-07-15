@@ -183,6 +183,11 @@ class Episode:
     """All transitions of one game, plus the terminal result dict."""
 
     transitions: list[Transition] = field(default_factory=list)
+    # P17 bidding transitions use neutral seats and landlord-perspective labels,
+    # so they live beside (not inside) the role-perspective card replay.
+    bidding_transitions: list[object] = field(default_factory=list)
+    redeal_count: int = 0
+    abandoned_bidding_transitions: int = 0
     terminal_result: dict = field(default_factory=dict)
     # Complete public action trace, including forced single-action decisions.
     # P09 trajectory labels use it so spring/finisher targets are not biased by

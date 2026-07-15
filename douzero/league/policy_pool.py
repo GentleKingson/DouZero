@@ -145,9 +145,17 @@ class LoadedPolicySelector:
     policy_id: str
     contract: PolicyLoaderContract
     select: Callable[[object], int]
+    select_bidding: Callable[[object], int] | None = None
 
     def __call__(self, observation: object) -> int:
         return int(self.select(observation))
+
+    def bid(self, observation: object) -> int:
+        if self.select_bidding is None:
+            raise RuntimeError(
+                f"policy {self.policy_id!r} has no learned bidding selector"
+            )
+        return int(self.select_bidding(observation))
 
 
 def build_frozen_policy_model(

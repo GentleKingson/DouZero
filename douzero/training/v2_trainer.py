@@ -6,10 +6,9 @@ completes one optimizer step and changes the parameters).
 
 Design
 ------
-- Single process, CPU-only. No shared memory, no actor subprocesses, no
-  GPU handling. The legacy multiprocessing path (:mod:`douzero.dmc`) is
-  untouched. GPU + multi-process is P14.
-- Self-play: a single :class:`~douzero.env.env.Env` (legacy mode) plays
+- Single process by default, with explicit device and mixed-precision support.
+  The legacy multiprocessing path (:mod:`douzero.dmc`) is untouched.
+- Self-play: a single :class:`~douzero.env.env.Env` plays
   games to terminal. Each decision is made by an epsilon-greedy policy
   over the current :class:`~douzero.models_v2.model.ModelV2` outputs
   (random for the first few episodes when the buffer is empty).
@@ -23,10 +22,12 @@ Design
   gathers the chosen action's head values, concatenates them, and calls
   :meth:`MultiObjectiveLoss.forward_gathered`.
 
-P06 r1 hardening
-----------------
-- The trainer rejects a non-legacy ruleset at construction (standard mode
-  requires a bidding driver that is not part of P06).
+Hardening
+---------
+- Legacy card-play mode remains available with ``ruleset=None``. Standard
+  mode runs the bidding/redeal/reveal/play state machine with a separate
+  learned bidding head. It currently fails closed under DDP until the mixed
+  bidding/card-play graph has been validated.
 - The per-decision heads are concatenated with :func:`torch.cat` (not
   :func:`torch.stack`), so the gathered heads have shape ``(B, 1)`` as the
   loss module requires.
@@ -42,13 +43,16 @@ P06 r1 hardening
 from __future__ import annotations
 
 import math
+import os
 import random
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
 
+from douzero._version import git_sha
 from douzero.runtime import DistributedContext, SafeMixedPrecision
 
 from douzero.env.env import Env
@@ -56,10 +60,18 @@ from douzero.env.rules import RuleSet
 from douzero.models_v2.batch import observation_to_model_inputs
 from douzero.models_v2.model import ModelV2
 from douzero.observation.encode_v2 import get_obs_v2
+from douzero.observation.bidding import get_bidding_obs_v2
 
 from douzero.training.decision_policy import DecisionConfig, select_action
 from douzero.training.losses import LossComponents, LossConfig, MultiObjectiveLoss
 from douzero.training.v2_buffer import Episode, Transition, V2ReplayBuffer
+from douzero.training.bidding import (
+    BiddingPolicyConfig,
+    BiddingReplayBuffer,
+    BiddingTransition,
+    bidding_loss,
+    select_bidding_action,
+)
 
 
 @dataclass
@@ -100,6 +112,11 @@ class TrainerConfig:
     amp_enabled: bool = False
     amp_dtype: str = "float16"
     amp_fallback_on_nonfinite: bool = True
+    # P17 belief/value optimization. Frozen preserves the P07 path exactly.
+    belief_training_mode: str = "frozen"
+    belief_supervised_weight: float = 0.0
+    belief_alternating_interval: int = 1
+    belief_supervised_batch_size: int = 16
 
     def __post_init__(self) -> None:
         """Validate ranges so a malformed config fails fast (P06 r2).
@@ -152,6 +169,19 @@ class TrainerConfig:
             raise ValueError(
                 f"rmsprop_epsilon must be finite and > 0, got {self.rmsprop_epsilon}"
             )
+        if self.belief_training_mode not in {"frozen", "joint", "alternating"}:
+            raise ValueError(
+                "belief_training_mode must be 'frozen', 'joint', or 'alternating'"
+            )
+        if (
+            not _math.isfinite(self.belief_supervised_weight)
+            or self.belief_supervised_weight < 0
+        ):
+            raise ValueError("belief_supervised_weight must be non-negative finite")
+        if self.belief_alternating_interval < 1:
+            raise ValueError("belief_alternating_interval must be >= 1")
+        if self.belief_supervised_batch_size < 1:
+            raise ValueError("belief_supervised_batch_size must be >= 1")
 
 
 @dataclass
@@ -170,25 +200,23 @@ class TrainerStats:
     opening_strategy_counts: dict[str, int] = field(default_factory=dict)
     opening_predicted_win_mean: float = float("nan")
     amp_fallbacks: int = 0
+    bidding_transitions_collected: int = 0
+    redeals: int = 0
+    belief_phase: str = "frozen"
+    belief_supervised_steps: int = 0
 
 
-def _legacy_only(ruleset: RuleSet | None) -> None:
-    """Reject any non-None ruleset (P06 has no bidding driver).
-
-    ``Env`` treats ANY non-None ``RuleSet`` as standard mode (it enters the
-    bidding phase), even ``RuleSet.legacy()``. The P06 trainer has no
-    bidding driver, so the only valid value is ``ruleset=None`` (which
-    gives the legacy card-play-only env). This is a P06 limitation; P11's
-    league work adds the bidding driver.
-    """
+def _validate_training_ruleset(ruleset: RuleSet | None) -> None:
+    """Allow legacy card-play mode or the explicit standard state machine."""
     if ruleset is None:
         return
-    raise NotImplementedError(
-        f"V2Trainer only supports ruleset=None (the legacy card-play-only "
-        f"env) in P06. Env treats any non-None RuleSet as standard mode and "
-        f"enters the bidding phase, which requires a bidding driver that is "
-        f"part of P11's league work. Got ruleset={ruleset!r}."
-    )
+    if not isinstance(ruleset, RuleSet):
+        raise TypeError("ruleset must be a RuleSet or None")
+    if ruleset.ruleset_id != "standard":
+        raise ValueError(
+            "a non-None V2Trainer ruleset must be standard; legacy card-play "
+            "mode is represented by ruleset=None"
+        )
 
 
 class V2Trainer:
@@ -198,12 +226,11 @@ class V2Trainer:
     ----------
     model:
         The :class:`ModelV2` to optimize. The trainer takes ownership of
-        gradient updates. CPU-only — the model is NOT moved to a device
-        (GPU is P14).
+        gradient updates. The model is moved to ``config.device``.
     ruleset:
         :class:`RuleSet` for the env. ``None`` (default) keeps the legacy
-        card-play-only env (no bidding). Non-legacy rulesets are rejected
-        at construction (P06 has no bidding driver).
+        card-play-only env (no bidding); ``RuleSet.standard()`` enables the
+        complete learned-bidding game path.
     loss_config:
         :class:`LossConfig` for the multi-objective loss.
     decision_config:
@@ -221,6 +248,7 @@ class V2Trainer:
         decision_config: DecisionConfig | None = None,
         config: TrainerConfig | None = None,
         belief_model=None,
+        belief_supervised_samples=None,
         bc_aux_samples=None,
         bc_schedule=None,
         bc_temperature: float = 1.0,
@@ -232,9 +260,11 @@ class V2Trainer:
         coach_label_store=None,
         policy_version: str = "current",
         policy_step: int = 0,
+        bidding_policy_config: BiddingPolicyConfig | None = None,
         distributed_context: DistributedContext | None = None,
     ) -> None:
-        _legacy_only(ruleset)
+        _validate_training_ruleset(ruleset)
+        self.config = config or TrainerConfig()
         loss_cfg = loss_config or LossConfig()
         # P06 r2/r7: the loss target is clamped to loss_cfg.score_clamp in
         # BOTH raw and signed_log modes (r5 made the clamp universal). If
@@ -267,21 +297,33 @@ class V2Trainer:
             )
         self.model = model
         self.ruleset = ruleset
-        # P07 belief training integration (review round 3). A belief-enabled
-        # value model can only be trained via the "pretrain belief, freeze its
-        # features, train belief_proj" path: the trainer holds the frozen
-        # BeliefModel, computes the constrained posterior features from each
-        # obs.public, and passes them into ModelV2.forward at both the
-        # collection and optimizer call sites. Without this, a belief_enabled
-        # value model fails closed at the first forward.
+        self.standard_mode = ruleset is not None
+        if self.standard_mode and not bool(
+            getattr(self.model.config, "bidding_enabled", False)
+        ):
+            raise ValueError(
+                "standard V2 training requires model.config.bidding_enabled=True"
+            )
+        if not self.standard_mode and bidding_policy_config is not None:
+            raise ValueError("bidding_policy_config is only valid in standard mode")
+        self.bidding_policy_config = (
+            bidding_policy_config or BiddingPolicyConfig()
+            if self.standard_mode
+            else None
+        )
+        # P17 belief/value training modes. Frozen keeps the established exact
+        # NumPy posterior + detached fusion path. Joint uses differentiable
+        # constrained PyTorch marginals so value loss reaches BeliefModel.
+        # Alternating separates value-only and supervised-belief phases.
         belief_enabled = bool(getattr(self.model.config, "belief_enabled", False))
+        self.belief_training_mode = self.config.belief_training_mode
+        self.belief_supervised_weight = self.config.belief_supervised_weight
+        self.belief_supervised_samples = list(belief_supervised_samples or [])
         if belief_enabled and belief_model is None:
             raise ValueError(
                 "The value model has belief_enabled=True but no belief_model "
-                "was supplied to V2Trainer. A belief-enabled value model can "
-                "only be trained with a frozen BeliefModel that computes its "
-                "posterior features. Pass a pretrained belief_model= (load it "
-                "with load_belief_checkpoint)."
+                "was supplied to V2Trainer. Pass a pretrained belief_model= "
+                "(load it with load_belief_checkpoint)."
             )
         if belief_model is not None and not belief_enabled:
             raise ValueError(
@@ -289,11 +331,33 @@ class V2Trainer:
                 "belief_enabled=False. Drop belief_model or rebuild the value "
                 "model with belief_enabled=True."
             )
+        if not belief_enabled and self.belief_training_mode != "frozen":
+            raise ValueError(
+                f"belief_training_mode={self.belief_training_mode!r} requires "
+                "model.config.belief_enabled=True"
+            )
+        if self.belief_training_mode == "frozen" and self.belief_supervised_weight > 0:
+            raise ValueError(
+                "belief_supervised_weight must be zero in frozen mode"
+            )
+        if self.belief_supervised_weight > 0 and not self.belief_supervised_samples:
+            raise ValueError(
+                "belief_supervised_weight > 0 requires belief_supervised_samples"
+            )
+        if self.belief_training_mode == "alternating":
+            if self.belief_supervised_weight <= 0:
+                raise ValueError(
+                    "alternating belief training requires a positive "
+                    "belief_supervised_weight"
+                )
+            if not self.belief_supervised_samples:
+                raise ValueError(
+                    "alternating belief training requires supervised samples"
+                )
         if belief_model is not None:
-            # Freeze the belief model: only belief_proj (a value-model param)
-            # is trained; the belief posterior is a frozen feature source.
+            trainable = self.belief_training_mode != "frozen"
             for p in belief_model.parameters():
-                p.requires_grad_(False)
+                p.requires_grad_(trainable)
             belief_model.eval()
         self.belief_model = belief_model
         # P08: optional listwise BC auxiliary loss. When the BC schedule's base
@@ -354,13 +418,26 @@ class V2Trainer:
                 "model.strategy_aux_enabled=true"
             )
         self.decision_config = decision_config or DecisionConfig()
-        self.config = config or TrainerConfig()
         self.device = torch.device(self.config.device)
         self.distributed = distributed_context or DistributedContext(enabled=False)
         if self.distributed.enabled and self.distributed.device != self.device:
             raise ValueError(
                 "distributed context device does not match TrainerConfig.device: "
                 f"{self.distributed.device} != {self.device}"
+            )
+        if self.standard_mode and self.distributed.enabled:
+            raise NotImplementedError(
+                "bidding-enabled standard training is not supported under DDP: "
+                "the current P14 wrapper uses a static graph while bid and play "
+                "paths have different parameter usage. Run single-process until "
+                "a stable combined DDP graph is validated."
+            )
+        if self.distributed.enabled and self.belief_training_mode != "frozen":
+            raise NotImplementedError(
+                "joint/alternating belief training is not supported under DDP: "
+                "P14 wraps only ModelV2, so belief gradients would not be "
+                "synchronized across ranks. Use frozen mode or single-process "
+                "training until the belief model has its own DDP reducer."
             )
         if (
             self.distributed.enabled
@@ -381,6 +458,8 @@ class V2Trainer:
                 "strategy auxiliary loss weights are zero"
             )
         self.model.to(self.device)
+        if self.belief_model is not None:
+            self.belief_model.to(self.device)
         # DDP forward is a synchronization point. Self-play control flow is
         # intentionally rank-local, so inference must bypass the wrapper and
         # call the local module directly. Optimizer closures continue to use
@@ -402,7 +481,24 @@ class V2Trainer:
         active_loss = (
             loss_cfg.lambda_win + loss_cfg.lambda_score + loss_cfg.lambda_uncertainty
             + self.strategy_aux_weight
+            + loss_cfg.lambda_bid_policy + loss_cfg.lambda_bid_win
+            + loss_cfg.lambda_bid_score + loss_cfg.lambda_bid_regret
         )
+        self.bidding_loss_weight = (
+            loss_cfg.lambda_bid_policy + loss_cfg.lambda_bid_win
+            + loss_cfg.lambda_bid_score + loss_cfg.lambda_bid_regret
+        )
+        if not self.standard_mode and self.bidding_loss_weight > 0:
+            raise ValueError("bidding loss weights require standard rules")
+        if (
+            self.standard_mode
+            and self.config.optimizer_steps > 0
+            and self.bidding_loss_weight == 0
+        ):
+            raise ValueError(
+                "standard learned-bidding training requires at least one non-zero "
+                "lambda_bid_policy/lambda_bid_win/lambda_bid_score weight"
+            )
         if self.config.optimizer_steps > 0 and active_loss == 0:
             raise ValueError(
                 f"optimizer_steps > 0 requires at least one non-zero loss "
@@ -416,14 +512,23 @@ class V2Trainer:
                 f"batch_size ({self.config.batch_size}) when optimizer_steps > 0; "
                 f"otherwise step() can never sample a minibatch."
             )
+        self._value_parameters = list(self.model.parameters())
+        self._belief_parameters = (
+            list(self.belief_model.parameters())
+            if self.belief_model is not None else []
+        )
+        self._optimizer_parameters = list(self._value_parameters)
+        if self.belief_training_mode != "frozen":
+            self._optimizer_parameters.extend(self._belief_parameters)
         self.optimizer = torch.optim.RMSprop(
-            self.model.parameters(),
+            self._optimizer_parameters,
             lr=self.config.learning_rate,
             alpha=self.config.rmsprop_alpha,
             momentum=self.config.rmsprop_momentum,
             eps=self.config.rmsprop_epsilon,
         )
         self.buffer = V2ReplayBuffer(capacity_transitions=self.config.buffer_capacity)
+        self.bidding_buffer = BiddingReplayBuffer(self.config.buffer_capacity)
         # P06 r3: respect the project's seed=0 → no-op contract. When
         # rng_seed is 0, use system entropy (random.Random() with no arg)
         # so the trainer's action sampling is unseeded — matching the
@@ -436,6 +541,7 @@ class V2Trainer:
         self.stats = TrainerStats(
             episodes_per_team={"landlord": 0, "farmer": 0},
             opening_strategy_counts={},
+            belief_phase=self.belief_training_mode,
         )
         if coach_label_store is not None and opening_sampler is None:
             raise ValueError("coach_label_store requires an opening_sampler")
@@ -466,6 +572,8 @@ class V2Trainer:
         # step() toggles to train() for the optimizer step, then back to
         # eval() after.
         self.model.eval()
+        if self.belief_model is not None:
+            self.belief_model.eval()
         self.population_runner = None
         self._league_game_index = 0
         if policy_pool is not None:
@@ -487,11 +595,23 @@ class V2Trainer:
                     "policy pool runtime loader identity does not match the "
                     "V2Trainer model/schema identity"
                 )
+            if self.policy_version != policy_pool.current.policy_id:
+                raise ValueError(
+                    "V2Trainer policy_version must match the policy pool's "
+                    "current policy_id so bidding and card-play transitions "
+                    "carry one snapshot identity: "
+                    f"trainer={self.policy_version!r}, "
+                    f"pool={policy_pool.current.policy_id!r}"
+                )
 
             self.population_runner = PopulationEpisodeRunner(
                 policy_pool,
                 self._choose_action_index,
                 opponent_selectors=opponent_selectors,
+                current_bidding_selector=(
+                    self._choose_bidding_action if self.standard_mode else None
+                ),
+                bidding_policy_config=self.bidding_policy_config,
                 ruleset=self.ruleset,
                 max_steps=self.config.max_steps_per_episode,
                 logger=matchup_logger,
@@ -507,12 +627,24 @@ class V2Trainer:
             episode = self._run_one_episode()
             if episode.transitions:
                 self.buffer.add_episode(episode)
+            if episode.bidding_transitions:
+                self.bidding_buffer.add_terminal_deal(
+                    episode.bidding_transitions, episode.terminal_result
+                )
+            if episode.transitions or episode.bidding_transitions:
                 self.stats.episodes_completed += 1
                 team = episode.terminal_result.get("winner_team", "landlord")
                 self.stats.episodes_per_team[team] = (
                     self.stats.episodes_per_team.get(team, 0) + 1
                 )
-                self.stats.transitions_collected = len(self.buffer)
+                # Lifetime counters remain monotonic across replay eviction and
+                # checkpoint resume. Buffer occupancy is available separately
+                # via len(buffer); it must not overwrite restored counters.
+                self.stats.transitions_collected += len(episode.transitions)
+                self.stats.bidding_transitions_collected += len(
+                    episode.bidding_transitions
+                )
+                self.stats.redeals += episode.redeal_count
 
     def _run_one_episode(self) -> Episode:
         """Play one game to terminal, recording decisions and labels."""
@@ -575,6 +707,39 @@ class V2Trainer:
                     f"loop in the env or the decision policy."
                 )
             steps += 1
+            if self.standard_mode and env.bidding_obs is not None:
+                bid_obs = get_bidding_obs_v2(
+                    env.bidding_obs,
+                    ruleset=self.ruleset,
+                    redeal_count=env._redeal_count,
+                )
+                bid, source_policy = self._choose_bidding_action(bid_obs)
+                episode.bidding_transitions.append(BiddingTransition(
+                    obs=bid_obs,
+                    bid_action=bid,
+                    policy_version=policy_version_at_start,
+                    source_policy=source_policy,
+                ))
+                _obs_out, _reward, done, info = env.step(None, bid_value=bid)
+                if done and info.get("redeal"):
+                    # The abandoned deal has no landlord outcome. Never attach
+                    # the later deal's terminal result to these bid decisions.
+                    episode.abandoned_bidding_transitions += len(
+                        episode.bidding_transitions
+                    )
+                    episode.bidding_transitions.clear()
+                    episode.redeal_count = int(info["redeal_count"])
+                    env.redeal()
+                    continue
+                if done:
+                    raise RuntimeError(
+                        "bidding ended the episode without a terminal card-play result"
+                    )
+                if env.bidding_obs is not None:
+                    continue
+                # Landlord assignment and bottom reveal completed; roles now
+                # exist and the next iteration enters ordinary card play.
+                continue
             position = env._acting_player_position
             infoset = env.infoset
             legal_actions = infoset.legal_actions
@@ -593,6 +758,7 @@ class V2Trainer:
                         action_index=action_index,
                         position=position,
                         trace_index=len(episode.action_trace),
+                        policy_id=policy_version_at_start,
                     )
                 )
             episode.action_trace.append((position, tuple(sorted(action))))
@@ -613,6 +779,11 @@ class V2Trainer:
 
         if opening is None or self.coach_label_store is None:
             return
+        if episode.redeal_count:
+            # A redeal replaces the coach-selected deck. Labelling the original
+            # opening with the replacement game's result would corrupt the
+            # curriculum dataset.
+            return
         from douzero.coach import CoachLabel
 
         if not episode.policy_version_at_start or episode.policy_step_at_start < 0:
@@ -627,22 +798,30 @@ class V2Trainer:
             policy_step=episode.policy_step_at_start,
         ))
 
-    def _compute_belief_feature(self, obs) -> "torch.Tensor | None":
-        """Compute the (frozen) belief posterior feature for one observation.
-
-        Returns the 48-dim feature vector (detached) built from ``obs.public``
-        via the frozen :class:`BeliefModel`, or ``None`` when belief fusion is
-        disabled (so the value model's fail-closed path is not triggered and
-        ``belief_features`` is simply omitted). Always runs under
-        ``inference_mode`` and never builds a graph — the belief model is a
-        frozen feature source, not an optimization target.
-        """
+    def _compute_belief_feature(
+        self, obs, *, differentiable: bool = False
+    ) -> "torch.Tensor | None":
+        """Compute a public-only exact or differentiable posterior feature."""
         if self.belief_model is None:
             return None
         from douzero.belief import build_belief_input
-        from douzero.belief.model import belief_features_from_probs
+        from douzero.belief.model import (
+            belief_features_from_probs,
+            belief_features_from_torch_probs,
+        )
 
         binput = build_belief_input(obs.public)
+        if differentiable:
+            if self.belief_training_mode == "frozen":
+                raise RuntimeError(
+                    "differentiable belief features were requested in frozen mode"
+                )
+            bout = self.belief_model([binput], differentiable=True)
+            return belief_features_from_torch_probs(
+                bout.require_differentiable_probs(),
+                bout.opponent_a_total,
+                np.stack([binput.unseen_counts]),
+            )[0].to(self.device)
         with torch.inference_mode():
             bout = self.belief_model([binput])
             feat_np = belief_features_from_probs(
@@ -657,16 +836,29 @@ class V2Trainer:
     def _forward_bundle(self, bundle, belief_features=None):
         """Move one variable-action decision to the learner rank and forward."""
         return self._forward_bundle_with(
-            self.model, bundle, belief_features=belief_features
+            self.model,
+            bundle,
+            belief_features=belief_features,
+            belief_stop_gradient=self.belief_training_mode != "joint",
         )
 
     def _inference_forward_bundle(self, bundle, belief_features=None):
         """Forward rank-local self-play without entering a DDP sync point."""
         return self._forward_bundle_with(
-            self.inference_model, bundle, belief_features=belief_features
+            self.inference_model,
+            bundle,
+            belief_features=belief_features,
+            belief_stop_gradient=True,
         )
 
-    def _forward_bundle_with(self, model, bundle, belief_features=None):
+    def _forward_bundle_with(
+        self,
+        model,
+        bundle,
+        belief_features=None,
+        *,
+        belief_stop_gradient: bool = True,
+    ):
         """Move one variable-action decision to the learner device and forward."""
         bundle.to(self.device)
         if belief_features is not None:
@@ -683,11 +875,12 @@ class V2Trainer:
                 bundle.action_mask,
                 bundle.acting_role,
                 belief_features=belief_features,
+                belief_stop_gradient=belief_stop_gradient,
                 strategy_features=bundle.strategy_features,
                 style_features=bundle.style_features,
             )
 
-    def _compute_bc_aux_loss(self):
+    def _compute_bc_aux_loss(self, *, differentiable_belief: bool = False):
         """Sample a BC minibatch and return the averaged listwise BC loss.
 
         P08 task 11 (RL + BC combination). Forwards each sampled BC sample's
@@ -716,7 +909,9 @@ class V2Trainer:
             # model FAILS CLOSED at forward when belief_features are omitted,
             # so without this the P07+P08 combo would crash at every optimizer
             # step. The features come from the PUBLIC observation only.
-            belief_features = self._compute_belief_feature(s.obs)
+            belief_features = self._compute_belief_feature(
+                s.obs, differentiable=differentiable_belief
+            )
             out = self._forward_bundle(bundle, belief_features)
             if out.prior_logit is None:
                 raise RuntimeError(
@@ -734,6 +929,59 @@ class V2Trainer:
             per_decision.append((loss, hit))
         return average_bc_losses(per_decision)
 
+    def _belief_phase_for_step(self) -> str:
+        """Return ``frozen``, ``joint``, ``value``, or ``belief``."""
+        if self.belief_training_mode != "alternating":
+            return self.belief_training_mode
+        block = self.stats.optimizer_steps // self.config.belief_alternating_interval
+        return "value" if block % 2 == 0 else "belief"
+
+    def _configure_belief_phase(self, phase: str) -> None:
+        """Select exactly the parameters owned by this optimizer phase."""
+        value_trainable = phase != "belief"
+        belief_trainable = phase in {"joint", "belief"}
+        for parameter in self._value_parameters:
+            parameter.requires_grad_(value_trainable)
+        for parameter in self._belief_parameters:
+            parameter.requires_grad_(belief_trainable)
+        self.stats.belief_phase = phase
+        if self.belief_model is not None:
+            self.belief_model.train(belief_trainable)
+
+    def _restore_belief_trainability(self) -> None:
+        """Restore stable between-step flags after an alternating phase."""
+        for parameter in self._value_parameters:
+            parameter.requires_grad_(True)
+        belief_trainable = self.belief_training_mode != "frozen"
+        for parameter in self._belief_parameters:
+            parameter.requires_grad_(belief_trainable)
+        if self.belief_model is not None:
+            self.belief_model.eval()
+
+    def _compute_belief_supervised_loss(self):
+        """Compute masked CE from public inputs and privileged targets.
+
+        Privileged allocations are consumed only as loss targets. They are
+        never passed to ``BeliefModel.forward`` or to the public value model.
+        """
+        from douzero.belief.losses import belief_loss
+
+        batch_size = self.config.belief_supervised_batch_size
+        indices = [
+            self.rng.randrange(len(self.belief_supervised_samples))
+            for _ in range(batch_size)
+        ]
+        samples = [self.belief_supervised_samples[index] for index in indices]
+        output = self.belief_model(
+            [sample.binput for sample in samples], differentiable=True
+        )
+        targets = torch.as_tensor(
+            np.stack([sample.label.count_onehot for sample in samples]),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        return belief_loss(output.logits, targets, output.legal)
+
     def _choose_action_index(self, obs) -> int:
         """Epsilon-greedy action selection over the model's valid actions."""
         if self.config.exp_epsilon > 0.0 and self.rng.random() < self.config.exp_epsilon:
@@ -749,6 +997,27 @@ class V2Trainer:
             )
             out = self._inference_forward_bundle(bundle, belief_features)
         return select_action(out, self.decision_config)
+
+    def _choose_bidding_action(self, obs) -> tuple[int, str]:
+        if self.bidding_policy_config is None:
+            raise RuntimeError("bidding decision requested outside standard mode")
+
+        def learned_selector(bidding_obs) -> int:
+            if (
+                self.config.exp_epsilon > 0.0
+                and self.rng.random() < self.config.exp_epsilon
+            ):
+                return int(self.rng.choice(bidding_obs.legal_bids))
+            with torch.inference_mode(), self.mixed_precision.autocast():
+                out = self.inference_model.forward_bidding(bidding_obs)
+            return out.argmax_bid()
+
+        return select_bidding_action(
+            obs,
+            self.bidding_policy_config,
+            self.rng,
+            learned_selector,
+        )
 
     # ------------------------------------------------------------------ #
     # Optimization (fail-closed on non-finite loss / gradient)
@@ -775,6 +1044,256 @@ class V2Trainer:
         if state["cuda"] is not None:
             torch.cuda.set_rng_state(state["cuda"], self.device)
 
+    @staticmethod
+    def _encode_numpy_rng_state(state) -> dict:
+        return {
+            "algorithm": state[0],
+            "keys": state[1].tolist(),
+            "position": int(state[2]),
+            "has_gauss": int(state[3]),
+            "cached_gaussian": float(state[4]),
+        }
+
+    @staticmethod
+    def _decode_numpy_rng_state(state: dict):
+        return (
+            state["algorithm"],
+            np.asarray(state["keys"], dtype=np.uint32),
+            int(state["position"]),
+            int(state["has_gauss"]),
+            float(state["cached_gaussian"]),
+        )
+
+    def save_training_checkpoint(self, path: str) -> dict:
+        """Atomically save resumable optimizer/counter/RNG and identity state."""
+        from douzero.observation.bidding import (
+            BIDDING_ACTION_SCHEMA_VERSION,
+            BIDDING_HEAD_VERSION,
+        )
+
+        active_ruleset = self.ruleset or RuleSet.legacy()
+        bidding_schema_hash = ""
+        if self.model.config.bidding_enabled:
+            bidding_schema_hash = self.model.bidding_schema.stable_hash()
+        belief_config_hash = ""
+        if self.belief_model is not None:
+            belief_config_hash = self.belief_model.config.stable_hash()
+        coupled_belief = self.belief_training_mode != "frozen"
+        source_sha = git_sha()
+        if (
+            source_sha == "unknown"
+            or len(source_sha) not in (40, 64)
+            or any(char not in "0123456789abcdef" for char in source_sha)
+        ):
+            raise RuntimeError(
+                "resumable trainer checkpoints require a full source Git SHA; "
+                "build from a Git checkout or set DOUZERO_GIT_SHA"
+            )
+        bundle = {
+            # Version 1 is intentionally retained byte-for-field compatible
+            # for frozen mode. Version 2 is an atomic belief+value bundle.
+            "checkpoint_version": 2 if coupled_belief else 1,
+            "source_git_sha": source_sha,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "stats": asdict(self.stats),
+            "policy_version": self.policy_version,
+            "policy_step": self.policy_step,
+            "feature_schema_hash": self.model.schema.stable_hash(),
+            "model_config_hash": self.model.config.stable_hash(),
+            "model_config_identity_version": self.model.config.IDENTITY_VERSION,
+            "ruleset_id": active_ruleset.ruleset_id,
+            "ruleset_version": active_ruleset.ruleset_version,
+            "ruleset_hash": active_ruleset.stable_hash(),
+            "bidding_head_version": (
+                BIDDING_HEAD_VERSION if self.model.config.bidding_enabled else ""
+            ),
+            "bidding_action_schema": (
+                BIDDING_ACTION_SCHEMA_VERSION
+                if self.model.config.bidding_enabled else ""
+            ),
+            "bidding_feature_schema_hash": bidding_schema_hash,
+            "belief_config_hash": belief_config_hash,
+            "loss_config": self.loss_fn.config.to_dict(),
+            "bidding_policy_config": (
+                asdict(self.bidding_policy_config)
+                if self.bidding_policy_config is not None else None
+            ),
+            "counters": {
+                "curriculum_game_index": self._curriculum_game_index,
+                "league_game_index": self._league_game_index,
+                "opening_prediction_sum": self._opening_prediction_sum,
+                "opening_prediction_count": self._opening_prediction_count,
+            },
+            "rng": {
+                "trainer": self.rng.getstate(),
+                "python": random.getstate(),
+                "numpy": self._encode_numpy_rng_state(np.random.get_state()),
+                "torch": torch.random.get_rng_state(),
+                "cuda": (
+                    torch.cuda.get_rng_state(self.device)
+                    if self.device.type == "cuda" else None
+                ),
+            },
+        }
+        if coupled_belief:
+            bundle.update({
+                "belief_training_mode": self.belief_training_mode,
+                "belief_state_dict": self.belief_model.state_dict(),
+                "belief_public_input_contract": "belief_input_public_v1",
+                "belief_supervised_weight": self.belief_supervised_weight,
+                "belief_alternating_interval": self.config.belief_alternating_interval,
+                "belief_supervised_batch_size": self.config.belief_supervised_batch_size,
+            })
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + ".tmp")
+        torch.save(bundle, temporary)
+        os.replace(temporary, destination)
+        identity_keys = [
+            "checkpoint_version", "source_git_sha", "policy_version",
+            "feature_schema_hash", "model_config_hash",
+            "ruleset_id", "ruleset_version", "ruleset_hash",
+            "bidding_head_version", "bidding_action_schema",
+            "bidding_feature_schema_hash", "belief_config_hash",
+            "loss_config", "bidding_policy_config",
+        ]
+        if coupled_belief:
+            identity_keys.extend([
+                "belief_training_mode", "belief_public_input_contract",
+                "belief_supervised_weight", "belief_alternating_interval",
+                "belief_supervised_batch_size",
+            ])
+        return {
+            key: bundle[key]
+            for key in identity_keys
+        }
+
+    def load_training_checkpoint(self, path: str) -> dict:
+        """Strictly restore a checkpoint saved by :meth:`save_training_checkpoint`."""
+        from douzero.checkpoint.io import CheckpointCompatibilityError
+        from douzero.observation.bidding import (
+            BIDDING_ACTION_SCHEMA_VERSION,
+            BIDDING_HEAD_VERSION,
+        )
+
+        bundle = torch.load(path, map_location=self.device, weights_only=True)
+        expected_version = 1 if self.belief_training_mode == "frozen" else 2
+        if (
+            not isinstance(bundle, dict)
+            or bundle.get("checkpoint_version") != expected_version
+        ):
+            raise CheckpointCompatibilityError("unsupported V2 trainer checkpoint")
+        active_ruleset = self.ruleset or RuleSet.legacy()
+        source_sha = git_sha()
+        if (
+            source_sha == "unknown"
+            or len(source_sha) not in (40, 64)
+            or any(char not in "0123456789abcdef" for char in source_sha)
+        ):
+            raise CheckpointCompatibilityError(
+                "resumable trainer checkpoints require a full runtime Git SHA"
+            )
+        expected = {
+            "source_git_sha": source_sha,
+            "policy_version": self.policy_version,
+            "feature_schema_hash": self.model.schema.stable_hash(),
+            "model_config_hash": self.model.config.stable_hash(),
+            "model_config_identity_version": self.model.config.IDENTITY_VERSION,
+            "ruleset_id": active_ruleset.ruleset_id,
+            "ruleset_version": active_ruleset.ruleset_version,
+            "ruleset_hash": active_ruleset.stable_hash(),
+            "bidding_head_version": (
+                BIDDING_HEAD_VERSION if self.model.config.bidding_enabled else ""
+            ),
+            "bidding_action_schema": (
+                BIDDING_ACTION_SCHEMA_VERSION
+                if self.model.config.bidding_enabled else ""
+            ),
+            "bidding_feature_schema_hash": (
+                self.model.bidding_schema.stable_hash()
+                if self.model.config.bidding_enabled else ""
+            ),
+            "belief_config_hash": (
+                self.belief_model.config.stable_hash()
+                if self.belief_model is not None else ""
+            ),
+            "loss_config": self.loss_fn.config.to_dict(),
+            "bidding_policy_config": (
+                asdict(self.bidding_policy_config)
+                if self.bidding_policy_config is not None else None
+            ),
+        }
+        if self.belief_training_mode != "frozen":
+            expected.update({
+                "belief_training_mode": self.belief_training_mode,
+                "belief_public_input_contract": "belief_input_public_v1",
+                "belief_supervised_weight": self.belief_supervised_weight,
+                "belief_alternating_interval": self.config.belief_alternating_interval,
+                "belief_supervised_batch_size": self.config.belief_supervised_batch_size,
+            })
+        for name, value in expected.items():
+            if bundle.get(name) != value:
+                raise CheckpointCompatibilityError(
+                    f"V2 trainer checkpoint {name} mismatch: checkpoint has "
+                    f"{bundle.get(name)!r}, runtime expects {value!r}"
+                )
+        counters = bundle.get("counters")
+        required_counters = {
+            "curriculum_game_index", "league_game_index",
+            "opening_prediction_sum", "opening_prediction_count",
+        }
+        if not isinstance(counters, dict) or set(counters) != required_counters:
+            raise CheckpointCompatibilityError(
+                "V2 trainer checkpoint has invalid resumable counters"
+            )
+        for name in (
+            "curriculum_game_index", "league_game_index",
+            "opening_prediction_count",
+        ):
+            value = counters[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise CheckpointCompatibilityError(
+                    f"V2 trainer checkpoint counter {name} must be non-negative int"
+                )
+        opening_prediction_sum = counters["opening_prediction_sum"]
+        if (
+            isinstance(opening_prediction_sum, bool)
+            or not isinstance(opening_prediction_sum, (int, float))
+            or not math.isfinite(opening_prediction_sum)
+        ):
+            raise CheckpointCompatibilityError(
+                "V2 trainer checkpoint opening_prediction_sum must be finite"
+            )
+        self.model.load_state_dict(bundle["model_state_dict"], strict=True)
+        if self.belief_training_mode != "frozen":
+            belief_state = bundle.get("belief_state_dict")
+            if not isinstance(belief_state, dict):
+                raise CheckpointCompatibilityError(
+                    "coupled trainer checkpoint is missing belief_state_dict"
+                )
+            self.belief_model.load_state_dict(belief_state, strict=True)
+        self.optimizer.load_state_dict(bundle["optimizer_state_dict"])
+        self.stats = TrainerStats(**bundle["stats"])
+        self.policy_version = str(bundle["policy_version"])
+        self.policy_step = int(bundle["policy_step"])
+        self._curriculum_game_index = int(counters["curriculum_game_index"])
+        self._league_game_index = int(counters["league_game_index"])
+        self._opening_prediction_sum = float(counters["opening_prediction_sum"])
+        self._opening_prediction_count = int(counters["opening_prediction_count"])
+        rng = bundle["rng"]
+        self.rng.setstate(rng["trainer"])
+        random.setstate(rng["python"])
+        np.random.set_state(self._decode_numpy_rng_state(rng["numpy"]))
+        torch.random.set_rng_state(rng["torch"].cpu())
+        if rng["cuda"] is not None:
+            torch.cuda.set_rng_state(rng["cuda"], self.device)
+        self.model.eval()
+        if self.belief_model is not None:
+            self.belief_model.eval()
+        self._restore_belief_trainability()
+        return {name: bundle[name] for name in expected}
+
     def step(self) -> LossComponents | None:
         """Run one optimizer step on a sampled minibatch.
 
@@ -786,26 +1305,45 @@ class V2Trainer:
         :class:`FloatingPointError`.
         """
         local_batch_ready = len(self.buffer) >= self.config.batch_size
+        if self.bidding_loss_weight > 0:
+            local_batch_ready = (
+                local_batch_ready
+                and len(self.bidding_buffer) >= self.config.batch_size
+            )
         if not self.distributed.all_true(local_batch_ready):
             return None
         batch = self.buffer.sample_minibatch(self.config.batch_size, rng=self.rng)
         if batch is None:
             raise RuntimeError("replay buffer reported ready but returned no minibatch")
+        bidding_batch = None
+        if self.bidding_loss_weight > 0:
+            bidding_batch = self.bidding_buffer.sample(
+                self.config.batch_size, self.rng
+            )
+            if bidding_batch is None:
+                raise RuntimeError(
+                    "bidding replay reported ready but returned no minibatch"
+                )
 
         # P06 r4: use try/finally so model.eval() + gradient cleanup are
         # guaranteed even when clip_grad_norm_(error_if_nonfinite=True) or
         # the non-finite-loss guard raises. Without this, an exception
         # leaves the model in training mode, and subsequent self-play
         # collection would run with dropout active.
+        belief_phase = self._belief_phase_for_step()
+        self._configure_belief_phase(belief_phase)
+        differentiable_belief = self.belief_training_mode != "frozen"
         self.model.train()
         try:
             components = None
             aux_diag: dict[str, float] = {}
             bc_diag: dict[str, float] = {}
+            bid_diag: dict[str, float] = {}
+            belief_diag: dict[str, float] = {}
             win_logit = score_if_win = score_if_loss = None
 
             def loss_closure():
-                nonlocal components, aux_diag, bc_diag
+                nonlocal components, aux_diag, bc_diag, bid_diag, belief_diag
                 nonlocal win_logit, score_if_win, score_if_loss
                 gathered_win: list[torch.Tensor] = []
                 gathered_siw: list[torch.Tensor] = []
@@ -821,7 +1359,10 @@ class V2Trainer:
                         style_enabled=self.model.config.style_enabled,
                     )
                     out = self._forward_bundle(
-                        bundle, self._compute_belief_feature(obs)
+                        bundle,
+                        self._compute_belief_feature(
+                            obs, differentiable=differentiable_belief
+                        ),
                     )
                     idx = int(batch.action_indices[i].item())
                     gathered_win.append(out.win_logit[idx : idx + 1])
@@ -880,12 +1421,36 @@ class V2Trainer:
                     )
                     total = total + aux_components.total
                     aux_diag = aux_components.as_log_dict()
+                bid_diag = {}
+                if bidding_batch is not None:
+                    bid_outputs = []
+                    for transition in bidding_batch.transitions:
+                        with self.mixed_precision.autocast():
+                            bid_outputs.append(
+                                self.model.forward_bidding(transition.obs)
+                            )
+                    cfg = self.loss_fn.config
+                    bid_components = bidding_loss(
+                        bid_outputs,
+                        bidding_batch,
+                        lambda_policy=cfg.lambda_bid_policy,
+                        lambda_landlord_win=cfg.lambda_bid_win,
+                        lambda_landlord_score=cfg.lambda_bid_score,
+                        lambda_regret=cfg.lambda_bid_regret,
+                        score_delta=cfg.score_delta,
+                        score_target_transform=cfg.score_target_transform,
+                        score_clamp=cfg.score_clamp,
+                    )
+                    total = total + bid_components.total
+                    bid_diag = bid_components.as_log_dict()
                 eff_lambda = self.bc_schedule.effective_lambda(
                     self.stats.optimizer_steps
                 )
                 bc_diag = {}
                 if eff_lambda > 0.0:
-                    bc_term = self._compute_bc_aux_loss()
+                    bc_term = self._compute_bc_aux_loss(
+                        differentiable_belief=differentiable_belief
+                    )
                     total = total + eff_lambda * bc_term.total
                     bc_diag = {
                         "bc_cross_entropy": bc_term.cross_entropy,
@@ -896,10 +1461,25 @@ class V2Trainer:
                         "bc_effective_lambda": eff_lambda,
                         "bc_num_decisions": bc_term.num_decisions,
                     }
+                belief_diag = {}
+                if (
+                    self.belief_supervised_weight > 0
+                    and belief_phase in {"joint", "belief"}
+                ):
+                    belief_term = self._compute_belief_supervised_loss()
+                    belief_diag = belief_term.as_log_dict()
+                    weighted_belief = self.belief_supervised_weight * belief_term.total
+                    if belief_phase == "belief":
+                        # Strict alternating phase: only the supervised belief
+                        # target updates parameters; every value parameter is
+                        # frozen by _configure_belief_phase.
+                        total = weighted_belief
+                    else:
+                        total = total + weighted_belief
                 return total
 
             step_result = self.mixed_precision.step(
-                loss_closure, self.optimizer, self.model.parameters(),
+                loss_closure, self.optimizer, self._optimizer_parameters,
                 max_grad_norm=self.config.max_grad_norm,
                 clip_grad_norm=nn.utils.clip_grad_norm_,
                 collective_all_true=self.distributed.all_true,
@@ -913,6 +1493,8 @@ class V2Trainer:
             grad_norm = step_result.grad_norm
             self.stats.amp_fallbacks = self.mixed_precision.fallback_count
             self.stats.optimizer_steps += 1
+            if belief_diag:
+                self.stats.belief_supervised_steps += 1
             # Merge BC diagnostics into the last_loss log dict when active.
             loss_log = components.as_log_dict()
             loss_log["loss_total"] = float(total_loss.detach().float().item())
@@ -923,6 +1505,13 @@ class V2Trainer:
                 # Round 6 suggestion: loss_total must reflect the ACTUAL total
                 # that was back-propagated (RL + BC), not just the RL part.
                 loss_log["loss_total"] = float(total_loss.detach().item())
+            if bid_diag:
+                loss_log.update(bid_diag)
+                loss_log["loss_total"] = float(total_loss.detach().float().item())
+            if belief_diag:
+                loss_log.update(belief_diag)
+                loss_log["belief_supervised_weight"] = self.belief_supervised_weight
+                loss_log["loss_total"] = float(total_loss.detach().float().item())
             self.stats.last_loss = loss_log
             self.stats.grad_norm_last_step = float(grad_norm.detach().float().item())
             # p_win distribution diagnostics.
@@ -943,6 +1532,7 @@ class V2Trainer:
             # runs without dropout and without stale .grad accumulations.
             self.model.eval()
             self.optimizer.zero_grad(set_to_none=True)
+            self._restore_belief_trainability()
 
     def train(self) -> TrainerStats:
         """Run the configured number of episodes + optimizer steps.
@@ -953,16 +1543,25 @@ class V2Trainer:
         ``batch_size``, or explicitly set ``optimizer_steps=0`` for a
         collect-only run.
         """
-        # Snapshot one parameter for the "parameters changed" smoke check.
-        before = next(self.model.parameters()).detach().clone()
+        # Watch each independently-trainable path. In particular, a bid-only
+        # run must not be reported unchanged merely because the first card
+        # encoder parameter correctly received no gradient.
+        watched = [next(self.model.parameters())]
+        if self.model.bidding_heads is not None:
+            watched.append(next(self.model.bidding_heads.parameters()))
+        if self.belief_model is not None and self.belief_training_mode != "frozen":
+            watched.append(next(self.belief_model.parameters()))
+        before = [parameter.detach().clone() for parameter in watched]
         self.collect_episodes()
         steps_taken = 0
         for _ in range(self.config.optimizer_steps):
             result = self.step()
             if result is not None:
                 steps_taken += 1
-        after = next(self.model.parameters()).detach().clone()
-        self.stats_last_run_changed = not torch.equal(before, after)
+        self.stats_last_run_changed = any(
+            not torch.equal(snapshot, parameter.detach())
+            for snapshot, parameter in zip(before, watched)
+        )
         if self.config.optimizer_steps > 0 and steps_taken < self.config.optimizer_steps:
             raise RuntimeError(
                 f"requested {self.config.optimizer_steps} optimizer steps but "

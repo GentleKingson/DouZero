@@ -72,6 +72,12 @@ class Env:
         # Standard-mode: redeal counter (bounded by ruleset.max_redeals).
         self._redeal_count = 0
 
+    def _current_bidding_observation(self):
+        """Return the public bidding state with session-level redeal metadata."""
+        obs = self._env.get_bidding_obs()
+        obs["redeal_count"] = self._redeal_count
+        return obs
+
     def reset(self, opening=None):
         """
         Every time reset is called, the environment
@@ -127,7 +133,7 @@ class Env:
             self._env.card_play_init_standard(
                 card_play_data, bidding_order=bidding_order
             )
-            self.bidding_obs = self._env.get_bidding_obs()
+            self.bidding_obs = self._current_bidding_observation()
             self.infoset = None
             return self.bidding_obs
 
@@ -166,7 +172,7 @@ class Env:
         for key in card_play_data:
             card_play_data[key].sort()
         self._env.card_play_init_standard(card_play_data)
-        self.bidding_obs = self._env.get_bidding_obs()
+        self.bidding_obs = self._current_bidding_observation()
         self.infoset = None
         return self.bidding_obs
 
@@ -248,7 +254,7 @@ class Env:
 
         if self._env.phase == PHASE_BIDDING:
             # More bids to go.
-            self.bidding_obs = self._env.get_bidding_obs()
+            self.bidding_obs = self._current_bidding_observation()
             return self.bidding_obs, 0.0, False, {}
 
         # Bidding complete; transitioned to PLAYING.

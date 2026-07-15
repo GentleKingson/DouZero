@@ -12,12 +12,19 @@ from typing import Callable, Mapping
 
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
+from douzero.observation.bidding import BiddingObservationV2, get_bidding_obs_v2
 from douzero.observation.encode_v2 import ObservationV2, get_obs_v2
+from douzero.training.bidding import (
+    BiddingPolicyConfig,
+    BiddingTransition,
+    select_bidding_action,
+)
 from douzero.training.v2_buffer import Episode, Transition
 
 from .policy_pool import LoadedPolicySelector, PolicyBundle, PolicyPool
 
 ActionSelector = Callable[[ObservationV2], int]
+BiddingSelector = Callable[[BiddingObservationV2], tuple[int, str] | int]
 
 
 @dataclass(frozen=True)
@@ -31,6 +38,10 @@ class MatchupRecord:
     winner_team: str
     score: float
     policy_bundle_hash: str
+    bid_value: int = 0
+    redeal_count: int = 0
+    bidding_transitions: int = 0
+    abandoned_bidding_transitions: int = 0
 
 
 class MatchupLogger:
@@ -64,14 +75,17 @@ class PopulationEpisodeRunner:
         current_selector: ActionSelector,
         *,
         opponent_selectors: Mapping[str, LoadedPolicySelector] | None = None,
+        current_bidding_selector: BiddingSelector | None = None,
+        bidding_policy_config: BiddingPolicyConfig | None = None,
         ruleset: RuleSet | None = None,
         max_steps: int = 600,
         logger: MatchupLogger | None = None,
     ) -> None:
-        if ruleset is not None:
-            raise NotImplementedError(
-                "PopulationEpisodeRunner currently supports legacy card-play "
-                "mode only; a standard-rules bidding driver is not yet wired."
+        if ruleset is not None and ruleset.ruleset_id != "standard":
+            raise ValueError("population ruleset must be standard or None")
+        if ruleset is not None and current_bidding_selector is None:
+            raise ValueError(
+                "standard population self-play requires current_bidding_selector"
             )
         self.pool = pool
         self.current_selector = current_selector
@@ -84,6 +98,8 @@ class PopulationEpisodeRunner:
                 )
             pool.validate_loaded_selector(selector)
         self.ruleset = ruleset
+        self.current_bidding_selector = current_bidding_selector
+        self.bidding_policy_config = bidding_policy_config or BiddingPolicyConfig()
         self.max_steps = max_steps
         self.logger = logger
 
@@ -108,16 +124,101 @@ class PopulationEpisodeRunner:
             policy_version_at_start=policy_version_at_start,
             policy_step_at_start=policy_step_at_start,
         )
+        # In standard mode the bundle is assigned to physical seats before a
+        # landlord exists. These canonical labels are only bundle slots; after
+        # bidding we remap the same fixed policies to actual roles.
+        neutral_to_bundle_seat = {
+            "0": "landlord",
+            "1": "landlord_up",
+            "2": "landlord_down",
+        }
         for _ in range(self.max_steps):
             bundle.assert_unchanged(expected_bundle_hash)
+            if self.ruleset is not None and env.bidding_obs is not None:
+                bidding_obs = get_bidding_obs_v2(
+                    env.bidding_obs,
+                    ruleset=self.ruleset,
+                    redeal_count=env._redeal_count,
+                )
+                neutral_seat = bidding_obs.current_seat
+                bundle_seat = neutral_to_bundle_seat[neutral_seat]
+                policy_id = bundle.policy_ids_by_seat[bundle_seat]
+                source_policy = "learned"
+                if policy_id == self.pool.current.policy_id:
+                    selected = self.current_bidding_selector(bidding_obs)
+                    if isinstance(selected, tuple):
+                        bid, source_policy = int(selected[0]), str(selected[1])
+                    else:
+                        bid = int(selected)
+                elif policy_id == "builtin-random":
+                    bid = int(rng.choice(bidding_obs.legal_bids))
+                    source_policy = "random"
+                elif policy_id == "builtin-rule":
+                    bid, source_policy = select_bidding_action(
+                        bidding_obs, BiddingPolicyConfig(policy="rule"), rng
+                    )
+                else:
+                    try:
+                        selector = self.opponent_selectors[policy_id]
+                    except KeyError as exc:
+                        raise RuntimeError(
+                            f"no bidding selector loaded for policy {policy_id!r}"
+                        ) from exc
+                    bid = selector.bid(bidding_obs)
+                if bid not in bidding_obs.legal_bids:
+                    raise ValueError(
+                        f"policy {policy_id!r} returned illegal bid {bid}"
+                    )
+                if bundle_seat in bundle.learner_controlled_seats:
+                    episode.bidding_transitions.append(BiddingTransition(
+                        obs=bidding_obs,
+                        bid_action=bid,
+                        policy_version=policy_version_at_start,
+                        source_policy=source_policy,
+                    ))
+                _obs, _reward, done, info = env.step(None, bid_value=bid)
+                if done and info.get("redeal"):
+                    episode.abandoned_bidding_transitions += len(
+                        episode.bidding_transitions
+                    )
+                    episode.bidding_transitions.clear()
+                    episode.redeal_count = int(info["redeal_count"])
+                    env.redeal()
+                    continue
+                if done:
+                    raise RuntimeError("bidding ended without terminal card play")
+                if env.bidding_obs is not None:
+                    continue
+                role_to_neutral = {
+                    role: neutral for neutral, role in env._env._seat_to_role.items()
+                }
+                actual_assignments = {
+                    role: bundle.policy_ids_by_seat[
+                        neutral_to_bundle_seat[neutral]
+                    ]
+                    for role, neutral in role_to_neutral.items()
+                }
+                learner_roles = tuple(
+                    role
+                    for role, neutral in role_to_neutral.items()
+                    if neutral_to_bundle_seat[neutral]
+                    in bundle.learner_controlled_seats
+                )
+                episode.policy_ids_by_seat = actual_assignments
+                episode.learner_controlled_seats = learner_roles
+                continue
             position = env._acting_player_position
             infoset = env.infoset
-            policy_id = bundle.policy_ids_by_seat[position]
+            policy_ids = episode.policy_ids_by_seat or dict(bundle.policy_ids_by_seat)
+            learner_seats = episode.learner_controlled_seats or bundle.learner_controlled_seats
+            policy_id = policy_ids[position]
             if len(infoset.legal_actions) == 1:
                 action_index = 0
                 action = infoset.legal_actions[0]
             else:
-                obs = get_obs_v2(infoset, ruleset=RuleSet.legacy())
+                obs = get_obs_v2(
+                    infoset, ruleset=self.ruleset or RuleSet.legacy()
+                )
                 if policy_id == self.pool.current.policy_id:
                     action_index = int(self.current_selector(obs))
                 elif policy_id == "builtin-random":
@@ -150,14 +251,22 @@ class PopulationEpisodeRunner:
                         f"policy {policy_id!r} returned illegal action index {action_index}"
                     )
                 action = infoset.legal_actions[action_index]
-                if position in bundle.learner_controlled_seats:
+                if position in learner_seats:
+                    teammate_policy_id = None
+                    if position != "landlord":
+                        teammate = (
+                            "landlord_down"
+                            if position == "landlord_up"
+                            else "landlord_up"
+                        )
+                        teammate_policy_id = policy_ids[teammate]
                     episode.transitions.append(Transition(
                         obs=obs,
                         action_index=action_index,
                         position=position,
                         trace_index=len(episode.action_trace),
                         policy_id=policy_id,
-                        teammate_policy_id=bundle.teammate_policy_id(position),
+                        teammate_policy_id=teammate_policy_id,
                     ))
             episode.action_trace.append((position, tuple(sorted(action))))
             _obs, _reward, done, info = env.step(action)
@@ -178,15 +287,37 @@ class PopulationEpisodeRunner:
         landlord_target = team_targets.get("landlord", {})
         return MatchupRecord(
             game_index=bundle.game_index,
-            policy_ids_by_seat=dict(bundle.policy_ids_by_seat),
-            learner_controlled_seats=bundle.learner_controlled_seats,
+            policy_ids_by_seat=(
+                dict(episode.policy_ids_by_seat)
+                if episode.policy_ids_by_seat
+                else dict(bundle.policy_ids_by_seat)
+            ),
+            learner_controlled_seats=(
+                episode.learner_controlled_seats
+                or bundle.learner_controlled_seats
+            ),
             teammate_policy_ids={
-                seat: bundle.teammate_policy_id(seat)
-                for seat in bundle.learner_controlled_seats
+                seat: (
+                    None
+                    if seat == "landlord"
+                    else episode.policy_ids_by_seat[
+                        "landlord_down" if seat == "landlord_up" else "landlord_up"
+                    ]
+                )
+                for seat in (
+                    episode.learner_controlled_seats
+                    or bundle.learner_controlled_seats
+                )
             },
-            ruleset_id="legacy",
+            ruleset_id=(self.ruleset.ruleset_id if self.ruleset else "legacy"),
             ruleset_hash=self.pool.runtime_ruleset_hash,
             winner_team=str(terminal.get("winner_team", "")),
             score=float(landlord_target.get("target_score", 0.0)),
             policy_bundle_hash=bundle.bundle_hash,
+            bid_value=int(terminal.get("bid_value", 0)),
+            redeal_count=episode.redeal_count,
+            bidding_transitions=len(episode.bidding_transitions),
+            abandoned_bidding_transitions=(
+                episode.abandoned_bidding_transitions
+            ),
         )

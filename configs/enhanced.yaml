@@ -59,6 +59,15 @@ ddp_enabled: false
 ddp_backend: auto
 compile_model: false
 
+# P17 belief/value optimization. Frozen is byte-compatible with the P07
+# pretrained-belief path. Joint/alternating require model.belief_enabled=true
+# and --belief_checkpoint; alternating also requires supervised samples.
+belief_training_mode: frozen
+belief_supervised_weight: 0.0
+belief_alternating_interval: 1
+belief_supervised_batch_size: 16
+belief_supervised_episodes: 0
+
 # Reproducibility (consumed: seed=0 means no-op per the project convention)
 seed: 0
 deterministic: false
@@ -88,6 +97,11 @@ model:
   role_embedding_dim: 32
   belief_enabled: false
   human_prior_enabled: false
+  # Standard full-game bidding is opt-in. Keeping this false preserves the
+  # exact legacy V2 parameter graph and checkpoint identity.
+  bidding_enabled: false
+  bidding_hidden_size: 128
+  bidding_uncertainty_enabled: false
   # P11 public action-style conditioning. Disabled is exactly the P10 model.
   style_enabled: false
   style_embedding_dim: 64
@@ -117,6 +131,10 @@ loss:
   lambda_win: 1.0
   lambda_score: 0.5
   lambda_uncertainty: 0.0
+  lambda_bid_policy: 0.0
+  lambda_bid_win: 0.0
+  lambda_bid_score: 0.0
+  lambda_bid_regret: 0.0
   # P09 auxiliary objectives. Each is independently ablatable and all default
   # off; non-zero values require model.strategy_aux_enabled: true.
   lambda_min_turns: 0.0
@@ -160,6 +178,13 @@ bc:
   schedule: constant
   schedule_steps: 0
   schedule_floor: 0.0
+
+# P17 public score bidding. Disabled for this legacy-ruleset config.
+bidding:
+  enabled: false
+  policy: rule
+  warm_start_policy: rule
+  learned_probability: 0.0
 
 # P10 privileged-teacher/public-student distillation. Disabled by default so
 # the P06-P09 trainer and every deployment path remain unchanged. Enable only
