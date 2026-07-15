@@ -87,7 +87,11 @@ def render_markdown(result: PairedEvaluationResult) -> str:
         f"{metrics['anti_spring_rate']:.4f} |",
         f"| Inference p50 / p95 / p99 ms | {_format_optional(latency['p50'])} / "
         f"{_format_optional(latency['p95'])} / {_format_optional(latency['p99'])} |",
-        f"| Actor FPS | {_format_optional(metrics['actor_fps'])} |",
+        f"| Actor FPS (P15 alias; inference calls/s) | "
+        f"{_format_optional(metrics['actor_fps'])} |",
+        f"| Search timeout / fallback rate | "
+        f"{_format_optional(metrics['search']['timeout_rate'])} / "
+        f"{_format_optional(metrics['search']['fallback_rate'])} |",
         f"| p_win Brier / NLL / ECE | {_format_optional(calibration['brier'])} / "
         f"{_format_optional(calibration['nll'])} / "
         f"{_format_optional(calibration['ece'])} |",
@@ -140,6 +144,9 @@ def write_report(
         "candidate_log_score", "winner_team", "winner_position", "bid_value",
         "candidate_bid_attempts", "candidate_positive_bids", "candidate_landlord",
         "bomb_count", "rocket_count", "spring", "anti_spring", "game_length",
+        "redeal_count", "max_redeals_exceeded", "search_calls",
+        "search_timeouts", "search_fallbacks",
+        "bidding_inference_calls",
     ]
     with open(paths["csv"], "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(

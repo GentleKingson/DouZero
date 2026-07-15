@@ -41,6 +41,9 @@ class TimedAgent:
     role: str
     latencies_ms: list[float] = field(default_factory=list)
     predictions: list[float] = field(default_factory=list)
+    search_calls: int = 0
+    search_timeouts: int = 0
+    search_fallbacks: int = 0
 
     def act(self, infoset):
         started = time.perf_counter_ns()
@@ -50,6 +53,11 @@ class TimedAgent:
         prediction = getattr(self.inner, "last_p_win", None)
         if prediction is not None:
             self.predictions.append(float(prediction))
+        search_log = getattr(self.inner, "last_search_log", None)
+        if search_log is not None:
+            self.search_calls += 1
+            self.search_timeouts += int(bool(search_log.timed_out))
+            self.search_fallbacks += int(bool(search_log.fallback_reason))
         return action
 
 
@@ -59,6 +67,7 @@ class BundleFactory:
     def __init__(self, ruleset: RuleSet) -> None:
         self.ruleset = ruleset
         self._model_agents: dict[tuple[int, str], Any] = {}
+        self._bidding_models: dict[int, Any] = {}
 
     def build(
         self,
@@ -120,6 +129,52 @@ class BundleFactory:
             )
         raise ValueError(f"unsupported bundle backend {bundle.backend!r}")
 
+    def choose_bid(
+        self,
+        bundle: BundleSpec,
+        bidding_observation: dict[str, Any],
+        legal_bids: list[int],
+        rng: random.Random,
+        *,
+        redeal_count: int,
+    ) -> int:
+        """Select an external or manifest-validated learned bid."""
+
+        if bundle.bidding_policy != "learned":
+            return choose_bid(bundle, bidding_observation, legal_bids, rng)
+        key = id(bundle)
+        if key not in self._bidding_models:
+            from douzero.evaluation.deep_agent import load_v2_model
+            from douzero.models_v2.config import ModelV2Config
+            from douzero.observation.schema import build_v2_schema
+
+            config = ModelV2Config(**dict(bundle.model_config))
+            if not config.bidding_enabled:
+                raise ValueError(
+                    "learned bidding requires model_config.bidding_enabled=true"
+                )
+            self._bidding_models[key] = load_v2_model(
+                bundle.bidding_checkpoint,
+                build_v2_schema(),
+                self.ruleset,
+                config=config,
+                device="cpu",
+            )
+        from douzero.observation.bidding import get_bidding_obs_v2
+
+        observation = get_bidding_obs_v2(
+            {**bidding_observation, "legal_bids": list(legal_bids)},
+            ruleset=self.ruleset,
+            redeal_count=redeal_count,
+        )
+        import torch
+
+        with torch.inference_mode():
+            bid = self._bidding_models[key].forward_bidding(observation).argmax_bid()
+        if bid not in legal_bids:
+            raise RuntimeError("learned bidding model selected an illegal bid")
+        return bid
+
 
 def choose_bid(
     bundle: BundleSpec,
@@ -128,6 +183,11 @@ def choose_bid(
     rng: random.Random,
 ) -> int:
     """Apply the bundle's explicit bidding policy to a public observation."""
+    if bundle.bidding_policy == "learned":
+        raise ValueError(
+            "learned bidding must use BundleFactory.choose_bid so its checkpoint "
+            "identity is validated"
+        )
     if bundle.bidding_policy == "pass":
         return 0
     if bundle.bidding_policy == "max":

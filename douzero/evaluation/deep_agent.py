@@ -362,6 +362,13 @@ class DeepAgentV2:
                 "package: manifest.search_compatible is false. Repackage a model "
                 "that was explicitly validated for search."
             )
+        # A self-contained deployment package attaches its verified public
+        # BeliefModel to the loaded value model. Preserve explicit injection for
+        # training/evaluation callers, while making the packaged model directly
+        # usable by the public agent API.
+        if belief_model is None:
+            belief_model = getattr(self.model, "belief_model", None)
+
         # P07 belief deployment wiring (review blocker #2). A belief-enabled
         # value model REQUIRES a BeliefModel at deployment so the constrained
         # posterior features are computed and fused; without it the value model

@@ -1,4 +1,4 @@
-"""Closed identity constants for promotion-eligible P15 evaluation."""
+"""Versioned P15 evaluation and P17 empirical-readiness policies."""
 
 from __future__ import annotations
 
@@ -12,7 +12,15 @@ EVALUATION_PROTOCOL = "p15_paired_v1"
 PROMOTION_MODE = "cardplay_only"
 PROMOTION_ESTIMATOR = "cardplay_win_rate_delta"
 OFFICIAL_CONFIDENCE_LEVEL = 0.95
+# Preserve the closed P15 v1 promotion contract. P17 raises release-evidence
+# requirements through a separate policy below; changing these values under
+# the same protocol identifier would invalidate previously eligible reports.
 MIN_PROMOTION_BOOTSTRAP_SAMPLES = 1000
+MIN_PROMOTION_PAIRED_DEALS = 0
+
+P17_READINESS_PROTOCOL = "p17_empirical_readiness_v1"
+P17_MIN_BOOTSTRAP_SAMPLES = 2000
+P17_MIN_PAIRED_DEALS = 1000
 
 OFFICIAL_PERMUTATIONS = MappingProxyType({
     "cardplay_only": (

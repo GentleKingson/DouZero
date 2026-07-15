@@ -121,12 +121,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline", default="random")
     parser.add_argument(
         "--candidate-bidding",
-        choices=("rule", "random", "pass", "max"),
+        choices=("rule", "random", "pass", "max", "learned"),
         default="rule",
     )
     parser.add_argument(
         "--baseline-bidding",
-        choices=("rule", "random", "pass", "max"),
+        choices=("rule", "random", "pass", "max", "learned"),
         default="rule",
     )
     parser.add_argument("--model-matrix", default="", help="JSON bundle and ablation registry")

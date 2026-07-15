@@ -12,10 +12,15 @@ from douzero.deployment.abi import MODEL_ABI_VERSION, model_implementation_hash
 from douzero.models_v2.config import SUPPORTED_ROLES
 
 if TYPE_CHECKING:
+    from douzero.belief.model import BeliefConfig
     from douzero.env.rules import RuleSet
     from douzero.models_v2.model import ModelV2
 
-CURRENT_MODEL_FORMAT_VERSION = 1
+# P17 adds audited model/training configuration identities, empirical-summary
+# placeholders, and rollback instructions to every release directory.  Older
+# P16 packages remain readable as files, but are intentionally not accepted by
+# the stricter production verifier without being rebuilt.
+CURRENT_MODEL_FORMAT_VERSION = 2
 PUBLIC_MODEL = "public"
 PRIVILEGED_MODEL = "privileged"
 _ACCESS_CLASSES = frozenset({PUBLIC_MODEL, PRIVILEGED_MODEL})
@@ -48,8 +53,13 @@ class ModelManifest:
     ruleset_hash: str
     git_sha: str
     training_config_hash: str
+    belief_config_hash: str
     role_support: tuple[str, ...]
     belief_enabled: bool
+    bidding_enabled: bool
+    bidding_head_version: str
+    bidding_action_schema: str
+    bidding_feature_schema_hash: str
     search_compatible: bool
     public_or_privileged: str
     dtype: str
@@ -73,6 +83,7 @@ class ModelManifest:
             "ruleset_hash",
             "git_sha",
             "training_config_hash",
+            "belief_config_hash",
         ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value:
@@ -83,6 +94,7 @@ class ModelManifest:
             "model_config_hash",
             "ruleset_hash",
             "training_config_hash",
+            "belief_config_hash",
         ):
             value = getattr(self, name)
             if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
@@ -102,11 +114,34 @@ class ModelManifest:
             )
         if self.dtype not in _DTYPES:
             raise ModelManifestError(f"unsupported dtype {self.dtype!r}")
-        if not isinstance(self.belief_enabled, bool) or not isinstance(
-            self.search_compatible, bool
+        if (
+            not isinstance(self.belief_enabled, bool)
+            or not isinstance(self.bidding_enabled, bool)
+            or not isinstance(self.search_compatible, bool)
         ):
             raise ModelManifestError(
-                "belief_enabled and search_compatible must be booleans"
+                "belief_enabled, bidding_enabled, and search_compatible must be booleans"
+            )
+        bidding_identity = (
+            self.bidding_head_version,
+            self.bidding_action_schema,
+            self.bidding_feature_schema_hash,
+        )
+        if self.bidding_enabled:
+            if not all(isinstance(value, str) and value for value in bidding_identity):
+                raise ModelManifestError(
+                    "bidding-enabled manifests require complete bidding identity"
+                )
+            if len(self.bidding_feature_schema_hash) != 64 or any(
+                char not in "0123456789abcdef"
+                for char in self.bidding_feature_schema_hash
+            ):
+                raise ModelManifestError(
+                    "bidding_feature_schema_hash must be a lowercase SHA-256"
+                )
+        elif any(bidding_identity):
+            raise ModelManifestError(
+                "bidding-disabled manifests must not carry bidding identity"
             )
         if not isinstance(self.required_package_versions, dict) or not all(
             isinstance(k, str) and k and isinstance(v, str) and v
@@ -159,6 +194,7 @@ def build_model_manifest(
     ruleset: "RuleSet",
     *,
     training_config: Mapping[str, Any] | None = None,
+    belief_config: "BeliefConfig | None" = None,
     role_support: tuple[str, ...] = SUPPORTED_ROLES,
     search_compatible: bool = False,
     public_or_privileged: str = PUBLIC_MODEL,
@@ -189,6 +225,42 @@ def build_model_manifest(
             dtype = str(next(model.parameters()).dtype).removeprefix("torch.")
         except StopIteration:
             dtype = "float32"
+    belief_enabled = bool(model.config.belief_enabled)
+    if belief_enabled:
+        from douzero.belief.model import BeliefConfig
+
+        if not isinstance(belief_config, BeliefConfig):
+            raise TypeError(
+                "belief-enabled manifests require an actual BeliefConfig "
+                "identity"
+            )
+        belief_config_hash = belief_config.stable_hash()
+    else:
+        if belief_config is not None:
+            raise TypeError(
+                "belief_config was supplied for a belief-disabled model"
+            )
+        belief_config_hash = canonical_hash(None)
+
+    bidding_enabled = bool(getattr(model.config, "bidding_enabled", False))
+    if bidding_enabled:
+        if ruleset.ruleset_id != "standard":
+            raise ModelManifestError(
+                "learned-bidding packages require the standard ruleset"
+            )
+        from douzero.observation.bidding import (
+            BIDDING_ACTION_SCHEMA_VERSION,
+            BIDDING_HEAD_VERSION,
+            build_bidding_schema,
+        )
+
+        bidding_head_version = BIDDING_HEAD_VERSION
+        bidding_action_schema = BIDDING_ACTION_SCHEMA_VERSION
+        bidding_feature_schema_hash = build_bidding_schema().stable_hash()
+    else:
+        bidding_head_version = ""
+        bidding_action_schema = ""
+        bidding_feature_schema_hash = ""
     return ModelManifest(
         format_version=CURRENT_MODEL_FORMAT_VERSION,
         model_abi_version=MODEL_ABI_VERSION,
@@ -201,8 +273,13 @@ def build_model_manifest(
         ruleset_hash=ruleset.stable_hash(),
         git_sha=source_sha,
         training_config_hash=canonical_hash(training_config),
+        belief_config_hash=belief_config_hash,
         role_support=tuple(role_support),
-        belief_enabled=bool(model.config.belief_enabled),
+        belief_enabled=belief_enabled,
+        bidding_enabled=bidding_enabled,
+        bidding_head_version=bidding_head_version,
+        bidding_action_schema=bidding_action_schema,
+        bidding_feature_schema_hash=bidding_feature_schema_hash,
         search_compatible=bool(search_compatible),
         public_or_privileged=public_or_privileged,
         dtype=dtype,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace
 
 import pytest
@@ -10,9 +11,14 @@ import pytest
 from douzero.env.rules import RuleSet
 from douzero.evaluation.ablation import ABLATION_NAMES, AblationRunner
 from douzero.evaluation.gates import RegressionGateConfig, evaluate_regression_gates
-from douzero.evaluation.paired import evaluate_scenario
+from douzero.evaluation.paired import GameRecord, evaluate_scenario
+from douzero.evaluation.p17 import result_readiness
 from douzero.evaluation.reporting import write_report
-from douzero.evaluation.scenario import BundleSpec, EvaluationScenario
+from douzero.evaluation.scenario import (
+    BundleSpec,
+    EvaluationScenario,
+    bundle_from_dict,
+)
 from douzero.evaluation.statistics import deal_cluster_means, paired_bootstrap_ci
 from evaluate_paired import _load_matrix, generate_deals
 
@@ -28,6 +34,57 @@ def _scenario(mode: str, *, seed: int = 17, deals: int = 2):
         deterministic_seed=seed,
         bootstrap_samples=100,
     )
+
+
+def test_p17_fields_preserve_pre_p17_positional_dataclass_contracts():
+    bundle = BundleSpec(
+        "positional",
+        "rule",
+        {},
+        "max",
+        "pure_win",
+        {},
+        "",
+        {"enabled": False},
+        ("pre-p17",),
+    )
+    assert bundle.search_config == {"enabled": False}
+    assert bundle.tags == ("pre-p17",)
+    assert bundle.bidding_checkpoint == ""
+    matrix_payload = bundle.to_dict(include_paths=True)
+    assert "checkpoint_identities" not in matrix_payload
+    assert bundle_from_dict(matrix_payload) == bundle
+    assert "checkpoint_identities" in bundle.to_dict()
+
+    calibration = (("landlord", 0.75, 1.0),)
+    record = GameRecord(
+        "deal",
+        "leg",
+        "cardplay_only",
+        ("candidate", "baseline", "baseline"),
+        ("landlord",),
+        1.0,
+        1.0,
+        {"landlord": 1.0},
+        {"landlord": 1.0},
+        "landlord",
+        "landlord",
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        False,
+        False,
+        1,
+        (1.25,),
+        calibration,
+    )
+    assert record.candidate_latencies_ms == (1.25,)
+    assert record.calibration == calibration
+    assert record.redeal_count == 0
+    assert record.formal_evaluation_eligible is True
 
 
 def test_deal_cluster_bootstrap_does_not_treat_legs_as_independent():
@@ -86,6 +143,7 @@ def test_cardplay_evaluation_is_reproducible_and_paired_by_deal():
     assert first.metrics["sample_counts"]["deals"] == 2
     assert first.metrics["sample_counts"]["games"] == 4
     assert first.metrics["paired_win_rate_delta_ci"]["paired_deals"] == 2
+    assert first.metrics["actor_fps"] == first.metrics["inference_calls_per_second"]
     assert {game.mode for game in first.games} == {"cardplay_only"}
     with pytest.raises(ValueError, match="at least 1000 bootstrap"):
         first.to_promotion_evaluation()
@@ -183,7 +241,18 @@ def test_full_game_all_pass_is_bounded_and_deterministic():
         game.winner_team for game in second.games
     ]
     assert all(game.bid_value == 1 for game in first.games)
-    assert first.metrics["bid_rate"] == 0.0
+    assert all(not game.formal_evaluation_eligible for game in first.games)
+    assert all(
+        game.exclusion_reason == "redeal_cap_exhausted_forced_smoke_fallback"
+        for game in first.games
+    )
+    assert first.metrics["formal_evaluation"]["excluded_deals"] == 1
+    assert first.metrics["paired_estimate_ci"]["paired_deals"] == 0
+    assert math.isnan(first.metrics["bid_rate"])
+    assert first.metrics["smoke_descriptive"]["bid_rate"] == 0.0
+    readiness = result_readiness(first.to_dict(), mode="full_game")
+    assert readiness["status"] == "insufficient"
+    assert any("redeal cap" in issue for issue in readiness["issues"])
 
 
 def test_report_writes_json_csv_and_markdown_without_nonstandard_nan(tmp_path):

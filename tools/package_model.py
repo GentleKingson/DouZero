@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a strict P16 release package from a public Model V2 sidecar."""
+"""Build a strict P17 release package from manifest-bearing checkpoints."""
 
 from __future__ import annotations
 
@@ -31,6 +31,16 @@ def main() -> int:
     parser.add_argument("--model-config", help="JSON ModelV2Config object")
     parser.add_argument("--training-config", help="JSON training config for audit hash")
     parser.add_argument("--model-card", help="reviewed Markdown model card")
+    parser.add_argument("--evaluation-summary", help="reviewed Markdown evaluation summary")
+    parser.add_argument("--gpu-validation-summary", help="reviewed Markdown GPU validation summary")
+    parser.add_argument("--rollback", help="reviewed Markdown rollback instructions")
+    parser.add_argument(
+        "--belief-checkpoint",
+        help=(
+            "manifest-bearing public belief checkpoint; required when the "
+            "value model has belief_enabled=true"
+        ),
+    )
     parser.add_argument("--max-history-len", type=int, default=100)
     parser.add_argument("--search-compatible", action="store_true")
     args = parser.parse_args()
@@ -39,18 +49,20 @@ def main() -> int:
     config = ModelV2Config(**_json(args.model_config))
     schema = build_v2_schema(max_history_len=args.max_history_len)
     model = load_v2_model(args.checkpoint, schema, ruleset, config, device="cpu")
-    card = (
-        Path(args.model_card).read_text(encoding="utf-8")
-        if args.model_card
-        else None
-    )
+    def markdown(path: str | None) -> str | None:
+        return Path(path).read_text(encoding="utf-8") if path else None
+
     manifest = create_model_package(
         args.output,
         model,
         ruleset,
         training_config=_json(args.training_config),
         search_compatible=args.search_compatible,
-        model_card=card,
+        model_card=markdown(args.model_card),
+        evaluation_summary=markdown(args.evaluation_summary),
+        gpu_validation_summary=markdown(args.gpu_validation_summary),
+        rollback_instructions=markdown(args.rollback),
+        belief_checkpoint=args.belief_checkpoint,
     )
     print(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
     return 0

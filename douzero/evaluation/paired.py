@@ -13,17 +13,23 @@ from typing import Any
 from douzero.env.game import GameEnv
 from douzero.env.rules import PHASE_BIDDING
 
-from .agents import BundleFactory, RuleAgent, TimedAgent, choose_bid
+from .agents import BundleFactory, RuleAgent, TimedAgent
 from .protocol import (
     EVALUATION_PROTOCOL,
     MIN_PROMOTION_BOOTSTRAP_SAMPLES,
+    MIN_PROMOTION_PAIRED_DEALS,
     OFFICIAL_CONFIDENCE_LEVEL,
     OFFICIAL_PERMUTATION_HASHES,
     PROMOTION_ESTIMATOR,
     PROMOTION_MODE,
 )
 from .scenario import ROLES, EvaluationScenario, default_seat_permutations
-from .statistics import deal_cluster_means, paired_bootstrap_ci, percentile
+from .statistics import (
+    ConfidenceInterval,
+    deal_cluster_means,
+    paired_bootstrap_ci,
+    percentile,
+)
 
 
 def _seed(base: int, *parts: object) -> int:
@@ -62,6 +68,18 @@ class GameRecord:
     game_length: int
     candidate_latencies_ms: tuple[float, ...] = ()
     calibration: tuple[tuple[str, float, float], ...] = ()
+    # Every P17 field is appended after the two original defaulted fields so
+    # pre-P17 positional construction retains its exact argument meaning.
+    redeal_count: int = 0
+    max_redeals_exceeded: bool = False
+    search_calls: int = 0
+    search_timeouts: int = 0
+    search_fallbacks: int = 0
+    bidding_inference_calls: int = 0
+    # Forced post-cap gameplay is retained only as an audited smoke row and is
+    # excluded from every formal deal-level estimate.
+    formal_evaluation_eligible: bool = True
+    exclusion_reason: str = ""
 
     @property
     def candidate_log_score(self) -> float:
@@ -92,8 +110,16 @@ class GameRecord:
             "spring": self.spring,
             "anti_spring": self.anti_spring,
             "game_length": self.game_length,
+            "redeal_count": self.redeal_count,
+            "max_redeals_exceeded": self.max_redeals_exceeded,
             "candidate_latencies_ms": list(self.candidate_latencies_ms),
             "calibration": [list(sample) for sample in self.calibration],
+            "search_calls": self.search_calls,
+            "search_timeouts": self.search_timeouts,
+            "search_fallbacks": self.search_fallbacks,
+            "bidding_inference_calls": self.bidding_inference_calls,
+            "formal_evaluation_eligible": self.formal_evaluation_eligible,
+            "exclusion_reason": self.exclusion_reason or None,
         }
 
 
@@ -137,6 +163,11 @@ class PairedEvaluationResult:
             raise ValueError(
                 "promotion requires at least "
                 f"{MIN_PROMOTION_BOOTSTRAP_SAMPLES} bootstrap samples"
+            )
+        if self.metrics["paired_estimate_ci"]["paired_deals"] < MIN_PROMOTION_PAIRED_DEALS:
+            raise ValueError(
+                "promotion requires at least "
+                f"{MIN_PROMOTION_PAIRED_DEALS} paired deals"
             )
         expected_permutations = [
             list(row) for row in default_seat_permutations(PROMOTION_MODE)
@@ -185,6 +216,16 @@ def _candidate_samples(
     return tuple(latencies), tuple(calibration)
 
 
+def _candidate_search_counts(
+    agents: dict[str, TimedAgent], candidate_roles: tuple[str, ...]
+) -> tuple[int, int, int]:
+    return (
+        sum(agents[role].search_calls for role in candidate_roles),
+        sum(agents[role].search_timeouts for role in candidate_roles),
+        sum(agents[role].search_fallbacks for role in candidate_roles),
+    )
+
+
 def _run_cardplay_leg(
     scenario: EvaluationScenario,
     factory: BundleFactory,
@@ -221,6 +262,9 @@ def _run_cardplay_leg(
     role_wins = {role: candidate_win for role in candidate_roles}
     role_scores = {role: candidate_score for role in candidate_roles}
     latencies, calibration = _candidate_samples(agents, candidate_roles, winner_team)
+    search_calls, search_timeouts, search_fallbacks = _candidate_search_counts(
+        agents, candidate_roles
+    )
     return GameRecord(
         deal_id=deal_id,
         leg_id=f"cardplay-{leg_index}",
@@ -244,6 +288,9 @@ def _run_cardplay_leg(
         game_length=len(env.card_play_action_seq),
         candidate_latencies_ms=latencies,
         calibration=calibration,
+        search_calls=search_calls,
+        search_timeouts=search_timeouts,
+        search_fallbacks=search_fallbacks,
     )
 
 
@@ -265,6 +312,9 @@ def _run_full_game_leg(
     env = GameEnv({role: RuleAgent() for role in ROLES}, ruleset=scenario.ruleset)
     candidate_bid_attempts = 0
     candidate_positive_bids = 0
+    redeal_count = 0
+    max_redeals_exceeded = False
+    candidate_bid_latencies_ms: list[float] = []
 
     for _attempt in range(scenario.ruleset.max_redeals + 1):
         env.reset()
@@ -276,14 +326,25 @@ def _run_full_game_leg(
             seat = env.acting_player_position
             label = assignment[int(seat)]
             bundle = scenario.candidate if label == "candidate" else scenario.baseline
-            bid = choose_bid(
-                bundle, env.get_bidding_obs(), env.get_legal_bids(), bid_rng
+            import time
+
+            bid_started = time.perf_counter_ns()
+            bid = factory.choose_bid(
+                bundle,
+                env.get_bidding_obs(),
+                env.get_legal_bids(),
+                bid_rng,
+                redeal_count=redeal_count,
             )
             if label == "candidate":
+                candidate_bid_latencies_ms.append(
+                    (time.perf_counter_ns() - bid_started) / 1_000_000.0
+                )
                 candidate_bid_attempts += 1
                 candidate_positive_bids += int(bid > 0)
             redeal = env.step_bidding(bid)
             if redeal:
+                redeal_count += 1
                 # Redeal decks depend only on the paired deal and retry index,
                 # not on seat permutation or how many random bids were drawn.
                 deck = list(deal["deck"])
@@ -309,6 +370,7 @@ def _run_full_game_leg(
         env.bid_value = 1
         env.bidding_history = [(bidding_order[0], 1)]
         env._reveal_bottom_cards()
+        max_redeals_exceeded = True
 
     role_to_seat = {role: seat for seat, role in env._seat_to_role.items()}
     agents: dict[str, TimedAgent] = {}
@@ -339,8 +401,12 @@ def _run_full_game_leg(
     candidate_score = float(
         result.landlord_score if candidate_team == "landlord" else result.farmer_score
     )
-    latencies, calibration = _candidate_samples(
+    cardplay_latencies, calibration = _candidate_samples(
         agents, candidate_roles, result.winner_team
+    )
+    latencies = (*candidate_bid_latencies_ms, *cardplay_latencies)
+    search_calls, search_timeouts, search_fallbacks = _candidate_search_counts(
+        agents, candidate_roles
     )
     return GameRecord(
         deal_id=deal_id,
@@ -363,8 +429,19 @@ def _run_full_game_leg(
         spring=result.spring,
         anti_spring=result.anti_spring,
         game_length=len(env.card_play_action_seq),
+        redeal_count=redeal_count,
+        max_redeals_exceeded=max_redeals_exceeded,
         candidate_latencies_ms=latencies,
         calibration=calibration,
+        search_calls=search_calls,
+        search_timeouts=search_timeouts,
+        search_fallbacks=search_fallbacks,
+        bidding_inference_calls=len(candidate_bid_latencies_ms),
+        formal_evaluation_eligible=not max_redeals_exceeded,
+        exclusion_reason=(
+            "redeal_cap_exhausted_forced_smoke_fallback"
+            if max_redeals_exceeded else ""
+        ),
     )
 
 
@@ -402,24 +479,46 @@ def _calibration_metrics(samples: list[tuple[str, float, float]]) -> dict[str, A
 
 
 def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[str, Any]:
+    audit_games = tuple(games)
+    games_by_deal: dict[str, list[GameRecord]] = {}
+    for game in audit_games:
+        games_by_deal.setdefault(game.deal_id, []).append(game)
+    excluded_deal_ids = {
+        deal_id
+        for deal_id, rows in games_by_deal.items()
+        if any(not row.formal_evaluation_eligible for row in rows)
+    }
+    # A deal is the statistical unit. If any seat rotation used a forced smoke
+    # fallback, exclude every rotation of that deal from formal metrics.
+    games = [
+        game for game in audit_games if game.deal_id not in excluded_deal_ids
+    ]
+
     win_by_deal = deal_cluster_means(
         (game.deal_id, game.candidate_win - 0.5) for game in games
     )
     score_by_deal = deal_cluster_means(
         (game.deal_id, game.candidate_score) for game in games
     )
-    win_ci = paired_bootstrap_ci(
-        win_by_deal,
-        confidence_level=scenario.confidence_level,
-        samples=scenario.bootstrap_samples,
-        seed=scenario.deterministic_seed,
-    )
-    score_ci = paired_bootstrap_ci(
-        score_by_deal,
-        confidence_level=scenario.confidence_level,
-        samples=scenario.bootstrap_samples,
-        seed=scenario.deterministic_seed + 1,
-    )
+    def confidence_interval(values: dict[str, float], seed: int) -> ConfidenceInterval:
+        if values:
+            return paired_bootstrap_ci(
+                values,
+                confidence_level=scenario.confidence_level,
+                samples=scenario.bootstrap_samples,
+                seed=seed,
+            )
+        return ConfidenceInterval(
+            estimate=float("nan"),
+            low=float("nan"),
+            high=float("nan"),
+            confidence_level=scenario.confidence_level,
+            paired_deals=0,
+            bootstrap_samples=scenario.bootstrap_samples,
+        )
+
+    win_ci = confidence_interval(win_by_deal, scenario.deterministic_seed)
+    score_ci = confidence_interval(score_by_deal, scenario.deterministic_seed + 1)
     paired_estimator = (
         PROMOTION_ESTIMATOR
         if scenario.mode == PROMOTION_MODE
@@ -451,16 +550,83 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
     inference_seconds = sum(latencies) / 1000.0
     calibration = [sample for game in games for sample in game.calibration]
     total_bids = sum(game.candidate_bid_attempts for game in games)
+    total_searches = sum(game.search_calls for game in games)
     denominator = len(games)
+
+    def mean(values) -> float:
+        rows = list(values)
+        return sum(rows) / len(rows) if rows else float("nan")
+
+    inference_calls_per_second = (
+        len(latencies) / inference_seconds
+        if inference_seconds > 0 else float("nan")
+    )
+    by_bid_value = {}
+    if scenario.mode == "full_game":
+        for bid_value in (1, 2, 3):
+            bid_games = [game for game in games if game.bid_value == bid_value]
+            by_bid_value[str(bid_value)] = {
+                "games": len(bid_games),
+                "win_percentage": (
+                    sum(game.candidate_win for game in bid_games) / len(bid_games)
+                    if bid_games else float("nan")
+                ),
+                "mean_score": (
+                    sum(game.candidate_score for game in bid_games) / len(bid_games)
+                    if bid_games else float("nan")
+                ),
+            }
+    excluded_games = [
+        game for game in audit_games if game.deal_id in excluded_deal_ids
+    ]
+    exclusion_reasons: dict[str, int] = {}
+    for game in excluded_games:
+        reason = game.exclusion_reason or "formal_evaluation_ineligible"
+        exclusion_reasons[reason] = exclusion_reasons.get(reason, 0) + 1
+    excluded_bid_attempts = sum(
+        game.candidate_bid_attempts for game in excluded_games
+    )
+    smoke_descriptive = {
+        "status": "present" if excluded_games else "not_present",
+        "games": len(excluded_games),
+        "bid_rate": (
+            sum(game.candidate_positive_bids for game in excluded_games)
+            / excluded_bid_attempts
+            if excluded_bid_attempts else float("nan")
+        ),
+        "mean_score": mean(game.candidate_score for game in excluded_games),
+        "winner_team_counts": {
+            team: sum(game.winner_team == team for game in excluded_games)
+            for team in ("landlord", "farmer")
+        },
+    }
     return {
         "sample_counts": {
-            "deals": len(scenario.deals),
+            "deals": len(win_by_deal),
+            "requested_deals": len(scenario.deals),
             "games": len(games),
+            "games_total": len(audit_games),
+            "excluded_games": len(excluded_games),
             "seat_permutations": len(scenario.seat_permutations),
             "calibration_decisions": len(calibration),
             "inference_calls": len(latencies),
+            "bidding_inference_calls": sum(
+                game.bidding_inference_calls for game in games
+            ),
         },
-        "overall_win_percentage": sum(game.candidate_win for game in games) / denominator,
+        "formal_evaluation": {
+            "status": (
+                "contains_excluded_smoke_fallbacks"
+                if excluded_games else "eligible_input"
+            ),
+            "eligible_deals": len(win_by_deal),
+            "eligible_games": len(games),
+            "excluded_deals": len(excluded_deal_ids),
+            "excluded_games": len(excluded_games),
+            "exclusion_reasons": exclusion_reasons,
+        },
+        "smoke_descriptive": smoke_descriptive,
+        "overall_win_percentage": mean(game.candidate_win for game in games),
         "team_win_percentage": {
             team: (
                 sum(game.candidate_win for game in team_games) / len(team_games)
@@ -477,8 +643,12 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
             win_ci.to_dict() if scenario.mode == PROMOTION_MODE else None
         ),
         "descriptive_win_rate_delta_ci": win_ci.to_dict(),
-        "mean_score": sum(game.candidate_score for game in games) / denominator,
-        "mean_log_score": sum(game.candidate_log_score for game in games) / denominator,
+        "mean_score": mean(game.candidate_score for game in games),
+        "mean_raw_score": mean(game.candidate_score for game in games),
+        "mean_log_score": mean(game.candidate_log_score for game in games),
+        "zero_sum_seat_score": (
+            score_ci.estimate if scenario.mode == "full_game" else float("nan")
+        ),
         "paired_mean_score_ci": score_ci.to_dict(),
         "by_role": by_role,
         "bid_rate": (
@@ -487,13 +657,20 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
         ),
         "landlord_acquisition_rate": (
             sum(game.candidate_landlord for game in games) / denominator
-            if scenario.mode == "full_game" else float("nan")
+            if scenario.mode == "full_game" and denominator else float("nan")
         ),
-        "bomb_rate": sum(game.bomb_count > 0 for game in games) / denominator,
-        "rocket_rate": sum(game.rocket_count > 0 for game in games) / denominator,
-        "spring_rate": sum(game.spring for game in games) / denominator,
-        "anti_spring_rate": sum(game.anti_spring for game in games) / denominator,
-        "mean_game_length": sum(game.game_length for game in games) / denominator,
+        "by_bid_value": by_bid_value,
+        "redeals": {
+            "total": sum(game.redeal_count for game in audit_games),
+            "max_redeals_exceeded_games": sum(
+                game.max_redeals_exceeded for game in audit_games
+            ),
+        },
+        "bomb_rate": mean(game.bomb_count > 0 for game in games),
+        "rocket_rate": mean(game.rocket_count > 0 for game in games),
+        "spring_rate": mean(game.spring for game in games),
+        "anti_spring_rate": mean(game.anti_spring for game in games),
+        "mean_game_length": mean(game.game_length for game in games),
         "calibration": _calibration_metrics(calibration),
         "inference_latency_ms": {
             "count": len(latencies),
@@ -501,7 +678,30 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
             "p95": percentile(latencies, 0.95),
             "p99": percentile(latencies, 0.99),
         },
-        "actor_fps": len(latencies) / inference_seconds if inference_seconds > 0 else float("nan"),
+        "inference_calls_per_second": inference_calls_per_second,
+        # P15 exposed this key even though it counts instrumented inference
+        # calls rather than actor-loop frames. Keep it as a deprecated schema
+        # alias so existing result consumers do not break.
+        "actor_fps": inference_calls_per_second,
+        "search": {
+            "calls": total_searches,
+            "timeout_rate": (
+                sum(game.search_timeouts for game in games) / total_searches
+                if total_searches else float("nan")
+            ),
+            "fallback_rate": (
+                sum(game.search_fallbacks for game in games) / total_searches
+                if total_searches else float("nan")
+            ),
+        },
+        "belief": {
+            "status": "not_instrumented" if any(
+                bundle.belief_checkpoint
+                for bundle in (scenario.candidate, scenario.baseline)
+            ) else "not_enabled",
+            "exact_decode_rate": float("nan"),
+            "conservation_violation_rate": float("nan"),
+        },
     }
 
 

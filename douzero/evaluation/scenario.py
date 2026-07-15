@@ -6,6 +6,7 @@ import hashlib
 import json
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Mapping
 
 from douzero.env.rules import RuleSet
@@ -20,7 +21,7 @@ from .protocol import (
 SCENARIO_MODES = ("cardplay_only", "full_game")
 DATASET_SCOPES = ("public", "private_holdout")
 BACKENDS = ("random", "rule", "legacy", "legacy_factorized", "v2", "bc")
-BIDDING_POLICIES = ("rule", "random", "pass", "max")
+BIDDING_POLICIES = ("rule", "random", "pass", "max", "learned")
 SEATS = ("0", "1", "2")
 ROLES = ("landlord", "landlord_up", "landlord_down")
 
@@ -43,6 +44,8 @@ class BundleSpec:
     belief_checkpoint: str = ""
     search_config: Mapping[str, Any] = field(default_factory=dict)
     tags: tuple[str, ...] = ()
+    # P17 field appended after every pre-P17 positional field.
+    bidding_checkpoint: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not isinstance(self.backend, str):
@@ -59,12 +62,64 @@ class BundleSpec:
         for field_name in ("checkpoints", "model_config", "search_config"):
             if not isinstance(getattr(self, field_name), Mapping):
                 raise TypeError(f"bundle {field_name} must be a mapping")
+        if any(
+            not isinstance(role, str) or not isinstance(path, str)
+            for role, path in self.checkpoints.items()
+        ):
+            raise TypeError("bundle checkpoints must map role strings to path strings")
+        if not isinstance(self.belief_checkpoint, str) or not isinstance(
+            self.bidding_checkpoint, str
+        ):
+            raise TypeError("belief_checkpoint and bidding_checkpoint must be strings")
         if self.backend in ("legacy", "legacy_factorized", "v2", "bc"):
             missing = [role for role in ROLES if not self.checkpoints.get(role)]
             if missing:
                 raise ValueError(
                     f"bundle {self.name!r} is missing checkpoints for {missing}"
                 )
+        if self.bidding_policy == "learned":
+            if self.backend not in ("v2", "bc"):
+                raise ValueError("learned bidding requires a V2 bundle backend")
+            if not self.bidding_checkpoint:
+                raise ValueError("learned bidding requires bidding_checkpoint")
+        elif self.bidding_checkpoint:
+            raise ValueError(
+                "bidding_checkpoint is only valid with bidding_policy='learned'"
+            )
+
+    @staticmethod
+    def _checkpoint_sha256(path: str) -> str | None:
+        """Hash a checkpoint without exposing its local filesystem path.
+
+        P17 model-matrix validation separately verifies the embedded checkpoint
+        manifest. Hashing the complete file here then binds that verified
+        manifest and its weights to an evaluation result with one immutable
+        identity.
+        """
+
+        if not path:
+            return None
+        checkpoint = Path(path)
+        if not checkpoint.is_file():
+            return None
+        digest = hashlib.sha256()
+        with checkpoint.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def checkpoint_identities(self) -> dict[str, Any]:
+        """Return path-free identities for every checkpoint in this bundle."""
+
+        return {
+            "scheme": "sha256-file-including-embedded-manifest-v1",
+            "roles": {
+                role: self._checkpoint_sha256(path)
+                for role, path in sorted(self.checkpoints.items())
+            },
+            "belief": self._checkpoint_sha256(self.belief_checkpoint),
+            "bidding": self._checkpoint_sha256(self.bidding_checkpoint),
+        }
 
     def to_dict(self, *, include_paths: bool = False) -> dict[str, Any]:
         checkpoints = (
@@ -72,17 +127,27 @@ class BundleSpec:
             if include_paths
             else {role: bool(path) for role, path in self.checkpoints.items()}
         )
-        return {
+        payload = {
             "name": self.name,
             "backend": self.backend,
             "checkpoints": checkpoints,
             "bidding_policy": self.bidding_policy,
             "decision_mode": self.decision_mode,
             "model_config": dict(self.model_config),
-            "belief_checkpoint": bool(self.belief_checkpoint),
+            "belief_checkpoint": (
+                self.belief_checkpoint
+                if include_paths else bool(self.belief_checkpoint)
+            ),
+            "bidding_checkpoint": (
+                self.bidding_checkpoint
+                if include_paths else bool(self.bidding_checkpoint)
+            ),
             "search_config": dict(self.search_config),
             "tags": list(self.tags),
         }
+        if not include_paths:
+            payload["checkpoint_identities"] = self.checkpoint_identities()
+        return payload
 
 
 def default_seat_permutations(mode: str) -> tuple[tuple[str, str, str], ...]:
