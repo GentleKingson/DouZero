@@ -55,6 +55,7 @@ def _ddp_worker(rank: int, world_size: int, port: int) -> None:
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
     )
+    torch.set_num_threads(1)
     context = initialize_distributed(enabled=True, backend="gloo")
     try:
         assert list(context.shard_indices(6)) == list(range(rank, 6, world_size))
@@ -74,6 +75,7 @@ def _ddp_v2_readiness_worker(rank: int, world_size: int, port: int) -> None:
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
     )
+    torch.set_num_threads(1)
     context = initialize_distributed(enabled=True, backend="gloo")
     try:
         from douzero.models_v2 import ModelV2, ModelV2Config
@@ -140,6 +142,7 @@ def _ddp_rank_one_nan_worker(
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
     )
+    torch.set_num_threads(1)
     context = initialize_distributed(enabled=True, backend="gloo")
     try:
         model = context.wrap(nn.Linear(2, 1, bias=False))
@@ -195,6 +198,7 @@ def _ddp_v2_self_play_worker(rank: int, world_size: int, port: int) -> None:
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(port),
     )
+    torch.set_num_threads(1)
     context = initialize_distributed(enabled=True, backend="gloo")
     try:
         import numpy as np
@@ -203,7 +207,6 @@ def _ddp_v2_self_play_worker(rank: int, world_size: int, port: int) -> None:
         from douzero.observation import build_v2_schema
         from douzero.training import TrainerConfig, V2Trainer
 
-        torch.set_num_threads(1)
         rank_seed = 2400 + rank
         random.seed(rank_seed)
         np.random.seed(rank_seed)
