@@ -25,7 +25,17 @@ def render_markdown(result: PairedEvaluationResult) -> str:
     """Render a compact, auditable report that never hides the scenario mode."""
     scenario = result.scenario
     metrics = result.metrics
-    ci = metrics["paired_win_rate_delta_ci"]
+    ci = metrics["paired_estimate_ci"]
+    estimate_label = (
+        "Paired WP delta"
+        if metrics["paired_estimator"] == "cardplay_win_rate_delta"
+        else "Paired zero-sum seat score"
+    )
+    win_percentage_label = (
+        "Candidate WP"
+        if scenario["mode"] == "cardplay_only"
+        else "Candidate seat WP (descriptive)"
+    )
     latency = metrics["inference_latency_ms"]
     calibration = metrics["calibration"]["overall"]
     lines = [
@@ -43,8 +53,9 @@ def render_markdown(result: PairedEvaluationResult) -> str:
         "",
         "| Metric | Value |",
         "| --- | ---: |",
-        f"| Candidate WP | {metrics['overall_win_percentage']:.4f} |",
-        f"| Paired WP delta | {ci['estimate']:+.4f} [{ci['low']:+.4f}, {ci['high']:+.4f}] |",
+        f"| {win_percentage_label} | {metrics['overall_win_percentage']:.4f} |",
+        f"| {estimate_label} | {ci['estimate']:+.4f} "
+        f"[{ci['low']:+.4f}, {ci['high']:+.4f}] |",
         f"| Mean score | {metrics['mean_score']:+.4f} |",
         f"| Mean log score | {metrics['mean_log_score']:+.4f} |",
         f"| Mean game length | {metrics['mean_game_length']:.2f} |",

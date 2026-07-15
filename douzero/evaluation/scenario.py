@@ -10,8 +10,13 @@ from typing import Any, Mapping
 
 from douzero.env.rules import RuleSet
 
+from .protocol import (
+    EVALUATION_PROTOCOL,
+    OFFICIAL_PERMUTATIONS,
+    OFFICIAL_PERMUTATION_HASHES,
+)
 
-EVALUATION_PROTOCOL = "p15_paired_v1"
+
 SCENARIO_MODES = ("cardplay_only", "full_game")
 DATASET_SCOPES = ("public", "private_holdout")
 BACKENDS = ("random", "rule", "legacy", "legacy_factorized", "v2", "bc")
@@ -82,20 +87,10 @@ class BundleSpec:
 
 def default_seat_permutations(mode: str) -> tuple[tuple[str, str, str], ...]:
     """Return the minimum balanced candidate/baseline assignments."""
-    if mode == "cardplay_only":
-        # Role order is landlord, landlord_up, landlord_down.
-        return (
-            ("candidate", "baseline", "baseline"),
-            ("baseline", "candidate", "candidate"),
-        )
-    if mode == "full_game":
-        # Neutral seat order is 0, 1, 2. Rotate the candidate through all seats.
-        return (
-            ("candidate", "baseline", "baseline"),
-            ("baseline", "candidate", "baseline"),
-            ("baseline", "baseline", "candidate"),
-        )
-    raise ValueError(f"unknown scenario mode {mode!r}")
+    try:
+        return OFFICIAL_PERMUTATIONS[mode]
+    except KeyError as exc:
+        raise ValueError(f"unknown scenario mode {mode!r}") from exc
 
 
 @dataclass(frozen=True)
@@ -142,7 +137,12 @@ class EvaluationScenario:
             raise ValueError("bootstrap_samples must be positive")
         if not 0.0 < self.confidence_level < 1.0:
             raise ValueError("confidence_level must be between 0 and 1")
-        permutations = self.seat_permutations or default_seat_permutations(self.mode)
+        permutations = tuple(
+            tuple(permutation)
+            for permutation in (
+                self.seat_permutations or default_seat_permutations(self.mode)
+            )
+        )
         for permutation in permutations:
             if len(permutation) != 3:
                 raise ValueError("each seat permutation must contain exactly 3 entries")
@@ -168,6 +168,11 @@ class EvaluationScenario:
                     "full_game permutations must rotate exactly one candidate seat"
                 )
         object.__setattr__(self, "seat_permutations", tuple(permutations))
+        if tuple(permutations) != default_seat_permutations(self.mode):
+            raise ValueError(
+                f"{EVALUATION_PROTOCOL} requires exactly the official "
+                f"{self.mode} seat permutations in canonical order"
+            )
         expected_ruleset = "legacy" if self.mode == "cardplay_only" else "standard"
         if self.ruleset.ruleset_id != expected_ruleset:
             raise ValueError(
@@ -233,6 +238,7 @@ class EvaluationScenario:
             "num_deals": len(self.deals),
             "deterministic_seed": self.deterministic_seed,
             "seat_permutations": [list(p) for p in self.seat_permutations],
+            "seat_permutation_hash": OFFICIAL_PERMUTATION_HASHES[self.mode],
             "bootstrap_samples": self.bootstrap_samples,
             "confidence_level": self.confidence_level,
         }

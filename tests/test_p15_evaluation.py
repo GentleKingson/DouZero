@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -55,6 +56,21 @@ def test_scenario_default_permutations_are_balanced_and_mode_specific():
     assert all(permutation.count("candidate") == 1 for permutation in full.seat_permutations)
 
 
+def test_scenario_rejects_incomplete_or_repeated_official_permutations():
+    base = _scenario("full_game", deals=1)
+    with pytest.raises(ValueError, match="official.*seat permutations"):
+        replace(base, seat_permutations=(base.seat_permutations[0],))
+    with pytest.raises(ValueError, match="official.*seat permutations"):
+        replace(
+            base,
+            seat_permutations=(
+                base.seat_permutations[0],
+                base.seat_permutations[0],
+                base.seat_permutations[2],
+            ),
+        )
+
+
 def test_cardplay_evaluation_is_reproducible_and_paired_by_deal():
     scenario = _scenario("cardplay_only")
     first = evaluate_scenario(scenario)
@@ -71,9 +87,30 @@ def test_cardplay_evaluation_is_reproducible_and_paired_by_deal():
     assert first.metrics["sample_counts"]["games"] == 4
     assert first.metrics["paired_win_rate_delta_ci"]["paired_deals"] == 2
     assert {game.mode for game in first.games} == {"cardplay_only"}
-    promotion = first.to_promotion_evaluation()
+    with pytest.raises(ValueError, match="at least 1000 bootstrap"):
+        first.to_promotion_evaluation()
+    official = evaluate_scenario(replace(scenario, bootstrap_samples=1000))
+    promotion = official.to_promotion_evaluation()
     assert promotion.evaluator_protocol == "p15_paired_v1"
     assert promotion.paired_games == 2
+    assert promotion.mode == "cardplay_only"
+    assert promotion.confidence_level == 0.95
+    assert promotion.bootstrap_samples == 1000
+
+
+def test_cardplay_identical_policies_have_zero_promotion_estimate():
+    ruleset = RuleSet.legacy()
+    scenario = EvaluationScenario(
+        mode="cardplay_only",
+        ruleset=ruleset,
+        candidate=BundleSpec(name="same-candidate", backend="random"),
+        baseline=BundleSpec(name="same-baseline", backend="random"),
+        deals=generate_deals("cardplay_only", 3, 72, ruleset),
+        deterministic_seed=72,
+        bootstrap_samples=100,
+    )
+    result = evaluate_scenario(scenario)
+    assert result.metrics["paired_estimate_ci"]["estimate"] == pytest.approx(0.0)
 
 
 def test_full_game_rotates_candidate_and_reports_rules_metrics():
@@ -94,6 +131,35 @@ def test_full_game_rotates_candidate_and_reports_rules_metrics():
     assert [game.to_dict() | {"candidate_latencies_ms": []} for game in result.games] == [
         game.to_dict() | {"candidate_latencies_ms": []} for game in repeated.games
     ]
+    assert result.metrics["paired_win_rate_delta_ci"] is None
+    with pytest.raises(ValueError, match="cannot be used for promotion"):
+        result.to_promotion_evaluation()
+
+
+def test_full_game_identical_policies_have_zero_paired_estimate():
+    ruleset = RuleSet.standard()
+    candidate = BundleSpec(
+        name="same-candidate",
+        backend="random",
+        bidding_policy="random",
+    )
+    baseline = BundleSpec(
+        name="same-baseline",
+        backend="random",
+        bidding_policy="random",
+    )
+    scenario = EvaluationScenario(
+        mode="full_game",
+        ruleset=ruleset,
+        candidate=candidate,
+        baseline=baseline,
+        deals=generate_deals("full_game", 3, 91, ruleset),
+        deterministic_seed=91,
+        bootstrap_samples=100,
+    )
+    result = evaluate_scenario(scenario)
+    assert result.metrics["paired_estimator"] == "full_game_zero_sum_seat_score"
+    assert result.metrics["paired_estimate_ci"]["estimate"] == pytest.approx(0.0)
 
 
 def test_full_game_all_pass_is_bounded_and_deterministic():
@@ -206,3 +272,14 @@ def test_regression_gates_cover_rules_latency_calibration_and_roles():
         check["name"] == "required:environment_rules" and not check["passed"]
         for check in gates["checks"]
     )
+
+
+@pytest.mark.parametrize("bad_value", ["false", 0, 1, None])
+def test_regression_gate_required_checks_reject_non_booleans(bad_value):
+    with pytest.raises(TypeError, match="strings to booleans"):
+        RegressionGateConfig(required_checks={"legacy_behavior": bad_value})
+
+
+def test_regression_gate_required_checks_reject_non_string_names():
+    with pytest.raises(TypeError, match="strings to booleans"):
+        RegressionGateConfig(required_checks={1: False})

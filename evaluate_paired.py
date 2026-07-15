@@ -225,10 +225,11 @@ def main(argv=None) -> int:
             gates_failed = gates_failed or not gate_report["passed"]
         prefix = args.output if name == "base" else f"{args.output}-{name}"
         paths = write_report(result, prefix)
-        ci = result.metrics["paired_win_rate_delta_ci"]
+        ci = result.metrics["paired_estimate_ci"]
         print(
             f"{name}: mode={result.scenario['mode']} deals={ci['paired_deals']} "
-            f"delta={ci['estimate']:+.4f} "
+            f"estimator={result.metrics['paired_estimator']} "
+            f"estimate={ci['estimate']:+.4f} "
             f"CI=[{ci['low']:+.4f}, {ci['high']:+.4f}] "
             f"json={paths['json']}"
         )

@@ -19,9 +19,17 @@ are mapped to landlord roles. A bundle declares its bidding policy explicitly:
 not expose a learned bidding head; `rule` is a fixed public hand-strength policy
 and reports must not describe it as model bidding.
 
-Both modes use isolated RNGs derived from the scenario seed, deal ID, leg, and
-role. Inference timing is measured and is therefore the only field expected to
-vary slightly between identical runs.
+`cardplay_only` uses common random streams derived from scenario seed, deal ID,
+and role. `full_game` derives them from deal ID and physical seat. Inference
+timing is measured and is therefore the only field expected to vary slightly
+between identical runs.
+
+The protocol identity is closed over its seat schedule. `cardplay_only` must
+contain exactly the candidate-landlord and candidate-two-farmers legs once
+each. `full_game` must contain exactly one candidate in each neutral seat once.
+Missing, duplicated, reordered, or additional permutations are rejected. In
+In `full_game`, stochastic policies use common random streams by physical seat so
+identical candidate and baseline policies replay the same game under rotation.
 
 ## Statistical Unit
 
@@ -31,9 +39,17 @@ bootstrap resampling. Decisions and seats are never treated as independent
 samples. Reports include the paired deal count, bootstrap sample count, and
 confidence level.
 
-The promotion estimate is candidate win rate minus 0.5. `PairedEvaluationResult`
-can produce the strict `PromotionEvaluation` consumed by the P11 promotion
-gate. Mean-score confidence intervals use the same deal clusters.
+For `cardplay_only`, the paired estimate is candidate win rate minus 0.5. For
+`full_game`, raw win percentage is descriptive because a landlord win gives
+one winning seat while a farmer win gives two. Its paired estimate is instead
+the standard zero-sum seat score: landlord and both farmer scores sum to zero
+for every game. Identical policies therefore have an estimate of zero.
+
+Only `cardplay_only` may produce the `PromotionEvaluation` consumed by the P11
+promotion gate. Promotion additionally requires confidence level 0.95, at
+least 1000 bootstrap samples, the official permutation hash, and the
+`cardplay_win_rate_delta` estimator. `PromotionGate` validates all of these
+fields again; `full_game` reports cannot be promoted.
 
 ## Metrics And Outputs
 
@@ -143,3 +159,5 @@ Pass a predeclared JSON file with `--gates`. Supported thresholds are
 boolean results through `required_checks`, for example
 `{"legacy_behavior": true, "environment_rules": true}`. A failed gate is
 written into the report and makes the command exit with status 2.
+`required_checks` accepts only string keys and JSON boolean values; strings
+such as `"false"` are rejected rather than coerced.

@@ -23,6 +23,11 @@ class RegressionGateConfig:
             raise TypeError("min_role_win_percentage must be a mapping")
         if not isinstance(self.required_checks, Mapping):
             raise TypeError("required_checks must be a mapping")
+        for name, passed in self.required_checks.items():
+            if not isinstance(name, str) or not isinstance(passed, bool):
+                raise TypeError(
+                    "required_checks must map strings to booleans"
+                )
         for name in ("max_p95_latency_ms", "max_brier", "max_ece"):
             value = getattr(self, name)
             if value is not None and (not math.isfinite(value) or value < 0):

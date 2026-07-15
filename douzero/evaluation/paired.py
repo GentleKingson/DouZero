@@ -14,7 +14,15 @@ from douzero.env.game import GameEnv
 from douzero.env.rules import PHASE_BIDDING
 
 from .agents import BundleFactory, RuleAgent, TimedAgent, choose_bid
-from .scenario import EVALUATION_PROTOCOL, ROLES, EvaluationScenario
+from .protocol import (
+    EVALUATION_PROTOCOL,
+    MIN_PROMOTION_BOOTSTRAP_SAMPLES,
+    OFFICIAL_CONFIDENCE_LEVEL,
+    OFFICIAL_PERMUTATION_HASHES,
+    PROMOTION_ESTIMATOR,
+    PROMOTION_MODE,
+)
+from .scenario import ROLES, EvaluationScenario, default_seat_permutations
 from .statistics import deal_cluster_means, paired_bootstrap_ci, percentile
 
 
@@ -111,7 +119,40 @@ class PairedEvaluationResult:
         """Bridge directly to the P11 promotion gate's strict P15 contract."""
         from douzero.league.promotion import PromotionEvaluation
 
-        ci = self.metrics["paired_win_rate_delta_ci"]
+        if self.scenario.get("protocol") != EVALUATION_PROTOCOL:
+            raise ValueError("promotion requires the official P15 protocol identity")
+        if self.scenario["mode"] != PROMOTION_MODE:
+            raise ValueError(
+                "full_game results are descriptive and cannot be used for "
+                "promotion; use a cardplay_only P15 evaluation"
+            )
+        if self.scenario["confidence_level"] != OFFICIAL_CONFIDENCE_LEVEL:
+            raise ValueError(
+                f"promotion requires confidence_level={OFFICIAL_CONFIDENCE_LEVEL}"
+            )
+        if (
+            self.scenario["bootstrap_samples"]
+            < MIN_PROMOTION_BOOTSTRAP_SAMPLES
+        ):
+            raise ValueError(
+                "promotion requires at least "
+                f"{MIN_PROMOTION_BOOTSTRAP_SAMPLES} bootstrap samples"
+            )
+        expected_permutations = [
+            list(row) for row in default_seat_permutations(PROMOTION_MODE)
+        ]
+        if (
+            self.scenario["seat_permutations"] != expected_permutations
+            or self.scenario["seat_permutation_hash"]
+            != OFFICIAL_PERMUTATION_HASHES[PROMOTION_MODE]
+        ):
+            raise ValueError("promotion requires the official P15 seat permutations")
+        if self.metrics.get("paired_estimator") != PROMOTION_ESTIMATOR:
+            raise ValueError(
+                f"promotion requires estimator={PROMOTION_ESTIMATOR!r}"
+            )
+
+        ci = self.metrics["paired_estimate_ci"]
         return PromotionEvaluation(
             candidate_policy_id=self.scenario["candidate"]["name"],
             incumbent_policy_id=self.scenario["baseline"]["name"],
@@ -121,6 +162,11 @@ class PairedEvaluationResult:
             ci_high=ci["high"],
             evaluator_protocol=EVALUATION_PROTOCOL,
             deal_set_id=self.scenario["deal_set_id"],
+            mode=PROMOTION_MODE,
+            confidence_level=self.scenario["confidence_level"],
+            bootstrap_samples=self.scenario["bootstrap_samples"],
+            seat_permutation_hash=self.scenario["seat_permutation_hash"],
+            estimator=PROMOTION_ESTIMATOR,
         )
 
 
@@ -154,7 +200,7 @@ def _run_cardplay_leg(
         agents[role] = factory.build(
             bundle,
             role,
-            seed=_seed(scenario.deterministic_seed, deal_id, leg_index, role),
+            seed=_seed(scenario.deterministic_seed, deal_id, "role", role),
             bundle_label=label,
         )
     env = GameEnv(agents)
@@ -212,7 +258,7 @@ def _run_full_game_leg(
     from douzero.evaluation.legacy_data_adapter import deal_standard_deck
 
     bid_rng = random.Random(
-        _seed(scenario.deterministic_seed, deal_id, leg_index, "bidding")
+        _seed(scenario.deterministic_seed, deal_id, "bidding")
     )
     deck = list(deal["deck"])
     bidding_order = list(deal["bidding_order"])
@@ -273,7 +319,7 @@ def _run_full_game_leg(
         agents[role] = factory.build(
             bundle,
             role,
-            seed=_seed(scenario.deterministic_seed, deal_id, leg_index, role),
+            seed=_seed(scenario.deterministic_seed, deal_id, "seat", seat),
             bundle_label=label,
         )
     env.players = agents
@@ -374,6 +420,12 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
         samples=scenario.bootstrap_samples,
         seed=scenario.deterministic_seed + 1,
     )
+    paired_estimator = (
+        PROMOTION_ESTIMATOR
+        if scenario.mode == PROMOTION_MODE
+        else "full_game_zero_sum_seat_score"
+    )
+    paired_estimate_ci = win_ci if scenario.mode == PROMOTION_MODE else score_ci
     by_role: dict[str, Any] = {}
     for role_index, role in enumerate(ROLES):
         role_games = [game for game in games if role in game.role_wins]
@@ -419,7 +471,12 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
                 ("farmer", [g for g in games if any(r != "landlord" for r in g.candidate_roles)]),
             )
         },
-        "paired_win_rate_delta_ci": win_ci.to_dict(),
+        "paired_estimator": paired_estimator,
+        "paired_estimate_ci": paired_estimate_ci.to_dict(),
+        "paired_win_rate_delta_ci": (
+            win_ci.to_dict() if scenario.mode == PROMOTION_MODE else None
+        ),
+        "descriptive_win_rate_delta_ci": win_ci.to_dict(),
         "mean_score": sum(game.candidate_score for game in games) / denominator,
         "mean_log_score": sum(game.candidate_log_score for game in games) / denominator,
         "paired_mean_score_ci": score_ci.to_dict(),
