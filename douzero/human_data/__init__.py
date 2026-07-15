@@ -50,11 +50,19 @@ from .schema import (
     write_jsonl,
 )
 from .identifiers import (
+    EXTERNAL_ID_ATTESTATION_VERSION,
+    ExternalGameIdentity,
+    ExternalGameIdPseudonymizer,
+    HMAC_KEY_FILE_ENV,
     is_canonical_game_id,
+    load_hmac_project_key,
     make_internal_game_id,
     pseudonymize_external_game_id,
 )
+from .adapters import Adapter, AttestedAdapterRecord
 from .validate import assert_legacy_ruleset
+from .ingest import dedupe_by_game_id
+from .rebuild import RebuildReport, rebuild_without_game_ids
 
 __all__ = [
     "CANONICAL_FORMAT_VERSION",
@@ -71,7 +79,17 @@ __all__ = [
     "read_jsonl",
     "write_jsonl",
     "assert_legacy_ruleset",
+    "dedupe_by_game_id",
+    "Adapter",
+    "AttestedAdapterRecord",
+    "EXTERNAL_ID_ATTESTATION_VERSION",
+    "ExternalGameIdentity",
+    "ExternalGameIdPseudonymizer",
+    "HMAC_KEY_FILE_ENV",
     "is_canonical_game_id",
+    "load_hmac_project_key",
     "make_internal_game_id",
     "pseudonymize_external_game_id",
+    "RebuildReport",
+    "rebuild_without_game_ids",
 ]
