@@ -7,7 +7,10 @@ legality / turn order / hand conservation / terminal consistency, and writes:
 - ``<output>.quarantine.jsonl`` — the invalid records, each prefixed with a
   diagnostic line carrying the failure reason.
 
-Invalid records are NEVER silently dropped or repaired (AGENTS.md).
+Invalid records are NEVER silently dropped or repaired (AGENTS.md). Canonical
+inputs require a verified provenance sidecar. The migration-only
+``--allow-unverified-input`` path can quarantine malformed legacy JSONL, but
+its output is marked with unverified lineage and is rejected by training.
 
 No real human data is required: pass ``--synthetic`` to generate deterministic
 synthetic records and validate them end-to-end (smoke / CI path).
@@ -29,6 +32,7 @@ from typing import Sequence
 from douzero.human_data.schema import (
     HumanGameRecord,
     iter_jsonl_resilient,
+    verify_jsonl_manifest,
     write_jsonl,
 )
 from douzero.human_data.synthetic import generate_synthetic_records
@@ -60,6 +64,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--num_synthetic", type=int, default=8)
     p.add_argument("--synthetic_seed", type=int, default=0)
+    p.add_argument(
+        "--allow-unverified-input",
+        action="store_true",
+        help="migration-only: quarantine an unmanifested legacy input instead "
+             "of requiring its canonical provenance sidecar",
+    )
     return p.parse_args(argv)
 
 
@@ -70,6 +80,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     quarantined: list[str] = []  # JSONL lines: {"reason":..., "record"/"line":...}
     total = 0
     n_parse_errors = 0
+    input_manifest = None
 
     if args.synthetic:
         for record in generate_synthetic_records(
@@ -94,10 +105,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         if not args.input:
             raise SystemExit("--input is required when --synthetic is not set")
-        # Resilient read (Blocker 3): a malformed line (invalid JSON / wrong
-        # schema version / missing field / bad type) is QUARANTINED, not fatal.
-        # This is the only way JSON/schema errors reach the quarantine file
-        # alongside replay failures.
+        if not args.allow_unverified_input:
+            input_manifest = verify_jsonl_manifest(args.input)
+        # Canonical inputs were verified above and cannot contain malformed
+        # lines. The migration-only opt-out reaches this resilient reader so
+        # legacy JSON/schema errors can be quarantined alongside replay errors;
+        # its output is explicitly marked as unverified lineage.
         for line_result in iter_jsonl_resilient(args.input):
             total += 1
             if line_result.error:
@@ -133,7 +146,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     valid_path = args.output + ".jsonl"
     quarantine_path = args.output + ".quarantine.jsonl"
-    n_valid = write_jsonl(valid, valid_path)
+    n_valid = write_jsonl(
+        valid,
+        valid_path,
+        config_identity={
+            "operation": "replay_validation",
+            "synthetic": bool(args.synthetic),
+            "num_synthetic": args.num_synthetic if args.synthetic else None,
+            "synthetic_seed": args.synthetic_seed if args.synthetic else None,
+            "input_dataset_sha256": (
+                input_manifest["dataset_sha256"]
+                if input_manifest is not None else None
+            ),
+            "unverified_input": bool(
+                not args.synthetic and args.allow_unverified_input
+            ),
+        },
+        lineage_verified=bool(args.synthetic or input_manifest is not None),
+    )
     with open(quarantine_path, "w", encoding="utf-8") as fh:
         for line in quarantined:
             fh.write(line)

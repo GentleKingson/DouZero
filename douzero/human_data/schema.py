@@ -28,16 +28,20 @@ AGENTS.md "Human-game data" rules this module enforces:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from douzero._version import git_sha
+
+from .identifiers import is_canonical_game_id
 from .privacy import assert_no_forbidden as _assert_no_forbidden_privacy
 from .privacy import assert_valid_source_metadata
-from .identifiers import is_canonical_game_id
 
 # --------------------------------------------------------------------------- #
 # Canonical version stamps
@@ -50,6 +54,7 @@ CANONICAL_FORMAT_VERSION: int = 1
 #: The per-record schema version. Bumped whenever a field is added, removed, or
 #: its semantic changes. The loader rejects a mismatch rather than guessing.
 HUMAN_RECORD_SCHEMA_VERSION: int = 2
+HUMAN_DATASET_MANIFEST_VERSION: str = "human-dataset-manifest-v1"
 
 #: Kind stamp identifying a human-game record as privileged training data. A
 #: deployment guard can reject any object/dict carrying this kind without
@@ -783,19 +788,198 @@ def record_from_jsonl_line(line: str) -> HumanGameRecord:
 # --------------------------------------------------------------------------- #
 # JSONL file I/O (streaming, ordered)
 # --------------------------------------------------------------------------- #
-def write_jsonl(records: Iterable[HumanGameRecord], path: str) -> int:
+def dataset_manifest_path(path: str | Path) -> Path:
+    """Return the non-secret provenance sidecar path for canonical JSONL."""
+
+    return Path(f"{path}.manifest.json")
+
+
+def _canonical_config_hash(config: Mapping[str, Any] | None) -> str:
+    try:
+        payload = json.dumps(
+            dict(config or {"operation": "write_jsonl"}),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RecordValidationError(
+            "dataset config identity must be strict JSON"
+        ) from exc
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def write_jsonl(
+    records: Iterable[HumanGameRecord],
+    path: str,
+    *,
+    config_identity: Mapping[str, Any] | None = None,
+    lineage_verified: bool = True,
+) -> int:
     """Write records to ``path`` as JSONL. Returns the number of records written.
 
     Records are written in iteration order; deterministic ordering is the
     caller's responsibility (ingest sorts by ``game_id`` for reproducibility).
     """
+    source_sha = git_sha()
+    if not isinstance(lineage_verified, bool):
+        raise RecordValidationError("lineage_verified must be a bool")
+    if (
+        len(source_sha) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in source_sha)
+    ):
+        raise RecordValidationError(
+            "canonical dataset writes require a full source Git SHA; set "
+            "DOUZERO_GIT_SHA in source-less runtimes"
+        )
     n = 0
+    digest = hashlib.sha256()
+    rulesets: set[tuple[str, str, str]] = set()
     with open(path, "w", encoding="utf-8") as fh:
         for rec in records:
-            fh.write(rec.to_jsonl_line())
-            fh.write("\n")
+            line = rec.to_jsonl_line() + "\n"
+            fh.write(line)
+            digest.update(line.encode("utf-8"))
+            rulesets.add(
+                (rec.ruleset_id, rec.ruleset_version, rec.ruleset_hash)
+            )
             n += 1
+    manifest = {
+        "schema_version": HUMAN_DATASET_MANIFEST_VERSION,
+        "canonical_format_version": CANONICAL_FORMAT_VERSION,
+        "record_schema_version": HUMAN_RECORD_SCHEMA_VERSION,
+        "source_git_sha": source_sha,
+        "config_identity_hash": _canonical_config_hash(config_identity),
+        "rulesets": [
+            {
+                "ruleset_id": identity[0],
+                "ruleset_version": identity[1],
+                "ruleset_hash": identity[2],
+            }
+            for identity in sorted(rulesets)
+        ],
+        "record_count": n,
+        "dataset_sha256": digest.hexdigest(),
+        "access_class": "privileged_training_data",
+        "lineage_verified": lineage_verified,
+    }
+    dataset_manifest_path(path).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
     return n
+
+
+def verify_jsonl_manifest(
+    path: str | Path, *, allow_unverified_lineage: bool = False
+) -> dict[str, Any]:
+    """Verify canonical dataset provenance and content checksum."""
+
+    source = Path(path)
+    sidecar = dataset_manifest_path(source)
+    try:
+        manifest = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RecordValidationError("canonical dataset manifest is missing or invalid") from exc
+    expected_keys = {
+        "schema_version", "canonical_format_version", "record_schema_version",
+        "source_git_sha", "config_identity_hash", "rulesets", "record_count",
+        "dataset_sha256", "access_class",
+        "lineage_verified",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+        raise RecordValidationError("canonical dataset manifest fields are invalid")
+    if manifest["schema_version"] != HUMAN_DATASET_MANIFEST_VERSION:
+        raise RecordValidationError("canonical dataset manifest schema mismatch")
+    if manifest["canonical_format_version"] != CANONICAL_FORMAT_VERSION:
+        raise RecordValidationError("canonical dataset format identity mismatch")
+    if manifest["record_schema_version"] != HUMAN_RECORD_SCHEMA_VERSION:
+        raise RecordValidationError("canonical dataset record schema mismatch")
+    for name in ("source_git_sha", "config_identity_hash", "dataset_sha256"):
+        value = manifest[name]
+        lengths = (40, 64) if name == "source_git_sha" else (64,)
+        if (
+            not isinstance(value, str)
+            or len(value) not in lengths
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise RecordValidationError(f"canonical dataset {name} is invalid")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    if digest != manifest["dataset_sha256"]:
+        raise RecordValidationError("canonical dataset checksum mismatch")
+    if manifest["access_class"] != "privileged_training_data":
+        raise RecordValidationError("canonical dataset access class mismatch")
+    if not isinstance(manifest["lineage_verified"], bool):
+        raise RecordValidationError("canonical dataset lineage identity is invalid")
+    if not manifest["lineage_verified"] and not allow_unverified_lineage:
+        raise RecordValidationError(
+            "canonical dataset has unverified migration lineage and cannot be "
+            "used for training or release"
+        )
+    if (
+        isinstance(manifest["record_count"], bool)
+        or not isinstance(manifest["record_count"], int)
+        or manifest["record_count"] < 0
+    ):
+        raise RecordValidationError("canonical dataset record_count is invalid")
+    actual_count = 0
+    actual_rulesets: set[tuple[str, str, str]] = set()
+    with source.open("r", encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, start=1):
+            try:
+                record = record_from_jsonl_line(line)
+            except RecordValidationError as exc:
+                raise RecordValidationError(
+                    f"{source}:{lineno}: {exc}"
+                ) from exc
+            actual_count += 1
+            actual_rulesets.add(
+                (record.ruleset_id, record.ruleset_version, record.ruleset_hash)
+            )
+    if manifest["record_count"] != actual_count:
+        raise RecordValidationError(
+            "canonical dataset manifest record_count does not match content"
+        )
+    raw_rulesets = manifest["rulesets"]
+    if not isinstance(raw_rulesets, list):
+        raise RecordValidationError("canonical dataset rulesets are invalid")
+    manifest_rulesets: set[tuple[str, str, str]] = set()
+    for identity in raw_rulesets:
+        if (
+            not isinstance(identity, dict)
+            or set(identity)
+            != {"ruleset_id", "ruleset_version", "ruleset_hash"}
+            or not all(isinstance(value, str) for value in identity.values())
+            or not identity["ruleset_id"]
+            or not identity["ruleset_version"]
+            or len(identity["ruleset_hash"]) != 64
+            or any(
+                char not in "0123456789abcdef"
+                for char in identity["ruleset_hash"]
+            )
+        ):
+            raise RecordValidationError("canonical dataset rulesets are invalid")
+        manifest_rulesets.add(
+            (
+                identity["ruleset_id"],
+                identity["ruleset_version"],
+                identity["ruleset_hash"],
+            )
+        )
+    if len(manifest_rulesets) != len(raw_rulesets):
+        raise RecordValidationError("canonical dataset rulesets contain duplicates")
+    if manifest_rulesets != actual_rulesets:
+        raise RecordValidationError(
+            "canonical dataset manifest rulesets do not match content"
+        )
+    return manifest
+
+
+def read_verified_jsonl(path: str) -> Iterator[HumanGameRecord]:
+    """Verify the provenance sidecar, then stream canonical records."""
+
+    verify_jsonl_manifest(path)
+    yield from read_jsonl(path)
 
 
 def read_jsonl(path: str) -> Iterator[HumanGameRecord]:

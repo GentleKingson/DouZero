@@ -12,25 +12,30 @@ from __future__ import annotations
 
 import os
 import platform
-import subprocess
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 import torch
 
+from douzero._version import git_sha
+
 JOINT_CHECKPOINT_SCHEMA_VERSION = 1
 JOINT_CHECKPOINT_KIND = "joint_belief_value_training"
 JOINT_BELIEF_MODES = frozenset({"joint", "alternating"})
 
 
-def _git_sha() -> str:
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
-        ).decode().strip()
-    except Exception:
-        return "unknown"
+def _full_git_sha() -> str:
+    value = git_sha()
+    if (
+        len(value) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise ValueError(
+            "joint checkpoints require a full source Git SHA; build from a "
+            "Git checkout or set DOUZERO_GIT_SHA"
+        )
+    return value
 
 
 def _unwrap(module: torch.nn.Module) -> torch.nn.Module:
@@ -65,7 +70,9 @@ class JointCheckpointManifest:
         return asdict(self)
 
 
-def _identities(value_model, belief_model) -> tuple[torch.nn.Module, torch.nn.Module, str, str, str]:
+def _identities(
+    value_model, belief_model
+) -> tuple[torch.nn.Module, torch.nn.Module, str, str, str]:
     value = _unwrap(value_model)
     belief = _unwrap(belief_model)
     if not hasattr(value, "config") or not hasattr(value.config, "stable_hash"):
@@ -105,7 +112,11 @@ def save_joint_checkpoint(
         )
     if not isinstance(ruleset, RuleSet):
         raise TypeError("ruleset must be a RuleSet")
-    if isinstance(optimizer_steps, bool) or not isinstance(optimizer_steps, int) or optimizer_steps < 0:
+    if (
+        isinstance(optimizer_steps, bool)
+        or not isinstance(optimizer_steps, int)
+        or optimizer_steps < 0
+    ):
         raise ValueError("optimizer_steps must be a non-negative int")
 
     value, belief, value_hash, belief_hash, schema_hash = _identities(
@@ -125,7 +136,7 @@ def save_joint_checkpoint(
         public_input_contract="belief_input_public_v1",
         optimizer_included=optimizer is not None,
         optimizer_steps=optimizer_steps,
-        git_sha=_git_sha(),
+        git_sha=_full_git_sha(),
         python_version=platform.python_version(),
         torch_version=str(torch.__version__),
         platform=platform.platform(),
@@ -216,6 +227,11 @@ def load_joint_checkpoint(
             raise ValueError(f"joint checkpoint {name} mismatch")
     if manifest.public_input_contract != "belief_input_public_v1":
         raise ValueError("joint checkpoint public input contract mismatch")
+    if (
+        len(manifest.git_sha) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in manifest.git_sha)
+    ):
+        raise ValueError("joint checkpoint git_sha must be a full source Git SHA")
 
     value_state = bundle["value_state_dict"]
     belief_state = bundle["belief_state_dict"]

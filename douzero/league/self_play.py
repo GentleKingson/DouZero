@@ -42,6 +42,7 @@ class MatchupRecord:
     redeal_count: int = 0
     bidding_transitions: int = 0
     abandoned_bidding_transitions: int = 0
+    max_redeals_exceeded: bool = False
 
 
 class MatchupLogger:
@@ -185,6 +186,12 @@ class PopulationEpisodeRunner:
                     episode.redeal_count = int(info["redeal_count"])
                     env.redeal()
                     continue
+                if info.get("max_redeals_exceeded"):
+                    episode.abandoned_bidding_transitions += len(
+                        episode.bidding_transitions
+                    )
+                    episode.bidding_transitions.clear()
+                    episode.max_redeals_exceeded = True
                 if done:
                     raise RuntimeError("bidding ended without terminal card play")
                 if env.bidding_obs is not None:
@@ -316,6 +323,7 @@ class PopulationEpisodeRunner:
             policy_bundle_hash=bundle.bundle_hash,
             bid_value=int(terminal.get("bid_value", 0)),
             redeal_count=episode.redeal_count,
+            max_redeals_exceeded=episode.max_redeals_exceeded,
             bidding_transitions=len(episode.bidding_transitions),
             abandoned_bidding_transitions=(
                 episode.abandoned_bidding_transitions

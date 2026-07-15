@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Iterable
 
 from .identifiers import is_canonical_game_id
-from .schema import read_jsonl, write_jsonl
+from .schema import (
+    dataset_manifest_path,
+    read_jsonl,
+    verify_jsonl_manifest,
+    write_jsonl,
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,7 @@ def rebuild_without_game_ids(
     if any(not is_canonical_game_id(game_id) for game_id in excluded):
         raise ValueError("every excluded game_id must be a canonical opaque ID")
 
+    source_manifest = verify_jsonl_manifest(source)
     records = list(read_jsonl(str(source)))
     retained = [record for record in records if record.game_id not in excluded]
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -61,12 +67,25 @@ def rebuild_without_game_ids(
             delete=False,
         ) as handle:
             temporary = Path(handle.name)
-        write_jsonl(retained, str(temporary))
+        write_jsonl(
+            retained,
+            str(temporary),
+            config_identity={
+                "operation": "rebuild_without_game_ids",
+                "requested_ids": len(excluded),
+                "source_dataset_sha256": source_manifest["dataset_sha256"],
+            },
+        )
         os.replace(temporary, destination)
+        os.replace(
+            dataset_manifest_path(temporary),
+            dataset_manifest_path(destination),
+        )
         temporary = None
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+            dataset_manifest_path(temporary).unlink(missing_ok=True)
     return RebuildReport(
         input_records=len(records),
         output_records=len(retained),

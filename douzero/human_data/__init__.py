@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from .schema import (
     CANONICAL_FORMAT_VERSION,
+    HUMAN_DATASET_MANIFEST_VERSION,
     HUMAN_RECORD_KIND,
     HUMAN_RECORD_SCHEMA_VERSION,
     ACTION_ROLES,
@@ -47,6 +48,9 @@ from .schema import (
     record_from_dict,
     record_from_jsonl_line,
     read_jsonl,
+    read_verified_jsonl,
+    dataset_manifest_path,
+    verify_jsonl_manifest,
     write_jsonl,
 )
 from .identifiers import (
@@ -66,6 +70,7 @@ from .rebuild import RebuildReport, rebuild_without_game_ids
 
 __all__ = [
     "CANONICAL_FORMAT_VERSION",
+    "HUMAN_DATASET_MANIFEST_VERSION",
     "HUMAN_RECORD_KIND",
     "HUMAN_RECORD_SCHEMA_VERSION",
     "ACTION_ROLES",
@@ -77,6 +82,9 @@ __all__ = [
     "record_from_dict",
     "record_from_jsonl_line",
     "read_jsonl",
+    "read_verified_jsonl",
+    "dataset_manifest_path",
+    "verify_jsonl_manifest",
     "write_jsonl",
     "assert_legacy_ruleset",
     "dedupe_by_game_id",

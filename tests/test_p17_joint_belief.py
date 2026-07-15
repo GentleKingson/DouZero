@@ -104,6 +104,25 @@ def test_torch_constrained_marginals_conserve_counts_jokers_and_gradients():
     assert float(logits.grad.abs().sum()) > 0
 
 
+def test_standard_supervised_belief_collection_uses_playing_public_states():
+    from douzero.belief.data import collect_random_dataset
+
+    dataset = collect_random_dataset(
+        1, seed=1702, ruleset=RuleSet.standard()
+    )
+    assert dataset.samples
+    assert all(
+        sample.binput.acting_role
+        in {"landlord", "landlord_up", "landlord_down"}
+        for sample in dataset.samples
+    )
+    assert all(
+        int(sample.binput.unseen_counts.sum())
+        == sample.binput.opponent_a_total + sample.binput.opponent_b_total
+        for sample in dataset.samples
+    )
+
+
 def test_value_only_loss_reaches_belief_encoder_through_torch_dp():
     torch.manual_seed(18)
     obs = _public_observation(18)
@@ -182,6 +201,7 @@ def test_joint_checkpoint_roundtrip_binds_both_models_and_optimizer(tmp_path):
     )
     assert manifest.optimizer_included
     assert manifest.public_input_contract == "belief_input_public_v1"
+    assert len(manifest.git_sha) in (40, 64)
 
     with torch.no_grad():
         next(value.parameters()).add_(1)

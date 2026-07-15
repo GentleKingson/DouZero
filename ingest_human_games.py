@@ -130,7 +130,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 base_seed=args.synthetic_seed,
             )
         )
-        n = write_jsonl(records, args.output)
+        n = write_jsonl(
+            records,
+            args.output,
+            config_identity={
+                "operation": "synthetic_ingest",
+                "num_synthetic": args.num_synthetic,
+                "synthetic_seed": args.synthetic_seed,
+            },
+        )
         print(
             f"[ingest_human_games] synthetic: wrote {n} canonical records to "
             f"{args.output}",
@@ -153,6 +161,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         adapter,
         args.output,
         project_key=project_key,
+        adapter_identity=args.adapter,
     )
     print(
         f"[ingest_human_games] ingested {n} canonical records to {args.output}",

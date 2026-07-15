@@ -528,6 +528,7 @@ def _build_training_metrics(
             "total_decisions": decisions,
             "learner_steps": int(stats.optimizer_steps),
             "redeals": int(stats.redeals),
+            "max_redeals_exceeded": int(stats.max_redeals_exceeded),
             "belief_supervised_steps": int(stats.belief_supervised_steps),
         },
         "metrics": {
@@ -797,7 +798,7 @@ def main() -> None:
                 "The value model has belief_enabled=true but no "
                 "--belief_checkpoint was supplied. A belief-enabled value "
                 "model requires a pretrained BeliefModel initialization. Run "
-                "train_belief.py first, then pass its "
+                "train_belief.py with the matching --ruleset first, then pass its "
                 "checkpoint via --belief_checkpoint."
             )
         from douzero.belief.checkpoint import load_belief_checkpoint
@@ -808,6 +809,7 @@ def main() -> None:
                 "douzero.env.rules", fromlist=["RuleSet"]
             ).RuleSet.legacy(),
             expected_feature_version="v2",
+            require_full_git_sha=True,
         )
 
     belief_supervised_episodes = resolve(
@@ -825,18 +827,13 @@ def main() -> None:
             raise ValueError(
                 "belief_supervised_episodes requires belief_supervised_weight > 0"
             )
-        if ruleset is not None:
-            raise NotImplementedError(
-                "synthetic supervised belief collection currently uses the "
-                "legacy card-play fixture. Supply programmatic standard-labelled "
-                "samples instead of relabelling them as standard data."
-            )
         from douzero.belief.data import collect_random_dataset
 
         belief_dataset = collect_random_dataset(
             belief_supervised_episodes,
             seed=rank_seed,
             max_steps_per_episode=trainer_cfg.max_steps_per_episode,
+            ruleset=ruleset,
         )
         belief_supervised_samples = belief_dataset.samples
         if not belief_supervised_samples:
@@ -883,7 +880,7 @@ def main() -> None:
         # Load + validate + sample the human data ONCE at startup (Blocker 2:
         # the ruleset identity is verified inside build_bc_samples).
         from douzero.human_data.sample import build_bc_samples_with_report
-        from douzero.human_data.schema import read_jsonl
+        from douzero.human_data.schema import read_verified_jsonl
         from douzero.human_data.validate import validate_record
         from douzero.human_data.weights import WeightConfig, apply_sample_weights
 
@@ -893,7 +890,7 @@ def main() -> None:
         # the game_id + reason + error. They are NEVER swallowed by a filter
         # generator (the earlier `r for r in ... if validate_record(r).ok`
         # silently dropped them with no trace).
-        bc_records = list(read_jsonl(bc_cfg.data_path))
+        bc_records = list(read_verified_jsonl(bc_cfg.data_path))
         valid_records = []
         validation_quarantine: list[str] = []
         import json as _json
@@ -1068,6 +1065,7 @@ def main() -> None:
         f"transitions={stats.transitions_collected} "
         f"bidding_transitions={stats.bidding_transitions_collected} "
         f"redeals={stats.redeals} "
+        f"max_redeals_exceeded={stats.max_redeals_exceeded} "
         f"optimizer_steps={stats.optimizer_steps} "
         f"parameters_changed={getattr(trainer, 'stats_last_run_changed', 'unknown')} "
         f"last_loss={stats.last_loss} "

@@ -3,10 +3,10 @@
 > Status: **P03 complete.** This page documents the versioned observation V2
 > schema introduced in P03. The legacy encoder
 > (`douzero/env/env.py:get_obs`) is unchanged and remains the default; V2 is
-> opt-in via `feature_version="v2"`. **V2 is NOT yet wired into training** —
-> `train()` rejects `feature_version="v2"` until P05/P06 integrate the V2 model
-> and buffers. V2 observations can be built and round-tripped today (evaluation
-> adapters, tests); they just are not consumed by the actor/learner.
+> opt-in via `feature_version="v2"`. P05/P06 wired the schema into the separate
+> `train_v2.py` model, replay, and learner path; legacy `train.py` remains
+> unchanged. P17 additionally uses the separate public bidding observation for
+> opt-in standard full-game training.
 
 P03 separates **public** information (everything a deployment model may see)
 from **privileged** information (true hidden hands, training-only) and gives
@@ -191,6 +191,11 @@ change a model's identity contract.
 full 64-char hash) so a checkpoint/model can reject an incompatible schema
 precisely. The hash changes on any field name/shape/dtype/order change,
 `max_history_len` change, or stamp change.
+
+The separate pre-landlord `BiddingObservationV2` has the same strict identity
+rule. Its `v2-bidding-2` schema uses canonical public neutral-seat indices
+`0/1/2` for `current_seat`, `first_bidder`, and each bidding-history token;
+rotating `bidding_order` never erases those public identities.
 
 ## 8. Deep immutability
 

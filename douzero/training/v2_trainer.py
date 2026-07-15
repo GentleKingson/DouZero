@@ -202,6 +202,7 @@ class TrainerStats:
     amp_fallbacks: int = 0
     bidding_transitions_collected: int = 0
     redeals: int = 0
+    max_redeals_exceeded: int = 0
     belief_phase: str = "frozen"
     belief_supervised_steps: int = 0
 
@@ -625,6 +626,10 @@ class V2Trainer:
         target = num_episodes if num_episodes is not None else self.config.max_episodes
         for _ in range(target):
             episode = self._run_one_episode()
+            self.stats.redeals += episode.redeal_count
+            self.stats.max_redeals_exceeded += int(
+                episode.max_redeals_exceeded
+            )
             if episode.transitions:
                 self.buffer.add_episode(episode)
             if episode.bidding_transitions:
@@ -644,7 +649,6 @@ class V2Trainer:
                 self.stats.bidding_transitions_collected += len(
                     episode.bidding_transitions
                 )
-                self.stats.redeals += episode.redeal_count
 
     def _run_one_episode(self) -> Episode:
         """Play one game to terminal, recording decisions and labels."""
@@ -731,6 +735,15 @@ class V2Trainer:
                     episode.redeal_count = int(info["redeal_count"])
                     env.redeal()
                     continue
+                if info.get("max_redeals_exceeded"):
+                    # The cap fallback creates a playable guard state, not a
+                    # real auction outcome. Never attach its later terminal
+                    # result to the all-pass bidding decisions.
+                    episode.abandoned_bidding_transitions += len(
+                        episode.bidding_transitions
+                    )
+                    episode.bidding_transitions.clear()
+                    episode.max_redeals_exceeded = True
                 if done:
                     raise RuntimeError(
                         "bidding ended the episode without a terminal card-play result"
@@ -779,7 +792,7 @@ class V2Trainer:
 
         if opening is None or self.coach_label_store is None:
             return
-        if episode.redeal_count:
+        if episode.redeal_count or episode.max_redeals_exceeded:
             # A redeal replaces the coach-selected deck. Labelling the original
             # opening with the replacement game's result would corrupt the
             # curriculum dataset.

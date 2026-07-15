@@ -25,6 +25,8 @@ from typing import Any
 
 import torch
 
+from douzero._version import git_sha
+
 #: Current belief-checkpoint manifest schema version.
 BELIEF_MANIFEST_SCHEMA_VERSION: int = 1
 
@@ -62,16 +64,17 @@ class BeliefManifest:
         return dataclasses.asdict(self)
 
 
-def _git_sha() -> str:
-    try:
-        import subprocess
-
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-    except Exception:
-        return "unknown"
+def _full_git_sha() -> str:
+    value = git_sha()
+    if (
+        len(value) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise ValueError(
+            "belief checkpoints require a full source Git SHA; build from a "
+            "Git checkout or set DOUZERO_GIT_SHA"
+        )
+    return value
 
 
 def save_belief_checkpoint(
@@ -124,7 +127,7 @@ def save_belief_checkpoint(
         ruleset_version=rs_ident.get("ruleset_version", "legacy-v1"),
         ruleset_hash=rs_ident.get("ruleset_hash", ""),
         checkpoint_kind="belief_model",
-        git_sha=_git_sha(),
+        git_sha=_full_git_sha(),
         python_version=platform.python_version(),
         # str() coerces torch's TorchVersion (a str subclass) to a native
         # Python str. Storing a TorchVersion object triggers an "Unsupported
@@ -163,6 +166,7 @@ def load_belief_checkpoint(
     expected_belief_config: "object | None" = None,
     map_location: Any = "cpu",
     allow_unsafe_pickle: bool = False,
+    require_full_git_sha: bool = False,
 ) -> "object":
     """Load and validate a belief checkpoint, returning a ready model.
 
@@ -261,6 +265,21 @@ def load_belief_checkpoint(
             "feature_version mismatch: checkpoint "
             f"{manifest.get('feature_version')!r} != expected "
             f"{expected_feature_version!r}."
+        )
+    checkpoint_git_sha = manifest.get("git_sha")
+    if (
+        not isinstance(checkpoint_git_sha, str)
+        or len(checkpoint_git_sha) < 7
+        or len(checkpoint_git_sha) > 64
+        or any(char not in "0123456789abcdef" for char in checkpoint_git_sha)
+    ):
+        raise ValueError(
+            "belief checkpoint git_sha must be a hexadecimal source revision"
+        )
+    if require_full_git_sha and len(checkpoint_git_sha) not in (40, 64):
+        raise ValueError(
+            "belief checkpoint git_sha must be a full source Git SHA for "
+            "training, evaluation, or release use"
         )
 
     # Reconstruct the config from the CONSTRUCTOR fields (stored at the bundle

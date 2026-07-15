@@ -68,6 +68,46 @@ def _opening(order: tuple[str, str, str]) -> OpeningRecord:
     )
 
 
+def _standard_policy_pool(
+    model: ModelV2,
+    ruleset: RuleSet,
+    *,
+    seed: int = 31,
+    learner_seats_per_game: int = 1,
+) -> tuple[PolicyEntry, PolicyPool]:
+    contract = PolicyLoaderContract.for_v2_runtime(
+        model.schema,
+        model.config,
+        checkpoint_kind="training_checkpoint",
+    )
+    current = PolicyEntry(
+        policy_id="current-bid-policy",
+        checkpoint_paths_by_role={},
+        model_version="v2",
+        ruleset_hash=ruleset.stable_hash(),
+        feature_schema_hash=model.schema.stable_hash(),
+        model_config_hash=model.config.stable_hash(),
+        model_config_identity_version=model.config.IDENTITY_VERSION,
+        checkpoint_kind="training_checkpoint",
+        objective="adp",
+        created_step=3,
+        tags=("current",),
+    )
+    pool = PolicyPool(
+        LeagueManifest((current,), current.policy_id),
+        current,
+        runtime_loader=contract,
+        runtime_ruleset_hash=ruleset.stable_hash(),
+        config=PolicyPoolConfig(
+            mode="population",
+            seed=seed,
+            learner_seats_per_game=learner_seats_per_game,
+            include_random_agent=True,
+        ),
+    )
+    return current, pool
+
+
 def _raw_bidding_obs(
     *,
     order: tuple[str, str, str] = ("0", "1", "2"),
@@ -85,6 +125,15 @@ def _raw_bidding_obs(
         "first_bidder": order[0],
         "legal_bids": [bid for bid in ruleset.bid_values if bid == 0 or bid > highest],
     }
+
+
+def _bidding_feature_field(obs, name: str) -> np.ndarray:
+    offset = 0
+    for field in obs.schema.fields:
+        if field.name == name:
+            return obs.features[offset : offset + field.width]
+        offset += field.width
+    raise AssertionError(f"missing bidding feature field {name!r}")
 
 
 @pytest.mark.parametrize(
@@ -107,6 +156,49 @@ def test_public_bidding_observation_handles_every_first_bidder(order):
         assert not done
     assert tuple(seen) == order
     assert env.bidding_obs is None
+
+
+@pytest.mark.parametrize(
+    "order",
+    (("0", "1", "2"), ("1", "2", "0"), ("2", "0", "1")),
+)
+def test_bidding_features_preserve_absolute_neutral_seat_identity(order):
+    ruleset = RuleSet.standard()
+    first = get_bidding_obs_v2(_raw_bidding_obs(order=order), ruleset=ruleset)
+    assert np.array_equal(
+        _bidding_feature_field(first, "current_seat"),
+        np.eye(3, dtype=np.float32)[int(order[0])],
+    )
+    assert np.array_equal(
+        _bidding_feature_field(first, "first_bidder"),
+        np.eye(3, dtype=np.float32)[int(order[0])],
+    )
+
+    second = get_bidding_obs_v2(
+        _raw_bidding_obs(order=order, history=((order[0], 0),)),
+        ruleset=ruleset,
+    )
+    assert np.array_equal(
+        _bidding_feature_field(second, "current_seat"),
+        np.eye(3, dtype=np.float32)[int(order[1])],
+    )
+    history = _bidding_feature_field(second, "bidding_history").reshape(3, -1)
+    assert np.array_equal(
+        history[0, :3], np.eye(3, dtype=np.float32)[int(order[0])]
+    )
+
+
+def test_first_bidder_rotations_produce_distinct_model_features():
+    ruleset = RuleSet.standard()
+    observations = [
+        get_bidding_obs_v2(_raw_bidding_obs(order=order), ruleset=ruleset)
+        for order in (("0", "1", "2"), ("1", "2", "0"), ("2", "0", "1"))
+    ]
+    assert all(
+        not np.array_equal(left.features, right.features)
+        for index, left in enumerate(observations)
+        for right in observations[index + 1 :]
+    )
 
 
 def test_bidding_encoder_is_allowlisted_hidden_allocation_invariant_and_strict():
@@ -230,49 +322,22 @@ def test_all_pass_redeal_discards_abandoned_bid_transitions():
     )
     episode = trainer._run_one_episode()
     assert episode.redeal_count == 1
-    assert episode.abandoned_bidding_transitions == 3
-    assert len(episode.bidding_transitions) == 3
-    assert {tr.obs.redeal_count for tr in episode.bidding_transitions} == {1}
-    assert all(tr.source_policy == "pass" for tr in episode.bidding_transitions)
-    trainer.bidding_buffer.add_terminal_deal(
-        episode.bidding_transitions, episode.terminal_result
-    )
-    assert len(trainer.bidding_buffer) == 3
+    assert episode.max_redeals_exceeded is True
+    assert episode.abandoned_bidding_transitions == 6
+    assert episode.bidding_transitions == []
+
+    trainer._run_one_episode = lambda: episode
+    trainer.collect_episodes(1)
+    assert trainer.stats.redeals == 1
+    assert trainer.stats.max_redeals_exceeded == 1
+    assert trainer.stats.bidding_transitions_collected == 0
+    assert len(trainer.bidding_buffer) == 0
 
 
 def test_standard_population_runner_records_only_learner_policy_decisions():
     ruleset = RuleSet.standard()
     model = ModelV2(build_v2_schema(), _tiny_config())
-    contract = PolicyLoaderContract.for_v2_runtime(
-        model.schema,
-        model.config,
-        checkpoint_kind="training_checkpoint",
-    )
-    current = PolicyEntry(
-        policy_id="current-bid-policy",
-        checkpoint_paths_by_role={},
-        model_version="v2",
-        ruleset_hash=ruleset.stable_hash(),
-        feature_schema_hash=model.schema.stable_hash(),
-        model_config_hash=model.config.stable_hash(),
-        model_config_identity_version=model.config.IDENTITY_VERSION,
-        checkpoint_kind="training_checkpoint",
-        objective="adp",
-        created_step=3,
-        tags=("current",),
-    )
-    pool = PolicyPool(
-        LeagueManifest((current,), current.policy_id),
-        current,
-        runtime_loader=contract,
-        runtime_ruleset_hash=ruleset.stable_hash(),
-        config=PolicyPoolConfig(
-            mode="population",
-            seed=31,
-            learner_seats_per_game=1,
-            include_random_agent=True,
-        ),
-    )
+    current, pool = _standard_policy_pool(model, ruleset)
     with pytest.raises(ValueError, match="policy_version must match"):
         V2Trainer(
             model,
@@ -319,7 +384,39 @@ def test_standard_population_runner_records_only_learner_policy_decisions():
     )
     assert record.bid_value in (1, 2, 3)
     assert record.redeal_count == episode.redeal_count
+    assert record.max_redeals_exceeded is False
     assert record.bidding_transitions == len(episode.bidding_transitions)
+
+
+def test_population_runner_audits_cap_and_discards_all_pass_bids():
+    ruleset = replace(RuleSet.standard(), max_redeals=1)
+    model = ModelV2(build_v2_schema(), _tiny_config())
+    current, pool = _standard_policy_pool(
+        model, ruleset, seed=37, learner_seats_per_game=3
+    )
+    runner = PopulationEpisodeRunner(
+        pool,
+        lambda _obs: 0,
+        current_bidding_selector=lambda _obs: (0, "learned"),
+        bidding_policy_config=BiddingPolicyConfig(
+            policy="learned", learned_probability=1.0
+        ),
+        ruleset=ruleset,
+    )
+
+    episode, record = runner.run(
+        0,
+        policy_version_at_start=current.policy_id,
+        policy_step_at_start=3,
+    )
+    assert episode.redeal_count == 1
+    assert episode.max_redeals_exceeded is True
+    assert episode.abandoned_bidding_transitions == 6
+    assert episode.bidding_transitions == []
+    assert record.max_redeals_exceeded is True
+    assert record.redeal_count == 1
+    assert record.bidding_transitions == 0
+    assert record.abandoned_bidding_transitions == 6
 
 
 def test_standard_coach_runner_labels_kept_opening_but_not_redeal(tmp_path):

@@ -25,6 +25,7 @@ def render_markdown(result: PairedEvaluationResult) -> str:
     """Render a compact, auditable report that never hides the scenario mode."""
     scenario = result.scenario
     metrics = result.metrics
+    runtime_identity = result.to_dict()["runtime_identity"]
     ci = metrics["paired_estimate_ci"]
     estimate_label = (
         "Paired WP delta"
@@ -46,6 +47,12 @@ def render_markdown(result: PairedEvaluationResult) -> str:
         f"- Ruleset: `{scenario['ruleset']['ruleset_id']}`",
         f"- Deal set: `{scenario['deal_set_id']}` ({scenario['dataset_scope']})",
         f"- Seed: `{scenario['deterministic_seed']}`",
+        f"- Result schema: `{runtime_identity['schema_version']}`",
+        f"- Source Git SHA: `{runtime_identity['source_git_sha']}`",
+        f"- Evaluation config SHA-256: "
+        f"`{runtime_identity['evaluation_config_hash']}`",
+        f"- Feature schemas: "
+        f"`{json.dumps(runtime_identity['model_feature_schemas'], sort_keys=True)}`",
         f"- Deals / games: {metrics['sample_counts']['deals']} / "
         f"{metrics['sample_counts']['games']}",
         "",
@@ -134,8 +141,10 @@ def write_report(
         "csv": str(prefix.with_suffix(".csv").resolve()),
         "markdown": str(prefix.with_suffix(".md").resolve()),
     }
+    payload = result.to_dict()
+    runtime_identity = payload["runtime_identity"]
     with open(paths["json"], "w", encoding="utf-8") as handle:
-        json.dump(_json_safe(result.to_dict()), handle, indent=2, sort_keys=True, allow_nan=False)
+        json.dump(_json_safe(payload), handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
 
     rows = [game.to_dict() for game in result.games]
@@ -148,18 +157,34 @@ def write_report(
         "search_timeouts", "search_fallbacks",
         "bidding_inference_calls",
     ]
+    provenance_fields = [
+        "result_schema_version",
+        "source_git_sha",
+        "evaluation_config_hash",
+        "ruleset_hash",
+        "model_feature_schemas",
+    ]
     with open(paths["csv"], "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=scalar_fields + [
                 "assignment", "candidate_roles", "role_wins", "role_scores"
-            ],
+            ] + provenance_fields,
         )
         writer.writeheader()
         for row in rows:
             output = {field: row[field] for field in scalar_fields}
             for field in ("assignment", "candidate_roles", "role_wins", "role_scores"):
                 output[field] = json.dumps(row[field], sort_keys=True)
+            output.update({
+                "result_schema_version": runtime_identity["schema_version"],
+                "source_git_sha": runtime_identity["source_git_sha"],
+                "evaluation_config_hash": runtime_identity["evaluation_config_hash"],
+                "ruleset_hash": runtime_identity["ruleset_hash"],
+                "model_feature_schemas": json.dumps(
+                    runtime_identity["model_feature_schemas"], sort_keys=True
+                ),
+            })
             writer.writerow(output)
 
     with open(paths["markdown"], "w", encoding="utf-8") as handle:

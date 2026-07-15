@@ -43,15 +43,18 @@ from douzero.evaluation.agents import RuleAgent
 from douzero.evaluation.deep_agent import DeepAgentV2
 from douzero.evaluation.legacy_data_adapter import deal_standard_deck
 from douzero.human_data import (
+    dataset_manifest_path,
     dedupe_by_game_id,
     load_hmac_project_key,
     read_jsonl,
     rebuild_without_game_ids,
+    verify_jsonl_manifest,
     write_jsonl,
 )
 from douzero.human_data.synthetic import generate_synthetic_records
 from douzero.models_v2 import ModelV2, ModelV2Config
 from douzero.observation import build_v2_schema, get_obs_v2
+from douzero.search import SearchConfig
 import tools.gpu_validation_probe as gpu_validation_probe
 from tools.gpu_validation_probe import probe_environment
 from tools.validate_amp_fallback import validate_amp_fallback
@@ -209,8 +212,10 @@ def test_belief_package_is_self_contained_and_runs_public_inference(tmp_path):
         model,
         ruleset,
         belief_checkpoint=belief_checkpoint,
+        search_compatible=True,
     )
     assert manifest.belief_config_hash == belief.config.stable_hash()
+    assert manifest.search_compatible is True
     assert (package / "belief_config.json").is_file()
     assert (package / "belief_weights.pt").is_file()
     assert "  belief_weights.pt\n" in (package / "SHA256SUMS").read_text()
@@ -233,10 +238,39 @@ def test_belief_package_is_self_contained_and_runs_public_inference(tmp_path):
     env.reset()
     observation = get_obs_v2(env.infoset, ruleset=ruleset, schema=model.schema)
     assert len(observation.actions.legal_actions) > 1
-    agent = DeepAgentV2("landlord", loaded, ruleset, device="cpu")
-    action, explanation = agent.act_v2(observation, return_explanation=True)
+    base_agent = DeepAgentV2("landlord", loaded, ruleset, device="cpu")
+    action, explanation = base_agent.act_v2(
+        observation, return_explanation=True
+    )
     assert action in observation.actions.legal_actions
     assert explanation["source"] == "model"
+    assert explanation["search_enabled"] is False
+
+    search_agent = DeepAgentV2(
+        "landlord",
+        loaded,
+        ruleset,
+        search_config=SearchConfig(
+            enabled=True,
+            top_k=1,
+            belief_samples=1,
+            rollout_depth=0,
+            endgame_cards_threshold=0,
+            max_nodes=100,
+            max_rollouts=1,
+            max_milliseconds=5_000,
+            seed=17,
+        ),
+        device="cpu",
+    )
+    search_action, search_explanation = search_agent.act_v2(
+        observation, return_explanation=True
+    )
+    assert search_action == action
+    assert search_explanation["search_enabled"] is True
+    assert search_agent.last_search_log.timed_out is False
+    assert search_agent.last_search_log.samples == 1
+    assert search_agent.last_search_log.rollouts == 1
 
 
 def test_belief_package_rejects_tamper_and_wrong_checkpoint_identity(tmp_path):
@@ -370,6 +404,16 @@ def test_learned_bidding_package_requires_identity_bound_schema(tmp_path):
     observation = get_bidding_obs_v2(env.get_bidding_obs(), ruleset=ruleset)
     assert loaded.forward_bidding(observation).argmax_bid() in env.get_legal_bids()
 
+    env.step_bidding(3)
+    play_observation = get_obs_v2(
+        env.get_infoset(), ruleset=ruleset, schema=loaded.schema
+    )
+    loaded_agent = DeepAgentV2("landlord", loaded, ruleset, device="cpu")
+    original_agent = DeepAgentV2("landlord", model, ruleset, device="cpu")
+    loaded_action = loaded_agent.act_v2(play_observation)
+    assert loaded_action in play_observation.actions.legal_actions
+    assert loaded_action == original_agent.act_v2(play_observation)
+
     payload["bidding_actions"] = [0, 1, 2]
     (package / "bidding_schema.json").write_text(json.dumps(payload), encoding="utf-8")
     _refresh_checksums(package)
@@ -430,6 +474,7 @@ def test_training_metrics_are_measured_and_amp_fallback_is_exercised():
         bidding_transitions_collected = 2
         optimizer_steps = 4
         redeals = 1
+        max_redeals_exceeded = 1
         belief_supervised_steps = 0
         amp_fallbacks = 1
 
@@ -457,6 +502,7 @@ def test_training_metrics_are_measured_and_amp_fallback_is_exercised():
         "learner_steps_per_second": 2.0,
     }
     assert report["amp"]["fallback_exercised"] is True
+    assert report["counts"]["max_redeals_exceeded"] == 1
     fallback = validate_amp_fallback(device="cpu", dtype="bfloat16")
     assert fallback["status"] == "passed"
     assert fallback["fallback_count"] == 1
@@ -485,6 +531,16 @@ def test_game_id_deletion_rebuild_removes_complete_record_without_logging_ids(tm
     source = tmp_path / "canonical.jsonl"
     output = tmp_path / "rebuilt.jsonl"
     write_jsonl(records, str(source))
+    source_manifest = verify_jsonl_manifest(source)
+    assert source_manifest["record_count"] == 3
+    assert source_manifest["record_schema_version"] == 2
+    assert source_manifest["lineage_verified"] is True
+    assert len(source_manifest["source_git_sha"]) in (40, 64)
+    assert len(source_manifest["config_identity_hash"]) == 64
+    assert source_manifest["rulesets"][0]["ruleset_hash"] == records[0].ruleset_hash
+    assert all(
+        record.game_id not in json.dumps(source_manifest) for record in records
+    )
     removed = records[1].game_id
 
     report = rebuild_without_game_ids(source, output, [removed])
@@ -495,11 +551,53 @@ def test_game_id_deletion_rebuild_removes_complete_record_without_logging_ids(tm
         "requested_ids": 1,
     }
     rebuilt = list(read_jsonl(str(output)))
+    rebuilt_manifest = verify_jsonl_manifest(output)
+    assert rebuilt_manifest["record_count"] == 2
+    assert dataset_manifest_path(output).is_file()
     assert removed not in {record.game_id for record in rebuilt}
     assert removed not in json.dumps(report.to_dict())
     assert {record.game_id for record in rebuilt} == {
         records[0].game_id, records[2].game_id
     }
+
+    with output.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    with pytest.raises(Exception, match="checksum mismatch"):
+        verify_jsonl_manifest(output)
+
+
+def test_human_dataset_manifest_rejects_fabricated_counts_and_rulesets(tmp_path):
+    records = list(generate_synthetic_records(num_games=2, base_seed=23))
+    source = tmp_path / "canonical.jsonl"
+    write_jsonl(records, str(source))
+    sidecar = dataset_manifest_path(source)
+    original = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    forged = dict(original)
+    forged["record_count"] = 99
+    sidecar.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(Exception, match="record_count does not match"):
+        verify_jsonl_manifest(source)
+
+    forged = dict(original)
+    forged["rulesets"] = []
+    sidecar.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(Exception, match="rulesets do not match"):
+        verify_jsonl_manifest(source)
+
+
+def test_human_dataset_training_reader_rejects_missing_or_unverified_lineage(tmp_path):
+    from douzero.human_data import read_verified_jsonl
+
+    records = list(generate_synthetic_records(num_games=1, base_seed=29))
+    source = tmp_path / "canonical.jsonl"
+    write_jsonl(records, str(source), lineage_verified=False)
+    with pytest.raises(Exception, match="unverified migration lineage"):
+        list(read_verified_jsonl(str(source)))
+
+    dataset_manifest_path(source).unlink()
+    with pytest.raises(Exception, match="manifest is missing"):
+        list(read_verified_jsonl(str(source)))
 
 
 def test_duplicate_ingest_warning_redacts_canonical_identifier(caplog):
@@ -684,6 +782,17 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
             tmp_path / "wrong-identity",
             matrix=matrix,
             full_game_result=wrong_identity,
+        )
+
+    wrong_runtime_schema = copy.deepcopy(result_payload)
+    wrong_runtime_schema["runtime_identity"]["model_feature_schemas"][
+        "candidate"
+    ]["feature_schema_hash"] = "0" * 64
+    with pytest.raises(P17MatrixError, match="runtime identity is invalid"):
+        write_p17_artifacts(
+            tmp_path / "wrong-runtime-schema",
+            matrix=matrix,
+            full_game_result=wrong_runtime_schema,
         )
 
     inflated = copy.deepcopy(result_payload)

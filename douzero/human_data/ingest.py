@@ -37,6 +37,20 @@ class IngestError(ValueError):
     """Raised when ingest cannot convert a raw payload canonically."""
 
 
+def _adapter_identity(adapter: Adapter) -> str:
+    """Return a stable implementation identity without serializing adapter state."""
+
+    target = adapter if hasattr(adapter, "__qualname__") else type(adapter)
+    module = getattr(target, "__module__", "")
+    qualname = getattr(target, "__qualname__", "")
+    identity = f"{module}.{qualname}".strip(".")
+    if not identity:
+        raise IngestError(
+            "external ingest adapter has no stable implementation identity"
+        )
+    return identity
+
+
 def ingest_record(
     raw: Mapping[str, Any],
     adapter: Adapter,
@@ -157,6 +171,7 @@ def ingest_to_jsonl(
     *,
     sort_by_game_id: bool = True,
     project_key: bytes | bytearray | None = None,
+    adapter_identity: str | None = None,
 ) -> int:
     """Ingest raw payloads and write canonical JSONL. Returns records written."""
     records = ingest_batch(
@@ -165,4 +180,13 @@ def ingest_to_jsonl(
         sort_by_game_id=sort_by_game_id,
         project_key=project_key,
     )
-    return write_jsonl(records, output_path)
+    return write_jsonl(
+        records,
+        output_path,
+        config_identity={
+            "operation": "external_ingest",
+            "sort_by_game_id": sort_by_game_id,
+            "adapter_contract": "keyed_attested_v1",
+            "adapter_identity": adapter_identity or _adapter_identity(adapter),
+        },
+    )

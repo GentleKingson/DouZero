@@ -1,7 +1,7 @@
-"""Synthetic self-play data collection for belief training (P07).
+"""Synthetic self-play data collection for belief training (P07/P17).
 
-A small, single-process collector that plays random self-play games on the
-legacy card-play env and, at every non-trivial decision, records:
+A small, single-process collector that plays random card actions on the legacy
+or standard env and, at every non-trivial card-play decision, records:
 
 - the public :class:`~douzero.belief.features.BeliefInput` (built from the
   public observation), and
@@ -104,6 +104,7 @@ def collect_random_dataset(
     *,
     seed: int = 0,
     max_steps_per_episode: int = 600,
+    ruleset=None,
 ) -> BeliefDataset:
     """Play random self-play games and collect labelled belief samples.
 
@@ -112,14 +113,21 @@ def collect_random_dataset(
     would use model-guided self-play (out of scope for P07's smoke path).
     """
     from douzero.env.env import Env
+    from douzero.env.rules import RuleSet
     from douzero.observation.encode_v2 import get_obs_v2
+
+    if ruleset is not None and (
+        not isinstance(ruleset, RuleSet) or ruleset.ruleset_id != "standard"
+    ):
+        raise ValueError("belief collection ruleset must be standard or None (legacy)")
+    active_ruleset = ruleset or RuleSet.legacy()
 
     py_rng = random.Random(seed)
     np_rng = np.random.default_rng(seed + 1)
     np.random.seed(seed)  # Env.reset uses np.random.shuffle
     dataset = BeliefDataset()
     for _ in range(num_episodes):
-        env = Env("adp")
+        env = Env("adp", ruleset=ruleset)
         env.reset()
         steps = 0
         while True:
@@ -129,6 +137,11 @@ def collect_random_dataset(
                     "possible infinite loop."
                 )
             steps += 1
+            if ruleset is not None and env.bidding_obs is not None:
+                # A deterministic maximum bid ends the auction immediately and
+                # prevents synthetic all-pass states from entering collection.
+                env.step(None, bid_value=max(env.bidding_obs["legal_bids"]))
+                continue
             infoset = env.infoset
             legal = list(infoset.legal_actions)
             if not legal:
@@ -137,7 +150,7 @@ def collect_random_dataset(
             pool = nonempty if nonempty else legal
             action = list(pool[int(np_rng.integers(len(pool)))])
             if len(legal) > 1:
-                obs = get_obs_v2(infoset)
+                obs = get_obs_v2(infoset, ruleset=active_ruleset)
                 binput = build_belief_input(obs.public)
                 # Fail-fast: a conservation inconsistency here indicates an
                 # env/feature bug, NOT a recoverable data point. Earlier this

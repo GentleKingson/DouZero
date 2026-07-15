@@ -11,7 +11,11 @@ import pytest
 from douzero.env.rules import RuleSet
 from douzero.evaluation.ablation import ABLATION_NAMES, AblationRunner
 from douzero.evaluation.gates import RegressionGateConfig, evaluate_regression_gates
-from douzero.evaluation.paired import GameRecord, evaluate_scenario
+from douzero.evaluation.paired import (
+    GameRecord,
+    evaluate_scenario,
+    validate_evaluation_runtime_identity,
+)
 from douzero.evaluation.p17 import result_readiness
 from douzero.evaluation.reporting import write_report
 from douzero.evaluation.scenario import (
@@ -262,9 +266,56 @@ def test_report_writes_json_csv_and_markdown_without_nonstandard_nan(tmp_path):
     assert payload["protocol"] == "p15_paired_v1"
     assert payload["scenario"]["mode"] == "cardplay_only"
     assert payload["metrics"]["bid_rate"] is None
-    assert (tmp_path / "report.csv").read_text(encoding="utf-8").startswith("deal_id,")
-    assert "Mode: `cardplay_only`" in (tmp_path / "report.md").read_text(encoding="utf-8")
+    csv_text = (tmp_path / "report.csv").read_text(encoding="utf-8")
+    markdown_text = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert csv_text.startswith("deal_id,")
+    assert payload["runtime_identity"]["source_git_sha"] in csv_text
+    assert "Mode: `cardplay_only`" in markdown_text
+    assert payload["runtime_identity"]["source_git_sha"] in markdown_text
+    assert payload["runtime_identity"]["evaluation_config_hash"] in markdown_text
     assert set(paths) == {"json", "csv", "markdown"}
+
+
+def test_evaluation_runtime_identity_binds_protocol_mode_rules_and_schemas():
+    payload = evaluate_scenario(_scenario("cardplay_only", deals=1)).to_dict()
+    runtime = payload["runtime_identity"]
+    assert len(runtime["source_git_sha"]) in (40, 64)
+    assert runtime["model_feature_schemas"]["candidate"]["feature_version"] == (
+        "builtin-no-model-input"
+    )
+    assert runtime["model_feature_schemas"]["baseline"]["feature_version"] == (
+        "builtin-no-model-input"
+    )
+    validate_evaluation_runtime_identity(payload, expected_mode="cardplay_only")
+
+    wrong_protocol = json.loads(json.dumps(payload))
+    wrong_protocol["protocol"] = "pretend-protocol"
+    with pytest.raises(ValueError, match="result protocol mismatch"):
+        validate_evaluation_runtime_identity(wrong_protocol)
+
+    wrong_mode = json.loads(json.dumps(payload))
+    wrong_mode["scenario"]["mode"] = "full_game"
+    with pytest.raises(ValueError, match="mode mismatch"):
+        validate_evaluation_runtime_identity(
+            wrong_mode, expected_mode="cardplay_only"
+        )
+
+    wrong_rules = json.loads(json.dumps(payload))
+    wrong_rules["runtime_identity"]["ruleset_hash"] = "0" * 64
+    with pytest.raises(ValueError, match="ruleset hash mismatch"):
+        validate_evaluation_runtime_identity(wrong_rules)
+
+    wrong_schema = json.loads(json.dumps(payload))
+    wrong_schema["runtime_identity"]["model_feature_schemas"]["candidate"][
+        "feature_version"
+    ] = "legacy"
+    with pytest.raises(ValueError, match="feature-schema identities"):
+        validate_evaluation_runtime_identity(wrong_schema)
+
+    wrong_config = json.loads(json.dumps(payload))
+    wrong_config["scenario"]["deterministic_seed"] += 1
+    with pytest.raises(ValueError, match="evaluation_config_hash"):
+        validate_evaluation_runtime_identity(wrong_config)
 
 
 def test_private_holdout_name_is_redacted_from_report_identity():

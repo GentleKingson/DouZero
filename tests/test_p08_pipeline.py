@@ -378,6 +378,7 @@ class TestQuarantineContract:
         out_base = str(tmp_path / "out")
         rc = validate_human_games.main([
             "--input", data_path, "--output", out_base,
+            "--allow-unverified-input",
         ])
         assert rc == 0
         import json as _json
@@ -393,6 +394,10 @@ class TestQuarantineContract:
             assert entry["reason"] == "parse_error"
         v_path = out_base + ".jsonl"
         assert os.path.isfile(v_path)
+        from douzero.human_data import verify_jsonl_manifest
+
+        with pytest.raises(Exception, match="unverified migration lineage"):
+            verify_jsonl_manifest(v_path)
 
     def test_pretrain_quarantines_bad_records(self, tmp_path):
         """pretrain_bc.py writes a quarantine file for records that fail replay

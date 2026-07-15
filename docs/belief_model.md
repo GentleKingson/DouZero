@@ -191,26 +191,42 @@ device/dtype inside the forward).
 python train_belief.py --save_dir /tmp/belief_smoke \
     --num_episodes 20 --epochs 3 --batch_size 32 --seed 0
 
+# Standard-ruleset bootstrap for P17 full-game training.
+python train_belief.py --ruleset standard \
+    --save_dir /tmp/belief_standard --num_episodes 20 \
+    --epochs 3 --batch_size 32 --seed 0
+
 # Evaluate: rank accuracy, exact-match, count-MAE, argmax-total conservation.
 python evaluate_belief.py --checkpoint /tmp/belief_smoke/belief.pt \
+    --num_episodes 20 --seed 42
+
+python evaluate_belief.py --ruleset standard \
+    --checkpoint /tmp/belief_standard/belief.pt \
     --num_episodes 20 --seed 42
 ```
 
 `train_belief.py` uses the masked cross-entropy loss, clips gradients, guards
 against non-finite loss, and writes a checkpoint with `model_version =
-"belief_v1"`, the `BeliefConfig.stable_hash()`, the ruleset identity, git sha,
+"belief_v1"`, the `BeliefConfig.stable_hash()`, the ruleset identity, full git
+SHA,
 torch/python version, and frame count. `load_belief_checkpoint` loads with
 `weights_only=True` by default (safe unpickling — untrusted checkpoints cannot
 trigger arbitrary code execution) and validates the full manifest identity
 (schema version, model version, checkpoint kind, feature version, architecture
 hash, ruleset identity). `expected_ruleset` is **required**.
 
-The standalone P07 `train_belief.py` collector still runs on the **legacy**
-card-play env only (`Env("adp")`), so checkpoints created by that command are
-stamped `legacy`, never mislabeled as `standard`. This is a limitation of that
-pretraining command, not of the P17 standard V2 game loop: standard full-game
-training and learned bidding are available through `train_v2.py`, but require
-a belief checkpoint whose ruleset identity matches that run.
+The standalone collector supports both the legacy card-play path and a
+standard full-game path. `--ruleset standard` takes the maximum legal bid to
+complete the auction deterministically, then uses random card play while
+recording public observations with privileged labels. It stamps the checkpoint
+with the strict standard ruleset identity. Standard V2 training and belief
+evaluation must receive a checkpoint whose ruleset identity matches the run.
+
+New saves require a full 40- or 64-character source Git SHA. Source-less
+runtimes must set `DOUZERO_GIT_SHA`. The P07 compatibility loader still accepts
+historical hexadecimal short-SHA checkpoints by default, while P17 training,
+P17 matrix validation, and release-package paths set
+`require_full_git_sha=True` and require those older checkpoints to be rebuilt.
 
 `evaluate_belief.py` reports metrics for **both** decoders:
 
@@ -219,6 +235,12 @@ a belief checkpoint whose ruleset identity matches that run.
 - `constrained_map_*` — the DP MAP decoder used at deployment, and
 - `constrained_map_conservation` — the fraction of DP decodes that satisfy the
   exact total constraint (**must be 1.0** by construction).
+
+Its machine-readable result omits local paths and binds a full evaluator Git
+SHA, ruleset identity, public belief-input schema, belief-config hash,
+checkpoint file SHA-256, and a canonical evaluation-config hash. Evaluation
+uses strict full-SHA checkpoint loading even though the standalone P07
+compatibility loader can still inspect historical short-SHA checkpoints.
 
 ## Checkpoint impact
 

@@ -8,8 +8,9 @@ import json
 import math
 import random
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
+from douzero._version import git_sha
 from douzero.env.game import GameEnv
 from douzero.env.rules import PHASE_BIDDING
 
@@ -30,6 +31,140 @@ from .statistics import (
     paired_bootstrap_ci,
     percentile,
 )
+
+
+EVALUATION_RESULT_SCHEMA_VERSION = "p15-paired-result-v2"
+
+
+def _canonical_sha256(value: Mapping[str, Any]) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _bundle_feature_schema(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    backend = str(bundle.get("backend", ""))
+    if backend in {"v2", "bc"}:
+        from douzero.observation.bidding import build_bidding_schema
+        from douzero.observation.schema import build_v2_schema
+
+        learned_bidding = bundle.get("bidding_policy") == "learned"
+        return {
+            "feature_version": "v2",
+            "feature_schema_hash": build_v2_schema().stable_hash(),
+            "bidding_feature_schema_hash": (
+                build_bidding_schema().stable_hash() if learned_bidding else None
+            ),
+        }
+    if backend in {"legacy", "legacy_factorized"}:
+        return {
+            "feature_version": "legacy",
+            "feature_schema_hash": None,
+            "bidding_feature_schema_hash": None,
+        }
+    if backend in {"random", "rule"}:
+        return {
+            "feature_version": "builtin-no-model-input",
+            "feature_schema_hash": None,
+            "bidding_feature_schema_hash": None,
+        }
+    raise ValueError(f"unsupported evaluation backend for schema identity: {backend!r}")
+
+
+def evaluation_runtime_identity(
+    scenario: Mapping[str, Any], *, ablation: str
+) -> dict[str, Any]:
+    """Bind evaluator code and effective scenario/schema configuration."""
+
+    source_sha = git_sha()
+    if (
+        len(source_sha) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in source_sha)
+    ):
+        raise RuntimeError(
+            "paired evaluation requires a full source Git SHA; set "
+            "DOUZERO_GIT_SHA in source-less runtimes"
+        )
+    schema_identities = {
+        side: _bundle_feature_schema(scenario.get(side, {}))
+        for side in ("candidate", "baseline")
+    }
+    config_payload = {
+        "protocol": EVALUATION_PROTOCOL,
+        "ablation": ablation,
+        "scenario": dict(scenario),
+        "model_feature_schemas": schema_identities,
+    }
+    ruleset = scenario.get("ruleset", {})
+    return {
+        "schema_version": EVALUATION_RESULT_SCHEMA_VERSION,
+        "source_git_sha": source_sha,
+        "evaluation_config_hash": _canonical_sha256(config_payload),
+        "ruleset_hash": (
+            ruleset.get("ruleset_hash") if isinstance(ruleset, Mapping) else None
+        ),
+        "model_feature_schemas": schema_identities,
+    }
+
+
+def validate_evaluation_runtime_identity(
+    result: Mapping[str, Any], *, expected_mode: str | None = None
+) -> None:
+    """Reject missing or self-inconsistent evaluation provenance."""
+
+    runtime = result.get("runtime_identity")
+    scenario = result.get("scenario")
+    ablation = result.get("ablation")
+    if not isinstance(runtime, Mapping) or not isinstance(scenario, Mapping):
+        raise ValueError("evaluation result is missing runtime identity or scenario")
+    if result.get("protocol") != EVALUATION_PROTOCOL:
+        raise ValueError("evaluation result protocol mismatch")
+    if scenario.get("protocol") != EVALUATION_PROTOCOL:
+        raise ValueError("evaluation scenario protocol mismatch")
+    mode = scenario.get("mode")
+    if mode not in {"cardplay_only", "full_game"}:
+        raise ValueError("evaluation scenario mode is invalid")
+    if expected_mode is not None and mode != expected_mode:
+        raise ValueError(
+            f"evaluation scenario mode mismatch: expected {expected_mode!r}, got {mode!r}"
+        )
+    if not isinstance(ablation, str) or not ablation:
+        raise ValueError("evaluation ablation identity must be a non-empty string")
+    if runtime.get("schema_version") != EVALUATION_RESULT_SCHEMA_VERSION:
+        raise ValueError("evaluation runtime schema version mismatch")
+    source_sha = runtime.get("source_git_sha")
+    if (
+        not isinstance(source_sha, str)
+        or len(source_sha) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in source_sha)
+    ):
+        raise ValueError("evaluation source_git_sha must be a full Git SHA")
+    schema_identities = runtime.get("model_feature_schemas")
+    if not isinstance(schema_identities, Mapping):
+        raise ValueError("evaluation model feature-schema identities are missing")
+    expected_schema_identities: dict[str, dict[str, Any]] = {}
+    for side in ("candidate", "baseline"):
+        bundle = scenario.get(side)
+        if not isinstance(bundle, Mapping):
+            raise ValueError(f"evaluation scenario {side} bundle is invalid")
+        expected_schema_identities[side] = _bundle_feature_schema(bundle)
+    if dict(schema_identities) != expected_schema_identities:
+        raise ValueError(
+            "evaluation model feature-schema identities do not match the scenario"
+        )
+    config_payload = {
+        "protocol": EVALUATION_PROTOCOL,
+        "ablation": ablation,
+        "scenario": dict(scenario),
+        "model_feature_schemas": expected_schema_identities,
+    }
+    if runtime.get("evaluation_config_hash") != _canonical_sha256(config_payload):
+        raise ValueError("evaluation_config_hash does not match the result scenario")
+    ruleset = scenario.get("ruleset")
+    if (
+        not isinstance(ruleset, Mapping)
+        or runtime.get("ruleset_hash") != ruleset.get("ruleset_hash")
+    ):
+        raise ValueError("evaluation runtime ruleset hash mismatch")
 
 
 def _seed(base: int, *parts: object) -> int:
@@ -133,13 +268,17 @@ class PairedEvaluationResult:
     ablation: str = "base"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "protocol": EVALUATION_PROTOCOL,
             "ablation": self.ablation,
             "scenario": self.scenario,
             "metrics": self.metrics,
             "games": [game.to_dict() for game in self.games],
         }
+        payload["runtime_identity"] = evaluation_runtime_identity(
+            self.scenario, ablation=self.ablation
+        )
+        return payload
 
     def to_promotion_evaluation(self):
         """Bridge directly to the P11 promotion gate's strict P15 contract."""

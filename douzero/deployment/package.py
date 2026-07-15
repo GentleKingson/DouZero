@@ -288,6 +288,7 @@ def create_model_package(
                 expected_ruleset=ruleset,
                 expected_feature_version=model.schema.feature_version,
                 map_location="cpu",
+                require_full_git_sha=True,
             )
         except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
             raise ModelPackageError(
@@ -640,6 +641,7 @@ def verify_model_package(
                 expected_feature_version=packaged_schema.feature_version,
                 expected_belief_config=packaged_belief_config,
                 map_location="cpu",
+                require_full_git_sha=True,
             )
         except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
             raise ModelPackageError(
@@ -812,8 +814,16 @@ def load_model_package(
                 expected_feature_version=schema.feature_version,
                 expected_belief_config=belief_config,
                 map_location="cpu",
+                require_full_git_sha=True,
             )
-        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+        except (
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
             raise ModelPackageError(
                 f"failed to load packaged belief model: {exc}"
             ) from exc

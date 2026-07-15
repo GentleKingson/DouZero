@@ -75,6 +75,13 @@ uncertainty flag are all bound into model/checkpoint identity. With bidding
 disabled, those conditional fields and modules are absent, preserving earlier
 V2 parameter graphs and compatibility hashes.
 
+Schema `v2-bidding-2` encodes neutral seats canonically as physical public
+identities `0/1/2` for the current bidder, first bidder, and history tokens.
+They are not reindexed relative to the rotated bidding order, so all three
+first-bidder rotations remain distinguishable to the model. This semantic
+change is included in the bidding feature-schema hash; `v2-bidding-1`
+checkpoints fail strict identity validation rather than loading silently.
+
 ### Key invariants (tested in `tests/test_model_v2.py`)
 
 - **State/history encoded once per decision.** Only the action path and the

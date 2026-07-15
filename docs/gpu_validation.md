@@ -69,8 +69,12 @@ Frozen and joint belief validation require a public belief-enabled standard V2
 config and a compatible standard-ruleset belief checkpoint:
 
 ```bash
+python train_belief.py --ruleset standard \
+    --save_dir /tmp/belief_standard --num_episodes 20 \
+    --epochs 3 --batch_size 32 --seed 0
+
 DOUZERO_GPU_BELIEF_CONFIG=/path/to/belief-standard-v2.yaml \
-DOUZERO_GPU_BELIEF_CHECKPOINT=/path/to/belief.pt \
+DOUZERO_GPU_BELIEF_CHECKPOINT=/tmp/belief_standard/belief.pt \
 scripts/validate_gpu_training.sh
 ```
 

@@ -156,6 +156,7 @@ def _validate_available_bundle_checkpoints(
                     bundle.belief_checkpoint,
                     expected_ruleset=ruleset,
                     expected_feature_version="v2",
+                    require_full_git_sha=True,
                 )
             except Exception as exc:
                 fail("belief", exc)
@@ -605,6 +606,14 @@ def write_p17_artifacts(
                     f"{mode} result {side} checkpoint/manifest identity does not "
                     f"match the validated P17 matrix entry for {name!r}"
                 )
+        from .paired import validate_evaluation_runtime_identity
+
+        try:
+            validate_evaluation_runtime_identity(result, expected_mode=mode)
+        except (TypeError, ValueError) as exc:
+            raise P17MatrixError(
+                f"{mode} result runtime identity is invalid: {exc}"
+            ) from exc
 
     validate_result_inventory(cardplay_result, "cardplay_only")
     validate_result_inventory(full_game_result, "full_game")
@@ -744,13 +753,18 @@ def render_p17_markdown(
         lines.append(
             f"| {block['mode']} | {block['status']} | {readiness['status']} |"
         )
-    lines.extend(["", "## Model Matrix", "", "| Model | Card-play | Full game |", "| --- | --- | --- |"]) 
+    lines.extend([
+        "", "## Model Matrix", "", "| Model | Card-play | Full game |",
+        "| --- | --- | --- |",
+    ])
     for name in P17_MODEL_NAMES:
         lines.append(
             f"| {name} | {matrix['models'][name]['cardplay_only']['status']} | "
             f"{matrix['models'][name]['full_game']['status']} |"
         )
-    lines.extend(["", "## Ablations", "", "| Ablation | Status |", "| --- | --- |"]) 
+    lines.extend([
+        "", "## Ablations", "", "| Ablation | Status |", "| --- | --- |",
+    ])
     for name in ABLATION_NAMES:
         lines.append(f"| {name} | {ablations['results'][name]['status']} |")
     lines.extend([

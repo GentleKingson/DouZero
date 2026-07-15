@@ -23,7 +23,7 @@ from .public import BIDDING_TOKEN_WIDTH, encode_bidding_history
 from .schema import BIDDING_ENCODING_VERSION
 
 BIDDING_FEATURE_VERSION = "v2-bidding"
-BIDDING_SCHEMA_VERSION = "v2-bidding-1"
+BIDDING_SCHEMA_VERSION = "v2-bidding-2"
 BIDDING_ACTION_SCHEMA_VERSION = "score-0-1-2-3-v1"
 BIDDING_HEAD_VERSION = "bid-policy-value-v1"
 BIDDING_ACTIONS: tuple[int, ...] = (0, 1, 2, 3)
@@ -307,8 +307,11 @@ def get_bidding_obs_v2(
     if style:
         style_vec[: len(style)] = np.asarray(style, dtype=np.float32)
 
-    seat_to_index = {seat: index for index, seat in enumerate(order)}
-    history_batch = encode_bidding_history(history, order)
+    # Neutral-seat identity is canonical rather than relative to the rotated
+    # bidding order. Otherwise all three first-bidder rotations collapse to the
+    # same model input and neither current_seat nor first_bidder is observable.
+    seat_to_index = {seat: index for index, seat in enumerate(NEUTRAL_SEATS)}
+    history_batch = encode_bidding_history(history, NEUTRAL_SEATS)
     history_vec = np.zeros(
         (active_schema.max_history, BIDDING_TOKEN_WIDTH), dtype=np.float32
     )

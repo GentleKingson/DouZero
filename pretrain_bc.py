@@ -30,7 +30,7 @@ import torch
 
 from douzero.env.rules import RuleSet
 from douzero.human_data.sample import build_bc_samples
-from douzero.human_data.schema import read_jsonl
+from douzero.human_data.schema import read_jsonl, verify_jsonl_manifest
 from douzero.human_data.synthetic import generate_synthetic_records
 from douzero.human_data.validate import validate_record
 from douzero.models_v2.config import ModelV2Config
@@ -90,11 +90,15 @@ def _load_records(args: argparse.Namespace):
         return
     if not args.data:
         raise SystemExit("either --synthetic or --data is required")
+    # ``main`` verifies the provenance manifest before reaching this loader.
     yield from read_jsonl(args.data)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    dataset_identity = (
+        verify_jsonl_manifest(args.data) if args.data and not args.synthetic else None
+    )
 
     # Seed (seed=0 -> no-op per the project convention).
     if args.seed != 0:
@@ -259,6 +263,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "temperature": args.temperature,
             "seed": args.seed,
             "synthetic": bool(args.synthetic),
+            "dataset_sha256": (
+                dataset_identity["dataset_sha256"]
+                if dataset_identity is not None else None
+            ),
         },
     )
     print(f"[pretrain_bc] saved checkpoint to {out_path}", file=sys.stderr)
