@@ -25,6 +25,7 @@ baselines/*/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.venv/
 
 # Editor / agent tooling directories.
 .zcode/

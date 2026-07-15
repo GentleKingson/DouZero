@@ -1,0 +1,67 @@
+# Manual target-hardware gate. It never runs on push or pull_request and makes
+# no claim about hardware that was not actually attached to the self-hosted job.
+name: P17 GPU Validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: p17-gpu-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: [self-hosted, linux, gpu, nvidia]
+    timeout-minutes: 120
+    env:
+      DOUZERO_GIT_SHA: ${{ github.sha }}
+      DOUZERO_GPU_VALIDATION_OUTPUT: artifacts/gpu-validation
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Probe target environment
+        run: scripts/validate_gpu_training.sh --probe-only
+
+      - name: Run P17 CUDA and NCCL validation
+        run: scripts/validate_gpu_training.sh
+
+      - name: Publish summary
+        if: always()
+        run: |
+          if [[ -f artifacts/gpu-validation/summary.md ]]; then
+            cat artifacts/gpu-validation/summary.md >>"$GITHUB_STEP_SUMMARY"
+          fi
+          for report in artifacts/gpu-validation/*.json; do
+            if [[ -f "$report" ]]; then
+              printf '\n### `%s`\n\n```json\n' "$(basename "$report")" >>"$GITHUB_STEP_SUMMARY"
+              cat "$report" >>"$GITHUB_STEP_SUMMARY"
+              printf '```\n' >>"$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+      # actions/upload-artifact@v4.6.2
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p17-gpu-validation-${{ github.run_id }}
+          path: artifacts/gpu-validation/
+          if-no-files-found: warn
+          retention-days: 14
