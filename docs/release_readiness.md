@@ -190,7 +190,7 @@ under ignored `artifacts/`.
 | Docker temporary venv install/import from `/tmp` | First assertion used nonexistent `douzero.__version__` and failed after successful install; corrected `importlib.metadata.version` check PASS, importing from venv site-packages with Torch 2.13.0+cpu |
 | `scripts/validate_gpu_training.sh --probe-only`; full script | Probe PASS; full script expected exit 3 with CUDA unavailable and DDP implementation blockers, no GPU metrics claimed |
 | `git diff --check`; clean-tree and SHA readback after code validation | PASS; clean `b7db29a3856324d65170b49ef32d17be7d3a6996` |
-| Draft PR Python 3.11/3.12/3.13 matrix for the final documentation SHA | PENDING FINAL PUSH; must pass before merge |
+| Draft PR build/test matrix on `43b50a3e223e08844724762ea2b49f458564794f` | PASS: build and test on Python 3.11/3.12/3.13; slowest test job 3m59s |
 
 ## 7. Conclusion
 
