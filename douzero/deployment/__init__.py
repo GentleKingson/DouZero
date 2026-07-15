@@ -1,5 +1,6 @@
 """Strict Model V2 deployment, export, and packaging APIs."""
 
+from douzero.deployment.abi import MODEL_ABI_VERSION, model_implementation_hash
 from douzero.deployment.export import (
     ExportReport,
     ExportableModelV2,
@@ -22,6 +23,7 @@ __all__ = [
     "CURRENT_MODEL_FORMAT_VERSION",
     "ExportReport",
     "ExportableModelV2",
+    "MODEL_ABI_VERSION",
     "ModelManifest",
     "ModelManifestError",
     "ModelPackageError",
@@ -29,5 +31,6 @@ __all__ = [
     "create_model_package",
     "export_padded_model",
     "load_model_package",
+    "model_implementation_hash",
     "verify_model_package",
 ]

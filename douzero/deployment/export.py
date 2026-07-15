@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -124,15 +126,25 @@ def export_padded_model(
 
     output = Path(output_path)
     report_path = output.with_suffix(output.suffix + ".report.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # A failed attempt must never leave an old target that can be mistaken for
+    # the new export. The new artifact is written to a same-directory temporary
+    # path and becomes visible only after reload + numerical alignment succeed.
+    output.unlink(missing_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    temporary.unlink()
     try:
         wrapper = ExportableModelV2(model.eval(), acting_role).eval()
         inputs = _padded_inputs(bundle, max_actions)
         with torch.inference_mode():
             expected = wrapper(*inputs)
         exported = torch.export.export(wrapper, inputs)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        torch.export.save(exported, output)
-        loaded = torch.export.load(output).module()
+        torch.export.save(exported, temporary)
+        loaded = torch.export.load(temporary).module()
         with torch.inference_mode():
             actual = loaded(*inputs)
         errors = [
@@ -152,6 +164,8 @@ def export_padded_model(
             max_abs_error=max(errors, default=0.0),
             message="export aligned" if aligned else "export output mismatch",
         )
+        if aligned:
+            os.replace(temporary, output)
     except Exception as exc:  # capability reporting is intentionally non-fatal
         report = ExportReport(
             success=False,
@@ -162,6 +176,8 @@ def export_padded_model(
             max_abs_error=None,
             message=f"{type(exc).__name__}: {exc}",
         )
+    finally:
+        temporary.unlink(missing_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(asdict(report), indent=2) + "\n", encoding="utf-8")
     return report

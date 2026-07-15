@@ -351,6 +351,17 @@ class DeepAgentV2:
             )
         self.search_config = search_config
         self.last_search_log = None
+        deployment_manifest = getattr(self.model, "deployment_manifest", None)
+        if (
+            search_config.enabled
+            and deployment_manifest is not None
+            and not bool(getattr(deployment_manifest, "search_compatible", False))
+        ):
+            raise ValueError(
+                "SearchConfig.enabled=True is incompatible with this deployment "
+                "package: manifest.search_compatible is false. Repackage a model "
+                "that was explicitly validated for search."
+            )
         # P07 belief deployment wiring (review blocker #2). A belief-enabled
         # value model REQUIRES a BeliefModel at deployment so the constrained
         # posterior features are computed and fused; without it the value model

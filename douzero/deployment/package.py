@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 import torch
 
+from douzero.deployment.abi import MODEL_ABI_VERSION, model_implementation_hash
 from douzero.deployment.manifest import (
     PUBLIC_MODEL,
     ModelManifest,
@@ -63,6 +64,9 @@ def _default_model_card(manifest: ModelManifest) -> str:
 ## Model Details
 
 - Model version: `{manifest.model_version}`
+- Model ABI: `{manifest.model_abi_version}`
+- Implementation hash: `{manifest.implementation_hash}`
+- Source Git SHA: `{manifest.git_sha}`
 - Feature version: `{manifest.feature_version}`
 - Ruleset: `{manifest.ruleset_id}`
 - Roles: `{', '.join(manifest.role_support)}`
@@ -214,6 +218,17 @@ def verify_model_package(
         raise ModelPackageError(
             f"unsupported packaged model_version {manifest.model_version!r}; expected 'v2'"
         )
+    if manifest.model_abi_version != MODEL_ABI_VERSION:
+        raise ModelPackageError(
+            f"model ABI mismatch: package has {manifest.model_abi_version!r}, "
+            f"runtime expects {MODEL_ABI_VERSION!r}"
+        )
+    runtime_implementation_hash = model_implementation_hash()
+    if manifest.implementation_hash != runtime_implementation_hash:
+        raise ModelPackageError(
+            "model implementation hash mismatch: the runtime deployment code "
+            "differs from the code used to build this package"
+        )
 
     expected_lines = {}
     for line in (root / "SHA256SUMS").read_text(encoding="ascii").splitlines():
@@ -230,24 +245,6 @@ def verify_model_package(
             raise ModelPackageError(f"checksum mismatch for {name}: {actual} != {expected}")
     if manifest.weights_sha256 != _sha256(root / "weights.pt"):
         raise ModelPackageError("manifest weights_sha256 does not match weights.pt")
-    try:
-        weights_bundle = torch.load(
-            root / "weights.pt", map_location="cpu", weights_only=True
-        )
-        state_dict = weights_bundle["model_state_dict"]
-        floating_dtypes = {
-            str(tensor.dtype).removeprefix("torch.")
-            for tensor in state_dict.values()
-            if isinstance(tensor, torch.Tensor) and tensor.is_floating_point()
-        }
-    except (OSError, KeyError, TypeError, RuntimeError) as exc:
-        raise ModelPackageError(f"weights.pt is not a valid safe state bundle: {exc}") from exc
-    if floating_dtypes != {manifest.dtype}:
-        raise ModelPackageError(
-            f"weights dtype {sorted(floating_dtypes)} does not match manifest "
-            f"dtype {manifest.dtype!r}"
-        )
-
     try:
         ruleset_payload = json.loads((root / "ruleset.json").read_text(encoding="utf-8"))
         schema_payload = json.loads((root / "feature_schema.json").read_text(encoding="utf-8"))
@@ -291,6 +288,42 @@ def verify_model_package(
         )
     if packaged_schema.stable_hash() != manifest.feature_schema_hash:
         raise ModelPackageError("feature_schema.json identity does not match manifest.json")
+
+    # Validate the manifest-bearing checkpoint sidecar itself, not only the
+    # outer package metadata. A release pipeline must not approve a package
+    # whose checksums are internally consistent but whose weights were replaced
+    # by another valid public-policy sidecar.
+    from douzero.checkpoint import (
+        CheckpointCompatibilityError,
+        load_v2_position_weights,
+    )
+
+    try:
+        state_dict, checkpoint_manifest = load_v2_position_weights(
+            str(root / "weights.pt"),
+            expected_schema_hash=manifest.feature_schema_hash,
+            expected_model_config_hash=manifest.model_config_hash,
+            expected_ruleset=packaged_ruleset,
+            training_device="cpu",
+        )
+    except (CheckpointCompatibilityError, OSError, KeyError, TypeError, RuntimeError) as exc:
+        raise ModelPackageError(
+            f"weights.pt checkpoint identity does not match the package: {exc}"
+        ) from exc
+    if checkpoint_manifest.git_sha != manifest.git_sha:
+        raise ModelPackageError(
+            "weights.pt git_sha does not match the outer deployment manifest"
+        )
+    floating_dtypes = {
+        str(tensor.dtype).removeprefix("torch.")
+        for tensor in state_dict.values()
+        if isinstance(tensor, torch.Tensor) and tensor.is_floating_point()
+    }
+    if floating_dtypes != {manifest.dtype}:
+        raise ModelPackageError(
+            f"weights dtype {sorted(floating_dtypes)} does not match manifest "
+            f"dtype {manifest.dtype!r}"
+        )
     if expected_schema_hash and expected_schema_hash != manifest.feature_schema_hash:
         raise ModelPackageError("runtime feature schema does not match packaged model")
     if expected_feature_version and expected_feature_version != manifest.feature_version:

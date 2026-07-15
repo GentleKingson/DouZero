@@ -6,6 +6,11 @@
 
 set -euo pipefail
 
+# The Docker build context intentionally excludes .git. Deployment package
+# tests still require an explicit source identity, so use a fixed test-only
+# object ID unless CI injects the real commit through DOUZERO_GIT_SHA.
+export DOUZERO_GIT_SHA="${DOUZERO_GIT_SHA:-0000000000000000000000000000000000000000}"
+
 echo "=== environment ==="
 python -c "import sys, platform, torch, numpy; \
 print('python', sys.version.split()[0]); \

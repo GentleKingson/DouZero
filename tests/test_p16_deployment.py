@@ -4,28 +4,44 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from douzero.deployment import (
+    MODEL_ABI_VERSION,
     ModelManifest,
     ModelPackageError,
     build_model_manifest,
     create_model_package,
     export_padded_model,
     load_model_package,
+    model_implementation_hash,
     verify_model_package,
 )
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.evaluation.deep_agent import DeepAgentV2
+from douzero.search import SearchConfig
 from douzero.models_v2 import (
     ModelV2,
     ModelV2Config,
     observation_to_model_inputs,
 )
 from douzero.observation import build_v2_schema, get_obs_v2
+
+
+def _refresh_package_checksums(package):
+    names = sorted(
+        path.name for path in package.iterdir() if path.name != "SHA256SUMS"
+    )
+    lines = [
+        f"{hashlib.sha256((package / name).read_bytes()).hexdigest()}  {name}\n"
+        for name in names
+    ]
+    (package / "SHA256SUMS").write_text("".join(lines), encoding="ascii")
 
 
 @pytest.fixture
@@ -58,7 +74,15 @@ def test_model_manifest_roundtrip_and_complete_fields(p16_runtime):
     assert manifest.public_or_privileged == "public"
     assert manifest.feature_schema_hash == model.schema.stable_hash()
     assert manifest.model_config_hash == model.config.stable_hash()
-    assert set(manifest.required_package_versions) == {"python", "torch", "douzero"}
+    assert manifest.model_abi_version == MODEL_ABI_VERSION
+    assert manifest.implementation_hash == model_implementation_hash()
+    assert manifest.git_sha != "unknown"
+    assert set(manifest.required_package_versions) == {
+        "python",
+        "numpy",
+        "torch",
+        "douzero",
+    }
 
 
 def test_manifest_rejects_unknown_or_missing_fields(p16_runtime):
@@ -71,6 +95,13 @@ def test_manifest_rejects_unknown_or_missing_fields(p16_runtime):
     raw.pop("feature_version")
     with pytest.raises(ValueError, match="field mismatch"):
         ModelManifest.from_dict(raw)
+
+
+def test_release_manifest_rejects_unknown_git_sha(monkeypatch, p16_runtime):
+    model, _, _, ruleset, _ = p16_runtime
+    monkeypatch.setattr("douzero.deployment.manifest.git_sha", lambda: "unknown")
+    with pytest.raises(ValueError, match="known git_sha"):
+        build_model_manifest(model, ruleset)
 
 
 def test_package_roundtrip_clean_inference_and_checksums(tmp_path, p16_runtime):
@@ -101,6 +132,19 @@ def test_package_roundtrip_clean_inference_and_checksums(tmp_path, p16_runtime):
     assert loaded_agent.act_v2(obs) == original_agent.act_v2(obs)
 
 
+def test_package_rejects_runtime_implementation_drift(
+    tmp_path, monkeypatch, p16_runtime
+):
+    model, _, _, ruleset, _ = p16_runtime
+    package = tmp_path / "release"
+    create_model_package(package, model, ruleset)
+    monkeypatch.setattr(
+        "douzero.deployment.package.model_implementation_hash", lambda: "f" * 64
+    )
+    with pytest.raises(ModelPackageError, match="implementation hash mismatch"):
+        verify_model_package(package)
+
+
 def test_package_rejects_wrong_ruleset_feature_config_and_tamper(tmp_path, p16_runtime):
     model, schema, config, ruleset, _ = p16_runtime
     package = tmp_path / "release"
@@ -120,15 +164,30 @@ def test_package_rejects_wrong_ruleset_feature_config_and_tamper(tmp_path, p16_r
     raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     raw["feature_version"] = "wrong-version"
     manifest_path.write_text(json.dumps(raw), encoding="utf-8")
-    manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    sums_path = package / "SHA256SUMS"
-    sums = sums_path.read_text(encoding="ascii").splitlines()
-    sums = [
-        f"{manifest_sha}  manifest.json" if line.endswith("  manifest.json") else line
-        for line in sums
-    ]
-    sums_path.write_text("\n".join(sums) + "\n", encoding="ascii")
+    _refresh_package_checksums(package)
     with pytest.raises(ModelPackageError, match="feature_version"):
+        verify_model_package(package)
+
+
+def test_package_rejects_replaced_valid_v2_sidecar(tmp_path, p16_runtime):
+    from douzero.checkpoint import save_v2_position_weights
+
+    model, _, config, ruleset, _ = p16_runtime
+    package = tmp_path / "release"
+    create_model_package(package, model, ruleset)
+
+    other_schema = build_v2_schema(max_history_len=9)
+    other_model = ModelV2(other_schema, config).eval()
+    weights_path = package / "weights.pt"
+    save_v2_position_weights(str(weights_path), other_model, ruleset=ruleset)
+
+    manifest_path = package / "manifest.json"
+    outer = json.loads(manifest_path.read_text(encoding="utf-8"))
+    outer["weights_sha256"] = hashlib.sha256(weights_path.read_bytes()).hexdigest()
+    manifest_path.write_text(json.dumps(outer), encoding="utf-8")
+    _refresh_package_checksums(package)
+
+    with pytest.raises(ModelPackageError, match="checkpoint identity"):
         verify_model_package(package)
 
     with (package / "README.md").open("a", encoding="utf-8") as handle:
@@ -163,6 +222,75 @@ def test_export_padded_action_batch_aligns(tmp_path, p16_runtime):
     assert report.max_abs_error is not None and report.max_abs_error <= 1e-5
     assert (tmp_path / "model.pt2").is_file()
     assert (tmp_path / "model.pt2.report.json").is_file()
+
+
+def test_failed_export_removes_stale_target_and_temporary_file(tmp_path, p16_runtime):
+    model, schema, config, _, obs = p16_runtime
+    unsupported = ModelV2(schema, replace(config, belief_enabled=True)).eval()
+    bundle = observation_to_model_inputs(obs)
+    output = tmp_path / "model.pt2"
+    output.write_bytes(b"stale export")
+
+    report = export_padded_model(
+        unsupported,
+        bundle,
+        output,
+        acting_role=obs.public.acting_role,
+        max_actions=len(obs.actions.legal_actions),
+    )
+
+    assert report.success is False
+    assert "belief_enabled" in report.message
+    assert not output.exists()
+    assert not list(tmp_path.glob(".model.pt2.*.tmp"))
+
+
+def test_alignment_failure_never_publishes_export(tmp_path, p16_runtime):
+    model, _, _, _, obs = p16_runtime
+    bundle = observation_to_model_inputs(obs)
+    output = tmp_path / "misaligned.pt2"
+    output.write_bytes(b"stale export")
+
+    report = export_padded_model(
+        model,
+        bundle,
+        output,
+        acting_role=obs.public.acting_role,
+        max_actions=len(obs.actions.legal_actions),
+        atol=-1.0,
+        rtol=-1.0,
+    )
+
+    assert report.success is False
+    assert not output.exists()
+    assert not list(tmp_path.glob(".misaligned.pt2.*.tmp"))
+
+
+def test_search_compatible_manifest_is_enforced(p16_runtime):
+    model, _, _, ruleset, _ = p16_runtime
+    search = SearchConfig(enabled=True)
+    belief_stub = torch.nn.Identity()
+    model.deployment_manifest = SimpleNamespace(search_compatible=False)
+    with pytest.raises(ValueError, match="search_compatible is false"):
+        DeepAgentV2(
+            "landlord",
+            model,
+            ruleset,
+            belief_model=belief_stub,
+            search_config=search,
+            device="cpu",
+        )
+
+    model.deployment_manifest = SimpleNamespace(search_compatible=True)
+    agent = DeepAgentV2(
+        "landlord",
+        model,
+        ruleset,
+        belief_model=belief_stub,
+        search_config=search,
+        device="cpu",
+    )
+    assert agent.search_config.enabled is True
 
 
 def test_agent_explicit_device_explanation_and_exception_fallback(p16_runtime):

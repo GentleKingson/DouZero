@@ -8,6 +8,7 @@ from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, Mapping
 
 from douzero._version import __version__, git_sha
+from douzero.deployment.abi import MODEL_ABI_VERSION, model_implementation_hash
 from douzero.models_v2.config import SUPPORTED_ROLES
 
 if TYPE_CHECKING:
@@ -37,6 +38,8 @@ class ModelManifest:
     """Complete identity and capability contract for one deployment model."""
 
     format_version: int
+    model_abi_version: str
+    implementation_hash: str
     model_version: str
     feature_version: str
     feature_schema_hash: str
@@ -61,6 +64,8 @@ class ModelManifest:
             )
         for name in (
             "model_version",
+            "model_abi_version",
+            "implementation_hash",
             "feature_version",
             "feature_schema_hash",
             "model_config_hash",
@@ -73,6 +78,7 @@ class ModelManifest:
             if not isinstance(value, str) or not value:
                 raise ModelManifestError(f"{name} must be a non-empty string")
         for name in (
+            "implementation_hash",
             "feature_schema_hash",
             "model_config_hash",
             "ruleset_hash",
@@ -81,6 +87,10 @@ class ModelManifest:
             value = getattr(self, name)
             if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
                 raise ModelManifestError(f"{name} must be a lowercase SHA-256")
+        if len(self.git_sha) not in (40, 64) or any(
+            c not in "0123456789abcdef" for c in self.git_sha
+        ):
+            raise ModelManifestError("git_sha must be a full lowercase Git object ID")
         if not self.role_support or len(set(self.role_support)) != len(self.role_support):
             raise ModelManifestError("role_support must contain unique supported roles")
         unknown_roles = set(self.role_support) - set(SUPPORTED_ROLES)
@@ -163,6 +173,12 @@ def build_model_manifest(
         raise TypeError(f"model must be ModelV2, got {type(model).__name__}")
     if not isinstance(ruleset, RuleSet):
         raise TypeError(f"ruleset must be RuleSet, got {type(ruleset).__name__}")
+    source_sha = git_sha()
+    if source_sha == "unknown":
+        raise ModelManifestError(
+            "release packages require a known git_sha; build from a Git checkout "
+            "or set DOUZERO_GIT_SHA to the exact source commit"
+        )
     if (
         public_or_privileged == PUBLIC_MODEL
         and getattr(model, "model_access", PUBLIC_MODEL) != PUBLIC_MODEL
@@ -175,13 +191,15 @@ def build_model_manifest(
             dtype = "float32"
     return ModelManifest(
         format_version=CURRENT_MODEL_FORMAT_VERSION,
+        model_abi_version=MODEL_ABI_VERSION,
+        implementation_hash=model_implementation_hash(),
         model_version="v2",
         feature_version=model.schema.feature_version,
         feature_schema_hash=model.schema.stable_hash(),
         model_config_hash=model.config.stable_hash(),
         ruleset_id=ruleset.ruleset_id,
         ruleset_hash=ruleset.stable_hash(),
-        git_sha=git_sha(),
+        git_sha=source_sha,
         training_config_hash=canonical_hash(training_config),
         role_support=tuple(role_support),
         belief_enabled=bool(model.config.belief_enabled),
@@ -190,6 +208,7 @@ def build_model_manifest(
         dtype=dtype,
         required_package_versions={
             "python": ">=3.11",
+            "numpy": ">=1.24",
             "torch": ">=2.0",
             "douzero": f"=={__version__}",
         },
