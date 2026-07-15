@@ -67,12 +67,13 @@ jobs:
           pip install -e .
 
       - name: compileall
-        run: python -m compileall -q douzero train.py evaluate.py generate_eval_data.py
+        run: python -m compileall -q douzero train.py evaluate.py evaluate_paired.py generate_eval_data.py
 
       - name: CLI --help
         run: |
           python train.py --help >/dev/null
           python evaluate.py --help >/dev/null
+          python evaluate_paired.py --help >/dev/null
           python generate_eval_data.py --help >/dev/null
 
       - name: pytest
