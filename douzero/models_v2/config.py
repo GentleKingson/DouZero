@@ -62,6 +62,11 @@ class ModelV2Config:
     # Auxiliary heads (P05 keeps the skeleton; heads wired in P07/P09).
     belief_enabled: bool = False
     human_prior_enabled: bool = False
+    # P17 learned bidding. Conditional identity fields below keep this fully
+    # backward compatible while disabled.
+    bidding_enabled: bool = False
+    bidding_hidden_size: int = 128
+    bidding_uncertainty_enabled: bool = False
     # P11 public other-player style conditioning. Disabled preserves P10 behavior
     # and the existing v3 checkpoint hash exactly.
     style_enabled: bool = False
@@ -162,6 +167,20 @@ class ModelV2Config:
                 f"strategy_time_budget_ms must be a non-negative int, got "
                 f"{self.strategy_time_budget_ms!r}"
             )
+        if not isinstance(self.bidding_enabled, bool):
+            raise TypeError("bidding_enabled must be bool")
+        if (
+            isinstance(self.bidding_hidden_size, bool)
+            or not isinstance(self.bidding_hidden_size, int)
+            or self.bidding_hidden_size <= 0
+        ):
+            raise ValueError("bidding_hidden_size must be a positive int")
+        if not isinstance(self.bidding_uncertainty_enabled, bool):
+            raise TypeError("bidding_uncertainty_enabled must be bool")
+        if self.bidding_uncertainty_enabled and not self.bidding_enabled:
+            raise ValueError(
+                "bidding_uncertainty_enabled requires bidding_enabled=True"
+            )
 
     # ------------------------------------------------------------------ #
     # Canonical identity (blocker #2 fix)
@@ -242,6 +261,21 @@ class ModelV2Config:
                 "style_embedding_dim": self.style_embedding_dim,
                 "style_feature_version": STYLE_FEATURE_VERSION,
                 "style_layout_hash": STYLE_LAYOUT_HASH,
+            })
+        if self.bidding_enabled:
+            from douzero.observation.bidding import (
+                BIDDING_ACTION_SCHEMA_VERSION,
+                BIDDING_HEAD_VERSION,
+                build_bidding_schema,
+            )
+
+            compatibility.update({
+                "bidding_enabled": True,
+                "bidding_hidden_size": self.bidding_hidden_size,
+                "bidding_uncertainty_enabled": self.bidding_uncertainty_enabled,
+                "bidding_head_version": BIDDING_HEAD_VERSION,
+                "bidding_action_schema": BIDDING_ACTION_SCHEMA_VERSION,
+                "bidding_feature_schema_hash": build_bidding_schema().stable_hash(),
             })
         return compatibility
 
@@ -335,7 +369,9 @@ class ModelV2Config:
         kwargs: dict[str, object] = {}
         for name in ("hidden_size", "history_encoder", "history_layers",
                      "history_heads", "role_embedding_dim", "belief_enabled",
-                     "human_prior_enabled", "style_enabled", "style_embedding_dim",
+                     "human_prior_enabled", "bidding_enabled",
+                     "bidding_hidden_size", "bidding_uncertainty_enabled",
+                     "style_enabled", "style_embedding_dim",
                      "strategy_features_enabled",
                      "strategy_hand_enabled", "strategy_structure_enabled",
                      "strategy_control_enabled", "strategy_cooperation_enabled",

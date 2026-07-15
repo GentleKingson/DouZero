@@ -92,6 +92,12 @@ _MODEL_CONFIG_HASH_KEY = "model_config_hash"
 #: on P05 checkpoints; the loader treats absence as version 1 and applies
 #: the P05 migration path (v1 hash + raw transform check).
 _MODEL_CONFIG_IDENTITY_VERSION_KEY = "model_config_identity_version"
+#: Learned-bidding identity is explicit as well as covered by the config hash.
+#: This lets deployment/audit tooling reject a head or action/token contract
+#: drift without reverse-engineering the ModelV2Config compatibility payload.
+_BIDDING_HEAD_VERSION_KEY = "bidding_head_version"
+_BIDDING_ACTION_SCHEMA_KEY = "bidding_action_schema"
+_BIDDING_FEATURE_SCHEMA_HASH_KEY = "bidding_feature_schema_hash"
 
 #: A small sentinel schema hash stamped into a manifest-less bundle so a loader
 #: can distinguish "no schema hash present" from "schema hash is the empty
@@ -102,6 +108,73 @@ _NO_SCHEMA_HASH = ""
 #: deployment sidecar (DeepAgentV2); ``training_checkpoint`` is the full
 #: bundle. Both are in the global CHECKPOINT_KINDS set.
 _V2_CHECKPOINT_KINDS = frozenset({"training_checkpoint", "public_policy"})
+
+
+def _bidding_identity_from_config(model_config: "ModelV2Config") -> dict[str, str]:
+    """Return the exact public-auction contract expected by a runtime config."""
+    if not bool(getattr(model_config, "bidding_enabled", False)):
+        return {
+            _BIDDING_HEAD_VERSION_KEY: "",
+            _BIDDING_ACTION_SCHEMA_KEY: "",
+            _BIDDING_FEATURE_SCHEMA_HASH_KEY: "",
+        }
+    from douzero.observation.bidding import (
+        BIDDING_ACTION_SCHEMA_VERSION,
+        BIDDING_HEAD_VERSION,
+        build_bidding_schema,
+    )
+
+    return {
+        _BIDDING_HEAD_VERSION_KEY: BIDDING_HEAD_VERSION,
+        _BIDDING_ACTION_SCHEMA_KEY: BIDDING_ACTION_SCHEMA_VERSION,
+        _BIDDING_FEATURE_SCHEMA_HASH_KEY: build_bidding_schema().stable_hash(),
+    }
+
+
+def _bidding_identity_from_model(model: "ModelV2") -> dict[str, str]:
+    identity = _bidding_identity_from_config(model.config)
+    if bool(getattr(model.config, "bidding_enabled", False)):
+        identity[_BIDDING_FEATURE_SCHEMA_HASH_KEY] = (
+            model.bidding_schema.stable_hash()
+        )
+    return identity
+
+
+def _validate_bidding_identity(
+    bundle: dict,
+    runtime_model_config: "ModelV2Config | None",
+    path: str,
+) -> None:
+    """Fail closed on learned-bidding head/action/feature contract drift.
+
+    Historical bidding-disabled bundles did not contain these fields, so
+    missing values remain equivalent to the empty disabled identity. A bundle
+    carrying any bidding identity requires the runtime config so the loader
+    never trusts the checkpoint's self-description.
+    """
+    actual = {
+        key: str(bundle.get(key, ""))
+        for key in (
+            _BIDDING_HEAD_VERSION_KEY,
+            _BIDDING_ACTION_SCHEMA_KEY,
+            _BIDDING_FEATURE_SCHEMA_HASH_KEY,
+        )
+    }
+    if runtime_model_config is None:
+        if any(actual.values()):
+            raise CheckpointCompatibilityError(
+                f"V2 checkpoint at {path!r} enables learned bidding; pass "
+                f"runtime_model_config so the bidding head/action/feature "
+                f"identity can be validated against runtime expectations."
+            )
+        return
+    expected = _bidding_identity_from_config(runtime_model_config)
+    for key, expected_value in expected.items():
+        if actual[key] != expected_value:
+            raise CheckpointCompatibilityError(
+                f"V2 checkpoint at {path!r} {key} mismatch: checkpoint has "
+                f"{actual[key]!r}, runtime expects {expected_value!r}."
+            )
 
 
 def _validate_model_config_hash(
@@ -455,6 +528,7 @@ def save_v2_checkpoint(
         # P06 r6: stamp the identity version so a future loader knows which
         # compatibility-dict field set produced this hash.
         _MODEL_CONFIG_IDENTITY_VERSION_KEY: model.config.IDENTITY_VERSION,
+        **_bidding_identity_from_model(model),
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, path)
@@ -598,6 +672,7 @@ def load_v2_checkpoint(
         runtime_model_config=runtime_model_config,
         path=path,
     )
+    _validate_bidding_identity(bundle, runtime_model_config, path)
 
     state_dict = bundle[_V2_STATE_DICT_KEY]
     if not isinstance(state_dict, dict):
@@ -690,6 +765,7 @@ def save_v2_position_weights(
         _MODEL_CONFIG_HASH_KEY: str(model_config_hash),
         # P06 r6: stamp the identity version (mirrors save_v2_checkpoint).
         _MODEL_CONFIG_IDENTITY_VERSION_KEY: model.config.IDENTITY_VERSION,
+        **_bidding_identity_from_model(model),
     }
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(bundle, path)
@@ -795,6 +871,7 @@ def load_v2_position_weights(
         runtime_model_config=runtime_model_config,
         path=path,
     )
+    _validate_bidding_identity(bundle, runtime_model_config, path)
     if not isinstance(state_dict, dict):
         raise CheckpointCompatibilityError(
             f"V2 sidecar at {path!r} state_dict is not a dict (got "

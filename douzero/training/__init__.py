@@ -47,6 +47,15 @@ from douzero.training.losses import (
     resolve_score_target,
     uncertainty_nll,
 )
+from douzero.training.bidding import (
+    BiddingLossComponents,
+    BiddingMinibatch,
+    BiddingPolicyConfig,
+    BiddingReplayBuffer,
+    BiddingTransition,
+    bidding_loss,
+    select_bidding_action,
+)
 from douzero.training.decision_policy import (
     DecisionConfig,
     select_action,
@@ -87,6 +96,13 @@ __all__ = [
     "conditional_score_huber_loss",
     "resolve_score_target",
     "uncertainty_nll",
+    "BiddingLossComponents",
+    "BiddingMinibatch",
+    "BiddingPolicyConfig",
+    "BiddingReplayBuffer",
+    "BiddingTransition",
+    "bidding_loss",
+    "select_bidding_action",
     "DecisionConfig",
     "select_action",
     "SUPPORTED_DECISION_MODES",

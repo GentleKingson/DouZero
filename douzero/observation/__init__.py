@@ -33,6 +33,17 @@ from douzero.observation.cards import (
     SMALL_JOKER_OFFSET,
     cards_to_vector,
 )
+from douzero.observation.bidding import (
+    BIDDING_ACTIONS,
+    BIDDING_ACTION_SCHEMA_VERSION,
+    BIDDING_FEATURE_VERSION,
+    BIDDING_HEAD_VERSION,
+    BIDDING_SCHEMA_VERSION,
+    BiddingFeatureSchema,
+    BiddingObservationV2,
+    build_bidding_schema,
+    get_bidding_obs_v2,
+)
 from douzero.observation.encode_v2 import (
     LegalActionBatch,
     ObservationV2,
@@ -92,6 +103,11 @@ from douzero.observation.seats import (
 )
 
 __all__ = [
+    # bidding observation
+    "BIDDING_ACTIONS", "BIDDING_ACTION_SCHEMA_VERSION",
+    "BIDDING_FEATURE_VERSION", "BIDDING_HEAD_VERSION",
+    "BIDDING_SCHEMA_VERSION", "BiddingFeatureSchema", "BiddingObservationV2",
+    "build_bidding_schema", "get_bidding_obs_v2",
     # cards
     "BIG_JOKER", "BIG_JOKER_OFFSET", "CARD_VECTOR_DIM", "DECK",
     "NUMERIC_RANKS", "SMALL_JOKER", "SMALL_JOKER_OFFSET", "cards_to_vector",

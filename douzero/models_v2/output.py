@@ -19,6 +19,40 @@ import torch
 
 
 @dataclass(frozen=True)
+class BiddingModelOutput:
+    """Learned bid output; outcome values use the landlord-side perspective."""
+
+    bid_logits: torch.Tensor
+    bid_action_mask: torch.Tensor
+    landlord_win_logit: torch.Tensor
+    expected_landlord_score: torch.Tensor
+    uncertainty: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.bid_logits.shape != (4,):
+            raise ValueError(
+                f"bid_logits must have shape (4,), got {tuple(self.bid_logits.shape)}"
+            )
+        if self.bid_action_mask.shape != (4,) or self.bid_action_mask.dtype != torch.bool:
+            raise ValueError("bid_action_mask must be bool with shape (4,)")
+        if not bool(self.bid_action_mask.any()):
+            raise ValueError("bidding output must contain a legal action")
+        for name in ("landlord_win_logit", "expected_landlord_score"):
+            if getattr(self, name).numel() != 1:
+                raise ValueError(f"{name} must be scalar")
+        if self.uncertainty is not None and self.uncertainty.numel() != 1:
+            raise ValueError("uncertainty must be scalar when present")
+
+    def masked_bid_logits(self) -> torch.Tensor:
+        masked = self.bid_logits.clone()
+        masked[~self.bid_action_mask] = float("-inf")
+        return masked
+
+    def argmax_bid(self) -> int:
+        return int(torch.argmax(self.masked_bid_logits()).item())
+
+
+@dataclass(frozen=True)
 class ModelOutput:
     """Typed multi-head output for one decision.
 
