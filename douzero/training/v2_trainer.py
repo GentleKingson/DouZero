@@ -816,12 +816,19 @@ class V2Trainer:
                 raise RuntimeError(
                     "differentiable belief features were requested in frozen mode"
                 )
-            bout = self.belief_model([binput], differentiable=True)
-            return belief_features_from_torch_probs(
-                bout.require_differentiable_probs(),
-                bout.opponent_a_total,
-                np.stack([binput.unseen_counts]),
-            )[0].to(self.device)
+            # Keep the complete graph-bearing belief path in float32 even
+            # under an outer CPU/CUDA autocast context. In particular, CPU
+            # BF16 can quantize a small value-only update to zero on some
+            # PyTorch/oneDNN combinations. The value model remains autocast;
+            # only the numerically sensitive belief encoder, constrained DP,
+            # and feature projection stay float32.
+            with torch.autocast(device_type=self.device.type, enabled=False):
+                bout = self.belief_model([binput], differentiable=True)
+                return belief_features_from_torch_probs(
+                    bout.require_differentiable_probs(),
+                    bout.opponent_a_total,
+                    np.stack([binput.unseen_counts]),
+                )[0].to(self.device)
         with torch.inference_mode():
             bout = self.belief_model([binput])
             feat_np = belief_features_from_probs(
