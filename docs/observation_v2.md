@@ -237,11 +237,11 @@ V2 is opt-in and does not change the default:
 - YAML/dict config: `feature_version: v2`.
 - Programmatic: `get_obs_v2(infoset)`.
 
-The legacy `get_obs` path, the legacy checkpoints, and the legacy training loop
-are byte-for-byte unchanged. **Training does not yet consume V2 observations**:
-`train()` rejects `feature_version="v2"` up front (before any CUDA/checkpoint/
-actor initialisation) until P05 (Model V2) and P06 (multi-objective training)
-wire the V2 schema into the actor/learner and buffers.
+The legacy `get_obs` path, legacy checkpoints, and legacy `train.py` loop remain
+unchanged. V2 training uses the separate `train_v2.py` entry point and consumes
+`ObservationV2` through the V2 replay buffer. P17 additionally enables the
+opt-in standard state machine with a separate public `BiddingObservationV2`;
+`configs/standard_v2.yaml` turns on both standard rules and learned bidding.
 
 ## 11. Deployment boundary note
 

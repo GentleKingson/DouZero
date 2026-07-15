@@ -1,7 +1,7 @@
 # Configuration
 
-> P01 introduces a typed configuration system. This page documents how to use
-> it and how it stays compatible with the legacy CLI.
+> P01 introduced the typed configuration system. This page documents the
+> current legacy and V2 entry points while preserving the original defaults.
 
 ## Overview
 
@@ -10,9 +10,9 @@ the legacy `douzero/dmc/arguments.py` argparse defaults **exactly**. The legacy
 CLI remains the default entry point; the typed config is an opt-in layer that
 makes the configuration inspectable, serializable, and YAML-loadable.
 
-- `douzero/config/schemas.py` — frozen dataclasses: `RuntimeConfig`,
-  `TrainingConfig`, `OptimizerConfig`, `ModelConfig`, `RuleConfig`,
-  `CheckpointConfig`, `EvaluationConfig`.
+- `douzero/config/schemas.py` — frozen dataclasses for runtime, training,
+  optimizer, model, loss, bidding, rules, checkpoints, evaluation, and the
+  other opt-in feature blocks.
 - `douzero/config/legacy.py` — `LegacyConfig`: a frozen snapshot of the current
   legacy defaults, used as a comparison target.
 - `douzero/config/loader.py` — `load_config` (YAML), `from_argparse` /
@@ -76,9 +76,50 @@ rejected.
 When `--ruleset standard` is set, a `rules:` block in the YAML config
 specifies the rule parameters (bidding mode, multipliers, base score, etc.).
 See `configs/standard.yaml` and `docs/rules_and_scoring.md` for details.
-**Training does not yet support `standard`** — `train.py` rejects it with a
-precise error. Standard mode is available for environment testing and
-end-to-end evaluation via `evaluate.py --ruleset standard`.
+The two training entry points intentionally differ:
+
+- legacy `train.py` still rejects `standard`, `feature_version=v2`, and
+  `model_version=v2` rather than approximating them in the legacy actor loop;
+- `train_v2.py --config configs/standard_v2.yaml` runs the complete standard
+  auction/redeal/reveal/card-play loop with `model.bidding_enabled=true`.
+
+The standard V2 path is single-process and eager today. It fails closed when
+DDP or `compile_model` is requested because the mixed bidding/card-play graph
+and separate `forward_bidding` contract have not been validated there.
+
+### Learned bidding block
+
+P17 adds a default-off `bidding:` block, consumed only by `train_v2.py` in
+standard mode:
+
+```yaml
+model:
+  bidding_enabled: true
+  bidding_hidden_size: 128
+  bidding_uncertainty_enabled: false
+bidding:
+  enabled: true
+  policy: learned
+  warm_start_policy: rule
+  learned_probability: 0.10
+```
+
+`policy` accepts `random`, `rule`, `max`, `pass`, or `learned`. In learned
+mode, `learned_probability` controls a gradual handoff from the non-learned
+warm-start policy; each collected auction transition records its true source.
+The bidding architecture and its versioned public schema enter checkpoint
+identity only when `bidding_enabled=true`, preserving the hashes of prior
+bidding-disabled V2 checkpoints.
+
+### Belief optimization controls
+
+P17 also adds `belief_training_mode` with `frozen` (default), `joint`, and
+`alternating` values plus supervised-loss weight, interval, batch-size, and
+bounded synthetic-smoke episode controls. Joint and alternating modes require
+`model.belief_enabled=true` and a strictly validated `--belief_checkpoint`.
+Alternating mode additionally requires a positive supervised weight and
+labelled samples. Joint/alternating modes are single-process and eager: DDP
+does not synchronize belief gradients, and `compile_model` rejects these modes.
 
 ### Distillation block
 
@@ -123,6 +164,12 @@ P14 adds `sync_interval_updates`, `policy_snapshot_slots`, `amp_enabled`,
 versioned actor snapshot mechanism is always active because it fixes a weight
 publication race without changing the learning objective. See
 `docs/training_system.md` for the torchrun and profiler commands.
+
+DDP support applies to the legacy-ruleset V2 card-play trainer with compatible
+optional features. Standard learned bidding, joint/alternating belief,
+curriculum/coach output, and RL+BC fail closed under DDP. `torch.compile` is
+likewise opt-in for the base V2 forward only; it rejects learned bidding and
+joint/alternating belief rather than silently running an unvalidated graph.
 
 ## Boolean flags and `--no-<flag>` overrides
 

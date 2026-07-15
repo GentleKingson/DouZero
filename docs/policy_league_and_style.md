@@ -69,9 +69,20 @@ seats, teammate IDs, ruleset hash, result, score, and immutable bundle hash.
 The logger is a serialized, single-process writer and flushes and fsyncs each
 record; multi-process actor deployments must route records through one writer.
 
-The current runner intentionally remains legacy card-play-only. Standard-rule
-bidding needs a policy interface for the bidding phase before it can be enabled;
-passing a standard `RuleSet` raises instead of silently choosing bids.
+P17 extends the runner to standard full-game self-play. A standard `RuleSet`
+requires an explicit current-policy bidding selector; built-in random and rule
+opponents use their named auction policies, and learned historical opponents
+must expose a compatible `bid()` selector rather than falling back silently.
+Policies are assigned to neutral seats before the auction and remapped to
+landlord/farmer roles only after the winning bid. Only learner-controlled bids
+enter bidding replay, and all-pass attempts are counted then discarded rather
+than receiving labels from a later redeal. Match logs include the terminal bid,
+redeal count, collected/abandoned bidding-transition counts, and final role
+mapping alongside the existing immutable bundle identity.
+
+This standard population path is still single-process because the mixed
+bidding/card-play graph is deliberately rejected under DDP. Legacy-ruleset V2
+population behavior remains available without a bidding selector.
 
 ## Snapshots and promotion
 
@@ -95,9 +106,12 @@ policy, and all user/pinned policies.
 `PromotionGate` accepts only `p15_paired_v1` results. It records the paired
 sample count, estimate, confidence interval, configured thresholds, decision,
 and deal-set identifier. The gate also requires `cardplay_only`, the official
-seat-permutation hash, 95% confidence, at least 1000 bootstrap samples, and the
-`cardplay_win_rate_delta` estimator. P15 supplies the evaluator; P11
-deliberately does not substitute unpaired self-play returns or descriptive
+seat-permutation hash, 95% confidence, at least 1,000 bootstrap samples, and
+the `cardplay_win_rate_delta` estimator; paired sample size remains the gate's
+configured threshold. P17's separate `p17_empirical_readiness_v1` release
+policy raises the evidence bar to 2,000 bootstrap samples and 1,000 paired
+deals without changing this closed P15 contract. P15 supplies the evaluator;
+P11 deliberately does not substitute unpaired self-play returns or descriptive
 `full_game` results for that protocol.
 
 ## Public style encoder

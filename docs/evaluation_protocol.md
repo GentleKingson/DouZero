@@ -15,9 +15,12 @@ cards.
 through neutral seats 0, 1, and 2 while the deck, first bidder, and clockwise
 bidding order stay fixed. Bidding determines the landlord before seat agents
 are mapped to landlord roles. A bundle declares its bidding policy explicitly:
-`rule`, `random`, `pass`, or `max`. The current learned card-play checkpoints do
-not expose a learned bidding head; `rule` is a fixed public hand-strength policy
-and reports must not describe it as model bidding.
+`learned`, `rule`, `random`, `pass`, or `max`. `learned` requires a V2/BC
+bundle with an explicit bidding checkpoint and `bidding_enabled` model config;
+the strict loader validates ruleset, model, card-play schema, bidding head,
+action schema, and bidding feature schema identity before inference. `rule` is
+a fixed public hand-strength policy and reports must not describe it as learned
+model bidding.
 
 `cardplay_only` uses common random streams derived from scenario seed, deal ID,
 and role. `full_game` derives them from deal ID and physical seat. Inference
@@ -28,7 +31,7 @@ The protocol identity is closed over its seat schedule. `cardplay_only` must
 contain exactly the candidate-landlord and candidate-two-farmers legs once
 each. `full_game` must contain exactly one candidate in each neutral seat once.
 Missing, duplicated, reordered, or additional permutations are rejected. In
-In `full_game`, stochastic policies use common random streams by physical seat so
+`full_game`, stochastic policies use common random streams by physical seat so
 identical candidate and baseline policies replay the same game under rotation.
 
 ## Statistical Unit
@@ -46,10 +49,16 @@ the standard zero-sum seat score: landlord and both farmer scores sum to zero
 for every game. Identical policies therefore have an estimate of zero.
 
 Only `cardplay_only` may produce the `PromotionEvaluation` consumed by the P11
-promotion gate. Promotion additionally requires confidence level 0.95, at
-least 1000 bootstrap samples, the official permutation hash, and the
-`cardplay_win_rate_delta` estimator. `PromotionGate` validates all of these
-fields again; `full_game` reports cannot be promoted.
+promotion gate. The closed `p15_paired_v1` contract requires confidence level
+0.95, at least 1,000 bootstrap samples, the official permutation hash, and the
+`cardplay_win_rate_delta` estimator; its paired-deal minimum remains the
+configured `PromotionGate.min_pairs`. `PromotionGate` validates all of these
+fields again, and `full_game` reports cannot be promoted.
+
+P17 release collation applies a distinct readiness policy,
+`p17_empirical_readiness_v1`, to a valid P15 result. It requires at least 2,000
+bootstrap samples and 1,000 paired deals. This stricter release bar does not
+change or relabel the underlying P15 protocol result.
 
 ## Metrics And Outputs
 
@@ -57,14 +66,19 @@ Every run writes JSON, per-game CSV, and Markdown. The report includes:
 
 - overall, team, landlord, landlord-up, and landlord-down win percentage;
 - mean raw score and signed `log1p(abs(score))` score;
-- bid and landlord-acquisition rate in full-game mode;
+- bid and landlord-acquisition rate plus per-bid win/score in full-game mode;
 - bomb, rocket, spring, anti-spring, and game-length rates;
 - selected-action `p_win` Brier, NLL, and 15-bin ECE when a V2 agent exposes
   predictions;
-- candidate inference p50/p95/p99 and inference-only actor FPS;
+- candidate inference p50/p95/p99 and candidate inference calls/s;
+- search timeout/fallback rates and all-pass redeal/max-redeal audit counts;
 - deal/game/decision sample counts and paired 95% confidence intervals.
 
 Unavailable metrics are JSON `null` and Markdown `n/a`, not invented zeros.
+Inference calls/s divides calls by summed inference latency; it is not actor
+wall-clock FPS. The JSON retains the deprecated P15 `actor_fps` key as an
+exact alias for compatibility, but its value is still inference calls/s;
+actual actor FPS requires separate rollout wall-time instrumentation.
 The raw game rows remain in JSON/CSV so headline results are auditable.
 
 ## Model Matrix And Ablations
@@ -76,6 +90,19 @@ register arbitrary bundle names such as `legacy-wp`, `legacy-adp`, `bc-v1`,
 an explicit alias for the V2 loader so behavior-cloned bundles remain visibly
 distinct. Historical policies use their real backend plus a `historical` tag.
 Weighted bundles provide all three role checkpoint paths.
+Full-game learned bidding additionally supplies `bidding_policy: learned`, an
+explicit `bidding_checkpoint`, and the exact `model_config` used to save that
+manifest-bearing V2 sidecar. The evaluator never guesses a bidding checkpoint
+from a role path.
+
+P17 matrix normalization hashes every role, bidding, and belief checkpoint
+after strict manifest loading. Result scenarios carry those path-free hashes,
+and collation requires an exact match. Release readiness is recomputed from
+the auditable game rows, including official seat-rotation completeness,
+unique deal count, paired confidence interval, and redeal-cap exclusions;
+headline summary fields are not trusted on their own. A bounded forced
+all-pass fallback remains visible only as a smoke row and is excluded from
+every formal deal statistic.
 
 ```json
 {

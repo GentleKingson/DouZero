@@ -140,10 +140,13 @@ python pretrain_bc.py --data /tmp/valid.jsonl \
 
 ### With authorized human data
 
-Write an [`Adapter`](../douzero/human_data/adapters.py) (a callable
-`raw_mapping -> HumanGameRecord`) and:
+Write an [`Adapter`](../douzero/human_data/adapters.py) using the strict keyed
+contract
+`(raw_mapping, *, pseudonymizer) -> AttestedAdapterRecord` and configure the
+project key outside the repository:
 
 ```bash
+export DOUZERO_HUMAN_DATA_HMAC_KEY_FILE=/secret-store/douzero-hmac.key
 python ingest_human_games.py --input raw_export.jsonl \
     --adapter mypkg.adapters.PlatformAAdapter \
     --output /tmp/games.jsonl
@@ -156,17 +159,23 @@ zero-argument constructor. A class that needs configuration must be exposed as
 an adapter function that closes over configuration or as a preconfigured
 callable instance.
 
-Adapters must map every raw platform game identifier before constructing a
-record:
+Adapters must use the pseudonymizer supplied by ingest and return its opaque
+attestation with the record:
 
 ```python
-from douzero.human_data import pseudonymize_external_game_id
+from douzero.human_data import AttestedAdapterRecord
 
-game_id = pseudonymize_external_game_id(
-    raw["platform_game_id"],
-    project_key=project_key,  # load from secret storage; never write to JSONL
-)
+def convert(raw, *, pseudonymizer):
+    identity = pseudonymizer.pseudonymize(raw["platform_game_id"])
+    record = build_record(raw, game_id=identity.game_id)
+    return AttestedAdapterRecord(record=record, identity=identity)
 ```
+
+External ingest fails closed unless `--hmac-key-file` or
+`DOUZERO_HUMAN_DATA_HMAC_KEY_FILE` supplies at least 32 bytes. The adapter never
+receives raw key bytes. Ingest verifies the keyed attestation and rejects an
+unkeyed SHA-256 or any merely regex-shaped `dzg_...` identifier. Synthetic mode
+continues to use internal fixture IDs and requires no secret.
 
 ## Configuration (`configs/enhanced.yaml`)
 

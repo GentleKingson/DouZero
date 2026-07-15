@@ -1,10 +1,10 @@
 # Joint Hidden-Hand Belief Model (P07)
 
-> **Status:** implemented behind `belief_enabled` (default off). The belief
-> model is **pretrainable and frozen**, then its public posterior features are
-> fused into Model V2. Legacy and belief-disabled V2 paths are byte-identical
-> to P06. Real playing-strength is **not measured** here — only conservation,
-> decoding correctness, and a CPU smoke loss-decrease are verified.
+> **Status:** implemented behind `belief_enabled` (default off). `frozen`
+> remains the compatibility default, while P17 adds explicit `joint` and
+> `alternating` optimization through a differentiable, constrained PyTorch DP.
+> Legacy and belief-disabled V2 paths remain unchanged. Real playing strength
+> is not established by these implementation and CPU correctness tests.
 
 This phase adds the imperfect-information-safe replacement for "reading the
 true hidden hands". At deployment the model predicts a **posterior** over how
@@ -70,11 +70,13 @@ The unplayed public bottom cards are *known* landlord property, so:
 |---|---|
 | `constraints.py` | 15-rank category set, canonical opponent A/B, `[15,5]` legal mask, per-rank count helpers, `opponent_unknown_total` (bottom-adjusted). |
 | `dynamic_programming.py` | Exact MAP `decode_map` + forward-filter/backward-sample `sample_allocation`. Bounded `O(15 · total · 5)`; no rejection loop. Raises `BeliefDPError` on an infeasible (inconsistent) observation. |
+| `torch_dynamic_programming.py` | Differentiable constrained marginals for joint training. It implements the same exact-total posterior in a forced-float32 Torch island so gradients reach belief logits under FP16/BF16 autocast. |
 | `features.py` | `build_belief_input(public_obs)` → a fixed-width public feature vector + the constraint totals. Enforces `pool.sum() == A_hidden + B_hidden`. |
 | `model.py` | `BeliefModel`: MLP encoder → `[B,15,5]` head + legal mask; `decode_map`, `sample`, and `belief_features_from_probs` (the value-fusion feature vector). `BeliefConfig` with its own `stable_hash()`. |
 | `labels.py` | `build_belief_label(...)` — the ONLY place the true hidden allocation is read; produces the `(15,)` target and `(15,5)` one-hot. |
 | `losses.py` | Masked cross-entropy + optional count/entropy regularizers + `belief_metrics` (rank accuracy, exact-match, count-MAE). |
 | `checkpoint.py` | Manifest-bearing save/load with architecture-hash + ruleset identity validation. |
+| `joint_checkpoint.py` | Atomic joint/alternating checkpoint helpers that bind both model states, both config hashes, mode, public-input contract, optimizer state, and ruleset/schema identity. |
 | `data.py` | Random self-play collector carrying `(BeliefInput, BeliefLabel)` pairs (privileged label never on the public observation). |
 
 ## Imperfect-information boundary
@@ -100,13 +102,12 @@ opponent A, opponent-A & B expected totals, total entropy) into the trunk and
   axis in `ModelV2Config.compatibility_dict`), so **no checkpoint
   identity-version bump** is needed and belief-disabled checkpoints load
   unchanged.
-- `belief_stop_gradient` (default `True`) detaches the belief features so the
-  value loss never updates the frozen belief weights — the "pretrain belief
-  then freeze" path. **Joint training (`belief_stop_gradient=False`) is NOT
-  implemented in P07** and raises `NotImplementedError`: the constrained-marginal
-  DP and the feature projection run in NumPy, which cuts the graph between the
-  value loss and the belief parameters. A differentiable belief path is future
-  work. The `belief_proj` layer itself stays trainable under the default path.
+- `belief_stop_gradient=True` detaches belief features for the default
+  "pretrain then freeze" path; `belief_proj` remains a trainable value-model
+  parameter. P17 joint training calls the public belief encoder with
+  `differentiable=True`, computes the same exact-total constrained marginals in
+  Torch, converts them to differentiable belief features, and forwards with
+  `belief_stop_gradient=False`, allowing value loss to update BeliefModel.
 - The belief model itself is **not owned** by Model V2; the caller computes
   the public posterior and passes it in. This keeps the value checkpoint
   decoupled from the belief architecture.
@@ -117,11 +118,13 @@ opponent A, opponent-A & B expected totals, total entropy) into the trunk and
 
 ## Training the value model with belief fusion
 
-A belief-enabled value model is trained via `train_v2.py` with the frozen
-pretrained belief model supplied as a feature source:
+A belief-enabled value model is trained via `train_v2.py` with a strictly
+validated pretrained belief model as its initialization. Frozen mode uses it
+as a feature source; joint and alternating modes opt into further updates:
 
 ```bash
-python train_v2.py --config configs/enhanced.yaml --belief_checkpoint /path/belief.pt
+python train_v2.py --config /path/to/belief_v2.yaml \
+  --belief_checkpoint /path/to/belief.pt
 ```
 
 `V2Trainer(model, ..., belief_model=belief)` freezes the BeliefModel
@@ -133,10 +136,36 @@ checkpoint is validated by `load_belief_checkpoint` (ruleset + feature version +
 architecture hash). A belief-enabled value model without `--belief_checkpoint`
 fails fast at trainer construction.
 
+P17 exposes three explicit modes:
+
+| Mode | Behavior |
+|---|---|
+| `frozen` (default) | Uses the established NumPy constrained posterior as a detached public feature source. Belief weights never enter the optimizer. |
+| `joint` | Uses differentiable Torch constrained marginals. Value loss reaches both the value model and BeliefModel; an optional supervised belief term may be added. |
+| `alternating` | Alternates value-only and supervised-belief-only optimizer blocks at `belief_alternating_interval`; labelled belief samples and a positive supervised weight are required. |
+
+For example, with a config whose `model.belief_enabled` is true:
+
+```bash
+python train_v2.py --config /path/to/belief_v2.yaml \
+  --belief_checkpoint /path/to/belief.pt \
+  --belief_training_mode joint \
+  --checkpoint_path /path/to/joint-trainer.pt
+```
+
+`--resume_checkpoint` strictly restores mode, both model states, optimizer,
+counters, and RNG state. The standalone `save_joint_checkpoint` /
+`load_joint_checkpoint` API provides the same coupled identity boundary for
+callers outside `V2Trainer`. `--belief_supervised_episodes` is a bounded
+synthetic labelled-data smoke path, not a substitute for an approved training
+dataset. Joint and alternating modes currently reject DDP because belief
+gradients are not synchronized, and reject `compile_model` because this graph
+has not been validated through Torch compilation.
+
 ## Deployment: `DeepAgentV2`
 
 A belief-enabled value model deploys via `DeepAgentV2(position, model, ruleset,
-belief_model=...)`. The agent holds the frozen `BeliefModel`, builds a
+belief_model=...)`. The agent holds the eval-mode `BeliefModel`, builds a
 `BeliefInput` from the **public** observation (`obs.public` — never a hidden
 hand), runs the constrained posterior, projects it into the 48-dim feature
 vector, and passes it into `ModelV2.forward` (cast to the value model's
@@ -149,6 +178,11 @@ device/dtype inside the forward).
 - Both the canonical `act_v2(obs)` and the legacy `act(infoset)` paths fuse
   belief features. The imperfect-information boundary is preserved: the belief
   model reads only `obs.public`.
+- A format-2 belief-enabled deployment package carries the strictly validated,
+  checksummed belief checkpoint and attaches the reconstructed BeliefModel to
+  the loaded value model. `DeepAgentV2` consumes this attachment by default,
+  avoiding an untracked external belief artifact at serving time. Direct
+  programmatic construction may still pass `belief_model=` explicitly.
 
 ## Training and evaluation CLI
 
@@ -171,9 +205,12 @@ trigger arbitrary code execution) and validates the full manifest identity
 (schema version, model version, checkpoint kind, feature version, architecture
 hash, ruleset identity). `expected_ruleset` is **required**.
 
-The P07 collector runs on the **legacy** card-play env only (`Env("adp")`).
-Standard-ruleset bidding/redeal collection is NOT implemented in this phase, so
-the checkpoint is always stamped `legacy` — never mislabeled as `standard`.
+The standalone P07 `train_belief.py` collector still runs on the **legacy**
+card-play env only (`Env("adp")`), so checkpoints created by that command are
+stamped `legacy`, never mislabeled as `standard`. This is a limitation of that
+pretraining command, not of the P17 standard V2 game loop: standard full-game
+training and learned bidding are available through `train_v2.py`, but require
+a belief checkpoint whose ruleset identity matches that run.
 
 `evaluate_belief.py` reports metrics for **both** decoders:
 
@@ -188,6 +225,9 @@ the checkpoint is always stamped `legacy` — never mislabeled as `standard`.
 - **Belief checkpoints** (`belief_v1`) are a separate kind with their own
   manifest (`douzero/belief/checkpoint.py`); they are not loadable by the V2
   value loader and vice versa.
+- **Coupled checkpoints** for `joint` and `alternating` atomically bind both
+  state dictionaries and the exact optimization mode. Cross-mode, config,
+  ruleset, feature, optimizer, or public-input-contract mismatches fail closed.
 - **Value checkpoints**: `belief_enabled` is already in
   `ModelV2Config.compatibility_dict`, so a belief-enabled value model has a
   different config hash from a belief-disabled one (enforced as an identity
@@ -216,6 +256,12 @@ the checkpoint is always stamped `legacy` — never mislabeled as `standard`.
 - Model V2 fusion: belief on/off gate, output changes with features,
   stop-gradient on/off, wrong-dim rejection, disabled-model rejection,
   fail-closed on missing features, parameter_count includes belief_proj.
+- P17 differentiable DP: Torch/NumPy marginal parity, exact-total conservation,
+  finite float32 behavior under CPU BF16 autocast, and gradients through the
+  constrained posterior into belief logits.
+- Frozen/joint/alternating trainer behavior: frozen belief weights stay fixed,
+  value-only joint loss updates belief weights, alternating phases isolate
+  optimizer ownership, and coupled save/resume restores both models.
 - Device/dtype: `BeliefModel.double()` produces float64 logits.
 - CLI smoke (`train_belief` / `evaluate_belief` end-to-end on CPU).
 
@@ -227,12 +273,9 @@ the checkpoint is always stamped `legacy` — never mislabeled as `standard`.
   it does **not** claim a stronger belief or a stronger value model. That
   requires the P15 paired-evaluation framework and model-guided self-play
   collection (P14), both out of scope here.
-- **Joint value+belief training is NOT supported.** The constrained-marginal
-  DP and the belief-feature projection are non-differentiable (NumPy), so
-  `belief_stop_gradient=False` raises `NotImplementedError`. Only the
-  "pretrain belief, then freeze its features while training `belief_proj`"
-  path is available. A differentiable belief path (so value loss can update
-  the BeliefModel) is deferred to a later phase.
+- Joint and alternating training have not been validated under DDP,
+  `torch.compile`, or on CUDA in this closure. Those requests fail closed where
+  applicable; CPU tests are not evidence of multi-GPU correctness or speed.
 - `DeepAgentV2` **does** wire belief features end-to-end (see "Deployment"
   above) on CPU; the optional CUDA path is symmetric but not exercised in CI
   (the test image is CPU-only).
