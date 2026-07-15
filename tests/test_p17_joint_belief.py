@@ -318,21 +318,31 @@ def test_trainer_alternates_value_only_then_supervised_belief_parameters():
 
 
 def test_joint_trainer_cpu_bfloat16_amp_is_finite_and_updates_belief():
+    from douzero.belief.data import collect_random_dataset
+
     torch.manual_seed(25)
     value, belief = _models()
     before = _parameters(belief)
+    config = _trainer_config("joint", amp=True)
+    config.belief_supervised_weight = 0.5
+    config.belief_supervised_batch_size = 2
     trainer = V2Trainer(
         value,
         belief_model=belief,
+        belief_supervised_samples=collect_random_dataset(
+            2, seed=25
+        ).samples,
         loss_config=LossConfig(lambda_win=1.0, lambda_score=0.5),
-        config=_trainer_config("joint", amp=True),
+        config=config,
     )
     trainer.collect_episodes()
     assert trainer.step() is not None
     assert _changed(before, belief)
     assert trainer.stats.amp_fallbacks == 0
+    assert trainer.stats.belief_supervised_steps == 1
     assert np.isfinite(trainer.stats.grad_norm_last_step)
     assert np.isfinite(trainer.stats.last_loss["loss_total"])
+    assert np.isfinite(trainer.stats.last_loss["belief_loss_total"])
 
 
 def test_joint_trainer_checkpoint_resume_restores_both_and_continues(tmp_path):
