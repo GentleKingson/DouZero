@@ -11,7 +11,8 @@ The legacy :file:`train.py` path is unchanged. This entry point exists so
 the multi-objective loss + decision-policy + team-perspective labels can be
 exercised without touching the legacy multiprocessing actor/learner.
 
-CPU-only (P06). GPU + multiprocessing is P14.
+CPU remains the default. P14 adds optional one-process-per-GPU DDP via
+``torchrun`` while keeping the single-process path simple.
 
 Precedence (P06 r1 fix)
 -----------------------
@@ -41,7 +42,6 @@ CPU smoke (no GPU required):
 from __future__ import annotations
 
 import argparse
-import os
 
 from douzero.config import load_config
 from douzero.runtime import maybe_set_global_deterministic, set_global_seed
@@ -55,7 +55,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ``--deterministic`` are the only exceptions (they have real defaults).
     """
     parser = argparse.ArgumentParser(
-        description="DouZero V2 multi-objective trainer (P06, CPU-only)",
+        description="DouZero V2 multi-objective trainer (CPU or P14 DDP)",
     )
     parser.add_argument(
         "--config",
@@ -77,6 +77,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_grad_norm", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--max_steps_per_episode", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--device", choices=["cpu", "cuda", "auto"],
+                        default=argparse.SUPPRESS)
+    parser.add_argument("--ddp_enabled", action=argparse.BooleanOptionalAction,
+                        default=argparse.SUPPRESS)
+    parser.add_argument("--ddp_backend", choices=["auto", "nccl", "gloo"],
+                        default=argparse.SUPPRESS)
+    parser.add_argument("--compile_model", action=argparse.BooleanOptionalAction,
+                        default=argparse.SUPPRESS)
+    parser.add_argument("--amp_enabled", action=argparse.BooleanOptionalAction,
+                        default=argparse.SUPPRESS)
+    parser.add_argument("--amp_dtype", choices=["float16", "bfloat16"],
+                        default=argparse.SUPPRESS)
+    parser.add_argument("--amp_fallback_on_nonfinite",
+                        action=argparse.BooleanOptionalAction,
+                        default=argparse.SUPPRESS)
     parser.add_argument(
         "--deterministic",
         action=argparse.BooleanOptionalAction,
@@ -362,12 +377,49 @@ def _build_curriculum(cfg):
     return sampler, label_store, cc.policy_version, cc.policy_step
 
 
+def _validate_ddp_features(cfg, model_cfg, loss_cfg, distributed) -> None:
+    """Reject training modes whose file side effects are not DDP-safe."""
+    if not distributed.enabled:
+        return
+    if cfg is not None and cfg.curriculum.enabled:
+        raise NotImplementedError(
+            "DDP does not support curriculum/coach-label training yet: its "
+            "audit and label stores require a single writer. Disable "
+            "curriculum or run train_v2.py without DDP."
+        )
+    if loss_cfg.lambda_bc > 0:
+        raise NotImplementedError(
+            "DDP does not support RL+BC auxiliary training yet: BC validation "
+            "and quarantine require rank-zero coordination. Set lambda_bc=0 "
+            "or run train_v2.py without DDP."
+        )
+    if model_cfg.human_prior_enabled:
+        raise ValueError(
+            "DDP requires every enabled trainable head to contribute to the "
+            "loss: model.human_prior_enabled=true but loss.lambda_bc=0. "
+            "Disable the prior head for DDP."
+        )
+    strategy_weight = sum(
+        float(getattr(loss_cfg, name))
+        for name in (
+            "lambda_min_turns",
+            "lambda_regain_initiative",
+            "lambda_teammate_finish",
+            "lambda_spring",
+            "lambda_structure",
+        )
+    )
+    if model_cfg.strategy_aux_enabled and strategy_weight == 0:
+        raise ValueError(
+            "DDP requires every enabled trainable head to contribute to the "
+            "loss: model.strategy_aux_enabled=true but all strategy auxiliary "
+            "loss weights are zero. Disable the auxiliary heads or enable an "
+            "auxiliary loss."
+        )
+
+
 def main() -> None:
     args = _build_parser().parse_args()
-
-    # CPU-only (P06). Force CUDA invisible so the model never accidentally
-    # lands on a GPU the trainer does not move tensors to.
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     yaml_cfg = _load_yaml_config(args.config)
 
@@ -403,13 +455,43 @@ def main() -> None:
         yaml_cfg.deterministic if yaml_cfg else None,
         False,
     )
-    set_global_seed(seed)
+    import torch
+
+    from douzero.runtime.distributed import initialize_distributed
+
+    ddp_enabled = resolve(
+        "ddp_enabled", yaml_cfg.ddp_enabled if yaml_cfg else None, False
+    )
+    ddp_backend = resolve(
+        "ddp_backend", yaml_cfg.ddp_backend if yaml_cfg else None, "auto"
+    )
+    distributed = initialize_distributed(
+        enabled=ddp_enabled, backend=ddp_backend
+    )
+    if distributed.enabled:
+        import atexit
+
+        atexit.register(distributed.close)
+    requested_device = resolve("device", None, "cpu")
+    if distributed.enabled:
+        learner_device = distributed.device
+    elif requested_device == "auto":
+        learner_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested but CUDA is unavailable")
+        learner_device = torch.device("cuda")
+    else:
+        learner_device = torch.device("cpu")
+    rank_seed = seed + distributed.rank if seed != 0 else 0
+    set_global_seed(rank_seed)
     maybe_set_global_deterministic(deterministic)
+    loss_cfg = _build_loss_config(yaml_cfg)
+    model_cfg = _build_model_cfg(yaml_cfg)
+    _validate_ddp_features(yaml_cfg, model_cfg, loss_cfg, distributed)
 
     # Build the V2 model from the schema + config (honouring score_clamp so
     # the head clamp matches the loss target clamp exactly).
-    import torch
-
     from douzero.models_v2.model import ModelV2
     from douzero.observation.schema import build_v2_schema
 
@@ -418,17 +500,34 @@ def main() -> None:
     # torch.manual_seed(0) or the model init would be seeded while the deal
     # shuffle is not — a mixed, contradictory reproducibility state. Only
     # seed Torch when the user explicitly requested a non-zero seed.
-    if seed != 0:
-        torch.manual_seed(seed)
+    if rank_seed != 0:
+        torch.manual_seed(rank_seed)
     schema = build_v2_schema()
-    model_cfg = _build_model_cfg(yaml_cfg)
-    model = ModelV2(schema, model_cfg)
+    model = ModelV2(schema, model_cfg).to(learner_device)
+    compile_enabled = resolve(
+        "compile_model", yaml_cfg.compile_model if yaml_cfg else None, False
+    )
+    if compile_enabled:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("compile_model requires torch.compile")
+        model = torch.compile(model, dynamic=True)
+    core_model = model
+    amp_enabled = resolve(
+        "amp_enabled", yaml_cfg.amp_enabled if yaml_cfg else None, False
+    )
+    model = distributed.wrap(model)
+    if distributed.enabled:
+        # DDP intentionally exposes only Module's API. The trainer also needs
+        # immutable model identity/config helpers, so forward them explicitly.
+        model.config = core_model.config
+        model.schema = core_model.schema
+        model.strategy_feature_config = core_model.strategy_feature_config
 
     from douzero.training import V2Trainer
 
     trainer_cfg = TrainerConfig(
-        seed=seed,
-        rng_seed=seed,
+        seed=rank_seed,
+        rng_seed=rank_seed,
         # CLI dest "episodes" maps to TrainerConfig.max_episodes (TrainingConfig
         # has no episodes field; it comes from CLI or the TrainerConfig default).
         max_episodes=resolve("episodes", None, defaults.max_episodes),
@@ -455,10 +554,19 @@ def main() -> None:
             "max_grad_norm", yaml_cfg.max_grad_norm if yaml_cfg else None, defaults.max_grad_norm
         ),
         max_steps_per_episode=resolve("max_steps_per_episode", None, defaults.max_steps_per_episode),
+        device=str(learner_device),
+        amp_enabled=amp_enabled,
+        amp_dtype=resolve(
+            "amp_dtype", yaml_cfg.amp_dtype if yaml_cfg else None, "float16"
+        ),
+        amp_fallback_on_nonfinite=resolve(
+            "amp_fallback_on_nonfinite",
+            yaml_cfg.amp_fallback_on_nonfinite if yaml_cfg else None,
+            True,
+        ),
     )
 
     ruleset = _resolve_ruleset(yaml_cfg)
-    loss_cfg = _build_loss_config(yaml_cfg)
     decision_cfg = _build_decision_config(yaml_cfg)
     opening_sampler, coach_label_store, policy_version, policy_step = (
         _build_curriculum(yaml_cfg)
@@ -622,9 +730,11 @@ def main() -> None:
         coach_label_store=coach_label_store,
         policy_version=policy_version,
         policy_step=policy_step,
+        distributed_context=distributed,
     )
 
-    print(
+    if distributed.is_rank_zero:
+        print(
         f"[train_v2] model={type(model).__name__} "
         f"params={sum(p.numel() for p in model.parameters())} "
         f"score_clamp={model_cfg.score_clamp} "
@@ -633,10 +743,15 @@ def main() -> None:
         f"trainer=batch_size={trainer_cfg.batch_size} "
         f"lr={trainer_cfg.learning_rate} "
         f"epsilon={trainer_cfg.exp_epsilon} "
+        f"amp={trainer_cfg.amp_enabled}:{trainer_cfg.amp_dtype} "
         f"ruleset={trainer.ruleset.ruleset_id if trainer.ruleset else 'legacy'}"
-    )
-    stats = trainer.train()
-    print(
+        )
+    try:
+        stats = trainer.train()
+    finally:
+        distributed.close()
+    if distributed.is_rank_zero:
+        print(
         f"[train_v2] episodes_completed={stats.episodes_completed} "
         f"transitions={stats.transitions_collected} "
         f"optimizer_steps={stats.optimizer_steps} "
@@ -646,7 +761,7 @@ def main() -> None:
         f"p_win_mean={stats.p_win_mean:.4f}"
         f" opening_strategies={stats.opening_strategy_counts}"
         f" opening_predicted_win_mean={stats.opening_predicted_win_mean:.4f}"
-    )
+        )
 
 
 if __name__ == "__main__":

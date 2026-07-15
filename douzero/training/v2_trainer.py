@@ -49,6 +49,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from douzero.runtime import DistributedContext, SafeMixedPrecision
+
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.models_v2.batch import observation_to_model_inputs
@@ -92,6 +94,12 @@ class TrainerConfig:
     buffer_capacity: int = 4096
     # RNG for action sampling / minibatch sampling.
     rng_seed: int = 0
+    # P14 learner placement. ``cpu`` preserves the P06 path; torchrun assigns
+    # one CUDA device per process and passes it here for DDP.
+    device: str = "cpu"
+    amp_enabled: bool = False
+    amp_dtype: str = "float16"
+    amp_fallback_on_nonfinite: bool = True
 
     def __post_init__(self) -> None:
         """Validate ranges so a malformed config fails fast (P06 r2).
@@ -161,6 +169,7 @@ class TrainerStats:
     score_mean_avg: float = float("nan")
     opening_strategy_counts: dict[str, int] = field(default_factory=dict)
     opening_predicted_win_mean: float = float("nan")
+    amp_fallbacks: int = 0
 
 
 def _legacy_only(ruleset: RuleSet | None) -> None:
@@ -223,6 +232,7 @@ class V2Trainer:
         coach_label_store=None,
         policy_version: str = "current",
         policy_step: int = 0,
+        distributed_context: DistributedContext | None = None,
     ) -> None:
         _legacy_only(ruleset)
         loss_cfg = loss_config or LossConfig()
@@ -345,6 +355,45 @@ class V2Trainer:
             )
         self.decision_config = decision_config or DecisionConfig()
         self.config = config or TrainerConfig()
+        self.device = torch.device(self.config.device)
+        self.distributed = distributed_context or DistributedContext(enabled=False)
+        if self.distributed.enabled and self.distributed.device != self.device:
+            raise ValueError(
+                "distributed context device does not match TrainerConfig.device: "
+                f"{self.distributed.device} != {self.device}"
+            )
+        if (
+            self.distributed.enabled
+            and self.model.config.human_prior_enabled
+            and self.bc_schedule.base_lambda == 0
+        ):
+            raise ValueError(
+                "DDP cannot train an enabled prior head when lambda_bc=0; "
+                "disable human_prior_enabled or enable its loss"
+            )
+        if (
+            self.distributed.enabled
+            and self.model.config.strategy_aux_enabled
+            and self.strategy_aux_weight == 0
+        ):
+            raise ValueError(
+                "DDP cannot train enabled strategy auxiliary heads when all "
+                "strategy auxiliary loss weights are zero"
+            )
+        self.model.to(self.device)
+        # DDP forward is a synchronization point. Self-play control flow is
+        # intentionally rank-local, so inference must bypass the wrapper and
+        # call the local module directly. Optimizer closures continue to use
+        # ``self.model`` so training forward/backward remains synchronized.
+        self.inference_model = (
+            self.model.module if self.distributed.enabled else self.model
+        )
+        self.mixed_precision = SafeMixedPrecision(
+            self.device,
+            enabled=self.config.amp_enabled,
+            dtype=self.config.amp_dtype,
+            fallback_on_nonfinite=self.config.amp_fallback_on_nonfinite,
+        )
         # P06 r4: reject a "valid but trains nothing" configuration.
         # (a) optimizer_steps > 0 with all loss weights at 0 produces a
         #     zero-gradient step that silently changes nothing.
@@ -603,7 +652,40 @@ class V2Trainer:
             )[0]
         # Detached leaf tensor: the value model casts it to its trunk
         # device/dtype and the value loss updates only belief_proj.
-        return torch.from_numpy(feat_np).detach()
+        return torch.from_numpy(feat_np).detach().to(self.device)
+
+    def _forward_bundle(self, bundle, belief_features=None):
+        """Move one variable-action decision to the learner rank and forward."""
+        return self._forward_bundle_with(
+            self.model, bundle, belief_features=belief_features
+        )
+
+    def _inference_forward_bundle(self, bundle, belief_features=None):
+        """Forward rank-local self-play without entering a DDP sync point."""
+        return self._forward_bundle_with(
+            self.inference_model, bundle, belief_features=belief_features
+        )
+
+    def _forward_bundle_with(self, model, bundle, belief_features=None):
+        """Move one variable-action decision to the learner device and forward."""
+        bundle.to(self.device)
+        if belief_features is not None:
+            belief_features = belief_features.to(self.device)
+        with self.mixed_precision.autocast():
+            return model(
+                bundle.state_card_vectors,
+                bundle.state_context_flat,
+                bundle.context_card_vectors,
+                bundle.context_flat,
+                bundle.history_tokens,
+                bundle.history_key_padding_mask,
+                bundle.action_features,
+                bundle.action_mask,
+                bundle.acting_role,
+                belief_features=belief_features,
+                strategy_features=bundle.strategy_features,
+                style_features=bundle.style_features,
+            )
 
     def _compute_bc_aux_loss(self):
         """Sample a BC minibatch and return the averaged listwise BC loss.
@@ -635,27 +717,14 @@ class V2Trainer:
             # so without this the P07+P08 combo would crash at every optimizer
             # step. The features come from the PUBLIC observation only.
             belief_features = self._compute_belief_feature(s.obs)
-            out = self.model(
-                bundle.state_card_vectors,
-                bundle.state_context_flat,
-                bundle.context_card_vectors,
-                bundle.context_flat,
-                bundle.history_tokens,
-                bundle.history_key_padding_mask,
-                bundle.action_features,
-                bundle.action_mask,
-                bundle.acting_role,
-                belief_features=belief_features,
-                strategy_features=bundle.strategy_features,
-                style_features=bundle.style_features,
-            )
+            out = self._forward_bundle(bundle, belief_features)
             if out.prior_logit is None:
                 raise RuntimeError(
                     "BC auxiliary loss requested but the model produced no "
                     "prior_logit (the prior head disappeared mid-training)."
                 )
             loss, hit = listwise_bc_loss(
-                out.prior_logit,
+                out.prior_logit.float(),
                 out.action_mask,
                 s.human_action_index,
                 weight=s.sample_weight,
@@ -678,41 +747,50 @@ class V2Trainer:
                 self.model.strategy_feature_config(),
                 style_enabled=self.model.config.style_enabled,
             )
-            out = self.model(
-                bundle.state_card_vectors,
-                bundle.state_context_flat,
-                bundle.context_card_vectors,
-                bundle.context_flat,
-                bundle.history_tokens,
-                bundle.history_key_padding_mask,
-                bundle.action_features,
-                bundle.action_mask,
-                bundle.acting_role,
-                belief_features=belief_features,
-                strategy_features=bundle.strategy_features,
-                style_features=bundle.style_features,
-            )
+            out = self._inference_forward_bundle(bundle, belief_features)
         return select_action(out, self.decision_config)
 
     # ------------------------------------------------------------------ #
     # Optimization (fail-closed on non-finite loss / gradient)
     # ------------------------------------------------------------------ #
+    def _capture_retry_rng_state(self):
+        """Capture every RNG source used by the optimizer closure."""
+        return {
+            "trainer": self.rng.getstate(),
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.random.get_rng_state(),
+            "cuda": (
+                torch.cuda.get_rng_state(self.device)
+                if self.device.type == "cuda" else None
+            ),
+        }
+
+    def _restore_retry_rng_state(self, state) -> None:
+        """Replay an AMP fallback with identical BC samples and dropout."""
+        self.rng.setstate(state["trainer"])
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.random.set_rng_state(state["torch"])
+        if state["cuda"] is not None:
+            torch.cuda.set_rng_state(state["cuda"], self.device)
+
     def step(self) -> LossComponents | None:
         """Run one optimizer step on a sampled minibatch.
 
         Returns the :class:`LossComponents` if a step was taken, or ``None``
         if the buffer did not have enough labelled transitions yet.
 
-        Fail-closed (P06 r1): if the total loss is non-finite OR the
-        gradient norm is non-finite, raise :class:`FloatingPointError`
-        BEFORE the optimizer mutates parameters. PyTorch's
-        :func:`torch.nn.utils.clip_grad_norm_` defaults to
-        ``error_if_nonfinite=False`` which silently lets NaN/Inf through;
-        we pass ``error_if_nonfinite=True`` to make the failure loud.
+        Non-finite loss or gradients are detected before optimizer mutation.
+        An AMP step retries once in float32; a float32 anomaly raises
+        :class:`FloatingPointError`.
         """
+        local_batch_ready = len(self.buffer) >= self.config.batch_size
+        if not self.distributed.all_true(local_batch_ready):
+            return None
         batch = self.buffer.sample_minibatch(self.config.batch_size, rng=self.rng)
         if batch is None:
-            return None
+            raise RuntimeError("replay buffer reported ready but returned no minibatch")
 
         # P06 r4: use try/finally so model.eval() + gradient cleanup are
         # guaranteed even when clip_grad_norm_(error_if_nonfinite=True) or
@@ -721,137 +799,119 @@ class V2Trainer:
         # collection would run with dropout active.
         self.model.train()
         try:
-            # Per-decision forward; gather the chosen action's heads and
-            # CONCATENATE (not stack) so the resulting tensors are (B, 1).
-            gathered_win: list[torch.Tensor] = []
-            gathered_siw: list[torch.Tensor] = []
-            gathered_sil: list[torch.Tensor] = []
-            gathered_aux: dict[str, list[torch.Tensor]] = {
-                "min_turns_after": [],
-                "regain_initiative_logit": [],
-                "teammate_finish_logit": [],
-                "spring_probability_logit": [],
-                "structure_cost": [],
-            }
-            for i, obs in enumerate(batch.observations):
-                bundle = observation_to_model_inputs(
-                    obs,
-                    self.model.strategy_feature_config(),
-                    style_enabled=self.model.config.style_enabled,
-                )
-                belief_features = self._compute_belief_feature(obs)
-                out = self.model(
-                    bundle.state_card_vectors,
-                    bundle.state_context_flat,
-                    bundle.context_card_vectors,
-                    bundle.context_flat,
-                    bundle.history_tokens,
-                    bundle.history_key_padding_mask,
-                    bundle.action_features,
-                    bundle.action_mask,
-                    bundle.acting_role,
-                    belief_features=belief_features,
-                    strategy_features=bundle.strategy_features,
-                    style_features=bundle.style_features,
-                )
-                idx = int(batch.action_indices[i].item())
-                gathered_win.append(out.win_logit[idx : idx + 1])
-                gathered_siw.append(out.score_if_win[idx : idx + 1])
-                gathered_sil.append(out.score_if_loss[idx : idx + 1])
-                if self.model.config.strategy_aux_enabled:
-                    for name in gathered_aux:
-                        tensor = getattr(out, name)
-                        if tensor is None:
-                            raise RuntimeError(
-                                f"strategy auxiliary head {name!r} disappeared mid-training"
-                            )
-                        gathered_aux[name].append(tensor[idx : idx + 1])
-
-            win_logit = torch.cat(gathered_win, dim=0)        # (B, 1)
-            score_if_win = torch.cat(gathered_siw, dim=0)    # (B, 1)
-            score_if_loss = torch.cat(gathered_sil, dim=0)   # (B, 1)
-            batch_labels = {
-                "target_win": batch.target_win,
-                "target_score": batch.target_score,
-                "target_log_score": batch.target_log_score,
-            }
-            components = self.loss_fn.forward_gathered(
-                win_logit, score_if_win, score_if_loss, batch_labels
-            )
-
-            # P08: optional listwise BC auxiliary term. When lambda_bc > 0 the
-            # trainer samples a minibatch of human BC samples, forwards each
-            # through the prior head, and adds the (weighted, averaged) listwise
-            # cross-entropy scaled by lambda_bc to the RL loss. Both terms
-            # contribute gradients in a single backward pass.
-            total_loss = components.total
+            components = None
             aux_diag: dict[str, float] = {}
-            if self.strategy_aux_weight > 0:
-                from douzero.strategy.auxiliary import strategy_auxiliary_loss
-
-                target_names = (
-                    "min_turns_after", "min_turns_exact_mask",
-                    "regain_initiative", "teammate_finish",
-                    "teammate_finish_mask", "spring_probability", "structure_cost",
-                )
-                targets = {
-                    name: getattr(batch, f"target_{name}") for name in target_names
-                }
-                if any(value is None for value in targets.values()):
-                    raise RuntimeError(
-                        "strategy auxiliary training requires trajectory labels; "
-                        "the replay minibatch contains unlabeled transitions"
-                    )
-                aux_predictions = {
-                    name: torch.cat(values, dim=0)
-                    for name, values in gathered_aux.items()
-                }
-                aux_components = strategy_auxiliary_loss(
-                    aux_predictions, targets, self.loss_fn.config
-                )
-                total_loss = total_loss + aux_components.total
-                aux_diag = aux_components.as_log_dict()
-            # P08 Blocker 1: the BC auxiliary weight follows the configured
-            # schedule (constant or linear_decay with a floor), evaluated at
-            # the CURRENT optimizer step so the weight evolves as configured.
-            eff_lambda = self.bc_schedule.effective_lambda(
-                self.stats.optimizer_steps
-            )
             bc_diag: dict[str, float] = {}
-            if eff_lambda > 0.0:
-                bc_term = self._compute_bc_aux_loss()
-                total_loss = total_loss + eff_lambda * bc_term.total
-                # Non-blocking (round 4): record BC diagnostics for logging so
-                # schedule effects / BC collapse / weight imbalance are visible.
-                bc_diag = {
-                    "bc_cross_entropy": bc_term.cross_entropy,
-                    "bc_top1_accuracy": (
-                        bc_term.top1_correct / bc_term.num_decisions
-                        if bc_term.num_decisions > 0 else 0.0
-                    ),
-                    "bc_effective_lambda": eff_lambda,
-                    "bc_num_decisions": bc_term.num_decisions,
+            win_logit = score_if_win = score_if_loss = None
+
+            def loss_closure():
+                nonlocal components, aux_diag, bc_diag
+                nonlocal win_logit, score_if_win, score_if_loss
+                gathered_win: list[torch.Tensor] = []
+                gathered_siw: list[torch.Tensor] = []
+                gathered_sil: list[torch.Tensor] = []
+                gathered_aux: dict[str, list[torch.Tensor]] = {
+                    "min_turns_after": [], "regain_initiative_logit": [],
+                    "teammate_finish_logit": [], "spring_probability_logit": [],
+                    "structure_cost": [],
                 }
+                for i, obs in enumerate(batch.observations):
+                    bundle = observation_to_model_inputs(
+                        obs, self.model.strategy_feature_config(),
+                        style_enabled=self.model.config.style_enabled,
+                    )
+                    out = self._forward_bundle(
+                        bundle, self._compute_belief_feature(obs)
+                    )
+                    idx = int(batch.action_indices[i].item())
+                    gathered_win.append(out.win_logit[idx : idx + 1])
+                    gathered_siw.append(out.score_if_win[idx : idx + 1])
+                    gathered_sil.append(out.score_if_loss[idx : idx + 1])
+                    if self.model.config.strategy_aux_enabled:
+                        for name in gathered_aux:
+                            tensor = getattr(out, name)
+                            if tensor is None:
+                                raise RuntimeError(
+                                    f"strategy auxiliary head {name!r} disappeared mid-training"
+                                )
+                            gathered_aux[name].append(tensor[idx : idx + 1])
 
-            # Fail-closed: a non-finite loss means something is wrong.
-            if not torch.isfinite(total_loss):
-                raise FloatingPointError(
-                    f"V2Trainer encountered a non-finite loss "
-                    f"({float(total_loss.item())!r}); refusing to take an "
-                    f"optimizer step. Check the head clamp, the target clamp, "
-                    f"and the input encoding."
+                # Keep all numerically sensitive objectives in float32 even
+                # when the model forward ran under autocast.
+                win_logit = torch.cat(gathered_win, dim=0).float()
+                score_if_win = torch.cat(gathered_siw, dim=0).float()
+                score_if_loss = torch.cat(gathered_sil, dim=0).float()
+                labels = {
+                    "target_win": batch.target_win.to(self.device),
+                    "target_score": batch.target_score.to(self.device),
+                    "target_log_score": batch.target_log_score.to(self.device),
+                }
+                components = self.loss_fn.forward_gathered(
+                    win_logit, score_if_win, score_if_loss, labels
                 )
+                total = components.total
+                aux_diag = {}
+                if self.strategy_aux_weight > 0:
+                    from douzero.strategy.auxiliary import strategy_auxiliary_loss
 
-            self.optimizer.zero_grad()
-            total_loss.backward()
-            # error_if_nonfinite=True so a NaN/Inf gradient raises loudly
-            # here instead of silently corrupting the optimizer state.
-            grad_norm = nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.max_grad_norm,
-                error_if_nonfinite=True,
+                    target_names = (
+                        "min_turns_after", "min_turns_exact_mask",
+                        "regain_initiative", "teammate_finish",
+                        "teammate_finish_mask", "spring_probability", "structure_cost",
+                    )
+                    targets = {
+                        name: getattr(batch, f"target_{name}")
+                        for name in target_names
+                    }
+                    if any(value is None for value in targets.values()):
+                        raise RuntimeError(
+                            "strategy auxiliary training requires trajectory labels; "
+                            "the replay minibatch contains unlabeled transitions"
+                        )
+                    targets = {
+                        name: value.to(self.device) for name, value in targets.items()
+                    }
+                    predictions = {
+                        name: torch.cat(values, dim=0).float()
+                        for name, values in gathered_aux.items()
+                    }
+                    aux_components = strategy_auxiliary_loss(
+                        predictions, targets, self.loss_fn.config
+                    )
+                    total = total + aux_components.total
+                    aux_diag = aux_components.as_log_dict()
+                eff_lambda = self.bc_schedule.effective_lambda(
+                    self.stats.optimizer_steps
+                )
+                bc_diag = {}
+                if eff_lambda > 0.0:
+                    bc_term = self._compute_bc_aux_loss()
+                    total = total + eff_lambda * bc_term.total
+                    bc_diag = {
+                        "bc_cross_entropy": bc_term.cross_entropy,
+                        "bc_top1_accuracy": (
+                            bc_term.top1_correct / bc_term.num_decisions
+                            if bc_term.num_decisions > 0 else 0.0
+                        ),
+                        "bc_effective_lambda": eff_lambda,
+                        "bc_num_decisions": bc_term.num_decisions,
+                    }
+                return total
+
+            step_result = self.mixed_precision.step(
+                loss_closure, self.optimizer, self.model.parameters(),
+                max_grad_norm=self.config.max_grad_norm,
+                clip_grad_norm=nn.utils.clip_grad_norm_,
+                collective_all_true=self.distributed.all_true,
+                synchronize_abandoned_backward=self.distributed.enabled,
+                capture_retry_state=self._capture_retry_rng_state,
+                restore_retry_state=self._restore_retry_rng_state,
             )
-            self.optimizer.step()
+            if components is None or win_logit is None:
+                raise RuntimeError("optimizer closure did not produce diagnostics")
+            total_loss = step_result.loss
+            grad_norm = step_result.grad_norm
+            self.stats.amp_fallbacks = self.mixed_precision.fallback_count
             self.stats.optimizer_steps += 1
             # Merge BC diagnostics into the last_loss log dict when active.
             loss_log = components.as_log_dict()

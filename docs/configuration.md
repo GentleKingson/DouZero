@@ -115,10 +115,20 @@ Node, rollout, and millisecond limits are mandatory fallback boundaries; a
 zero limit returns the base-policy action. See `configs/enhanced.yaml` and
 `docs/search.md`.
 
+### Training system controls
+
+P14 adds `sync_interval_updates`, `policy_snapshot_slots`, `amp_enabled`,
+`amp_dtype`, `amp_fallback_on_nonfinite`, `pin_memory`, `ddp_enabled`,
+`ddp_backend`, and `compile_model`. Optional accelerators default off. The
+versioned actor snapshot mechanism is always active because it fixes a weight
+publication race without changing the learning objective. See
+`docs/training_system.md` for the torchrun and profiler commands.
+
 ## Boolean flags and `--no-<flag>` overrides
 
-The four boolean flags (`--actor_device_cpu`, `--load_model`,
-`--disable_checkpoint`, `--deterministic`) use `argparse.BooleanOptionalAction`.
+Boolean flags such as `--actor_device_cpu`, `--load_model`,
+`--disable_checkpoint`, `--deterministic`, and the P14 system toggles use
+`argparse.BooleanOptionalAction`.
 This means:
 
 - `--<flag>` sets it to `True` (the legacy `store_true` behavior, unchanged).
@@ -131,8 +141,9 @@ example, if `configs/run.yaml` has `deterministic: true`, you can force it off:
 python train.py --config configs/run.yaml --no-deterministic
 ```
 
-The default is `False` for all four flags, matching the pre-P01 `store_true`
-defaults exactly.
+The compatibility-sensitive flags retain their pre-P01 defaults. P14's AMP,
+DDP, pinned-memory, and compile toggles default to `False`; anomaly fallback
+defaults to `True`.
 
 ## Programmatic use
 

@@ -47,14 +47,25 @@ def get_batch(free_queue,
     """
     This function will sample a batch from the buffers based
     on the indices received from the full queue. It will also
-    free the indices by sending it to full_queue.
+    free the indices by sending them to ``free_queue``. A ``None`` item is a
+    shutdown sentinel and returns ``None`` to the learner thread.
     """
+    indices = []
     with lock:
-        indices = [full_queue.get() for _ in range(flags.batch_size)]
+        for _ in range(flags.batch_size):
+            index = full_queue.get()
+            if index is None:
+                for acquired in indices:
+                    free_queue.put(acquired)
+                return None
+            indices.append(index)
     batch = {
         key: torch.stack([buffers[key][m] for m in indices], dim=1)
         for key in buffers
     }
+    if (getattr(flags, "pin_memory", False) and torch.cuda.is_available()
+            and not any(tensor.is_cuda for tensor in batch.values())):
+        batch = {key: tensor.pin_memory() for key, tensor in batch.items()}
     for m in indices:
         free_queue.put(m)
     return batch
@@ -95,6 +106,7 @@ def create_buffers(flags, device_iterator):
                 obs_x_no_action=dict(size=(T, x_dim), dtype=torch.int8),
                 obs_action=dict(size=(T, 54), dtype=torch.int8),
                 obs_z=dict(size=(T, 5, 162), dtype=torch.int8),
+                policy_version=dict(size=(T,), dtype=torch.int64),
             )
             _buffers: Buffers = {key: [] for key in specs}
             for _ in range(flags.num_buffers):
@@ -107,13 +119,16 @@ def create_buffers(flags, device_iterator):
             buffers[device][position] = _buffers
     return buffers
 
-def act(i, device, free_queue, full_queue, model, buffers, flags):
+def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
+        stop_event=None):
     """
     This function will run forever until we stop it. It will generate
     data from the environment and send the data to buffer. It uses
     a free queue and full queue to syncup with the main process.
     """
     positions = ['landlord', 'landlord_up', 'landlord_down']
+    lease = None
+    env = None
     try:
         T = flags.unroll_length
         # P01: per-actor deterministic seed + optional determinism (opt-in;
@@ -142,14 +157,19 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
         obs_x_no_action_buf = {p: [] for p in positions}
         obs_action_buf = {p: [] for p in positions}
         obs_z_buf = {p: [] for p in positions}
+        policy_version_buf = {p: [] for p in positions}
         size = {p: 0 for p in positions}
 
         position, obs, env_output = env.initial()
+        lease = policy_pool.acquire(owner_id=i)
+        model = lease.model
+        episode_policy_version = lease.version
 
-        while True:
+        while stop_event is None or not stop_event.is_set():
             while True:
                 obs_x_no_action_buf[position].append(env_output['obs_x_no_action'])
                 obs_z_buf[position].append(env_output['obs_z'])
+                policy_version_buf[position].append(episode_policy_version)
                 with torch.no_grad():
                     agent_output = model.forward(position, obs['z_batch'], obs['x_batch'], flags=flags)
                 _action_idx = int(agent_output['action'].cpu().detach().numpy())
@@ -170,11 +190,19 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
                             target_buf[p].extend([episode_return for _ in range(diff)])
                     break
 
+            # The environment has already reset, but no inference for the next
+            # game has happened. This is the only safe actor policy switch point.
+            policy_pool.release(lease)
+            lease = None
+            lease = policy_pool.acquire(owner_id=i)
+            model = lease.model
+            episode_policy_version = lease.version
+
             for p in positions:
                 while size[p] > T: 
                     index = free_queue[p].get()
                     if index is None:
-                        break
+                        return
                     for t in range(T):
                         buffers[p]['done'][index][t, ...] = done_buf[p][t]
                         buffers[p]['episode_return'][index][t, ...] = episode_return_buf[p][t]
@@ -182,6 +210,7 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
                         buffers[p]['obs_x_no_action'][index][t, ...] = obs_x_no_action_buf[p][t]
                         buffers[p]['obs_action'][index][t, ...] = obs_action_buf[p][t]
                         buffers[p]['obs_z'][index][t, ...] = obs_z_buf[p][t]
+                        buffers[p]['policy_version'][index][t, ...] = policy_version_buf[p][t]
                     full_queue[p].put(index)
                     done_buf[p] = done_buf[p][T:]
                     episode_return_buf[p] = episode_return_buf[p][T:]
@@ -189,6 +218,7 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
                     obs_x_no_action_buf[p] = obs_x_no_action_buf[p][T:]
                     obs_action_buf[p] = obs_action_buf[p][T:]
                     obs_z_buf[p] = obs_z_buf[p][T:]
+                    policy_version_buf[p] = policy_version_buf[p][T:]
                     size[p] -= T
 
     except KeyboardInterrupt:
@@ -198,6 +228,11 @@ def act(i, device, free_queue, full_queue, model, buffers, flags):
         traceback.print_exc()
         print()
         raise e
+    finally:
+        if lease is not None:
+            policy_pool.release(lease)
+        if env is not None:
+            env.close()
 
 def _cards2tensor(list_cards):
     """

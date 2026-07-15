@@ -32,6 +32,17 @@ num_buffers: 50
 num_threads: 4
 max_grad_norm: 40.0
 
+# P14 system controls. Optional accelerators are disabled by default.
+sync_interval_updates: 1
+policy_snapshot_slots: 2
+amp_enabled: false
+amp_dtype: float16
+amp_fallback_on_nonfinite: true
+pin_memory: false
+ddp_enabled: false
+ddp_backend: auto
+compile_model: false
+
 # P01-added knobs (defaults preserve legacy behavior)
 seed: 0
 deterministic: false

@@ -47,6 +47,18 @@ num_buffers: 50           # (ignored; legacy multiprocess buffer only)
 num_threads: 4            # (ignored; legacy multiprocess learner only)
 max_grad_norm: 40.0       # consumed: gradient clip
 
+# P14 training-system controls. AMP/DDP/compile remain opt-in so loading this
+# config on CPU is portable. Use torchrun for DDP.
+sync_interval_updates: 8
+policy_snapshot_slots: 2
+amp_enabled: false
+amp_dtype: float16
+amp_fallback_on_nonfinite: true
+pin_memory: false
+ddp_enabled: false
+ddp_backend: auto
+compile_model: false
+
 # Reproducibility (consumed: seed=0 means no-op per the project convention)
 seed: 0
 deterministic: false
