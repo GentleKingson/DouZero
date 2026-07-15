@@ -5,7 +5,7 @@
 - Repository: `https://github.com/GentleKingson/DouZero`
 - Base branch/SHA: `main` / `fa9f76de5ca31b4de33d4237e14b36e102c67655`
 - Review branch: `codex/p17-release-readiness-closure`
-- Reviewed implementation/test/CI SHA: `128301aa871011fbfb296ac185e1b81d289af21b`
+- Reviewed implementation/test/CI SHA: `5661671b6b752ceb9b48d4d7ca520a0daa4379ce`
   (the documentation-only closure commit follows this reviewed code SHA)
 - Review date: 2026-07-15 (Asia/Hong_Kong)
 - Host: macOS 26.5.2, arm64, Apple A18 Pro; no NVIDIA device or
@@ -157,6 +157,8 @@ under ignored `artifacts/`.
 | `train_belief.py --num_episodes 1 --epochs 1 ...` | PASS; 28 labelled samples, 7 finite batches, strict belief checkpoint saved |
 | Joint `train_v2.py ... --belief_training_mode joint` and strict resume | PASS; coupled checkpoint version 2; 1 then 2 optimizer steps, finite losses, parameters changed |
 | Final-SHA standard/joint checkpoint focused tests | Initial joint selector name was wrong and collected no such test; corrected command PASS, 2 tests |
+| First Draft-PR test matrix | FAILED on Linux CPU BF16: a value-only joint-belief update could quantize to zero under the runner's PyTorch/oneDNN combination |
+| Float32 joint-belief path fix; focused host and Docker tests | PASS; the belief encoder, constrained DP, and belief feature projection now opt out of outer autocast while the value model remains AMP-enabled |
 | `scripts/validate_gpu_training.sh --probe-only` | PASS; sanitized `environment.json` written |
 | `scripts/validate_gpu_training.sh` | EXPECTED BLOCKED (exit 3); GPU cases `not_run`, DDP `blocked_implementation` |
 | Synthetic `ingest_human_games.py` then `validate_human_games.py` | PASS; 4 total, 4 valid, 0 quarantined, 0 parse errors |
