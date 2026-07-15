@@ -515,7 +515,7 @@ def main() -> None:
     amp_enabled = resolve(
         "amp_enabled", yaml_cfg.amp_enabled if yaml_cfg else None, False
     )
-    model = distributed.wrap(model, static_graph=not amp_enabled)
+    model = distributed.wrap(model)
     if distributed.enabled:
         # DDP intentionally exposes only Module's API. The trainer also needs
         # immutable model identity/config helpers, so forward them explicitly.

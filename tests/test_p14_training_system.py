@@ -142,9 +142,7 @@ def _ddp_rank_one_nan_worker(
     )
     context = initialize_distributed(enabled=True, backend="gloo")
     try:
-        model = context.wrap(
-            nn.Linear(2, 1, bias=False), static_graph=False
-        )
+        model = context.wrap(nn.Linear(2, 1, bias=False))
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         amp = SafeMixedPrecision(
             torch.device("cpu"), enabled=True, dtype="bfloat16"
@@ -175,6 +173,7 @@ def _ddp_rank_one_nan_worker(
             model.parameters(),
             max_grad_norm=10.0,
             collective_all_true=context.all_true,
+            synchronize_abandoned_backward=True,
             clip_grad_norm=clip,
         )
         assert calls == 2

@@ -56,6 +56,7 @@ class SafeMixedPrecision:
         max_grad_norm: float,
         clip_grad_norm: Callable | None = None,
         collective_all_true: Callable[[bool], bool] | None = None,
+        synchronize_abandoned_backward: bool = False,
         capture_retry_state: Callable[[], object] | None = None,
         restore_retry_state: Callable[[object], None] | None = None,
     ) -> OptimizerStepResult:
@@ -76,7 +77,8 @@ class SafeMixedPrecision:
         try:
             return self._attempt(loss_closure, optimizer, params,
                                  max_grad_norm, attempted_amp, clip_grad_norm,
-                                 collective_all_true)
+                                 collective_all_true,
+                                 synchronize_abandoned_backward)
         except FloatingPointError:
             if not attempted_amp or not self.fallback_on_nonfinite:
                 raise
@@ -87,11 +89,13 @@ class SafeMixedPrecision:
                 restore_retry_state(retry_state)
             result = self._attempt(loss_closure, optimizer, params,
                                    max_grad_norm, False, clip_grad_norm,
-                                   collective_all_true)
+                                   collective_all_true,
+                                   synchronize_abandoned_backward)
             return OptimizerStepResult(result.loss, result.grad_norm, False, True)
 
     def _attempt(self, closure, optimizer, params, max_grad_norm, use_amp,
-                 clip_grad_norm, collective_all_true):
+                 clip_grad_norm, collective_all_true,
+                 synchronize_abandoned_backward):
         optimizer.zero_grad(set_to_none=True)
         with self.autocast(enabled=use_amp):
             loss = closure()
@@ -101,6 +105,18 @@ class SafeMixedPrecision:
             if collective_all_true is not None else local_loss_finite
         )
         if not loss_finite:
+            if synchronize_abandoned_backward:
+                # DDP prepared its reducer during forward. Even though this
+                # loss must never reach the optimizer, every rank must finish
+                # that reducer iteration before a coordinated retry. Replacing
+                # non-finite scalar values produces a synchronization-only
+                # backward; its gradients are discarded immediately.
+                torch.nan_to_num(
+                    loss,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).backward()
             detail = (
                 f"non-finite loss: {loss.detach().float().item()!r}"
                 if not local_loss_finite else "non-finite loss on a peer rank"

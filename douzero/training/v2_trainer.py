@@ -903,6 +903,7 @@ class V2Trainer:
                 max_grad_norm=self.config.max_grad_norm,
                 clip_grad_norm=nn.utils.clip_grad_norm_,
                 collective_all_true=self.distributed.all_true,
+                synchronize_abandoned_backward=self.distributed.enabled,
                 capture_retry_state=self._capture_retry_rng_state,
                 restore_retry_state=self._restore_retry_rng_state,
             )
