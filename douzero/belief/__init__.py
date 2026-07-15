@@ -64,6 +64,7 @@ from .dynamic_programming import (
     decode_map,
     sample_allocation,
 )
+from .torch_dynamic_programming import constrained_marginals_torch
 from .features import (
     BELIEF_INPUT_DIM,
     BeliefInput,
@@ -80,12 +81,18 @@ from .losses import (
     belief_loss,
     belief_metrics,
 )
+from .joint_checkpoint import (
+    JointCheckpointManifest,
+    load_joint_checkpoint,
+    save_joint_checkpoint,
+)
 from .model import (
     BELIEF_FEATURE_DIM,
     BeliefConfig,
     BeliefModel,
     BeliefOutput,
     belief_features_from_probs,
+    belief_features_from_torch_probs,
 )
 
 __all__ = [
@@ -109,6 +116,7 @@ __all__ = [
     "constrained_marginals",
     "decode_map",
     "sample_allocation",
+    "constrained_marginals_torch",
     "BELIEF_INPUT_DIM",
     "BeliefInput",
     "build_belief_feature_vector",
@@ -119,9 +127,13 @@ __all__ = [
     "BeliefLossComponents",
     "belief_loss",
     "belief_metrics",
+    "JointCheckpointManifest",
+    "load_joint_checkpoint",
+    "save_joint_checkpoint",
     "BELIEF_FEATURE_DIM",
     "BeliefConfig",
     "BeliefModel",
     "BeliefOutput",
     "belief_features_from_probs",
+    "belief_features_from_torch_probs",
 ]

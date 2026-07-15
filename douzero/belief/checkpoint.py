@@ -141,9 +141,8 @@ def save_belief_checkpoint(
     # compatibility_dict (with derived constants) is kept in the manifest for
     # the hash check; it must NOT be passed to the constructor.
     config_fields = {
-        "hidden_size": config.hidden_size,
-        "num_layers": config.num_layers,
-        "dropout": config.dropout,
+        item.name: getattr(config, item.name)
+        for item in dataclasses.fields(BeliefConfig)
     }
     bundle = {
         _STATE_DICT_KEY: model.state_dict(),

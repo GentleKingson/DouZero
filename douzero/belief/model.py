@@ -149,6 +149,10 @@ class BeliefOutput:
     opponent_a_role: list[str]
     expected_counts: np.ndarray  # (B, 15) float64 — from constrained marginals
     entropy: np.ndarray  # (B,) float64 — from constrained marginals
+    # Populated only by ``forward(..., differentiable=True)``.  The NumPy
+    # field above remains the compatibility surface used by exact evaluation,
+    # MAP decoding, and sampling.
+    constrained_probs_torch: torch.Tensor | None = None
 
     @property
     def probs(self) -> torch.Tensor:
@@ -166,6 +170,16 @@ class BeliefOutput:
     def detach_logits(self) -> np.ndarray:
         """Return the logits as a detached ``(B, 15, 5)`` numpy array."""
         return self.logits.detach().cpu().float().numpy()
+
+    def require_differentiable_probs(self) -> torch.Tensor:
+        """Return graph-bearing constrained marginals or fail explicitly."""
+        if self.constrained_probs_torch is None:
+            raise RuntimeError(
+                "This BeliefOutput was produced by the exact evaluation path. "
+                "Call BeliefModel.forward(..., differentiable=True) when a "
+                "value loss must update the belief model."
+            )
+        return self.constrained_probs_torch
 
 
 def _build_mlp(
@@ -250,7 +264,12 @@ class BeliefModel(nn.Module):
         flat = self.head(h)
         return flat.view(*feature_matrix.shape[:-1], NUM_BELIEF_RANKS, NUM_COUNT_SLOTS)
 
-    def forward(self, inputs: list[BeliefInput] | BeliefInput) -> BeliefOutput:
+    def forward(
+        self,
+        inputs: list[BeliefInput] | BeliefInput,
+        *,
+        differentiable: bool = False,
+    ) -> BeliefOutput:
         """Run a forward pass for one (or a batch of) :class:`BeliefInput`.
 
         Returns a :class:`BeliefOutput` carrying the masked logits, the
@@ -258,7 +277,11 @@ class BeliefModel(nn.Module):
         **constrained marginals** (``constrained_probs``) — the per-rank
         posterior conditioned on the total-count constraint, whose expected
         total equals ``opponent_a_total`` exactly. The value model should
-        consume the constrained marginals.
+        consume the constrained marginals.  ``differentiable=False`` keeps the
+        established exact NumPy forward-backward evaluation path.  Set it to
+        ``True`` during joint training to use the equivalent float32 PyTorch
+        recurrence and expose the graph-bearing tensor through
+        :meth:`BeliefOutput.require_differentiable_probs`.
 
         Single-input callers may pass one :class:`BeliefInput`; it is
         internally promoted to a length-1 batch. Device and dtype are derived
@@ -301,23 +324,36 @@ class BeliefModel(nn.Module):
 
         logits = self._forward_logits(feature_matrix, style_matrix)
         legal = torch.as_tensor(legal_np, device=logits.device).bool()
-        masked = logits.masked_fill(~legal, _MASK_LOGIT)
+        # Masked softmax and constrained partition arithmetic are intentionally
+        # float32 even when the encoder runs under autocast.
+        masked = logits.float().masked_fill(~legal, _MASK_LOGIT)
         factor_probs = torch.softmax(masked, dim=-1)
 
         # Constrained per-rank marginals P(c_r=k | sum=total). These are the
         # joint-posterior marginals (not the independent factor softmax); their
         # expected total equals opponent_a_total exactly, which is the property
         # the value-fusion features require (Blocker #3 fix).
-        logp_np = logits.detach().cpu().float().numpy()
-        logp_np = np.where(legal_np, logp_np, -np.inf)
-        constrained = np.zeros(
-            (len(inputs), NUM_BELIEF_RANKS, NUM_COUNT_SLOTS), dtype=np.float64
-        )
-        for i in range(len(inputs)):
-            constrained[i] = constrained_marginals(
-                logp_np[i], int(totals[i]),
-                summary=f"role={roles[i]} total={int(totals[i])}",
+        constrained_torch = None
+        if differentiable:
+            from .torch_dynamic_programming import constrained_marginals_torch
+
+            constrained_torch = constrained_marginals_torch(
+                logits,
+                torch.as_tensor(totals, device=logits.device, dtype=torch.long),
+                legal,
             )
+            constrained = constrained_torch.detach().cpu().numpy().astype(np.float64)
+        else:
+            logp_np = logits.detach().cpu().float().numpy()
+            logp_np = np.where(legal_np, logp_np, -np.inf)
+            constrained = np.zeros(
+                (len(inputs), NUM_BELIEF_RANKS, NUM_COUNT_SLOTS), dtype=np.float64
+            )
+            for i in range(len(inputs)):
+                constrained[i] = constrained_marginals(
+                    logp_np[i], int(totals[i]),
+                    summary=f"role={roles[i]} total={int(totals[i])}",
+                )
         return BeliefOutput(
             logits=logits,
             legal=legal,
@@ -327,7 +363,14 @@ class BeliefModel(nn.Module):
             opponent_a_role=roles,
             expected_counts=expected_counts_from_probs(constrained),
             entropy=total_entropy_from_probs(constrained),
+            constrained_probs_torch=constrained_torch,
         )
+
+    def forward_differentiable(
+        self, inputs: list[BeliefInput] | BeliefInput
+    ) -> BeliefOutput:
+        """Convenience wrapper for the graph-preserving training path."""
+        return self.forward(inputs, differentiable=True)
 
     # ------------------------------------------------------------------ #
     # Constrained decoding / sampling
@@ -460,3 +503,86 @@ def belief_features_from_probs(
             f"BELIEF_FEATURE_DIM {BELIEF_FEATURE_DIM}"
         )
     return feat
+
+
+def belief_features_from_torch_probs(
+    probs: torch.Tensor,
+    opponent_a_total: torch.Tensor | np.ndarray,
+    unseen_counts: torch.Tensor | np.ndarray,
+    *,
+    assert_constrained: bool = True,
+) -> torch.Tensor:
+    """Differentiable PyTorch projection of constrained belief marginals.
+
+    This is the graph-preserving counterpart to
+    :func:`belief_features_from_probs`.  It has the same 48-field layout and
+    consumes public posterior quantities only.  Arithmetic stays in float32
+    so entropy and expected-count features remain finite under AMP.
+    """
+
+    if not isinstance(probs, torch.Tensor):
+        raise TypeError(f"probs must be a torch.Tensor, got {type(probs).__name__}")
+    if probs.ndim != 3 or tuple(probs.shape[-2:]) != (
+        NUM_BELIEF_RANKS,
+        NUM_COUNT_SLOTS,
+    ):
+        raise ValueError(
+            f"probs must have shape (B, {NUM_BELIEF_RANKS}, "
+            f"{NUM_COUNT_SLOTS}), got {tuple(probs.shape)}"
+        )
+
+    p = probs.float()
+    counts = torch.arange(NUM_COUNT_SLOTS, device=p.device, dtype=torch.float32)
+    expected_a = (p * counts).sum(dim=-1)
+    totals = torch.as_tensor(
+        opponent_a_total, device=p.device, dtype=torch.float32
+    ).reshape(-1)
+    if totals.numel() != p.shape[0]:
+        raise ValueError(
+            f"opponent_a_total has {totals.numel()} values for batch "
+            f"size {p.shape[0]}"
+        )
+    if assert_constrained:
+        got = expected_a.sum(dim=-1)
+        if not torch.allclose(
+            got.detach(), totals.detach(), atol=2e-4, rtol=1e-5
+        ):
+            worst = float((got.detach() - totals.detach()).abs().max().item())
+            raise ValueError(
+                "belief_features_from_torch_probs received unconstrained "
+                "marginals: expected counts do not match opponent_a_total "
+                f"(max abs diff {worst:.4g})."
+            )
+
+    # clamp_min keeps log(0) out of the backward graph while retaining exact
+    # zero probability in the multiplicative term.
+    entropy = -(p * p.clamp_min(torch.finfo(torch.float32).tiny).log()).sum(dim=-1)
+    max_prob = p.max(dim=-1).values
+    unseen = torch.as_tensor(
+        unseen_counts, device=p.device, dtype=torch.float32
+    ).reshape(-1, NUM_BELIEF_RANKS)
+    if unseen.shape[0] != p.shape[0]:
+        raise ValueError(
+            f"unseen_counts batch {unseen.shape[0]} != probs batch {p.shape[0]}"
+        )
+    expected_b = unseen - expected_a
+    total_entropy = entropy.sum(dim=-1, keepdim=True)
+    features = torch.cat(
+        (
+            expected_a,
+            entropy,
+            max_prob,
+            expected_a.sum(dim=-1, keepdim=True),
+            expected_b.sum(dim=-1, keepdim=True),
+            total_entropy,
+        ),
+        dim=-1,
+    )
+    if features.shape[-1] != BELIEF_FEATURE_DIM:
+        raise RuntimeError(
+            f"belief feature dim mismatch: built {features.shape[-1]} != "
+            f"BELIEF_FEATURE_DIM {BELIEF_FEATURE_DIM}"
+        )
+    if not bool(torch.isfinite(features.detach()).all().item()):
+        raise FloatingPointError("differentiable belief features contain NaN/Inf")
+    return features
