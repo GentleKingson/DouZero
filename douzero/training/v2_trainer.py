@@ -362,7 +362,32 @@ class V2Trainer:
                 "distributed context device does not match TrainerConfig.device: "
                 f"{self.distributed.device} != {self.device}"
             )
+        if (
+            self.distributed.enabled
+            and self.model.config.human_prior_enabled
+            and self.bc_schedule.base_lambda == 0
+        ):
+            raise ValueError(
+                "DDP cannot train an enabled prior head when lambda_bc=0; "
+                "disable human_prior_enabled or enable its loss"
+            )
+        if (
+            self.distributed.enabled
+            and self.model.config.strategy_aux_enabled
+            and self.strategy_aux_weight == 0
+        ):
+            raise ValueError(
+                "DDP cannot train enabled strategy auxiliary heads when all "
+                "strategy auxiliary loss weights are zero"
+            )
         self.model.to(self.device)
+        # DDP forward is a synchronization point. Self-play control flow is
+        # intentionally rank-local, so inference must bypass the wrapper and
+        # call the local module directly. Optimizer closures continue to use
+        # ``self.model`` so training forward/backward remains synchronized.
+        self.inference_model = (
+            self.model.module if self.distributed.enabled else self.model
+        )
         self.mixed_precision = SafeMixedPrecision(
             self.device,
             enabled=self.config.amp_enabled,
@@ -631,11 +656,23 @@ class V2Trainer:
 
     def _forward_bundle(self, bundle, belief_features=None):
         """Move one variable-action decision to the learner rank and forward."""
+        return self._forward_bundle_with(
+            self.model, bundle, belief_features=belief_features
+        )
+
+    def _inference_forward_bundle(self, bundle, belief_features=None):
+        """Forward rank-local self-play without entering a DDP sync point."""
+        return self._forward_bundle_with(
+            self.inference_model, bundle, belief_features=belief_features
+        )
+
+    def _forward_bundle_with(self, model, bundle, belief_features=None):
+        """Move one variable-action decision to the learner device and forward."""
         bundle.to(self.device)
         if belief_features is not None:
             belief_features = belief_features.to(self.device)
         with self.mixed_precision.autocast():
-            return self.model(
+            return model(
                 bundle.state_card_vectors,
                 bundle.state_context_flat,
                 bundle.context_card_vectors,
@@ -710,7 +747,7 @@ class V2Trainer:
                 self.model.strategy_feature_config(),
                 style_enabled=self.model.config.style_enabled,
             )
-            out = self._forward_bundle(bundle, belief_features)
+            out = self._inference_forward_bundle(bundle, belief_features)
         return select_action(out, self.decision_config)
 
     # ------------------------------------------------------------------ #

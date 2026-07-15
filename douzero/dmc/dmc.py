@@ -1,4 +1,5 @@
 import os
+import queue
 import threading
 import time
 import timeit
@@ -16,6 +17,29 @@ from .utils import get_batch, log, create_env, create_buffers, create_optimizers
 from douzero.runtime import SafeMixedPrecision, VersionedPolicyPool
 
 mean_episode_return_buf = {p:deque(maxlen=100) for p in ['landlord', 'landlord_up', 'landlord_down']}
+
+
+class _LearnerThreadSupervisor:
+    """Propagate learner failures to the monitoring thread."""
+
+    def __init__(self, stop_event):
+        self.stop_event = stop_event
+        self.errors = queue.Queue()
+
+    def run(self, target, *args):
+        try:
+            target(*args)
+        except BaseException as exc:
+            self.errors.put((exc, exc.__traceback__))
+            self.stop_event.set()
+
+    def raise_if_failed(self):
+        try:
+            exc, traceback = self.errors.get_nowait()
+        except queue.Empty:
+            return
+        raise exc.with_traceback(traceback)
+
 
 def compute_loss(logits, targets):
     loss = ((logits.squeeze(-1) - targets)**2).mean()
@@ -282,6 +306,7 @@ def train(flags):
 
     # Starting actor processes
     stop_event = ctx.Event()
+    learner_supervisor = _LearnerThreadSupervisor(stop_event)
     for device in device_iterator:
         num_actors = flags.num_actors
         for i in range(flags.num_actors):
@@ -312,8 +337,15 @@ def train(flags):
                 )
             else:
                 models[device].recover_owner(actor_id)
+        learner_join_deadline = time.monotonic() + 5
         for thread in threads:
-            thread.join()
+            thread.join(
+                timeout=max(0.0, learner_join_deadline - time.monotonic())
+            )
+            if thread.is_alive():
+                log.error(
+                    'Learner thread %s did not stop within 5 seconds.', thread.name
+                )
 
     def batch_and_learn(i, device, position, local_lock, position_lock, lock=threading.Lock()):
         """Thread target for the learning process."""
@@ -350,7 +382,17 @@ def train(flags):
         for i in range(flags.num_threads):
             for position in ['landlord', 'landlord_up', 'landlord_down']:
                 thread = threading.Thread(
-                    target=batch_and_learn, name='batch-and-learn-%d' % i, args=(i,device,position,locks[device][position],position_locks[position]))
+                    target=learner_supervisor.run,
+                    name='batch-and-learn-%d-%s-%s' % (i, device, position),
+                    args=(
+                        batch_and_learn,
+                        i,
+                        device,
+                        position,
+                        locks[device][position],
+                        position_locks[position],
+                    ),
+                )
                 thread.start()
                 threads.append(thread)
     
@@ -382,10 +424,12 @@ def train(flags):
     try:
         last_checkpoint_time = timer() - flags.save_interval * 60
         while frames < flags.total_frames:
+            learner_supervisor.raise_if_failed()
             start_frames = frames
             position_start_frames = {k: position_frames[k] for k in position_frames}
             start_time = timer()
-            time.sleep(5)
+            stop_event.wait(timeout=5)
+            learner_supervisor.raise_if_failed()
 
             if timer() - last_checkpoint_time > flags.save_interval * 60:  
                 checkpoint(frames)
@@ -410,12 +454,13 @@ def train(flags):
                      position_fps['landlord_up'],
                      position_fps['landlord_down'],
                      pprint.pformat(stats))
+        learner_supervisor.raise_if_failed()
 
     except KeyboardInterrupt:
         stop_workers()
         plogger.close()
         return 
-    except Exception:
+    except BaseException:
         stop_workers()
         plogger.close()
         raise

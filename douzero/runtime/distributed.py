@@ -38,7 +38,11 @@ class DistributedContext:
         kwargs = {}
         if self.device.type == "cuda":
             kwargs = {"device_ids": [self.local_rank], "output_device": self.local_rank}
-        return DistributedDataParallel(model, **kwargs)
+        # ModelV2 has stable parameter usage across optimizer iterations. A
+        # static reducer avoids the per-step autograd traversal of
+        # find_unused_parameters=True and correctly handles its structured
+        # ModelOutput when only the selected objectives feed the loss.
+        return DistributedDataParallel(model, static_graph=True, **kwargs)
 
     def all_true(self, local_value: bool) -> bool:
         """Return true only when every learner rank reports true.

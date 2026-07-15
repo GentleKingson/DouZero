@@ -27,7 +27,9 @@ Leases carry an actor owner and generation, so duplicate releases cannot steal
 another actor's reader count. After an actor has exited or been terminated, the
 parent reclaims any lease still registered to that actor. Shutdown also sends
 sentinels to both actor free queues and learner full queues before joining every
-learner thread.
+learner thread with a bounded timeout. Learner-thread exceptions are returned
+to the monitoring thread, which requests shutdown and re-raises the original
+exception instead of leaving a partially trained role running silently.
 
 ## Mixed precision
 
@@ -58,11 +60,20 @@ replay samples are collected independently per rank. The runtime exposes
 non-overlapping rank shards for future dataset-backed training. Replay
 readiness is reduced across ranks before each optimizer step; all ranks either
 enter backward or skip the step together. Console summaries are rank-zero only.
+Self-play forwards call the rank-local underlying module, never the DDP wrapper;
+only synchronized optimizer closures enter DDP forward/backward. The wrapper
+uses a static reducer, avoiding the recurring graph traversal cost of
+`find_unused_parameters=True`.
 
 Curriculum/coach-label output and RL+BC validation/quarantine are currently
 rejected under DDP because those modes do not yet have coordinated single-writer
 side effects. Disable those features for DDP, or run them in one process; the
 entry point fails before opening their output files.
+
+DDP also rejects enabled optional trainable heads when their corresponding loss
+is disabled. In particular, `human_prior_enabled` requires BC loss and
+`strategy_aux_enabled` requires at least one strategy auxiliary weight; because
+RL+BC is currently unsupported under DDP, the prior head must remain disabled.
 
 ```bash
 torchrun --standalone --nproc-per-node=2 train_v2.py \

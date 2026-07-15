@@ -377,7 +377,7 @@ def _build_curriculum(cfg):
     return sampler, label_store, cc.policy_version, cc.policy_step
 
 
-def _validate_ddp_features(cfg, loss_cfg, distributed) -> None:
+def _validate_ddp_features(cfg, model_cfg, loss_cfg, distributed) -> None:
     """Reject training modes whose file side effects are not DDP-safe."""
     if not distributed.enabled:
         return
@@ -392,6 +392,29 @@ def _validate_ddp_features(cfg, loss_cfg, distributed) -> None:
             "DDP does not support RL+BC auxiliary training yet: BC validation "
             "and quarantine require rank-zero coordination. Set lambda_bc=0 "
             "or run train_v2.py without DDP."
+        )
+    if model_cfg.human_prior_enabled:
+        raise ValueError(
+            "DDP requires every enabled trainable head to contribute to the "
+            "loss: model.human_prior_enabled=true but loss.lambda_bc=0. "
+            "Disable the prior head for DDP."
+        )
+    strategy_weight = sum(
+        float(getattr(loss_cfg, name))
+        for name in (
+            "lambda_min_turns",
+            "lambda_regain_initiative",
+            "lambda_teammate_finish",
+            "lambda_spring",
+            "lambda_structure",
+        )
+    )
+    if model_cfg.strategy_aux_enabled and strategy_weight == 0:
+        raise ValueError(
+            "DDP requires every enabled trainable head to contribute to the "
+            "loss: model.strategy_aux_enabled=true but all strategy auxiliary "
+            "loss weights are zero. Disable the auxiliary heads or enable an "
+            "auxiliary loss."
         )
 
 
@@ -464,7 +487,8 @@ def main() -> None:
     set_global_seed(rank_seed)
     maybe_set_global_deterministic(deterministic)
     loss_cfg = _build_loss_config(yaml_cfg)
-    _validate_ddp_features(yaml_cfg, loss_cfg, distributed)
+    model_cfg = _build_model_cfg(yaml_cfg)
+    _validate_ddp_features(yaml_cfg, model_cfg, loss_cfg, distributed)
 
     # Build the V2 model from the schema + config (honouring score_clamp so
     # the head clamp matches the loss target clamp exactly).
@@ -479,7 +503,6 @@ def main() -> None:
     if rank_seed != 0:
         torch.manual_seed(rank_seed)
     schema = build_v2_schema()
-    model_cfg = _build_model_cfg(yaml_cfg)
     model = ModelV2(schema, model_cfg).to(learner_device)
     compile_enabled = resolve(
         "compile_model", yaml_cfg.compile_model if yaml_cfg else None, False

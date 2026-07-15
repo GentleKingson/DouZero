@@ -186,6 +186,77 @@ def _ddp_rank_one_nan_worker(
         context.close()
 
 
+def _ddp_v2_self_play_worker(rank: int, world_size: int, port: int) -> None:
+    os.environ.update(
+        RANK=str(rank),
+        WORLD_SIZE=str(world_size),
+        LOCAL_RANK=str(rank),
+        MASTER_ADDR="127.0.0.1",
+        MASTER_PORT=str(port),
+    )
+    context = initialize_distributed(enabled=True, backend="gloo")
+    try:
+        import numpy as np
+
+        from douzero.models_v2 import ModelV2, ModelV2Config
+        from douzero.observation import build_v2_schema
+        from douzero.training import TrainerConfig, V2Trainer
+
+        torch.set_num_threads(1)
+        rank_seed = 2400 + rank
+        random.seed(rank_seed)
+        np.random.seed(rank_seed)
+        torch.manual_seed(rank_seed)
+        core = ModelV2(
+            build_v2_schema(),
+            ModelV2Config(hidden_size=16, history_layers=1, history_heads=4),
+        )
+        model = context.wrap(core)
+        model.config = core.config
+        model.schema = core.schema
+        model.strategy_feature_config = core.strategy_feature_config
+        trainer = V2Trainer(
+            model,
+            config=TrainerConfig(
+                seed=rank_seed,
+                rng_seed=rank_seed,
+                max_episodes=1,
+                optimizer_steps=2,
+                batch_size=1,
+                buffer_capacity=256,
+                exp_epsilon=0.0,
+            ),
+            distributed_context=context,
+        )
+        ddp_forward_count = 0
+        training_forward = trainer._forward_bundle
+
+        def count_training_forward(*args, **kwargs):
+            nonlocal ddp_forward_count
+            ddp_forward_count += 1
+            return training_forward(*args, **kwargs)
+
+        trainer._forward_bundle = count_training_forward
+        trainer.collect_episodes()
+        # Rank-local games must never enter the DDP wrapper.
+        assert ddp_forward_count == 0
+        transition_counts = [
+            torch.zeros(1, dtype=torch.int64) for _ in range(world_size)
+        ]
+        dist.all_gather(
+            transition_counts,
+            torch.tensor([trainer.stats.transitions_collected], dtype=torch.int64),
+        )
+        assert transition_counts[0].item() != transition_counts[1].item()
+
+        for _ in range(2):
+            assert trainer.step() is not None
+        assert trainer.stats.optimizer_steps == 2
+        assert ddp_forward_count == 2
+    finally:
+        context.close()
+
+
 def test_policy_snapshot_is_stable_for_whole_episode():
     ctx = mp.get_context("spawn")
     slots = [_TinyPolicy(), _TinyPolicy()]
@@ -388,6 +459,52 @@ def test_get_batch_shutdown_sentinel_wakes_blocked_learner():
     assert result == [None]
 
 
+def test_legacy_learner_failure_reaches_monitor_and_requests_shutdown():
+    from douzero.dmc.dmc import _LearnerThreadSupervisor
+
+    stop_event = threading.Event()
+    supervisor = _LearnerThreadSupervisor(stop_event)
+    free = queue.Queue()
+    full = queue.Queue()
+    blocked_result = []
+
+    def blocked_learner():
+        blocked_result.append(
+            get_batch(
+                free,
+                full,
+                {"x": [torch.ones(2)]},
+                SimpleNamespace(batch_size=1, pin_memory=False),
+                threading.Lock(),
+            )
+        )
+
+    def fail_optimizer_step():
+        raise FloatingPointError("float32 retry remained non-finite")
+
+    blocked = threading.Thread(
+        target=supervisor.run,
+        args=(blocked_learner,),
+        name="blocked-legacy-learner",
+    )
+    failing = threading.Thread(
+        target=supervisor.run,
+        args=(fail_optimizer_step,),
+        name="failing-legacy-learner",
+    )
+    blocked.start()
+    failing.start()
+    failing.join(timeout=2)
+    assert not failing.is_alive()
+    assert stop_event.is_set()
+    with pytest.raises(FloatingPointError, match="float32 retry remained"):
+        supervisor.raise_if_failed()
+    full.put(None)
+    blocked.join(timeout=2)
+    assert not blocked.is_alive()
+    assert blocked_result == [None]
+
+
 @pytest.mark.parametrize(
     ("curriculum_enabled", "lambda_bc", "message"),
     [
@@ -406,7 +523,50 @@ def test_ddp_unsupported_file_side_effects_fail_fast(
     with pytest.raises(NotImplementedError, match=message):
         _validate_ddp_features(
             config,
+            SimpleNamespace(
+                human_prior_enabled=False,
+                strategy_aux_enabled=False,
+            ),
             SimpleNamespace(lambda_bc=lambda_bc),
+            DistributedContext(enabled=True),
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_config", "message"),
+    [
+        (
+            SimpleNamespace(
+                human_prior_enabled=True,
+                strategy_aux_enabled=False,
+            ),
+            "human_prior_enabled",
+        ),
+        (
+            SimpleNamespace(
+                human_prior_enabled=False,
+                strategy_aux_enabled=True,
+            ),
+            "strategy_aux_enabled",
+        ),
+    ],
+)
+def test_ddp_rejects_enabled_optional_head_without_loss(model_config, message):
+    from train_v2 import _validate_ddp_features
+
+    loss_config = SimpleNamespace(
+        lambda_bc=0.0,
+        lambda_min_turns=0.0,
+        lambda_regain_initiative=0.0,
+        lambda_teammate_finish=0.0,
+        lambda_spring=0.0,
+        lambda_structure=0.0,
+    )
+    with pytest.raises(ValueError, match=message):
+        _validate_ddp_features(
+            SimpleNamespace(curriculum=SimpleNamespace(enabled=False)),
+            model_config,
+            loss_config,
             DistributedContext(enabled=True),
         )
 
@@ -433,6 +593,15 @@ def test_v2_trainer_ddp_skips_asymmetric_replay_readiness_together():
     except PermissionError:
         pytest.skip("sandbox disallows loopback sockets required by gloo")
     mp.spawn(_ddp_v2_readiness_worker, args=(2, port), nprocs=2, join=True)
+
+
+@pytest.mark.timeout(120)
+def test_v2_trainer_ddp_independent_self_play_then_two_optimizer_steps():
+    try:
+        port = _free_port()
+    except PermissionError:
+        pytest.skip("sandbox disallows loopback sockets required by gloo")
+    mp.spawn(_ddp_v2_self_play_worker, args=(2, port), nprocs=2, join=True)
 
 
 @pytest.mark.timeout(60)
