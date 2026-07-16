@@ -30,6 +30,7 @@ from douzero.env.env import Env
 from douzero.checkpoint import save_v2_position_weights
 from douzero.env.rules import RuleSet
 from douzero.evaluation.paired import evaluation_runtime_identity, evaluate_scenario
+from douzero.evaluation.provenance import attach_result_integrity
 from douzero.evaluation.p17 import (
     P17MatrixError,
     empty_matrix,
@@ -627,7 +628,15 @@ def test_p17_empty_matrix_writes_explicit_not_run_artifact_set(tmp_path):
     assert set(paths) == {
         "model_matrix.json", "cardplay_results.json", "full_game_results.json",
         "ablations.json", "calibration.json", "latency.json", "report.md",
+        "manifest.json",
     }
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert set(manifest["files"]) == set(paths) - {"manifest.json"}
+    assert all(
+        manifest["files"][name]["sha256"]
+        == hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in manifest["files"]
+    )
     assert json.loads((tmp_path / "full_game_results.json").read_text())["status"] == "not_run"
     assert all(
         row["status"] == "not_run"
@@ -667,7 +676,7 @@ def test_prepare_p17_cli_requires_an_external_evaluator_sha(tmp_path):
         check=False,
     )
     assert missing_set.returncode == 2
-    assert "--expected-cardplay-deal-set-id is required" in missing_set.stderr
+    assert "--cardplay-attestation is required" in missing_set.stderr
 
 
 def test_prepare_p17_cli_uses_the_matrix_ablation_protocol(tmp_path):
@@ -685,6 +694,16 @@ def test_prepare_p17_cli_uses_the_matrix_ablation_protocol(tmp_path):
             f"no_belief={tmp_path / 'result.json'}",
             "--expected-evaluator-git-sha",
             "a" * 40,
+            "--ablation-attestation",
+            f"no_belief={tmp_path / 'attestation.jsonl'}",
+            "--attestation-repository",
+            "GentleKingson/DouZero",
+            "--attestation-signer-workflow",
+            "GentleKingson/DouZero/.github/workflows/formal-evaluation.yml",
+            "--attestation-signer-digest",
+            "b" * 40,
+            "--attestation-source-ref",
+            "refs/heads/main",
         ],
         cwd=ROOT,
         capture_output=True,
@@ -702,13 +721,18 @@ def test_p17_readiness_policy_is_versioned_separately_from_p15_promotion(
     assert EVALUATION_PROTOCOL == "p15_paired_v1"
     assert P17_READINESS_PROTOCOL == "p17_empirical_readiness_v1"
     assert P17_READINESS_PROTOCOL != EVALUATION_PROTOCOL
-    result = {
+    result = attach_result_integrity({
+        "protocol": EVALUATION_PROTOCOL,
+        "ablation": "base",
         "scenario": {"bootstrap_samples": 1999, "confidence_level": 0.95},
-    }
+        "metrics": {},
+        "games": [],
+        "runtime_identity": {"source_git_sha": "a" * 40},
+    })
     monkeypatch.setattr(
         p17_evaluation,
         "_recompute_result_evidence",
-        lambda _result, *, mode: ({"paired_deals": 999}, []),
+        lambda _result, **_kwargs: ({"paired_deals": 999}, []),
     )
     insufficient = result_readiness(result, mode="cardplay_only")
     assert insufficient == {
@@ -720,19 +744,24 @@ def test_p17_readiness_policy_is_versioned_separately_from_p15_promotion(
         },
         "status": "insufficient",
         "issues": [
+            "requires a verified detached GitHub OIDC/Sigstore attestation",
             "requires >= 2000 bootstrap samples",
             "requires >= 1000 paired deals",
         ],
-        "evidence": {"paired_deals": 999},
+        "evidence": {"paired_deals": 999, "provenance_verified": False},
     }
 
     result["scenario"]["bootstrap_samples"] = 2000
     monkeypatch.setattr(
         p17_evaluation,
         "_recompute_result_evidence",
-        lambda _result, *, mode: ({"paired_deals": 1000}, []),
+        lambda _result, **_kwargs: ({"paired_deals": 1000}, []),
     )
-    assert result_readiness(result, mode="cardplay_only")["status"] == "eligible"
+    readiness = result_readiness(result, mode="cardplay_only")
+    assert readiness["status"] == "insufficient"
+    assert readiness["issues"] == [
+        "requires a verified detached GitHub OIDC/Sigstore attestation"
+    ]
 
 
 def test_p17_matrix_rejects_missing_checkpoints_and_pretend_full_game(tmp_path):
@@ -839,11 +868,18 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
     result_payload = result.to_dict()
     approved_sha = result_payload["runtime_identity"]["source_git_sha"]
     approved_deal_set_id = result_payload["scenario"]["deal_set_id"]
+    with pytest.raises(P17MatrixError, match="verified detached attestation"):
+        write_p17_artifacts(
+            tmp_path / "missing-attestation",
+            matrix=matrix,
+            full_game_result=result_payload,
+        )
     with pytest.raises(P17MatrixError, match="expected evaluator Git SHA"):
         write_p17_artifacts(
             tmp_path / "missing-evaluator-sha",
             matrix=matrix,
             full_game_result=result_payload,
+            allow_unverified_results=True,
         )
     with pytest.raises(P17MatrixError, match="approved deal_set_id"):
         write_p17_artifacts(
@@ -851,19 +887,161 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
             matrix=matrix,
             full_game_result=result_payload,
             expected_evaluator_git_shas=[approved_sha],
+            allow_unverified_results=True,
         )
+    with pytest.raises(P17MatrixError, match="deal payloads for replay"):
+        write_p17_artifacts(
+            tmp_path / "missing-approved-deals",
+            matrix=matrix,
+            full_game_result=result_payload,
+            expected_evaluator_git_shas=[approved_sha],
+            expected_full_game_deal_set_id=approved_deal_set_id,
+            allow_unverified_results=True,
+        )
+    local_common = {
+        "expected_evaluator_git_shas": [approved_sha],
+        "expected_full_game_deal_set_id": approved_deal_set_id,
+        "approved_full_game_deals": scenario.deals,
+        "allow_unverified_results": True,
+    }
     write_p17_artifacts(
         artifacts,
         matrix=matrix,
         full_game_result=result_payload,
-        expected_evaluator_git_shas=[approved_sha],
-        expected_full_game_deal_set_id=approved_deal_set_id,
+        **local_common,
     )
     full_report = json.loads((artifacts / "full_game_results.json").read_text())
-    assert full_report["status"] == "completed"
+    assert full_report["status"] == "insufficient"
+    assert full_report["execution_status"] == "completed"
+    assert full_report["provenance"]["status"] == "unverified_local"
     assert full_report["approved_deal_set_id"] == approved_deal_set_id
     assert full_report["readiness"]["status"] == "insufficient"
     assert any("1000 paired deals" in issue for issue in full_report["readiness"]["issues"])
+    assert "| full_game | completed | insufficient |" in (
+        artifacts / "report.md"
+    ).read_text(encoding="utf-8")
+
+    recomputed = result_readiness(
+        result_payload,
+        mode="full_game",
+        approved_deals=scenario.deals,
+    )["evidence"]["recomputed_diagnostics"]
+    assert recomputed["status"] == "available"
+    forged_summaries = copy.deepcopy(result_payload)
+    forged_summaries["metrics"]["calibration"] = {"forged": "perfect"}
+    forged_summaries["metrics"]["inference_latency_ms"] = {
+        "count": 1,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+    }
+    forged_summaries["metrics"]["inference_calls_per_second"] = 1e12
+    forged_summaries["metrics"]["actor_fps"] = 1e12
+    forged_summaries["metrics"]["search"] = {
+        "calls": 0,
+        "timeouts": 0,
+        "fallbacks": 0,
+        "timeout_rate": 0.0,
+        "fallback_rate": 0.0,
+    }
+    forged_summaries = attach_result_integrity({
+        key: value
+        for key, value in forged_summaries.items()
+        if key != "result_integrity"
+    })
+    diagnostics_dir = tmp_path / "recomputed-diagnostics"
+    write_p17_artifacts(
+        diagnostics_dir,
+        matrix=matrix,
+        full_game_result=forged_summaries,
+        **local_common,
+    )
+    calibration_artifact = json.loads(
+        (diagnostics_dir / "calibration.json").read_text()
+    )
+    latency_artifact = json.loads(
+        (diagnostics_dir / "latency.json").read_text()
+    )
+    assert calibration_artifact["status"] == "insufficient"
+    assert calibration_artifact["results"][0]["calibration"] == recomputed[
+        "calibration"
+    ]
+    assert latency_artifact["status"] == "insufficient"
+    assert latency_artifact["results"][0]["inference_latency_ms"] == recomputed[
+        "inference_latency_ms"
+    ]
+    assert latency_artifact["results"][0][
+        "instrumented_inference_calls_per_second"
+    ] == recomputed["instrumented_inference_calls_per_second"]
+    assert latency_artifact["results"][0]["search"] == recomputed["search"]
+
+    private_payload = copy.deepcopy(result_payload)
+    private_payload["scenario"]["dataset_scope"] = "private_holdout"
+    private_payload["scenario"]["deal_set_name"] = "private_holdout"
+    private_payload["games"][0]["unexpected_private_payload"] = (
+        "must-not-cross-the-private-boundary"
+    )
+    private_payload["metrics"]["unexpected_private_metric"] = (
+        "must-not-cross-the-private-boundary"
+    )
+    private_payload["runtime_identity"] = evaluation_runtime_identity(
+        private_payload["scenario"], ablation=private_payload["ablation"]
+    )
+    private_payload = attach_result_integrity({
+        key: value
+        for key, value in private_payload.items()
+        if key != "result_integrity"
+    })
+    private_dir = tmp_path / "private-published"
+    write_p17_artifacts(
+        private_dir,
+        matrix=matrix,
+        full_game_result=private_payload,
+        **local_common,
+    )
+    published_private = json.loads(
+        (private_dir / "full_game_results.json").read_text()
+    )["result"]
+    assert set(published_private) == {
+        "schema_version",
+        "scenario",
+        "game_evidence",
+    }
+    assert published_private["schema_version"] == (
+        "p17-private-result-projection-v1"
+    )
+    assert set(published_private["scenario"]) == {
+        "mode",
+        "dataset_scope",
+        "deal_set_id",
+        "num_deals",
+        "candidate",
+        "baseline",
+    }
+    assert published_private["scenario"]["candidate"] == {
+        "name": private_payload["scenario"]["candidate"]["name"]
+    }
+    assert published_private["scenario"]["baseline"] == {
+        "name": private_payload["scenario"]["baseline"]["name"]
+    }
+    assert published_private["game_evidence"] == {
+        "status": "redacted",
+        "published_game_rows": 0,
+        "source_game_rows": len(private_payload["games"]),
+    }
+    serialized_private = json.dumps(published_private, sort_keys=True)
+    for forbidden in (
+        "result_integrity",
+        "games",
+        "candidate_decisions",
+        "candidate_latencies_ns",
+        "candidate_latencies_ms",
+        "calibration",
+        "bidding_trace",
+        "cardplay_trace",
+        "must-not-cross-the-private-boundary",
+    ):
+        assert forbidden not in serialized_private
 
     wrong_identity = copy.deepcopy(result_payload)
     wrong_identity["scenario"]["candidate"]["checkpoint_identities"][
@@ -874,8 +1052,7 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
             tmp_path / "wrong-identity",
             matrix=matrix,
             full_game_result=wrong_identity,
-            expected_evaluator_git_shas=[approved_sha],
-            expected_full_game_deal_set_id=approved_deal_set_id,
+            **local_common,
         )
 
     wrong_runtime_schema = copy.deepcopy(result_payload)
@@ -887,8 +1064,7 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
             tmp_path / "wrong-runtime-schema",
             matrix=matrix,
             full_game_result=wrong_runtime_schema,
-            expected_evaluator_git_shas=[approved_sha],
-            expected_full_game_deal_set_id=approved_deal_set_id,
+            **local_common,
         )
 
     replacement = "f" if approved_sha[0] != "f" else "e"
@@ -900,6 +1076,8 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
             full_game_result=result_payload,
             expected_evaluator_git_shas=[unapproved_sha],
             expected_full_game_deal_set_id=approved_deal_set_id,
+            approved_full_game_deals=scenario.deals,
+            allow_unverified_results=True,
         )
     write_p17_artifacts(
         tmp_path / "explicit-evaluator-allowlist",
@@ -907,18 +1085,22 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
         full_game_result=result_payload,
         expected_evaluator_git_shas=[unapproved_sha, approved_sha],
         expected_full_game_deal_set_id=approved_deal_set_id,
+        approved_full_game_deals=scenario.deals,
+        allow_unverified_results=True,
     )
 
     wrong_deal_set_id = "f" * 64
     if wrong_deal_set_id == approved_deal_set_id:
         wrong_deal_set_id = "e" * 64
-    with pytest.raises(P17MatrixError, match="approved evaluation set"):
+    with pytest.raises(P17MatrixError, match="do not match approved deal_set_id"):
         write_p17_artifacts(
             tmp_path / "wrong-deal-set-id",
             matrix=matrix,
             full_game_result=result_payload,
             expected_evaluator_git_shas=[approved_sha],
             expected_full_game_deal_set_id=wrong_deal_set_id,
+            approved_full_game_deals=scenario.deals,
+            allow_unverified_results=True,
         )
 
     self_consistent_forgery = copy.deepcopy(result_payload)
@@ -938,12 +1120,11 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
         self_consistent_forgery["scenario"], ablation="base"
     )
     forged_readiness = result_readiness(
-        self_consistent_forgery, mode="full_game"
+        self_consistent_forgery,
+        mode="full_game",
+        approved_deals=scenario.deals,
     )
-    assert not any(
-        "deal_set_id" in issue or "deal hashes" in issue
-        for issue in forged_readiness["issues"]
-    )
+    assert any("approved deal" in issue for issue in forged_readiness["issues"])
     with pytest.raises(P17MatrixError, match="approved evaluation set"):
         write_p17_artifacts(
             tmp_path / "self-consistent-forged-deal-set",
@@ -951,11 +1132,15 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
             full_game_result=self_consistent_forgery,
             expected_evaluator_git_shas=[approved_sha],
             expected_full_game_deal_set_id=approved_deal_set_id,
+            approved_full_game_deals=scenario.deals,
+            allow_unverified_results=True,
         )
 
     inflated = copy.deepcopy(result_payload)
     inflated["metrics"]["paired_estimate_ci"]["paired_deals"] = 1000
-    readiness = result_readiness(inflated, mode="full_game")
+    readiness = result_readiness(
+        inflated, mode="full_game", approved_deals=scenario.deals
+    )
     assert readiness["status"] == "insufficient"
     assert readiness["evidence"]["paired_deals"] == 1
     assert any("does not match game rows" in issue for issue in readiness["issues"])

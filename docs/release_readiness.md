@@ -5,9 +5,16 @@
 - Repository: `https://github.com/GentleKingson/DouZero`
 - Base branch/SHA: `main` / `fa9f76de5ca31b4de33d4237e14b36e102c67655`
 - Review branch: `codex/p17-release-readiness-closure`
-- Reviewed implementation/test/Docker SHA: `b7db29a3856324d65170b49ef32d17be7d3a6996`
-  (the documentation-only closure commit follows this reviewed code SHA)
-- Review date: 2026-07-15 (Asia/Hong_Kong)
+- Published PR head under this renewed review:
+  `852b63005709ef2ae39e4e40449cae9e6e8cbb42`
+- Current result-v3 replay/attestation remediation validation SHA: `NONE`.
+  The working-tree changes described below are not part of `852b630` and have
+  passed local host and Docker validation, but are not yet bound to a commit or
+  a Python 3.11-3.13 CI run.
+- Historical implementation/test/Docker evidence was collected at
+  `b7db29a3856324d65170b49ef32d17be7d3a6996`; it does not validate the current
+  evaluation trust-boundary changes.
+- Review window: 2026-07-15 through 2026-07-16 (Asia/Hong_Kong)
 - Host: macOS 26.5.2, arm64, Apple A18 Pro; no NVIDIA device or
   `nvidia-smi`
 - Isolated CPU runtime: Python 3.11.15, PyTorch 2.13.0+cpu, Linux arm64;
@@ -25,16 +32,23 @@ the local base SHA before this branch was created.
 ### Independent Deep Review (2026-07-16)
 
 An independent adversarial review invalidated the earlier code-merge judgment
-at `6f66650`: green CI did not cover the release trust boundaries around deal
-identity, statistical protocol, raw evidence, package loadability/provenance,
-frozen-belief resume, redeal fallback data, exploration labels, or atomic
-checkpoint restoration. PR #20 therefore remains Draft and must not be merged
-as "infrastructure first".
+at `6f66650`. A second review of published head `852b630` then showed that
+hash-bound rows and internally recomputed summaries still did not prove the
+declared game was played, that evaluator SHAs were still self-assertable,
+calibration labels were caller-controlled, and standalone diagnostics copied
+untrusted summaries. Green CI at that head therefore does not close the
+formal-evaluation trust boundary. PR #20 remains Draft and must not be merged.
 
-The current working tree contains directed remediations and regressions for
-those findings. This changes the code-correctness evidence, not the empirical
-release result. The release candidate remains `NONE`; GPU, authorized-data,
-formal strength, ablation, latency, and 1,000-deal gates remain open.
+The current working tree targets those findings with result-v3 full action
+traces, deterministic replay against separately approved deal payloads,
+replay-derived calibration labels, nanosecond timing evidence, a canonical
+whole-result digest, real clean/stable Git identity, and detached GitHub
+OIDC/Sigstore artifact attestation. Local CPU, Docker, workflow-static, and
+adversarial tamper validation now pass on the uncommitted working tree. No
+protected formal evaluation has produced an attested result under this
+boundary. The release candidate remains `NONE`; GPU,
+authorized-data, formal strength, ablation, latency, and 1,000-deal gates stay
+open.
 
 ## 2. Baseline Findings
 
@@ -74,9 +88,9 @@ or private-data validation.
 | P12 coach curriculum | Complete | `douzero/coach/`, P12 tests |
 | P13 search | Complete | `douzero/search/`, P13 tests |
 | P14 AMP/DDP runtime | Partial | CPU BF16/Gloo legacy tests pass; CUDA AMP/NCCL are untested and standard learned-bidding DDP is not implemented |
-| P15 paired evaluation | Partial | `p15-paired-result-v2` runtime identities, statistics, synthetic BC card-play, and identical-model learned full-game smokes pass; formal matrix was not run |
+| P15 paired evaluation | Partial | Working tree defines `p15-paired-result-v3` full traces, strict result integrity, real-checkout identity, and nanosecond timing; local validation passes, while commit-bound CI and a protected formal run remain pending |
 | P16 deployment package | Complete (current format) | format-2 strict package/checksum/access/identity, loaded bidding/card-play inference, self-contained belief/search, rollback, and explicit format-1 rejection diagnostics pass; no RC exists |
-| P17 closure | Partial | single-process CPU implementation and validation completed; standard/joint DDP and external empirical gates remain open |
+| P17 closure | Partial | Replay/attestation remediation is present in the working tree but is not yet bound to a validated SHA; standard/joint DDP and external empirical gates remain open |
 
 ## 4. Release Gates
 
@@ -89,19 +103,19 @@ or private-data validation.
 | Belief conservation | PASS (CPU) | exact decoder and differentiable marginal conservation tests |
 | Joint belief training | PASS (CPU) | gradient/frozen/joint/alternating tests; GPU remains untested |
 | Human-data canary | BLOCKED | No authorized data path was supplied; synthetic is not a real canary. External ingest now requires a keyed, HMAC-attested adapter result. |
-| CPU tests | PASS | Isolated Docker test suite and release gate |
+| CPU tests | PASS (uncommitted tree) | Host Python 3.14 and isolated Docker Python 3.11 each passed all 1,736 tests; commit-bound Python 3.11-3.13 CI remains pending |
 | Single GPU | BLOCKED | No CUDA/NVIDIA device |
 | Multi-GPU NCCL DDP | BLOCKED | No CUDA/NCCL runtime; standard learned bidding, joint/alternating belief, and distributed trainer resume also fail closed as implementation blockers |
 | CUDA FP16/BF16 AMP | BLOCKED | No CUDA device; CPU BF16 is not a substitute |
 | Checkpoint resume | PASS (focused CPU) | Full TrainerConfig/hash, value/optimizer/belief, GradScaler/AMP fallback, counters, first-bidder schedule, and Python/NumPy/Torch CPU/CUDA RNG are validated through temporary objects before commit. Frozen belief weights are hash-bound; replay uses an explicit flushed checkpoint boundary. Injected optimizer restore failure leaves the active model/optimizer unchanged. |
-| Paired evaluation | PARTIAL | 4-deal synthetic BC and 2-deal identical-model smokes only; no formal candidate. P17 collation rebuilds canonical deal/deal-set identities and outcome, CI, calibration, latency, search, overall, and role evidence from raw game rows under the fixed 95% deal-level paired-bootstrap protocol. |
+| Paired evaluation | PARTIAL / BLOCKED | Existing smokes predate result-v3 and are not formally collatable. Current collation requires separately approved deals, complete trace replay, a whole-result digest, real clean/stable Git identity, and detached GitHub OIDC/Sigstore attestation; no protected result has satisfied that boundary. |
 | Full-game learned evaluation | PARTIAL | Strict learned-bidding two-deal equality smoke passes; 1,000-deal formal gate not run |
 | Eight-ablation matrix | BLOCKED | Semantically trained ablation checkpoints unavailable |
-| Calibration | BLOCKED | No release-candidate predictions/results |
-| Target latency/throughput | BLOCKED | No target GPU or release candidate |
+| Calibration | BLOCKED | Labels are now intended to be derived from replayed winners, but no attested release-candidate predictions/results exist |
+| Target latency/throughput | BLOCKED | Nanosecond evidence and instrumented-throughput recomputation are present in the working tree; no validated target GPU result exists |
 | Model package | PASS (tooling) | Verification now strict-constructs the runtime model and strict-loads finite tensors, so verification implies CPU loadability. Format-2 provenance is inherited and cross-checked from the source public checkpoint; in-memory/legacy migration exports are explicitly `release_eligible=false`. |
 | Model card | PASS (documentation) | Honest no-RC draft; missing metrics marked unavailable |
-| Artifact provenance | PARTIAL / BLOCKED | P17 trainer/belief checkpoints, canonical human datasets, paired results, and format-2 packages carry strict identities; several historical coach/distillation/eval-data side artifacts do not yet meet the universal requirement |
+| Artifact provenance | PARTIAL / BLOCKED | Paired-result digest, real Git identity, and detached-attestation verification are under validation; no protected workflow result has been accepted. Several historical coach/distillation/eval-data side artifacts also remain below the universal requirement. |
 | License review | PASS | `docs/third_party_review.md`, `THIRD_PARTY_NOTICES`; no copied external code |
 | Rollback test | PASS (tooling) | Tampered candidate is rejected, then the immutable known-good package reloads and reproduces fixed-state inference |
 
@@ -109,6 +123,16 @@ or private-data validation.
 
 ### Blocker
 
+- The result-v3 replay/provenance working tree has no final validated commit.
+  Host and Docker gates pass locally, but must be rerun by Python 3.11-3.13 CI
+  on the eventual remediation SHA.
+- No protected GitHub Actions formal-evaluator workflow is currently recorded
+  as having produced the required detached OIDC/Sigstore attestation. Verifier
+  code is not an attestation, and an allowlisted SHA inside a result is not
+  software-supply-chain proof.
+- No private holdout has been replayed against approved deal payloads inside a
+  trusted environment under the new boundary. The public trace-redacted
+  projection therefore has no formal release evidence yet.
 - No release candidate satisfies the minimum model-quality gate. There is no
   standard full-game trained checkpoint with learned bidding and 1,000 paired
   deals.
@@ -133,6 +157,13 @@ or private-data validation.
 
 - Target-hardware throughput, peak memory, latency percentiles, long-run
   checkpoint recovery, and `torch.compile` benefit remain unmeasured.
+- Result-v3 records per-call nanoseconds and total evaluation wall time, but no
+  attested target-hardware run has established instrumented or end-to-end
+  throughput. The compatibility `actor_fps` field is not actor-loop FPS.
+- Result-v3 and the protected workflow now record the immutable GitHub run,
+  runner class, evaluator OCI image digest, dependency digest, and detailed
+  hardware/runtime inventory. No attested target-hardware run has populated
+  that evidence yet, so benchmark claims remain blocked.
 - Learned-bidding full-game paired strength, calibration, and regression
   confidence intervals remain unmeasured.
 - Standard learned-bidding and joint/alternating `torch.compile` paths are
@@ -153,18 +184,36 @@ or private-data validation.
 
 ### Low
 
-- A fresh Docker image build was attempted but the local Docker VM lacked
-  space. Validation used the existing isolated `douzero-p16-test` CPU image
-  with the current checkout bind-mounted. `.venv` is now excluded from Docker
-  context to prevent the 723 MB local environment from being sent again.
+- A fresh `douzero-p17-test` Docker image build reached final layer extraction
+  but the local Docker VM lacked space. No Docker data was deleted. Validation
+  used the existing isolated `douzero-p16-test` Python 3.11 CPU image with the
+  current checkout bind-mounted and an ephemeral memory-backed `/tmp`.
+  `.venv` remains excluded from the Docker context.
 
 ## 6. Validation Commands
 
-The final command log records only commands that validate deliverables, not
-routine source-inspection commands. Machine-specific and large outputs stay
-under ignored `artifacts/`.
+The current commands below validate the uncommitted working tree, not published
+head `852b630` and not an eventual remediation commit. Earlier green CI,
+1,575/1,582-test runs, hash-only collation, and historical Docker gates still
+must not be cited as current-head proof.
 
-| Command | Result |
+| Required validation on the eventual remediation SHA | Current status |
+|---|---|
+| Focused result-v3 replay, provenance, timing, calibration, strict JSON, protected-workflow, private-projection, and negative tamper tests | PASS; 200 focused tests are included in the final full run; the final four high-risk suites also passed independently |
+| Host full suite, compile, `actionlint`, and `git diff --check` | PASS; 1,736 tests, one expected `lambda_bc==0` warning, compileall/actionlint/diff clean |
+| Wheel build and new-module inventory | PASS; `douzero-1.1.0-py3-none-any.whl` contains replay, provenance, strict formal-data, and checkpoint-input modules |
+| Docker release gate | PASS with current tree bind-mounted into isolated Python 3.11.15/PyTorch 2.13 CPU image; 1,736 tests, compile/CLI/baseline/diff gate all passed. Fresh image extraction separately failed for local Docker disk space. |
+| Python 3.11, 3.12, and 3.13 GitHub CI matrix | NOT TRIGGERED for the working-tree remediation |
+| Protected GitHub evaluator run, detached OIDC/Sigstore attestation, approved-deal replay, and formal collation | NOT RUN |
+
+### Archived Pre-v3 Evidence
+
+These entries are retained only as historical engineering evidence tied to
+their stated older SHA. The words "current tree" and "post-review" in an
+archived command referred to that earlier review point, not the present
+working tree.
+
+| Archived command | Historical result |
 |---|---|
 | `git status`; `git branch --show-current`; `git rev-parse HEAD`; `git log --oneline --decorate -20`; `git fetch origin main` | PASS; clean start, new P17 branch from local/remote `fa9f76d` |
 | Host Python/Torch/CUDA, `nvidia-smi`, OS, Docker/runtime probes | PASS as probes; no CUDA device, driver interface, NCCL, or NVIDIA Docker runtime |
@@ -174,7 +223,7 @@ under ignored `artifacts/`.
 | `.venv/bin/python -m pytest -q tests/test_p17_bidding.py tests/test_p17_joint_belief.py tests/test_p17_release_tooling.py` | PASS, 49 tests |
 | `.venv/bin/python -m pytest --collect-only -qq`; `.venv/bin/python -m pytest -q` on clean `b7db29a` | 1,575 collected; PASS, 1,575 tests and one expected `lambda_bc==0` warning |
 | First post-review Docker `run_tests.sh` attempt | FAILED: the source-SHA tamper test replaced the image's fixed all-zero test SHA with the same value; the test now always chooses a different valid SHA |
-| Current-tree `docker run ... bash .docker/run_tests.sh -q` | PASS, 1,575 tests and one expected warning |
+| Historical bind-mounted checkout `docker run ... bash .docker/run_tests.sh -q` | PASS, 1,575 tests and one expected warning |
 | `/usr/bin/time -p docker run ... bash .docker/run_release_gate.sh` on clean `b7db29a` | PASS; 1,575 tests in 93.60 s plus compile/CLI/diff/baseline, 110.31 s total |
 | Fresh `train_v2.py --config configs/standard_v2.yaml ... --bidding_policy max` on `b7db29a` | PASS; 2 full games, 114 play and 2 bid transitions, one finite optimizer step, parameters changed, no redeals/caps |
 | Fresh strict standard `--resume_checkpoint ...`, one additional game | PASS; cumulative 3 games, 137 play and 3 bid transitions, 2 optimizer steps, parameters changed; full code/rule/model/`v2-bidding-2` identities matched |
@@ -190,9 +239,9 @@ under ignored `artifacts/`.
 | Dataset manifest missing/tamper/count/ruleset/unverified-lineage tests | PASS; training/rebuild consumers fail closed; migration output cannot train or release |
 | `pretrain_bc.py ... --epochs 1 --batch_size 4 ...` | PASS; 115 samples, val loss 1.2304, val top-1 0.486; checkpoint config binds dataset SHA; synthetic only |
 | RL+BC `train_v2.py --config /tmp/douzero-p17-rlbc.yaml ...` | PASS; 19 transitions, one finite optimizer step, parameters changed |
-| Fresh synthetic BC before/after `evaluate_paired.py ... --num-deals 4 --bootstrap-samples 2000` | PASS as code smoke; estimate -0.1250, CI [-0.5000, 0.2500]; `p15-paired-result-v2` identities verified; not strength evidence |
-| Fresh learned full-game equality on current `v2-bidding-2`, 2 deals/2,000 bootstrap | PASS as code smoke; 6 seat-rotated games, 5 learned-bid calls, estimate 0, CI [0, 0], no cap fallback |
-| `prepare_p17_evaluation.py --matrix ... --full-game-result ... --expected-evaluator-git-sha <approved-full-sha> --expected-full-game-deal-set-id <approved-set-sha256>` | PASS; fixed seven files; result/checkpoint/runtime/deal-set identities validated; recomputed readiness `insufficient` at 2/1,000 deals |
+| Fresh synthetic BC before/after `evaluate_paired.py ... --num-deals 4 --bootstrap-samples 2000` | PASS as a pre-v3 code smoke; estimate -0.1250, CI [-0.5000, 0.2500]; its old result identity is not accepted by current formal collation |
+| Historical learned full-game equality on `v2-bidding-2`, 2 deals/2,000 bootstrap | PASS as code smoke; 6 seat-rotated games, 5 learned-bid calls, estimate 0, CI [0, 0], no cap fallback |
+| Historical `prepare_p17_evaluation.py` hash/set-only command | OBSOLETE for formal use: it did not supply approved deal payloads or a detached attestation and cannot establish current eligibility |
 | P17 result-integrity and all-pass-cap tests | PASS; forged evaluator SHA, ordered deal hash/set, terminal outcome/score, confidence/count/CI evidence is rejected; forced cap fallbacks are cleared, audited, excluded, and release-ineligible |
 | `tools/package_model.py ...` with the fresh standard learned-bidding sidecar | PASS; format-2 public package binds `b7db29a`, `v2-bidding-2`, rule/model/training identities and summaries |
 | First manual package-load command | FAILED: omitted required runtime schema/rules/config and used a nonexistent rollback test selector; no inference was claimed |
@@ -207,7 +256,7 @@ under ignored `artifacts/`.
 | Independent-review directed regressions (`tests/test_p17_deep_review_fixes.py`) | PASS: canonical deal identity/raw evidence, fixed statistics, strict package loadability, source-checkpoint provenance, epsilon-label masking, frozen-belief identity, atomic restore failure, and whole-game redeal-cap exclusion |
 | Post-review focused evaluation/deployment/bidding/belief suites | PASS |
 | Post-review host full suite | PASS, 1,582 tests and the existing expected `lambda_bc==0` warning |
-| Post-review Docker release gate (`douzero-p16-test:latest`, bind-mounted current tree) | PASS, Python 3.11.15/Linux arm64; compile, CLI, 1,582 tests, baseline capture, and `git diff --check` |
+| Post-review Docker release gate (`douzero-p16-test:latest`, historical bind-mounted tree) | PASS, Python 3.11.15/Linux arm64; compile, CLI, 1,582 tests, baseline capture, and `git diff --check` |
 
 ## 7. Conclusion
 
@@ -217,11 +266,13 @@ Release status: NOT READY
 ```
 
 ```text
-Code trust-boundary remediation complete; external empirical validation pending
+Result-v3 trust-boundary remediation and formal attested validation pending
 ```
 
-That required sentence is scoped to the implemented P17 single-process CPU
-surface. It does not override unresolved repository-wide provenance work.
+The current working tree implements and locally validates the intended
+fail-closed boundary, but it is not a release claim until the committed code
+passes current-head CI and a protected attested replay run.
+It does not override unresolved repository-wide provenance work.
 Standard learned-bidding DDP, joint/alternating belief DDP, distributed trainer
 checkpoint resume, and standard/joint compile support remain explicit
 implementation blockers, not external-validation euphemisms. The open

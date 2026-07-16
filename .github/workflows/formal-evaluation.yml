@@ -1,0 +1,1082 @@
+# Formal P17 evidence producer. Configure the `formal-evaluation` environment
+# with required reviewers, and expose the `formal-evaluator` label only on the
+# isolated self-hosted runner allowed to read approved holdout/model assets.
+name: Formal P17 Evaluation
+run-name: Formal P17 at ${{ inputs.source_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Approved current main commit (full Git SHA)
+        required: true
+        type: string
+
+# Every capability is denied unless the sole job explicitly grants it.
+permissions: {}
+
+concurrency:
+  group: formal-p17-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate-and-attest:
+    # This environment must be protected with required independent reviewers.
+    environment: formal-evaluation
+    runs-on: [self-hosted, linux, formal-evaluator]
+    timeout-minutes: 1440
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      EXPECTED_REPOSITORY: GentleKingson/DouZero
+      EXPECTED_WORKFLOW_REF: >-
+        GentleKingson/DouZero/.github/workflows/formal-evaluation.yml@refs/heads/main
+      APPROVED_SOURCE_SHA: ${{ inputs.source_sha }}
+      # The request and its digest come from the protected environment. The
+      # dispatch caller cannot choose any evaluation or publication identity.
+      FORMAL_EVALUATION_REQUEST_PATH: >-
+        ${{ vars.FORMAL_EVALUATION_REQUEST_PATH }}
+      FORMAL_EVALUATION_REQUEST_SHA256: >-
+        ${{ vars.FORMAL_EVALUATION_REQUEST_SHA256 }}
+      # These values also come from the protected environment, never dispatch.
+      # The image must be a fully qualified immutable repository digest.
+      FORMAL_EVALUATOR_IMAGE: ${{ vars.FORMAL_EVALUATOR_IMAGE }}
+      APPROVED_PYTHON_PACKAGES_SHA256: >-
+        ${{ vars.FORMAL_PYTHON_PACKAGES_SHA256 }}
+      DOUZERO_GIT_SHA: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONNOUSERSITE: "1"
+      PYTHONPATH: ${{ github.workspace }}
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      # actions/checkout@v6.0.2
+      - name: Checkout the approved source commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+
+      - name: Enforce protected invocation and exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]
+          [[ "$GITHUB_REPOSITORY" == "$EXPECTED_REPOSITORY" ]]
+          [[ "$GITHUB_REF" == "refs/heads/main" ]]
+          [[ "$GITHUB_REF_PROTECTED" == "true" ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "$EXPECTED_WORKFLOW_REF" ]]
+          [[ "$APPROVED_SOURCE_SHA" =~ ^[0-9a-f]+$ ]]
+          (( ${#APPROVED_SOURCE_SHA} == 40 || ${#APPROVED_SOURCE_SHA} == 64 ))
+          [[ "$APPROVED_SOURCE_SHA" == "$GITHUB_SHA" ]]
+          [[ "$APPROVED_SOURCE_SHA" == "$GITHUB_WORKFLOW_SHA" ]]
+          [[ "${FORMAL_EVALUATOR_IMAGE:-}" =~ ^[a-z0-9][a-z0-9._:-]*(/[a-z0-9][a-z0-9._-]*)+@sha256:[0-9a-f]{64}$ ]]
+          [[ "${APPROVED_PYTHON_PACKAGES_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(git rev-parse --verify 'HEAD^{commit}')" == "$APPROVED_SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          git diff --quiet HEAD --
+          git diff --cached --quiet HEAD --
+          command -v gh >/dev/null
+          command -v docker >/dev/null
+
+      - name: Pull and verify protected immutable evaluator image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$FORMAL_EVALUATOR_IMAGE"
+          mapfile -t repo_digests < <(
+            docker image inspect \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+              "$FORMAL_EVALUATOR_IMAGE"
+          )
+          matched=false
+          for repo_digest in "${repo_digests[@]}"; do
+            if [[ "$repo_digest" == "$FORMAL_EVALUATOR_IMAGE" ]]; then
+              matched=true
+            fi
+          done
+          [[ "$matched" == true ]]
+          image_id="$(
+            docker image inspect --format '{{.Id}}' "$FORMAL_EVALUATOR_IMAGE"
+          )"
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          image_digest="${FORMAL_EVALUATOR_IMAGE##*@}"
+          [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "DOUZERO_EVALUATOR_IMAGE_DIGEST=$image_digest"
+            echo "FORMAL_EVALUATOR_IMAGE_ID=$image_id"
+          } >>"$GITHUB_ENV"
+
+      - name: Snapshot protected evaluation request
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "${FORMAL_EVALUATION_REQUEST_PATH:-}" == /* ]]
+          [[ "${FORMAL_EVALUATION_REQUEST_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]
+          [[ -f "$FORMAL_EVALUATION_REQUEST_PATH" ]]
+          [[ ! -L "$FORMAL_EVALUATION_REQUEST_PATH" ]]
+          request_size="$(stat -c '%s' "$FORMAL_EVALUATION_REQUEST_PATH")"
+          [[ "$request_size" =~ ^[0-9]+$ ]]
+          (( request_size > 0 && request_size <= 65536 ))
+          request_sha="$(sha256sum "$FORMAL_EVALUATION_REQUEST_PATH" | cut -d' ' -f1)"
+          [[ "$request_sha" == "$FORMAL_EVALUATION_REQUEST_SHA256" ]]
+
+          run_root="$RUNNER_TEMP/douzero-formal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [[ ! -e "$run_root" ]]
+          mkdir -m 0700 "$run_root" "$run_root/inputs" "$run_root/output"
+          request_snapshot="$run_root/inputs/evaluation-request.json"
+          install -m 0400 "$FORMAL_EVALUATION_REQUEST_PATH" "$request_snapshot"
+          [[ "$(sha256sum "$request_snapshot" | cut -d' ' -f1)" == "$request_sha" ]]
+          [[ "$(sha256sum "$FORMAL_EVALUATION_REQUEST_PATH" | cut -d' ' -f1)" == "$request_sha" ]]
+          {
+            echo "FORMAL_RUN_ROOT=$run_root"
+            echo "FORMAL_EVALUATION_REQUEST=$request_snapshot"
+            echo "FORMAL_RESULT_PREFIX=$run_root/output/formal-evaluation-result"
+            echo "FORMAL_RESULT_JSON=$run_root/output/formal-evaluation-result.json"
+            echo "FORMAL_P17_OUTPUT=$run_root/output/p17"
+          } >>"$GITHUB_ENV"
+
+      - name: Validate protected evaluation request in immutable image
+        id: request
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --interactive \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            --workdir "$GITHUB_WORKSPACE" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output" \
+            --env FORMAL_EVALUATION_REQUEST \
+            --env FORMAL_EVALUATION_REQUEST_SHA256 \
+            --env FORMAL_RUN_ROOT \
+            --env PYTHONDONTWRITEBYTECODE \
+            --env PYTHONNOUSERSITE \
+            --env PYTHONPATH="$GITHUB_WORKSPACE" \
+            --env HOME=/tmp/formal-home \
+            "$FORMAL_EVALUATOR_IMAGE" \
+            python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path, PurePosixPath
+
+          SCHEMA = "formal-evaluation-request-v1"
+          FIELDS = {
+              "schema_version",
+              "mode",
+              "dataset_scope",
+              "eval_data_path",
+              "eval_data_sha256",
+              "deal_set_id",
+              "model_matrix_path",
+              "model_matrix_sha256",
+              "p17_matrix_path",
+              "p17_matrix_sha256",
+              "candidate",
+              "baseline",
+              "bootstrap_samples",
+          }
+          SHA256 = re.compile(r"[0-9a-f]{64}")
+          NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+          SAFE_PATH = re.compile(r"/[A-Za-z0-9._+:/@-]{1,4095}")
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  value[key] = item
+              return value
+
+          def reject_constant(value):
+              raise ValueError(f"non-finite JSON number: {value}")
+
+          def require_string(payload, key, pattern):
+              value = payload[key]
+              if type(value) is not str or "\n" in value or "\r" in value:
+                  raise ValueError(f"request {key} must be one line of text")
+              if pattern.fullmatch(value) is None:
+                  raise ValueError(f"request {key} has invalid syntax")
+              return value
+
+          request_path = Path(os.environ["FORMAL_EVALUATION_REQUEST"])
+          expected_sha = os.environ["FORMAL_EVALUATION_REQUEST_SHA256"]
+          raw = request_path.read_bytes()
+          if hashlib.sha256(raw).hexdigest() != expected_sha:
+              raise SystemExit("protected request snapshot digest mismatch")
+          try:
+              payload = json.loads(
+                  raw.decode("utf-8"),
+                  object_pairs_hook=strict_object,
+                  parse_constant=reject_constant,
+              )
+          except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+              raise SystemExit("protected request is not strict JSON") from exc
+          if type(payload) is not dict or set(payload) != FIELDS:
+              raise SystemExit("protected request has missing or extra fields")
+          if payload["schema_version"] != SCHEMA:
+              raise SystemExit("protected request schema is unsupported")
+          if payload["mode"] not in {"cardplay_only", "full_game"}:
+              raise SystemExit("protected request mode is invalid")
+          if payload["dataset_scope"] not in {"private_holdout", "public"}:
+              raise SystemExit("protected request dataset scope is invalid")
+
+          for key in (
+              "eval_data_sha256",
+              "deal_set_id",
+              "model_matrix_sha256",
+              "p17_matrix_sha256",
+          ):
+              require_string(payload, key, SHA256)
+          for key in ("candidate", "baseline"):
+              require_string(payload, key, NAME)
+          if payload["candidate"] == payload["baseline"]:
+              raise SystemExit("candidate and baseline must differ")
+          for key in (
+              "eval_data_path",
+              "model_matrix_path",
+              "p17_matrix_path",
+          ):
+              value = require_string(payload, key, SAFE_PATH)
+              parsed = PurePosixPath(value)
+              if (
+                  value.startswith("//")
+                  or str(parsed) != value
+                  or not parsed.is_absolute()
+                  or any(part in {"", ".", ".."} for part in parsed.parts[1:])
+              ):
+                  raise SystemExit(f"protected request {key} is not canonical")
+          samples = payload["bootstrap_samples"]
+          if type(samples) is not int or not 2000 <= samples <= 100_000:
+              raise SystemExit("protected request bootstrap_samples is invalid")
+
+          env = {
+              "APPROVED_EVALUATION_REQUEST_SHA256": expected_sha,
+              "EVALUATION_MODE": payload["mode"],
+              "DATASET_SCOPE": payload["dataset_scope"],
+              "APPROVED_EVAL_DATA_PATH": payload["eval_data_path"],
+              "APPROVED_EVAL_DATA_SHA256": payload["eval_data_sha256"],
+              "APPROVED_DEAL_SET_ID": payload["deal_set_id"],
+              "APPROVED_MODEL_MATRIX_PATH": payload["model_matrix_path"],
+              "APPROVED_MODEL_MATRIX_SHA256": payload["model_matrix_sha256"],
+              "APPROVED_P17_MATRIX_PATH": payload["p17_matrix_path"],
+              "APPROVED_P17_MATRIX_SHA256": payload["p17_matrix_sha256"],
+              "CANDIDATE_BUNDLE": payload["candidate"],
+              "BASELINE_BUNDLE": payload["baseline"],
+              "BOOTSTRAP_SAMPLES": str(samples),
+          }
+          output_root = Path(os.environ["FORMAL_RUN_ROOT"]) / "output"
+          env_path = output_root / "validated-request.env"
+          outputs_path = output_root / "validated-request.outputs"
+          env_path.write_text(
+              "".join(f"{key}={value}\n" for key, value in env.items()),
+              encoding="utf-8",
+          )
+          outputs_path.write_text(
+              f"mode={payload['mode']}\n"
+              f"dataset_scope={payload['dataset_scope']}\n",
+              encoding="utf-8",
+          )
+          PY
+          env_file="$FORMAL_RUN_ROOT/output/validated-request.env"
+          outputs_file="$FORMAL_RUN_ROOT/output/validated-request.outputs"
+          [[ -f "$env_file" && ! -L "$env_file" ]]
+          [[ -f "$outputs_file" && ! -L "$outputs_file" ]]
+          [[ "$(wc -l <"$env_file")" -eq 13 ]]
+          [[ "$(wc -l <"$outputs_file")" -eq 2 ]]
+          cat "$env_file" >>"$GITHUB_ENV"
+          cat "$outputs_file" >>"$GITHUB_OUTPUT"
+          chmod 0400 "$env_file" "$outputs_file"
+
+      - name: Validate and snapshot approved evaluation inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$APPROVED_EVAL_DATA_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$APPROVED_MODEL_MATRIX_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$APPROVED_P17_MATRIX_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$APPROVED_DEAL_SET_ID" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$BOOTSTRAP_SAMPLES" =~ ^[0-9]+$ ]]
+          (( BOOTSTRAP_SAMPLES >= 2000 ))
+          [[ "$CANDIDATE_BUNDLE" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$BASELINE_BUNDLE" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$APPROVED_EVAL_DATA_PATH" == /* ]]
+          [[ "$APPROVED_MODEL_MATRIX_PATH" == /* ]]
+          [[ "$APPROVED_P17_MATRIX_PATH" == /* ]]
+          [[ -f "$APPROVED_EVAL_DATA_PATH" && ! -L "$APPROVED_EVAL_DATA_PATH" ]]
+          [[ -f "$APPROVED_MODEL_MATRIX_PATH" && ! -L "$APPROVED_MODEL_MATRIX_PATH" ]]
+          [[ -f "$APPROVED_P17_MATRIX_PATH" && ! -L "$APPROVED_P17_MATRIX_PATH" ]]
+
+          eval_sha="$(sha256sum "$APPROVED_EVAL_DATA_PATH" | cut -d' ' -f1)"
+          matrix_sha="$(sha256sum "$APPROVED_MODEL_MATRIX_PATH" | cut -d' ' -f1)"
+          p17_matrix_sha="$(sha256sum "$APPROVED_P17_MATRIX_PATH" | cut -d' ' -f1)"
+          [[ "$eval_sha" == "$APPROVED_EVAL_DATA_SHA256" ]]
+          [[ "$matrix_sha" == "$APPROVED_MODEL_MATRIX_SHA256" ]]
+          [[ "$p17_matrix_sha" == "$APPROVED_P17_MATRIX_SHA256" ]]
+
+          run_root="$FORMAL_RUN_ROOT"
+          install -m 0400 "$APPROVED_EVAL_DATA_PATH" "$run_root/inputs/eval-data.json"
+          install -m 0400 "$APPROVED_MODEL_MATRIX_PATH" "$run_root/inputs/model-matrix.approved.json"
+          install -m 0400 "$APPROVED_P17_MATRIX_PATH" "$run_root/inputs/p17-matrix.approved.json"
+          [[ "$(sha256sum "$run_root/inputs/eval-data.json" | cut -d' ' -f1)" == "$eval_sha" ]]
+          [[ "$(sha256sum "$run_root/inputs/model-matrix.approved.json" | cut -d' ' -f1)" == "$matrix_sha" ]]
+          [[ "$(sha256sum "$run_root/inputs/p17-matrix.approved.json" | cut -d' ' -f1)" == "$p17_matrix_sha" ]]
+
+          python tools/snapshot_evaluation_checkpoints.py \
+            --matrix "$run_root/inputs/model-matrix.approved.json" \
+            --kind evaluator \
+            --checkpoint-dir "$run_root/evaluator-checkpoints" \
+            --output "$run_root/inputs/model-matrix.json"
+          python tools/snapshot_evaluation_checkpoints.py \
+            --matrix "$run_root/inputs/p17-matrix.approved.json" \
+            --kind p17 \
+            --checkpoint-dir "$run_root/p17-checkpoints" \
+            --output "$run_root/inputs/p17-matrix.json"
+          model_snapshot_sha="$(sha256sum "$run_root/inputs/model-matrix.json" | cut -d' ' -f1)"
+          p17_snapshot_sha="$(sha256sum "$run_root/inputs/p17-matrix.json" | cut -d' ' -f1)"
+
+          {
+            echo "FORMAL_EVAL_DATA=$run_root/inputs/eval-data.json"
+            echo "FORMAL_MODEL_MATRIX=$run_root/inputs/model-matrix.json"
+            echo "FORMAL_P17_MATRIX=$run_root/inputs/p17-matrix.json"
+            echo "SNAPSHOT_MODEL_MATRIX_SHA256=$model_snapshot_sha"
+            echo "SNAPSHOT_P17_MATRIX_SHA256=$p17_snapshot_sha"
+          } >>"$GITHUB_ENV"
+
+      - name: Verify the immutable image dependency set
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=(
+            docker run --rm
+            --pull never
+            --entrypoint ""
+            --network none
+            --read-only
+            --user "$(id -u):$(id -g)"
+            --security-opt no-new-privileges
+            --cap-drop ALL
+            --tmpfs "/tmp:rw,nosuid,nodev,size=1g"
+            --workdir "$GITHUB_WORKSPACE"
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly"
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly"
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/evaluator-checkpoints,dst=$FORMAL_RUN_ROOT/evaluator-checkpoints,readonly"
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-checkpoints,dst=$FORMAL_RUN_ROOT/p17-checkpoints,readonly"
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output"
+            --env FORMAL_RUN_ROOT
+            --env PYTHONDONTWRITEBYTECODE
+            --env PYTHONNOUSERSITE
+            --env PYTHONPATH="$GITHUB_WORKSPACE"
+            --env PIP_DISABLE_PIP_VERSION_CHECK
+            --env HOME=/tmp/formal-home
+            "$FORMAL_EVALUATOR_IMAGE"
+          )
+          # The quoted program is expanded by the container shell, not here.
+          # shellcheck disable=SC2016
+          "${container[@]}" sh -ec '
+            mkdir -p "$HOME"
+            command -v gh >/dev/null
+            python -m pip freeze --all \
+              | LC_ALL=C sort \
+              >"$FORMAL_RUN_ROOT/output/python-packages.txt"
+          '
+          package_sha="$(sha256sum "$FORMAL_RUN_ROOT/output/python-packages.txt" | cut -d' ' -f1)"
+          [[ "$package_sha" == "$APPROVED_PYTHON_PACKAGES_SHA256" ]]
+          chmod 0444 "$FORMAL_RUN_ROOT/output/python-packages.txt"
+          echo "PYTHON_PACKAGES_SHA256=$package_sha" >>"$GITHUB_ENV"
+
+      - name: Run formal paired evaluation in the immutable image
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "EVALUATION_STARTED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >>"$GITHUB_ENV"
+          docker run --rm \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=4g \
+            --workdir "$GITHUB_WORKSPACE" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/evaluator-checkpoints,dst=$FORMAL_RUN_ROOT/evaluator-checkpoints,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-checkpoints,dst=$FORMAL_RUN_ROOT/p17-checkpoints,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output" \
+            --env GITHUB_ACTIONS \
+            --env GITHUB_REPOSITORY \
+            --env GITHUB_WORKFLOW_REF \
+            --env GITHUB_WORKFLOW_SHA \
+            --env GITHUB_REF \
+            --env GITHUB_SHA \
+            --env GITHUB_RUN_ID \
+            --env GITHUB_RUN_ATTEMPT \
+            --env RUNNER_ENVIRONMENT \
+            --env DOUZERO_EVALUATOR_IMAGE_DIGEST \
+            --env DOUZERO_GIT_SHA= \
+            --env PYTHONDONTWRITEBYTECODE \
+            --env PYTHONNOUSERSITE \
+            --env PYTHONPATH="$GITHUB_WORKSPACE" \
+            --env HOME=/tmp/formal-home \
+            "$FORMAL_EVALUATOR_IMAGE" \
+            python evaluate_paired.py \
+            --formal-release \
+            --expected-source-git-sha "$APPROVED_SOURCE_SHA" \
+            --mode "$EVALUATION_MODE" \
+            --dataset-scope "$DATASET_SCOPE" \
+            --eval-data "$FORMAL_EVAL_DATA" \
+            --model-matrix "$FORMAL_MODEL_MATRIX" \
+            --candidate "$CANDIDATE_BUNDLE" \
+            --baseline "$BASELINE_BUNDLE" \
+            --bootstrap-samples "$BOOTSTRAP_SAMPLES" \
+            --output "$FORMAL_RESULT_PREFIX"
+
+      - name: Bind run, input, dependency, and hardware identity into result
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -f "$FORMAL_RESULT_JSON" && ! -L "$FORMAL_RESULT_JSON" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          docker run --rm --interactive \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --workdir "$GITHUB_WORKSPACE" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/evaluator-checkpoints,dst=$FORMAL_RUN_ROOT/evaluator-checkpoints,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-checkpoints,dst=$FORMAL_RUN_ROOT/p17-checkpoints,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output" \
+            --env APPROVED_SOURCE_SHA \
+            --env APPROVED_EVALUATION_REQUEST_SHA256 \
+            --env APPROVED_EVAL_DATA_SHA256 \
+            --env APPROVED_MODEL_MATRIX_SHA256 \
+            --env APPROVED_P17_MATRIX_SHA256 \
+            --env APPROVED_DEAL_SET_ID \
+            --env CANDIDATE_BUNDLE \
+            --env BASELINE_BUNDLE \
+            --env EVALUATION_MODE \
+            --env DATASET_SCOPE \
+            --env GITHUB_ACTIONS \
+            --env GITHUB_SERVER_URL \
+            --env GITHUB_REPOSITORY \
+            --env GITHUB_WORKFLOW_REF \
+            --env GITHUB_WORKFLOW_SHA \
+            --env GITHUB_REF \
+            --env GITHUB_SHA \
+            --env GITHUB_RUN_ID \
+            --env GITHUB_RUN_ATTEMPT \
+            --env RUNNER_ENVIRONMENT \
+            --env RUNNER_OS \
+            --env RUNNER_ARCH \
+            --env DOUZERO_EVALUATOR_IMAGE_DIGEST \
+            --env FORMAL_EVALUATOR_IMAGE \
+            --env FORMAL_EVALUATOR_IMAGE_ID \
+            --env EVALUATION_STARTED_AT \
+            --env SNAPSHOT_MODEL_MATRIX_SHA256 \
+            --env SNAPSHOT_P17_MATRIX_SHA256 \
+            --env PYTHON_PACKAGES_SHA256 \
+            --env PYTHONDONTWRITEBYTECODE \
+            --env PYTHONNOUSERSITE \
+            --env PYTHONPATH="$GITHUB_WORKSPACE" \
+            --env HOME=/tmp/formal-home \
+            "$FORMAL_EVALUATOR_IMAGE" \
+            python - "$FORMAL_RESULT_JSON" <<'PY'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          from douzero.evaluation.paired import validate_evaluation_runtime_identity
+          from douzero.evaluation.provenance import (
+              RESULT_PAYLOAD_FIELDS,
+              attach_result_integrity,
+              verify_result_integrity,
+          )
+
+          path = Path(sys.argv[1])
+          protected = json.loads(path.read_text(encoding="utf-8"))
+          verify_result_integrity(protected)
+          payload = {field: protected[field] for field in RESULT_PAYLOAD_FIELDS}
+          scenario = payload["scenario"]
+          runtime = payload["runtime_identity"]
+
+          expected = {
+              "source_git_sha": os.environ["APPROVED_SOURCE_SHA"],
+              "mode": os.environ["EVALUATION_MODE"],
+              "dataset_scope": os.environ["DATASET_SCOPE"],
+              "deal_set_id": os.environ["APPROVED_DEAL_SET_ID"],
+              "candidate": os.environ["CANDIDATE_BUNDLE"],
+              "baseline": os.environ["BASELINE_BUNDLE"],
+              "bootstrap_samples": int(os.environ["BOOTSTRAP_SAMPLES"]),
+          }
+          if runtime.get("source_git_sha") != expected["source_git_sha"]:
+              raise SystemExit("runtime source SHA mismatch")
+          if runtime.get("source_worktree_clean") is not True:
+              raise SystemExit("formal result did not record a clean checkout")
+          if runtime.get("source_identity_stable") is not True:
+              raise SystemExit("formal result did not record stable source identity")
+          if runtime.get("source_identity_samples") != 2:
+              raise SystemExit("formal result did not sample source identity twice")
+          for key in ("mode", "dataset_scope", "deal_set_id"):
+              if scenario.get(key) != expected[key]:
+                  raise SystemExit(f"scenario {key} mismatch")
+          if scenario.get("candidate", {}).get("name") != expected["candidate"]:
+              raise SystemExit("scenario candidate mismatch")
+          if scenario.get("baseline", {}).get("name") != expected["baseline"]:
+              raise SystemExit("scenario baseline mismatch")
+          if scenario.get("bootstrap_samples") != expected["bootstrap_samples"]:
+              raise SystemExit("scenario bootstrap_samples mismatch")
+          if scenario.get("num_deals", 0) < 1000:
+              raise SystemExit("formal P17 evaluation requires at least 1000 deals")
+          if scenario.get("bootstrap_samples", 0) < 2000:
+              raise SystemExit("formal P17 evaluation requires at least 2000 bootstraps")
+
+          execution = runtime.get("execution_environment")
+          if not isinstance(execution, dict):
+              raise SystemExit("formal result has no execution environment")
+          expected_execution = {
+              "provider": "github_actions",
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+              "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
+              "source_ref": os.environ["GITHUB_REF"],
+              "source_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+              "run_url": (
+                  f"{os.environ['GITHUB_SERVER_URL']}/"
+                  f"{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                  f"{os.environ['GITHUB_RUN_ID']}/attempts/"
+                  f"{os.environ['GITHUB_RUN_ATTEMPT']}"
+              ),
+              "runner_environment": os.environ["RUNNER_ENVIRONMENT"],
+              "container_image_digest": os.environ[
+                  "DOUZERO_EVALUATOR_IMAGE_DIGEST"
+              ],
+          }
+          for key, value in expected_execution.items():
+              if execution.get(key) != value:
+                  raise SystemExit(f"execution identity mismatch: {key}")
+          execution.update({
+              "protected_environment": "formal-evaluation",
+              "container_image_reference": os.environ[
+                  "FORMAL_EVALUATOR_IMAGE"
+              ],
+              "container_image_id": os.environ[
+                  "FORMAL_EVALUATOR_IMAGE_ID"
+              ],
+              "evaluation_started_at": os.environ["EVALUATION_STARTED_AT"],
+              "evaluation_finished_at": datetime.now(timezone.utc).isoformat(),
+              "input_identity": {
+                  "evaluation_request_sha256": os.environ[
+                      "APPROVED_EVALUATION_REQUEST_SHA256"
+                  ],
+                  "eval_data_sha256": os.environ["APPROVED_EVAL_DATA_SHA256"],
+                  "model_matrix_sha256": os.environ[
+                      "APPROVED_MODEL_MATRIX_SHA256"
+                  ],
+                  "p17_matrix_sha256": os.environ[
+                      "APPROVED_P17_MATRIX_SHA256"
+                  ],
+                  "snapshot_model_matrix_sha256": os.environ[
+                      "SNAPSHOT_MODEL_MATRIX_SHA256"
+                  ],
+                  "snapshot_p17_matrix_sha256": os.environ[
+                      "SNAPSHOT_P17_MATRIX_SHA256"
+                  ],
+              },
+              "python_packages_sha256": os.environ["PYTHON_PACKAGES_SHA256"],
+              "runner_identity": {
+                  "os": os.environ["RUNNER_OS"],
+                  "arch": os.environ["RUNNER_ARCH"],
+              },
+          })
+          final_result = attach_result_integrity(payload)
+          validate_evaluation_runtime_identity(
+              final_result,
+              expected_mode=os.environ["EVALUATION_MODE"],
+              expected_source_git_shas=[os.environ["APPROVED_SOURCE_SHA"]],
+              require_formal_source=True,
+          )
+          temporary = path.with_suffix(".json.tmp")
+          temporary.write_text(
+              json.dumps(final_result, indent=2, sort_keys=True, allow_nan=False) + "\n",
+              encoding="utf-8",
+          )
+          temporary.replace(path)
+          verify_result_integrity(json.loads(path.read_text(encoding="utf-8")))
+          PY
+          chmod 0444 "$FORMAL_RESULT_JSON" "$FORMAL_RUN_ROOT/output/python-packages.txt"
+
+      - name: Calculate exact result digest
+        id: result-digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          result_sha="$(sha256sum "$FORMAL_RESULT_JSON" | cut -d' ' -f1)"
+          [[ "$result_sha" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$result_sha" >>"$GITHUB_OUTPUT"
+
+      # actions/attest@v4.1.1. This mints a short-lived OIDC identity and signs
+      # SLSA provenance for this one exact JSON file with Sigstore.
+      - name: Attest exact evaluation result
+        id: attest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: ${{ env.FORMAL_RESULT_JSON }}
+          show-summary: true
+
+      - name: Verify detached attestation and immutable subject
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_RESULT_SHA256: ${{ steps.result-digest.outputs.sha256 }}
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          [[ "$(sha256sum "$FORMAL_RESULT_JSON" | cut -d' ' -f1)" == "$EXPECTED_RESULT_SHA256" ]]
+          [[ -f "$ATTESTATION_BUNDLE" ]]
+          gh attestation verify "$FORMAL_RESULT_JSON" \
+            --bundle "$ATTESTATION_BUNDLE" \
+            --repo "$EXPECTED_REPOSITORY" \
+            --signer-workflow "GentleKingson/DouZero/.github/workflows/formal-evaluation.yml" \
+            --signer-digest "$GITHUB_WORKFLOW_SHA" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --format json \
+            >"$FORMAL_RUN_ROOT/output/attestation-verification.json"
+
+      - name: Collate replayed P17 artifacts inside protected boundary
+        shell: bash
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          [[ -f "$ATTESTATION_BUNDLE" && ! -L "$ATTESTATION_BUNDLE" ]]
+          attestation_snapshot="$FORMAL_RUN_ROOT/inputs/result-attestation.bundle"
+          install -m 0400 "$ATTESTATION_BUNDLE" "$attestation_snapshot"
+          [[ "$(sha256sum "$attestation_snapshot" | cut -d' ' -f1)" == \
+            "$(sha256sum "$ATTESTATION_BUNDLE" | cut -d' ' -f1)" ]]
+
+          common=(
+            --matrix "$FORMAL_P17_MATRIX"
+            --expected-evaluator-git-sha "$APPROVED_SOURCE_SHA"
+            --attestation-repository "$EXPECTED_REPOSITORY"
+            --attestation-signer-workflow \
+              "GentleKingson/DouZero/.github/workflows/formal-evaluation.yml"
+            --attestation-signer-digest "$GITHUB_WORKFLOW_SHA"
+            --attestation-source-ref "$GITHUB_REF"
+            --output "$FORMAL_P17_OUTPUT"
+          )
+          container=(
+            docker run --rm
+            --pull never
+            --entrypoint ""
+            --network none
+            --read-only
+            --user "$(id -u):$(id -g)"
+            --security-opt no-new-privileges
+            --cap-drop ALL
+            --tmpfs "/tmp:rw,nosuid,nodev,size=1g"
+            --workdir "$GITHUB_WORKSPACE"
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly"
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly"
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/evaluator-checkpoints,dst=$FORMAL_RUN_ROOT/evaluator-checkpoints,readonly"
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-checkpoints,dst=$FORMAL_RUN_ROOT/p17-checkpoints,readonly"
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output"
+            --env PYTHONDONTWRITEBYTECODE
+            --env PYTHONNOUSERSITE
+            --env PYTHONPATH="$GITHUB_WORKSPACE"
+            --env HOME=/tmp/formal-home
+            --env XDG_CACHE_HOME=/tmp/formal-cache
+            --env XDG_CONFIG_HOME=/tmp/formal-config
+            "$FORMAL_EVALUATOR_IMAGE"
+          )
+          if [[ "$EVALUATION_MODE" == "cardplay_only" ]]; then
+            "${container[@]}" python tools/prepare_p17_evaluation.py "${common[@]}" \
+              --cardplay-result "$FORMAL_RESULT_JSON" \
+              --cardplay-attestation "$attestation_snapshot" \
+              --expected-cardplay-deal-set-id "$APPROVED_DEAL_SET_ID" \
+              --approved-cardplay-eval-data "$FORMAL_EVAL_DATA"
+            release_result="$FORMAL_P17_OUTPUT/cardplay_results.json"
+          else
+            "${container[@]}" python tools/prepare_p17_evaluation.py "${common[@]}" \
+              --full-game-result "$FORMAL_RESULT_JSON" \
+              --full-game-attestation "$attestation_snapshot" \
+              --expected-full-game-deal-set-id "$APPROVED_DEAL_SET_ID" \
+              --approved-full-game-eval-data "$FORMAL_EVAL_DATA"
+            release_result="$FORMAL_P17_OUTPUT/full_game_results.json"
+          fi
+
+          if [[ "$DATASET_SCOPE" == "private_holdout" ]]; then
+            docker run --rm --interactive \
+              --pull never \
+              --entrypoint "" \
+              --network none \
+              --read-only \
+              --user "$(id -u):$(id -g)" \
+              --security-opt no-new-privileges \
+              --cap-drop ALL \
+              --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+              --workdir "$GITHUB_WORKSPACE" \
+              --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+              --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output,readonly" \
+              --env PYTHONDONTWRITEBYTECODE \
+              --env PYTHONNOUSERSITE \
+              --env PYTHONPATH="$GITHUB_WORKSPACE" \
+              --env HOME=/tmp/formal-home \
+              "$FORMAL_EVALUATOR_IMAGE" \
+              python - "$release_result" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          block = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          result = block.get("result")
+          if not isinstance(result, dict) or set(result) != {
+              "schema_version",
+              "scenario",
+              "game_evidence",
+          }:
+              raise SystemExit("private P17 result was not projected safely")
+          if result["schema_version"] != "p17-private-result-projection-v1":
+              raise SystemExit("private P17 projection schema is unsupported")
+          scenario = result.get("scenario")
+          if not isinstance(scenario, dict) or set(scenario) != {
+              "mode",
+              "dataset_scope",
+              "deal_set_id",
+              "num_deals",
+              "candidate",
+              "baseline",
+          }:
+              raise SystemExit("private P17 scenario projection is malformed")
+          if (
+              scenario["dataset_scope"] != "private_holdout"
+              or scenario["mode"] not in {"cardplay_only", "full_game"}
+              or not isinstance(scenario["deal_set_id"], str)
+              or len(scenario["deal_set_id"]) != 64
+              or type(scenario["num_deals"]) is not int
+              or scenario["num_deals"] < 1
+          ):
+              raise SystemExit("private P17 scenario identity is invalid")
+          for side in ("candidate", "baseline"):
+              identity = scenario[side]
+              if not isinstance(identity, dict) or set(identity) != {"name"}:
+                  raise SystemExit("private P17 model projection is malformed")
+              if not isinstance(identity["name"], str) or not identity["name"]:
+                  raise SystemExit("private P17 model identity is invalid")
+          evidence = result.get("game_evidence")
+          if not isinstance(evidence, dict) or set(evidence) != {
+              "status",
+              "published_game_rows",
+              "source_game_rows",
+          }:
+              raise SystemExit("private P17 game-evidence projection is malformed")
+          if (
+              evidence["status"] != "redacted"
+              or evidence["published_game_rows"] != 0
+              or type(evidence["source_game_rows"]) is not int
+              or evidence["source_game_rows"] < 1
+          ):
+              raise SystemExit("private per-game evidence escaped redaction")
+          PY
+          fi
+
+      - name: Calculate exact P17 manifest digest
+        id: p17-manifest-digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$FORMAL_P17_OUTPUT/manifest.json"
+          [[ -f "$manifest" && ! -L "$manifest" ]]
+          manifest_sha="$(sha256sum "$manifest" | cut -d' ' -f1)"
+          [[ "$manifest_sha" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$manifest_sha" >>"$GITHUB_OUTPUT"
+
+      - name: Attest exact P17 artifact manifest
+        id: p17-attest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: ${{ env.FORMAL_P17_OUTPUT }}/manifest.json
+          show-summary: true
+
+      - name: Verify P17 artifact manifest attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.p17-manifest-digest.outputs.sha256 }}
+          P17_ATTESTATION_BUNDLE: ${{ steps.p17-attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          manifest="$FORMAL_P17_OUTPUT/manifest.json"
+          [[ "$(sha256sum "$manifest" | cut -d' ' -f1)" == "$EXPECTED_MANIFEST_SHA256" ]]
+          [[ -f "$P17_ATTESTATION_BUNDLE" ]]
+          gh attestation verify "$manifest" \
+            --bundle "$P17_ATTESTATION_BUNDLE" \
+            --repo "$EXPECTED_REPOSITORY" \
+            --signer-workflow "GentleKingson/DouZero/.github/workflows/formal-evaluation.yml" \
+            --signer-digest "$GITHUB_WORKFLOW_SHA" \
+            --source-digest "$GITHUB_SHA" \
+            --source-ref "$GITHUB_REF" \
+            --format json \
+            >"$FORMAL_RUN_ROOT/output/p17-manifest-attestation-verification.json"
+
+      - name: Recheck signed P17 manifest closure before upload
+        shell: bash
+        env:
+          EXPECTED_MANIFEST_SHA256: ${{ steps.p17-manifest-digest.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          [[ -d "$FORMAL_P17_OUTPUT" && ! -L "$FORMAL_P17_OUTPUT" ]]
+          docker run --rm --interactive \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            --workdir "$GITHUB_WORKSPACE" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+            --mount "type=bind,src=$FORMAL_P17_OUTPUT,dst=$FORMAL_P17_OUTPUT,readonly" \
+            --env EXPECTED_MANIFEST_SHA256 \
+            --env PYTHONDONTWRITEBYTECODE \
+            --env PYTHONNOUSERSITE \
+            --env PYTHONPATH="$GITHUB_WORKSPACE" \
+            --env HOME=/tmp/formal-home \
+            "$FORMAL_EVALUATOR_IMAGE" \
+            python - "$FORMAL_P17_OUTPUT/manifest.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          from pathlib import Path
+
+          EXPECTED_FILES = {
+              "ablations.json",
+              "calibration.json",
+              "cardplay_results.json",
+              "full_game_results.json",
+              "latency.json",
+              "model_matrix.json",
+              "report.md",
+          }
+
+          def strict_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  value[key] = item
+              return value
+
+          def read_regular(path, *, capture=False):
+              if not hasattr(os, "O_NOFOLLOW"):
+                  raise SystemExit("O_NOFOLLOW is required for artifact checks")
+              before = os.stat(path, follow_symlinks=False)
+              if not stat.S_ISREG(before.st_mode):
+                  raise SystemExit(f"artifact is not a regular file: {path.name}")
+              descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+              try:
+                  opened = os.fstat(descriptor)
+                  if (opened.st_dev, opened.st_ino) != (
+                      before.st_dev,
+                      before.st_ino,
+                  ):
+                      raise SystemExit(f"artifact changed before open: {path.name}")
+                  digest = hashlib.sha256()
+                  size = 0
+                  captured = bytearray() if capture else None
+                  while True:
+                      block = os.read(descriptor, 1024 * 1024)
+                      if not block:
+                          break
+                      digest.update(block)
+                      size += len(block)
+                      if captured is not None:
+                          captured.extend(block)
+                  after = os.fstat(descriptor)
+              finally:
+                  os.close(descriptor)
+              identity = lambda item: (
+                  item.st_dev,
+                  item.st_ino,
+                  item.st_size,
+                  item.st_mtime_ns,
+                  item.st_ctime_ns,
+              )
+              if identity(before) != identity(after) or size != after.st_size:
+                  raise SystemExit(f"artifact changed while read: {path.name}")
+              payload = bytes(captured) if captured is not None else None
+              return digest.hexdigest(), size, payload
+
+          manifest_path = Path(sys.argv[1])
+          expected_manifest_sha = os.environ["EXPECTED_MANIFEST_SHA256"]
+          if not re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha):
+              raise SystemExit("expected manifest digest is malformed")
+          manifest_sha, _, manifest_bytes = read_regular(
+              manifest_path, capture=True
+          )
+          if manifest_sha != expected_manifest_sha:
+              raise SystemExit("signed manifest changed before upload")
+          try:
+              manifest = json.loads(
+                  manifest_bytes.decode("utf-8"),
+                  object_pairs_hook=strict_object,
+              )
+          except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+              raise SystemExit("signed manifest is not strict JSON") from exc
+          if set(manifest) != {
+              "schema_version",
+              "report_schema_version",
+              "files",
+              "release_status",
+              "source_result_provenance",
+          }:
+              raise SystemExit("signed manifest top-level shape is invalid")
+          if manifest["schema_version"] != "p17-artifact-manifest-v1":
+              raise SystemExit("signed manifest schema is unsupported")
+          declared = manifest["files"]
+          if not isinstance(declared, dict) or set(declared) != EXPECTED_FILES:
+              raise SystemExit("signed manifest has missing or extra file entries")
+
+          root = manifest_path.parent
+          root_info = os.stat(root, follow_symlinks=False)
+          if not stat.S_ISDIR(root_info.st_mode):
+              raise SystemExit("P17 output root is not a real directory")
+          entries = list(os.scandir(root))
+          actual = {entry.name for entry in entries}
+          if len(actual) != len(entries):
+              raise SystemExit("duplicate artifact directory entries")
+          if actual != EXPECTED_FILES | {"manifest.json"}:
+              raise SystemExit("P17 output has missing or extra artifacts")
+          for entry in entries:
+              info = entry.stat(follow_symlinks=False)
+              if entry.is_symlink() or not stat.S_ISREG(info.st_mode):
+                  raise SystemExit(f"artifact entry is not regular: {entry.name}")
+
+          for name in sorted(EXPECTED_FILES):
+              identity = declared[name]
+              if not isinstance(identity, dict) or set(identity) != {
+                  "sha256",
+                  "size_bytes",
+              }:
+                  raise SystemExit(f"manifest identity is malformed: {name}")
+              digest = identity["sha256"]
+              size = identity["size_bytes"]
+              if not isinstance(digest, str) or not re.fullmatch(
+                  r"[0-9a-f]{64}", digest
+              ):
+                  raise SystemExit(f"manifest SHA-256 is malformed: {name}")
+              if type(size) is not int or size < 0:
+                  raise SystemExit(f"manifest size is malformed: {name}")
+              actual_digest, actual_size, _ = read_regular(root / name)
+              if actual_digest != digest or actual_size != size:
+                  raise SystemExit(f"artifact does not match manifest: {name}")
+          PY
+
+      # Public deals may publish the exact attested trace result for audit.
+      # actions/upload-artifact@v4.6.2
+      - name: Upload public result, detached bundle, and audit material
+        if: steps.request.outputs.dataset_scope == 'public'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: formal-p17-${{ steps.request.outputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.FORMAL_RESULT_JSON }}
+            ${{ env.FORMAL_RUN_ROOT }}/output/python-packages.txt
+            ${{ env.FORMAL_RUN_ROOT }}/output/attestation-verification.json
+            ${{ env.FORMAL_RUN_ROOT }}/output/p17-manifest-attestation-verification.json
+            ${{ env.FORMAL_P17_OUTPUT }}/
+            ${{ steps.attest.outputs.bundle-path }}
+            ${{ steps.p17-attest.outputs.bundle-path }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # A complete card-play trace reconstructs a private holdout. Keep the
+      # raw signed result inside the protected runner boundary. The preceding
+      # protected collation replays it against the approved deals and emits
+      # only the redacted P17 projection plus detached provenance.
+      - name: Upload private attestation audit without game traces
+        if: steps.request.outputs.dataset_scope == 'private_holdout'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: formal-p17-private-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.FORMAL_RUN_ROOT }}/output/python-packages.txt
+            ${{ env.FORMAL_RUN_ROOT }}/output/attestation-verification.json
+            ${{ env.FORMAL_RUN_ROOT }}/output/p17-manifest-attestation-verification.json
+            ${{ env.FORMAL_P17_OUTPUT }}/
+            ${{ steps.attest.outputs.bundle-path }}
+            ${{ steps.p17-attest.outputs.bundle-path }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish immutable identities
+        shell: bash
+        env:
+          RESULT_SHA256: ${{ steps.result-digest.outputs.sha256 }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+          P17_ATTESTATION_URL: ${{ steps.p17-attest.outputs.attestation-url }}
+        run: |
+          {
+            echo "### Formal P17 evaluation"
+            echo
+            echo "- Repository: \`$GITHUB_REPOSITORY\`"
+            echo "- Workflow run: \`$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT\`"
+            echo "- Evaluated source: \`$APPROVED_SOURCE_SHA\`"
+            echo "- Evaluation request: \`$APPROVED_EVALUATION_REQUEST_SHA256\`"
+            echo "- Deal set: \`$APPROVED_DEAL_SET_ID\`"
+            echo "- Result SHA-256: \`$RESULT_SHA256\`"
+            echo "- Attestation: $ATTESTATION_URL"
+            echo "- P17 manifest attestation: $P17_ATTESTATION_URL"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Remove protected input snapshots
+        if: always()
+        shell: bash
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          P17_ATTESTATION_BUNDLE: ${{ steps.p17-attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          [[ -n "$RUNNER_TEMP" && "$RUNNER_TEMP" != "/" ]]
+          run_root="$RUNNER_TEMP/douzero-formal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [[ "$run_root" == "$RUNNER_TEMP"/douzero-formal-* ]]
+          chmod -R u+rwX -- "$run_root" 2>/dev/null || true
+          rm -rf -- "$run_root"
+          for bundle in "${ATTESTATION_BUNDLE:-}" "${P17_ATTESTATION_BUNDLE:-}"; do
+            if [[ -n "$bundle" && -f "$bundle" ]]; then
+              [[ "$bundle" == "$RUNNER_TEMP"/* ]]
+              rm -f -- "$bundle"
+            fi
+          done

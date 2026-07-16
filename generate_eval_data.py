@@ -20,6 +20,12 @@ def get_parser():
                         help='Optional YAML file with rule parameters for standard '
                              'mode. The generated data records the RuleSet hash so '
                              'that evaluate.py --ruleset_config <same.yaml> accepts it.')
+    parser.add_argument('--output-format', '--output_format',
+                        dest='output_format', default='pickle',
+                        choices=['pickle', 'formal-json'],
+                        help='pickle preserves historical local compatibility; '
+                             'formal-json writes the safe strict format required '
+                             'by formal paired evaluation')
     return parser
 
 def generate():
@@ -129,9 +135,13 @@ def _load_ruleset_from_config(config_path, *, expected_id="standard"):
 
 if __name__ == '__main__':
     flags = get_parser().parse_args()
-    output_pickle = flags.output + '.pkl'
+    from douzero.env.rules import RuleSet
 
-    print("output_pickle:", output_pickle)
+    output_path = flags.output + (
+        '.json' if flags.output_format == 'formal-json' else '.pkl'
+    )
+
+    print("output:", output_path)
     print("ruleset:", flags.ruleset)
     print("generating data...")
 
@@ -139,17 +149,24 @@ if __name__ == '__main__':
     if flags.ruleset == 'standard':
         # Build the RuleSet from config if provided (shared loader).
         rs = (_load_ruleset_from_config(flags.ruleset_config)
-              if flags.ruleset_config else None)
+              if flags.ruleset_config else RuleSet.standard())
         for _ in range(flags.num_games):
             data.append(generate_standard(ruleset=rs))
     else:
+        rs = RuleSet.legacy()
         for _ in range(flags.num_games):
             data.append(generate())
 
-    print("saving pickle file...")
-    with open(output_pickle,'wb') as g:
-        pickle.dump(data,g,pickle.HIGHEST_PROTOCOL)
+    if flags.output_format == 'formal-json':
+        from douzero.evaluation.formal_eval_data import write_formal_eval_data
 
+        mode = 'full_game' if flags.ruleset == 'standard' else 'cardplay_only'
+        print("saving strict formal JSON file...")
+        write_formal_eval_data(output_path, mode=mode, ruleset=rs, deals=data)
+    else:
+        print("saving pickle file...")
+        with open(output_path, 'wb') as g:
+            pickle.dump(data, g, pickle.HIGHEST_PROTOCOL)
 
 
 

@@ -17,6 +17,8 @@ from douzero.evaluation.paired import (
     validate_evaluation_runtime_identity,
 )
 from douzero.evaluation.p17 import result_readiness
+from douzero.evaluation.provenance import attach_result_integrity
+from douzero.evaluation.replay import replay_game_record
 from douzero.evaluation.reporting import write_report
 from douzero.evaluation.scenario import (
     BundleSpec,
@@ -60,7 +62,7 @@ def test_p17_fields_preserve_pre_p17_positional_dataclass_contracts():
     assert bundle_from_dict(matrix_payload) == bundle
     assert "checkpoint_identities" in bundle.to_dict()
 
-    calibration = (("landlord", 0.75, 1.0),)
+    calibration = (("landlord", 0.75),)
     record = GameRecord(
         "deal",
         "leg",
@@ -179,6 +181,15 @@ def test_full_game_rotates_candidate_and_reports_rules_metrics():
     scenario = _scenario("full_game", deals=1)
     result = evaluate_scenario(scenario)
     repeated = evaluate_scenario(scenario)
+
+    def without_timing(game):
+        payload = game.to_dict()
+        payload["candidate_latencies_ms"] = []
+        payload["candidate_latencies_ns"] = []
+        for decision in payload["candidate_decisions"]:
+            decision["latency_ns"] = 0
+        return payload
+
     assert len(result.games) == 3
     assert {game.assignment for game in result.games} == {
         ("candidate", "baseline", "baseline"),
@@ -190,8 +201,8 @@ def test_full_game_rotates_candidate_and_reports_rules_metrics():
     assert 0.0 <= result.metrics["landlord_acquisition_rate"] <= 1.0
     assert all(game.bid_value >= 1 for game in result.games)
     assert {game.mode for game in result.games} == {"full_game"}
-    assert [game.to_dict() | {"candidate_latencies_ms": []} for game in result.games] == [
-        game.to_dict() | {"candidate_latencies_ms": []} for game in repeated.games
+    assert [without_timing(game) for game in result.games] == [
+        without_timing(game) for game in repeated.games
     ]
     assert result.metrics["paired_win_rate_delta_ci"] is None
     with pytest.raises(ValueError, match="cannot be used for promotion"):
@@ -250,12 +261,39 @@ def test_full_game_all_pass_is_bounded_and_deterministic():
         game.exclusion_reason == "redeal_cap_exhausted_forced_smoke_fallback"
         for game in first.games
     )
+    assert all(
+        game.redeal_count == ruleset.max_redeals + 1 for game in first.games
+    )
+    assert all(
+        len(game.bidding_trace) == ruleset.max_redeals + 1
+        and all(
+            len(attempt) == 3 and all(bid == 0 for _seat, bid in attempt)
+            for attempt in game.bidding_trace
+        )
+        for game in first.games
+    )
+    for game in first.games:
+        replay = replay_game_record(
+            game.to_dict(),
+            scenario.deals[0],
+            mode="full_game",
+            ruleset=ruleset,
+            deterministic_seed=scenario.deterministic_seed,
+        )
+        assert replay.max_redeals_exceeded is True
+        assert replay.redeal_count == ruleset.max_redeals + 1
+        assert replay.bid_value == 1
+        assert replay.bidding_history == ((replay.bidding_order[0], 1),)
     assert first.metrics["formal_evaluation"]["excluded_deals"] == 1
     assert first.metrics["paired_estimate_ci"]["paired_deals"] == 0
     assert math.isnan(first.metrics["bid_rate"])
     assert first.metrics["smoke_descriptive"]["bid_rate"] == 0.0
-    readiness = result_readiness(first.to_dict(), mode="full_game")
+    readiness = result_readiness(
+        first.to_dict(), mode="full_game", approved_deals=scenario.deals
+    )
     assert readiness["status"] == "insufficient"
+    assert readiness["evidence"]["excluded_deals"] == 1
+    assert readiness["evidence"]["malformed_deals"] == 0
     assert any("redeal cap" in issue for issue in readiness["issues"])
 
 
@@ -313,20 +351,85 @@ def test_evaluation_runtime_identity_binds_protocol_mode_rules_and_schemas():
 
     wrong_rules = json.loads(json.dumps(payload))
     wrong_rules["runtime_identity"]["ruleset_hash"] = "0" * 64
-    with pytest.raises(ValueError, match="ruleset hash mismatch"):
+    with pytest.raises(ValueError, match="result integrity"):
         validate_evaluation_runtime_identity(wrong_rules)
 
     wrong_schema = json.loads(json.dumps(payload))
     wrong_schema["runtime_identity"]["model_feature_schemas"]["candidate"][
         "feature_version"
     ] = "legacy"
-    with pytest.raises(ValueError, match="feature-schema identities"):
+    with pytest.raises(ValueError, match="result integrity"):
         validate_evaluation_runtime_identity(wrong_schema)
 
     wrong_config = json.loads(json.dumps(payload))
     wrong_config["scenario"]["deterministic_seed"] += 1
-    with pytest.raises(ValueError, match="evaluation_config_hash"):
+    with pytest.raises(ValueError, match="result integrity"):
         validate_evaluation_runtime_identity(wrong_config)
+
+
+def test_formal_runtime_identity_binds_workflow_container_and_hardware():
+    payload = evaluate_scenario(_scenario("cardplay_only", deals=1)).to_dict()
+    runtime = payload["runtime_identity"]
+    source_sha = runtime["source_git_sha"]
+    runtime.update({
+        "source_worktree_clean": True,
+        "source_identity_stable": True,
+        "source_identity_samples": 2,
+    })
+    runtime["execution_environment"].update({
+        "provider": "github_actions",
+        "repository": "GentleKingson/DouZero",
+        "workflow_ref": (
+            "GentleKingson/DouZero/.github/workflows/"
+            "formal-evaluation.yml@refs/heads/main"
+        ),
+        "workflow_sha": source_sha,
+        "source_ref": "refs/heads/main",
+        "source_sha": source_sha,
+        "run_id": "12345",
+        "run_attempt": "2",
+        "run_url": (
+            "https://github.com/GentleKingson/DouZero/"
+            "actions/runs/12345/attempts/2"
+        ),
+        "runner_environment": "github-hosted",
+        "container_image_digest": "sha256:" + "b" * 64,
+    })
+    payload = attach_result_integrity({
+        key: value for key, value in payload.items() if key != "result_integrity"
+    })
+
+    validate_evaluation_runtime_identity(
+        payload,
+        expected_source_git_shas=[source_sha],
+        require_formal_source=True,
+    )
+
+    malformed = json.loads(json.dumps(payload))
+    malformed["runtime_identity"]["execution_environment"][
+        "container_image_digest"
+    ] = None
+    malformed = attach_result_integrity({
+        key: value
+        for key, value in malformed.items()
+        if key != "result_integrity"
+    })
+    with pytest.raises(ValueError, match="workflow/container identity"):
+        validate_evaluation_runtime_identity(
+            malformed,
+            require_formal_source=True,
+        )
+
+
+def test_runtime_source_identity_ignores_environment_sha(monkeypatch):
+    monkeypatch.setenv("DOUZERO_GIT_SHA", "0" * 40)
+    runtime = evaluate_scenario(
+        _scenario("cardplay_only", deals=1)
+    ).to_dict()["runtime_identity"]
+    assert runtime["source_git_sha"] != "0" * 40
+    assert runtime["source_identity_method"] == (
+        "git-head-tree-and-tracked-bytes-v1"
+    )
 
 
 def test_private_holdout_name_is_redacted_from_report_identity():

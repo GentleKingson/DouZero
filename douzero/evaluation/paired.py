@@ -6,13 +6,16 @@ import copy
 import hashlib
 import json
 import math
+import os
+import platform
 import random
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from douzero._version import git_sha
 from douzero.env.game import GameEnv
+from douzero._version import git_sha
 from douzero.env.rules import PHASE_BIDDING
 
 from .agents import BundleFactory, RuleAgent, TimedAgent
@@ -27,6 +30,14 @@ from .protocol import (
     PROMOTION_ESTIMATOR,
     PROMOTION_MODE,
 )
+from .provenance import (
+    GitCheckoutIdentity,
+    ProvenanceError,
+    attach_result_integrity,
+    inspect_git_checkout,
+    verify_result_integrity,
+)
+from .replay import evaluation_trace_digest
 from .scenario import (
     ROLES,
     EvaluationScenario,
@@ -42,12 +53,79 @@ from .statistics import (
 )
 
 
-EVALUATION_RESULT_SCHEMA_VERSION = "p15-paired-result-v2"
+EVALUATION_RESULT_SCHEMA_VERSION = "p15-paired-result-v3"
+
+
+def _execution_environment_identity() -> dict[str, Any]:
+    """Capture the signed workflow, container, and hardware run context."""
+
+    import torch
+
+    cuda_available = bool(torch.cuda.is_available())
+    cuda_device_count = torch.cuda.device_count() if cuda_available else 0
+    cuda_device_names: list[str] = []
+    if cuda_available:
+        for index in range(cuda_device_count):
+            try:
+                cuda_device_names.append(str(torch.cuda.get_device_name(index)))
+            except (AssertionError, RuntimeError):
+                cuda_device_names.append("unavailable")
+
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
+    run_url = None
+    if repository and run_id and run_attempt:
+        run_url = (
+            f"https://github.com/{repository}/actions/runs/{run_id}/"
+            f"attempts/{run_attempt}"
+        )
+    return {
+        "provider": (
+            "github_actions"
+            if os.environ.get("GITHUB_ACTIONS") == "true"
+            else "local"
+        ),
+        "repository": repository,
+        "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF"),
+        "workflow_sha": os.environ.get("GITHUB_WORKFLOW_SHA"),
+        "source_ref": os.environ.get("GITHUB_REF"),
+        "source_sha": os.environ.get("GITHUB_SHA"),
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "run_url": run_url,
+        "runner_environment": os.environ.get("RUNNER_ENVIRONMENT"),
+        "container_image_digest": os.environ.get(
+            "DOUZERO_EVALUATOR_IMAGE_DIGEST"
+        ),
+        "hardware": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python_implementation": platform.python_implementation(),
+            "python_version": platform.python_version(),
+            "torch_version": str(torch.__version__),
+            "cuda_runtime_version": torch.version.cuda,
+            "cuda_available": cuda_available,
+            "cuda_device_count": cuda_device_count,
+            "cuda_device_names": cuda_device_names,
+        },
+    }
 
 
 def _canonical_sha256(value: Mapping[str, Any]) -> str:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _json_result_value(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Mapping):
+        return {str(key): _json_result_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_result_value(item) for item in value]
+    return value
 
 
 def _bundle_feature_schema(bundle: Mapping[str, Any]) -> dict[str, Any]:
@@ -80,19 +158,22 @@ def _bundle_feature_schema(bundle: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def evaluation_runtime_identity(
-    scenario: Mapping[str, Any], *, ablation: str
+    scenario: Mapping[str, Any],
+    *,
+    ablation: str,
+    source_identity: GitCheckoutIdentity | None = None,
+    source_identity_stable: bool = False,
+    source_identity_samples: int = 1,
 ) -> dict[str, Any]:
     """Bind evaluator code and effective scenario/schema configuration."""
 
-    source_sha = git_sha()
-    if (
-        len(source_sha) not in (40, 64)
-        or any(char not in "0123456789abcdef" for char in source_sha)
-    ):
-        raise RuntimeError(
-            "paired evaluation requires a full source Git SHA; set "
-            "DOUZERO_GIT_SHA in source-less runtimes"
-        )
+    local_unverified_source = False
+    if source_identity is None:
+        try:
+            source_identity = inspect_git_checkout(require_clean=False)
+        except ProvenanceError:
+            local_unverified_source = True
+    source_sha = git_sha() if source_identity is None else source_identity.head_sha
     schema_identities = {
         side: _bundle_feature_schema(scenario.get(side, {}))
         for side in ("candidate", "baseline")
@@ -104,9 +185,29 @@ def evaluation_runtime_identity(
         "model_feature_schemas": schema_identities,
     }
     ruleset = scenario.get("ruleset", {})
+    source_fields = (
+        {
+            "source_git_sha": source_sha,
+            "source_git_tree_oid": None,
+            "source_tracked_tree_sha256": None,
+            "source_git_ref": None,
+            "source_worktree_clean": False,
+            "source_tracked_file_count": 0,
+        }
+        if source_identity is None
+        else source_identity.to_runtime_fields()
+    )
     return {
         "schema_version": EVALUATION_RESULT_SCHEMA_VERSION,
-        "source_git_sha": source_sha,
+        **source_fields,
+        "source_identity_method": (
+            "local-unverified-env-or-package-metadata-v1"
+            if local_unverified_source
+            else "git-head-tree-and-tracked-bytes-v1"
+        ),
+        "source_identity_stable": bool(source_identity_stable),
+        "source_identity_samples": source_identity_samples,
+        "execution_environment": _execution_environment_identity(),
         "evaluation_config_hash": _canonical_sha256(config_payload),
         "ruleset_hash": (
             ruleset.get("ruleset_hash") if isinstance(ruleset, Mapping) else None
@@ -120,6 +221,7 @@ def validate_evaluation_runtime_identity(
     *,
     expected_mode: str | None = None,
     expected_source_git_shas: str | Iterable[str] | None = None,
+    require_formal_source: bool = False,
 ) -> None:
     """Reject missing or self-inconsistent evaluation provenance."""
 
@@ -143,6 +245,10 @@ def validate_evaluation_runtime_identity(
         raise ValueError("evaluation ablation identity must be a non-empty string")
     if runtime.get("schema_version") != EVALUATION_RESULT_SCHEMA_VERSION:
         raise ValueError("evaluation runtime schema version mismatch")
+    try:
+        verify_result_integrity(result)
+    except ProvenanceError as exc:
+        raise ValueError(f"evaluation result integrity is invalid: {exc}") from exc
     source_sha = runtime.get("source_git_sha")
     if (
         not isinstance(source_sha, str)
@@ -165,6 +271,128 @@ def validate_evaluation_runtime_identity(
             raise ValueError("expected evaluator Git SHA allowlist is invalid")
         if source_sha not in approved_shas:
             raise ValueError("evaluation source_git_sha is not approved")
+    source_tree = runtime.get("source_git_tree_oid")
+    tracked_tree = runtime.get("source_tracked_tree_sha256")
+    tracked_count = runtime.get("source_tracked_file_count")
+    formal_identity_shape_invalid = (
+        not isinstance(source_tree, str)
+        or len(source_tree) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in source_tree)
+        or not isinstance(tracked_tree, str)
+        or len(tracked_tree) != 64
+        or any(char not in "0123456789abcdef" for char in tracked_tree)
+        or type(tracked_count) is not int
+        or tracked_count < 1
+        or runtime.get("source_identity_method")
+        != "git-head-tree-and-tracked-bytes-v1"
+    )
+    if require_formal_source and formal_identity_shape_invalid:
+        raise ValueError("evaluation source tree identity is malformed")
+    if require_formal_source and (
+        runtime.get("source_worktree_clean") is not True
+        or runtime.get("source_identity_stable") is not True
+        or runtime.get("source_identity_samples") != 2
+    ):
+        raise ValueError(
+            "formal evaluation requires a stable clean two-sample Git source identity"
+        )
+    execution = runtime.get("execution_environment")
+    if require_formal_source:
+        if not isinstance(execution, Mapping):
+            raise ValueError("formal evaluation execution identity is missing")
+        repository = execution.get("repository")
+        workflow_ref = execution.get("workflow_ref")
+        workflow_sha = execution.get("workflow_sha")
+        source_ref = execution.get("source_ref")
+        run_id = execution.get("run_id")
+        run_attempt = execution.get("run_attempt")
+        expected_run_url = (
+            f"https://github.com/{repository}/actions/runs/{run_id}/"
+            f"attempts/{run_attempt}"
+        )
+        image_digest = execution.get("container_image_digest")
+        hardware = execution.get("hardware")
+        def full_oid(value: object) -> bool:
+            return bool(
+                isinstance(value, str)
+                and len(value) in (40, 64)
+                and all(char in "0123456789abcdef" for char in value)
+            )
+        if (
+            execution.get("provider") != "github_actions"
+            or not isinstance(repository, str)
+            or repository.count("/") != 1
+            or not isinstance(workflow_ref, str)
+            or not workflow_ref.startswith(
+                f"{repository}/.github/workflows/"
+            )
+            or "@refs/" not in workflow_ref
+            or not full_oid(workflow_sha)
+            or not isinstance(source_ref, str)
+            or not source_ref.startswith("refs/")
+            or execution.get("source_sha") != source_sha
+            or not isinstance(run_id, str)
+            or not run_id.isdigit()
+            or int(run_id) < 1
+            or not isinstance(run_attempt, str)
+            or not run_attempt.isdigit()
+            or int(run_attempt) < 1
+            or execution.get("run_url") != expected_run_url
+            or execution.get("runner_environment")
+            not in {"github-hosted", "self-hosted"}
+            or not isinstance(image_digest, str)
+            or len(image_digest) != 71
+            or not image_digest.startswith("sha256:")
+            or any(
+                char not in "0123456789abcdef" for char in image_digest[7:]
+            )
+        ):
+            raise ValueError(
+                "formal evaluation GitHub workflow/container identity is malformed"
+            )
+        expected_hardware_fields = {
+            "system",
+            "release",
+            "machine",
+            "python_implementation",
+            "python_version",
+            "torch_version",
+            "cuda_runtime_version",
+            "cuda_available",
+            "cuda_device_count",
+            "cuda_device_names",
+        }
+        if (
+            not isinstance(hardware, Mapping)
+            or set(hardware) != expected_hardware_fields
+            or any(
+                not isinstance(hardware.get(name), str)
+                or not hardware.get(name)
+                for name in (
+                    "system",
+                    "release",
+                    "machine",
+                    "python_implementation",
+                    "python_version",
+                    "torch_version",
+                )
+            )
+            or (
+                hardware.get("cuda_runtime_version") is not None
+                and not isinstance(hardware.get("cuda_runtime_version"), str)
+            )
+            or type(hardware.get("cuda_available")) is not bool
+            or type(hardware.get("cuda_device_count")) is not int
+            or hardware.get("cuda_device_count", -1) < 0
+            or not isinstance(hardware.get("cuda_device_names"), list)
+            or any(
+                not isinstance(name, str)
+                for name in hardware.get("cuda_device_names", [])
+            )
+            or len(hardware.get("cuda_device_names", []))
+            != hardware.get("cuda_device_count")
+        ):
+            raise ValueError("formal evaluation hardware identity is malformed")
     schema_identities = runtime.get("model_feature_schemas")
     if not isinstance(schema_identities, Mapping):
         raise ValueError("evaluation model feature-schema identities are missing")
@@ -203,6 +431,72 @@ def _deal_id(index: int, deal: Mapping[str, Any]) -> str:
     return canonical_deal_id(index, canonical_deal_hash(deal))
 
 
+def _candidate_decision_id(
+    mode: str,
+    deal_id: str,
+    assignment: tuple[str, str, str],
+    phase: str,
+    primary_index: int,
+    secondary_index: int | None = None,
+) -> str:
+    """Return a trace-derived, stable identifier for one candidate decision."""
+
+    assignment_token = "".join(
+        "c" if label == "candidate" else "b" for label in assignment
+    )
+    suffix = f"{primary_index:06d}"
+    if secondary_index is not None:
+        suffix = f"{suffix}/{secondary_index:06d}"
+    return f"{mode}/{deal_id}/{assignment_token}/{phase}/{suffix}"
+
+
+def _candidate_decision_evidence(
+    *,
+    decision_id: str,
+    phase: str,
+    actor_role: str | None,
+    actor_seat: str | None,
+    latency_ns: int,
+    prediction: float | None,
+    forced_action: bool,
+    search_called: bool,
+    search_timed_out: bool,
+    search_fallback: bool,
+) -> dict[str, Any]:
+    return {
+        "decision_id": decision_id,
+        "phase": phase,
+        "actor_role": actor_role,
+        "actor_seat": actor_seat,
+        "latency_ns": latency_ns,
+        "prediction_status": (
+            "available" if prediction is not None else "unavailable"
+        ),
+        "prediction": prediction,
+        "forced_action": forced_action,
+        "search_called": search_called,
+        "search_timed_out": search_timed_out,
+        "search_fallback": search_fallback,
+    }
+
+
+def _decision_compatibility_fields(
+    evidence: list[dict[str, Any]],
+) -> tuple[tuple[float, ...], tuple[int, ...], tuple[tuple[str, float], ...]]:
+    latencies_ns = tuple(int(item["latency_ns"]) for item in evidence)
+    calibration = tuple(
+        (str(item["actor_role"]), float(item["prediction"]))
+        for item in evidence
+        if item["phase"] == "cardplay"
+        and item["prediction_status"] == "available"
+    )
+    return (
+        tuple(value / 1_000_000.0 for value in latencies_ns),
+        latencies_ns,
+        calibration,
+    )
+
+
 @dataclass(frozen=True)
 class GameRecord:
     """One mirrored leg or seat rotation, retaining its parent deal ID."""
@@ -228,7 +522,9 @@ class GameRecord:
     anti_spring: bool
     game_length: int
     candidate_latencies_ms: tuple[float, ...] = ()
-    calibration: tuple[tuple[str, float, float], ...] = ()
+    # Calibration rows carry only a role and model prediction. The terminal
+    # label is derived by the collator from a successfully replayed game.
+    calibration: tuple[tuple[str, float], ...] = ()
     # Every P17 field is appended after the two original defaulted fields so
     # pre-P17 positional construction retains its exact argument meaning.
     redeal_count: int = 0
@@ -246,6 +542,11 @@ class GameRecord:
     seat_to_role: dict[str, str] | None = None
     bidding_order: tuple[str, ...] = ()
     bidding_history: tuple[tuple[str, int], ...] = ()
+    candidate_latencies_ns: tuple[int, ...] = ()
+    bidding_trace: tuple[tuple[tuple[str, int], ...], ...] = ()
+    cardplay_trace: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    trace_digest: str = ""
+    candidate_decisions: tuple[dict[str, Any], ...] = ()
 
     @property
     def candidate_log_score(self) -> float:
@@ -290,6 +591,17 @@ class GameRecord:
             "seat_to_role": copy.deepcopy(self.seat_to_role),
             "bidding_order": list(self.bidding_order),
             "bidding_history": [list(bid) for bid in self.bidding_history],
+            "candidate_latencies_ns": list(self.candidate_latencies_ns),
+            "bidding_trace": [
+                [list(bid) for bid in attempt] for attempt in self.bidding_trace
+            ],
+            "cardplay_trace": [
+                [role, list(action)] for role, action in self.cardplay_trace
+            ],
+            "trace_digest": self.trace_digest,
+            "candidate_decisions": copy.deepcopy(
+                list(self.candidate_decisions)
+            ),
         }
 
 
@@ -301,6 +613,9 @@ class PairedEvaluationResult:
     metrics: dict[str, Any]
     games: tuple[GameRecord, ...]
     ablation: str = "base"
+    source_identity: GitCheckoutIdentity | None = None
+    source_identity_stable: bool = False
+    source_identity_samples: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -311,9 +626,13 @@ class PairedEvaluationResult:
             "games": [game.to_dict() for game in self.games],
         }
         payload["runtime_identity"] = evaluation_runtime_identity(
-            self.scenario, ablation=self.ablation
+            self.scenario,
+            ablation=self.ablation,
+            source_identity=self.source_identity,
+            source_identity_stable=self.source_identity_stable,
+            source_identity_samples=self.source_identity_samples or 1,
         )
-        return payload
+        return attach_result_integrity(_json_result_value(payload))
 
     def to_promotion_evaluation(self):
         """Bridge directly to the P11 promotion gate's strict P15 contract."""
@@ -381,28 +700,13 @@ class PairedEvaluationResult:
         )
 
 
-def _candidate_samples(
-    agents: dict[str, TimedAgent], candidate_roles: tuple[str, ...], winner_team: str
-) -> tuple[tuple[float, ...], tuple[tuple[str, float, float], ...]]:
-    latencies: list[float] = []
-    calibration: list[tuple[str, float, float]] = []
-    for role in candidate_roles:
-        agent = agents[role]
-        latencies.extend(agent.latencies_ms)
-        target = float(
-            winner_team == ("landlord" if role == "landlord" else "farmer")
-        )
-        calibration.extend((role, prediction, target) for prediction in agent.predictions)
-    return tuple(latencies), tuple(calibration)
-
-
-def _candidate_search_counts(
-    agents: dict[str, TimedAgent], candidate_roles: tuple[str, ...]
+def _decision_search_counts(
+    evidence: list[dict[str, Any]],
 ) -> tuple[int, int, int]:
     return (
-        sum(agents[role].search_calls for role in candidate_roles),
-        sum(agents[role].search_timeouts for role in candidate_roles),
-        sum(agents[role].search_fallbacks for role in candidate_roles),
+        sum(int(item["search_called"]) for item in evidence),
+        sum(int(item["search_timed_out"]) for item in evidence),
+        sum(int(item["search_fallback"]) for item in evidence),
     )
 
 
@@ -427,8 +731,38 @@ def _run_cardplay_leg(
         )
     env = GameEnv(agents)
     env.card_play_init(copy.deepcopy(deal))
+    cardplay_trace: list[tuple[str, tuple[int, ...]]] = []
+    decision_evidence: list[dict[str, Any]] = []
     while not env.game_over:
+        position = str(env.acting_player_position)
+        agent = agents[position]
+        sample_count = len(agent.decision_samples)
+        trace_index = len(cardplay_trace)
+        forced_action = len(env.game_infoset.legal_actions) == 1
         env.step()
+        if len(agent.decision_samples) != sample_count + 1:
+            raise RuntimeError("card-play agent did not emit one timing sample")
+        if agent.bundle_label == "candidate":
+            sample = agent.decision_samples[-1]
+            decision_evidence.append(_candidate_decision_evidence(
+                decision_id=_candidate_decision_id(
+                    scenario.mode,
+                    deal_id,
+                    assignment,
+                    "cardplay",
+                    trace_index,
+                ),
+                phase="cardplay",
+                actor_role=position,
+                actor_seat=None,
+                latency_ns=sample.latency_ns,
+                prediction=sample.prediction,
+                forced_action=forced_action,
+                search_called=sample.search_called,
+                search_timed_out=sample.search_timed_out,
+                search_fallback=sample.search_fallback,
+            ))
+        cardplay_trace.append((position, tuple(env.card_play_action_seq[-1])))
 
     candidate_roles = tuple(
         role for role, label in zip(ROLES, assignment) if label == "candidate"
@@ -442,9 +776,11 @@ def _run_cardplay_leg(
     candidate_win = float(winner_team == candidate_team)
     role_wins = {role: candidate_win for role in candidate_roles}
     role_scores = {role: candidate_score for role in candidate_roles}
-    latencies, calibration = _candidate_samples(agents, candidate_roles, winner_team)
-    search_calls, search_timeouts, search_fallbacks = _candidate_search_counts(
-        agents, candidate_roles
+    latencies, latencies_ns, calibration = _decision_compatibility_fields(
+        decision_evidence
+    )
+    search_calls, search_timeouts, search_fallbacks = _decision_search_counts(
+        decision_evidence
     )
     return GameRecord(
         deal_id=deal_id,
@@ -468,11 +804,20 @@ def _run_cardplay_leg(
         anti_spring=False,
         game_length=len(env.card_play_action_seq),
         candidate_latencies_ms=latencies,
+        candidate_latencies_ns=latencies_ns,
         calibration=calibration,
         search_calls=search_calls,
         search_timeouts=search_timeouts,
         search_fallbacks=search_fallbacks,
         deal_hash=deal_hash,
+        cardplay_trace=tuple(cardplay_trace),
+        trace_digest=evaluation_trace_digest(
+            mode=scenario.mode,
+            deal_hash=deal_hash,
+            bidding_trace=(),
+            cardplay_trace=cardplay_trace,
+        ),
+        candidate_decisions=tuple(decision_evidence),
     )
 
 
@@ -497,7 +842,8 @@ def _run_full_game_leg(
     candidate_positive_bids = 0
     redeal_count = 0
     max_redeals_exceeded = False
-    candidate_bid_latencies_ms: list[float] = []
+    bidding_trace: list[tuple[tuple[str, int], ...]] = []
+    decision_evidence: list[dict[str, Any]] = []
 
     for _attempt in range(scenario.ruleset.max_redeals + 1):
         env.reset()
@@ -505,12 +851,11 @@ def _run_full_game_leg(
             deal_standard_deck(deck), bidding_order=bidding_order
         )
         redeal = False
+        attempt_trace: list[tuple[str, int]] = []
         while env.phase == PHASE_BIDDING:
             seat = env.acting_player_position
             label = assignment[int(seat)]
             bundle = scenario.candidate if label == "candidate" else scenario.baseline
-            import time
-
             bid_started = time.perf_counter_ns()
             bid = factory.choose_bid(
                 bundle,
@@ -519,12 +864,30 @@ def _run_full_game_leg(
                 bid_rng,
                 redeal_count=redeal_count,
             )
+            elapsed_ns = max(0, time.perf_counter_ns() - bid_started)
             if label == "candidate":
-                candidate_bid_latencies_ms.append(
-                    (time.perf_counter_ns() - bid_started) / 1_000_000.0
-                )
+                decision_evidence.append(_candidate_decision_evidence(
+                    decision_id=_candidate_decision_id(
+                        scenario.mode,
+                        deal_id,
+                        assignment,
+                        "bidding",
+                        _attempt,
+                        len(attempt_trace),
+                    ),
+                    phase="bidding",
+                    actor_role=None,
+                    actor_seat=str(seat),
+                    latency_ns=elapsed_ns,
+                    prediction=None,
+                    forced_action=False,
+                    search_called=False,
+                    search_timed_out=False,
+                    search_fallback=False,
+                ))
                 candidate_bid_attempts += 1
                 candidate_positive_bids += int(bid > 0)
+            attempt_trace.append((str(seat), int(bid)))
             redeal = env.step_bidding(bid)
             if redeal:
                 redeal_count += 1
@@ -540,6 +903,7 @@ def _run_full_game_leg(
                     )
                 ).shuffle(deck)
                 break
+        bidding_trace.append(tuple(attempt_trace))
         if not redeal:
             break
     else:
@@ -568,8 +932,37 @@ def _run_full_game_leg(
             bundle_label=label,
         )
     env.players = agents
+    cardplay_trace: list[tuple[str, tuple[int, ...]]] = []
     while not env.game_over:
+        position = str(env.acting_player_position)
+        agent = agents[position]
+        sample_count = len(agent.decision_samples)
+        trace_index = len(cardplay_trace)
+        forced_action = len(env.game_infoset.legal_actions) == 1
         env.step()
+        if len(agent.decision_samples) != sample_count + 1:
+            raise RuntimeError("card-play agent did not emit one timing sample")
+        if agent.bundle_label == "candidate":
+            sample = agent.decision_samples[-1]
+            decision_evidence.append(_candidate_decision_evidence(
+                decision_id=_candidate_decision_id(
+                    scenario.mode,
+                    deal_id,
+                    assignment,
+                    "cardplay",
+                    trace_index,
+                ),
+                phase="cardplay",
+                actor_role=position,
+                actor_seat=str(role_to_seat[position]),
+                latency_ns=sample.latency_ns,
+                prediction=sample.prediction,
+                forced_action=forced_action,
+                search_called=sample.search_called,
+                search_timed_out=sample.search_timed_out,
+                search_fallback=sample.search_fallback,
+            ))
+        cardplay_trace.append((position, tuple(env.card_play_action_seq[-1])))
 
     result = env.game_result
     assert result is not None
@@ -584,12 +977,11 @@ def _run_full_game_leg(
     candidate_score = float(
         result.landlord_score if candidate_team == "landlord" else result.farmer_score
     )
-    cardplay_latencies, calibration = _candidate_samples(
-        agents, candidate_roles, result.winner_team
+    latencies, latencies_ns, calibration = _decision_compatibility_fields(
+        decision_evidence
     )
-    latencies = (*candidate_bid_latencies_ms, *cardplay_latencies)
-    search_calls, search_timeouts, search_fallbacks = _candidate_search_counts(
-        agents, candidate_roles
+    search_calls, search_timeouts, search_fallbacks = _decision_search_counts(
+        decision_evidence
     )
     return GameRecord(
         deal_id=deal_id,
@@ -615,11 +1007,14 @@ def _run_full_game_leg(
         redeal_count=redeal_count,
         max_redeals_exceeded=max_redeals_exceeded,
         candidate_latencies_ms=latencies,
+        candidate_latencies_ns=latencies_ns,
         calibration=calibration,
         search_calls=search_calls,
         search_timeouts=search_timeouts,
         search_fallbacks=search_fallbacks,
-        bidding_inference_calls=len(candidate_bid_latencies_ms),
+        bidding_inference_calls=sum(
+            item["phase"] == "bidding" for item in decision_evidence
+        ),
         formal_evaluation_eligible=not max_redeals_exceeded,
         exclusion_reason=(
             "redeal_cap_exhausted_forced_smoke_fallback"
@@ -631,6 +1026,15 @@ def _run_full_game_leg(
         bidding_history=tuple(
             (str(seat), int(bid)) for seat, bid in env.bidding_history
         ),
+        bidding_trace=tuple(bidding_trace),
+        cardplay_trace=tuple(cardplay_trace),
+        trace_digest=evaluation_trace_digest(
+            mode=scenario.mode,
+            deal_hash=deal_hash,
+            bidding_trace=bidding_trace,
+            cardplay_trace=cardplay_trace,
+        ),
+        candidate_decisions=tuple(decision_evidence),
     )
 
 
@@ -735,9 +1139,23 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
             "win_rate_delta_ci": role_ci.to_dict(),
         }
 
-    latencies = [latency for game in games for latency in game.candidate_latencies_ms]
-    inference_seconds = sum(latencies) / 1000.0
-    calibration = [sample for game in games for sample in game.calibration]
+    latencies_ns = [
+        latency for game in games for latency in game.candidate_latencies_ns
+    ]
+    latencies = [latency / 1_000_000.0 for latency in latencies_ns]
+    inference_seconds = sum(latencies_ns) / 1_000_000_000.0
+    calibration = [
+        (
+            role,
+            prediction,
+            float(
+                game.winner_team
+                == ("landlord" if role == "landlord" else "farmer")
+            ),
+        )
+        for game in games
+        for role, prediction in game.calibration
+    ]
     total_bids = sum(game.candidate_bid_attempts for game in games)
     total_searches = sum(game.search_calls for game in games)
     denominator = len(games)
@@ -868,12 +1286,15 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
             "p99": percentile(latencies, 0.99),
         },
         "inference_calls_per_second": inference_calls_per_second,
+        "evaluation_wall_calls_per_second": None,
         # P15 exposed this key even though it counts instrumented inference
         # calls rather than actor-loop frames. Keep it as a deprecated schema
         # alias so existing result consumers do not break.
         "actor_fps": inference_calls_per_second,
         "search": {
             "calls": total_searches,
+            "timeouts": sum(game.search_timeouts for game in games),
+            "fallbacks": sum(game.search_fallbacks for game in games),
             "timeout_rate": (
                 sum(game.search_timeouts for game in games) / total_searches
                 if total_searches else float("nan")
@@ -882,6 +1303,13 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
                 sum(game.search_fallbacks for game in games) / total_searches
                 if total_searches else float("nan")
             ),
+        },
+        "timing_evidence": {
+            "clock": "time.perf_counter_ns",
+            "scope": "candidate_bidding_and_cardplay_inference_calls_only",
+            "inference_calls": len(latencies_ns),
+            "inference_elapsed_ns": sum(latencies_ns),
+            "evaluation_wall_elapsed_ns": None,
         },
         "belief": {
             "status": "not_instrumented" if any(
@@ -898,6 +1326,11 @@ def evaluate_scenario(
     scenario: EvaluationScenario, *, ablation: str = "base"
 ) -> PairedEvaluationResult:
     """Run every deal/permutation sequentially with deterministic local RNGs."""
+    evaluation_started_ns = time.perf_counter_ns()
+    try:
+        source_identity_start = inspect_git_checkout(require_clean=False)
+    except ProvenanceError:
+        source_identity_start = None
     factory = BundleFactory(scenario.ruleset)
     games: list[GameRecord] = []
     for deal_index, deal in enumerate(scenario.deals):
@@ -925,9 +1358,31 @@ def evaluate_scenario(
                     leg_index,
                 )
             games.append(game)
+    metrics = _aggregate(scenario, games)
+    evaluation_wall_elapsed_ns = max(
+        0, time.perf_counter_ns() - evaluation_started_ns
+    )
+    metrics["timing_evidence"][
+        "evaluation_wall_elapsed_ns"
+    ] = evaluation_wall_elapsed_ns
+    metrics["evaluation_wall_calls_per_second"] = (
+        metrics["timing_evidence"]["inference_calls"]
+        / (evaluation_wall_elapsed_ns / 1_000_000_000.0)
+        if evaluation_wall_elapsed_ns > 0 else float("nan")
+    )
+    try:
+        source_identity_end = inspect_git_checkout(require_clean=False)
+    except ProvenanceError:
+        source_identity_end = None
     return PairedEvaluationResult(
         scenario=scenario.to_dict(),
-        metrics=_aggregate(scenario, games),
+        metrics=metrics,
         games=tuple(games),
         ablation=ablation,
+        source_identity=source_identity_start,
+        source_identity_stable=(
+            source_identity_start is not None
+            and source_identity_start == source_identity_end
+        ),
+        source_identity_samples=2,
     )

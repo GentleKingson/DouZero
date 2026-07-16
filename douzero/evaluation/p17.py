@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import math
 import re
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from douzero.env.rules import RuleSet
-from douzero.env.scoring import compute_team_score_magnitude
 
 from .ablation import ABLATION_NAMES
 from .protocol import (
@@ -27,10 +28,12 @@ from .protocol import (
     PROMOTION_ESTIMATOR,
     PROMOTION_MODE,
 )
+from .replay import REDEAL_CAP_EXCLUSION_REASON, replay_game_record
 from .scenario import (
     ROLES,
     BundleSpec,
     bundle_from_dict,
+    canonical_deal_hash,
     canonical_deal_id,
     canonical_deal_set_id,
     default_seat_permutations,
@@ -39,7 +42,9 @@ from .statistics import deal_cluster_means, paired_bootstrap_ci
 
 
 P17_MATRIX_SCHEMA_VERSION = "p17-model-matrix-v1"
-P17_REPORT_SCHEMA_VERSION = "p17-evaluation-report-v1"
+P17_REPORT_SCHEMA_VERSION = "p17-evaluation-report-v2"
+P17_ARTIFACT_MANIFEST_SCHEMA_VERSION = "p17-artifact-manifest-v1"
+P17_PRIVATE_RESULT_SCHEMA_VERSION = "p17-private-result-projection-v1"
 P17_MODEL_NAMES = (
     "legacy_wp",
     "legacy_adp",
@@ -119,6 +124,7 @@ def _validate_available_bundle_checkpoints(
 ) -> None:
     """Eagerly prove that every declared formal checkpoint is loadable."""
     from douzero.env.rules import RuleSet
+    from douzero.evaluation.checkpoint_inputs import load_verified_checkpoint
 
     ruleset = RuleSet.legacy() if protocol == "cardplay_only" else RuleSet.standard()
 
@@ -138,40 +144,58 @@ def _validate_available_bundle_checkpoints(
                 f"{model_name}.{protocol} requires an explicit V2 model_config"
             )
         schema = build_v2_schema()
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
 
-        def validate_v2(path: str, label: str) -> None:
-            if path in seen:
+        def validate_v2(path: str, digest: str, label: str) -> None:
+            checkpoint_identity = (path, digest)
+            if checkpoint_identity in seen:
                 return
-            seen.add(path)
+            seen.add(checkpoint_identity)
             try:
-                state_dict, _ = load_v2_position_weights(
+                def load_and_validate(verified_path: str) -> None:
+                    state_dict, _ = load_v2_position_weights(
+                        verified_path,
+                        expected_schema_hash=schema.stable_hash(),
+                        expected_model_config_hash=model_config.stable_hash(),
+                        expected_ruleset=ruleset,
+                        runtime_model_config=model_config,
+                        training_device="cpu",
+                    )
+                    ModelV2(schema, model_config).load_state_dict(
+                        state_dict, strict=True
+                    )
+
+                load_verified_checkpoint(
                     path,
-                    expected_schema_hash=schema.stable_hash(),
-                    expected_model_config_hash=model_config.stable_hash(),
-                    expected_ruleset=ruleset,
-                    runtime_model_config=model_config,
-                    training_device="cpu",
-                )
-                ModelV2(schema, model_config).load_state_dict(
-                    state_dict, strict=True
+                    digest,
+                    load_and_validate,
+                    label=f"{model_name}.{protocol}.{label}",
                 )
             except Exception as exc:
                 fail(label, exc)
 
         for role, path in bundle.checkpoints.items():
-            validate_v2(path, role)
+            validate_v2(path, bundle.checkpoint_sha256[role], role)
         if bundle.bidding_checkpoint:
-            validate_v2(bundle.bidding_checkpoint, "bidding")
+            validate_v2(
+                bundle.bidding_checkpoint,
+                bundle.bidding_checkpoint_sha256,
+                "bidding",
+            )
         if bundle.belief_checkpoint:
             try:
                 from douzero.belief.checkpoint import load_belief_checkpoint
 
-                load_belief_checkpoint(
+                load_verified_checkpoint(
                     bundle.belief_checkpoint,
-                    expected_ruleset=ruleset,
-                    expected_feature_version="v2",
-                    require_full_git_sha=True,
+                    bundle.belief_checkpoint_sha256,
+                    lambda verified_path: load_belief_checkpoint(
+                        verified_path,
+                        expected_ruleset=ruleset,
+                        expected_feature_version="v2",
+                        require_full_git_sha=True,
+                    ),
+                    label=f"{model_name}.{protocol}.belief",
                 )
             except Exception as exc:
                 fail("belief", exc)
@@ -191,7 +215,14 @@ def _validate_available_bundle_checkpoints(
         for role, path in bundle.checkpoints.items():
             try:
                 runtime_model = factories[role]()
-                load_position_state_dict_strict(path, runtime_model.state_dict())
+                load_verified_checkpoint(
+                    path,
+                    bundle.checkpoint_sha256[role],
+                    lambda verified_path: load_position_state_dict_strict(
+                        verified_path, runtime_model.state_dict()
+                    ),
+                    label=f"{model_name}.{protocol}.{role}",
+                )
             except Exception as exc:
                 fail(role, exc)
         return
@@ -382,6 +413,30 @@ def _numbers_match(actual: object, expected: float | int) -> bool:
     )
 
 
+def _strict_json_equal(actual: object, expected: object) -> bool:
+    """Compare redundant JSON evidence without Python bool/int coercion."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return bool(
+            set(actual) == set(expected)
+            and all(
+                _strict_json_equal(actual[key], value)
+                for key, value in expected.items()
+            )
+        )
+    if isinstance(expected, list):
+        return bool(
+            len(actual) == len(expected)
+            and all(
+                _strict_json_equal(left, right)
+                for left, right in zip(actual, expected)
+            )
+        )
+    return actual == expected
+
+
 _DEAL_ID_PATTERN = re.compile(r"^(?P<index>[0-9]{6,12})-[0-9a-f]{12}$")
 
 
@@ -416,69 +471,14 @@ def _mapping_numbers_match(
     actual: object, expected: Mapping[str, float]
 ) -> bool:
     return bool(
-        isinstance(actual, Mapping)
+        type(actual) is dict
         and set(actual) == set(expected)
-        and all(_numbers_match(actual[key], value) for key, value in expected.items())
+        and all(
+            type(actual[key]) is type(value)
+            and _numbers_match(actual[key], value)
+            for key, value in expected.items()
+        )
     )
-
-
-def _recompute_full_game_seat_to_role(
-    row: Mapping[str, Any], ruleset: RuleSet
-) -> dict[str, str] | None:
-    """Derive final roles from the legal final-attempt bidding transcript."""
-
-    order = row.get("bidding_order")
-    history = row.get("bidding_history")
-    bid_value = row.get("bid_value")
-    if (
-        not isinstance(order, list)
-        or len(order) != 3
-        or any(type(seat) is not str for seat in order)
-        or set(order) != {"0", "1", "2"}
-        or not isinstance(history, list)
-        or not 1 <= len(history) <= 3
-        or type(bid_value) is not int
-    ):
-        return None
-
-    current_max = 0
-    landlord_seat = ""
-    maximum_bid = max(ruleset.bid_values)
-    for index, entry in enumerate(history):
-        if (
-            not isinstance(entry, list)
-            or len(entry) != 2
-            or type(entry[0]) is not str
-            or type(entry[1]) is not int
-            or entry[0] != order[index]
-            or entry[1] not in ruleset.bid_values
-            or current_max == maximum_bid
-            or (entry[1] != 0 and entry[1] <= current_max)
-        ):
-            return None
-        if entry[1] > current_max:
-            current_max = entry[1]
-            landlord_seat = entry[0]
-    if (
-        current_max == 0
-        or bid_value != current_max
-        or (len(history) < len(order) and current_max != maximum_bid)
-    ):
-        return None
-
-    landlord_index = order.index(landlord_seat)
-    expected_mapping = {
-        landlord_seat: "landlord",
-        order[(landlord_index + 1) % 3]: "landlord_down",
-        order[(landlord_index + 2) % 3]: "landlord_up",
-    }
-    reported_mapping = row.get("seat_to_role")
-    if not isinstance(reported_mapping, Mapping):
-        return None
-    try:
-        return expected_mapping if dict(reported_mapping) == expected_mapping else None
-    except (TypeError, ValueError):
-        return None
 
 
 def _recompute_terminal_outcome(
@@ -486,18 +486,35 @@ def _recompute_terminal_outcome(
     *,
     mode: str,
     assignment: tuple[str, ...],
-    ruleset: RuleSet,
-) -> tuple[tuple[str, ...], float, float] | None:
-    """Derive candidate outcome only from terminal rule facts."""
+    replay: Any,
+) -> tuple[tuple[str, ...], float, float, str, bool] | None:
+    """Derive every terminal result from an engine-replayed approved deal."""
 
-    winner_position = row.get("winner_position")
-    winner_team = row.get("winner_team")
-    if winner_position not in ROLES:
+    terminal_fields = {
+        "winner_position": replay.winner_position,
+        "winner_team": replay.winner_team,
+        "bid_value": replay.bid_value,
+        "bomb_count": replay.bomb_count,
+        "rocket_count": replay.rocket_count,
+        "spring": replay.spring,
+        "anti_spring": replay.anti_spring,
+        "game_length": replay.game_length,
+        "redeal_count": replay.redeal_count,
+    }
+    if any(
+        not _strict_json_equal(row.get(name), expected)
+        for name, expected in terminal_fields.items()
+    ):
         return None
-    expected_winner_team = (
-        "landlord" if winner_position == "landlord" else "farmer"
-    )
-    if winner_team != expected_winner_team:
+    forced_smoke = replay.max_redeals_exceeded
+    formal_eligible = not forced_smoke
+    if (
+        type(row.get("redeal_count")) is not int
+        or row.get("max_redeals_exceeded") is not forced_smoke
+        or row.get("formal_evaluation_eligible") is not formal_eligible
+        or row.get("exclusion_reason")
+        != (REDEAL_CAP_EXCLUSION_REASON if forced_smoke else None)
+    ):
         return None
 
     if mode == "cardplay_only":
@@ -506,15 +523,58 @@ def _recompute_terminal_outcome(
             for role, label in zip(ROLES, assignment)
             if label == "candidate"
         )
+        if (
+            row.get("seat_to_role") is not None
+            or row.get("bidding_order") != []
+            or row.get("bidding_history") != []
+            or row.get("bidding_trace") != []
+            or type(row.get("candidate_bid_attempts")) is not int
+            or row.get("candidate_bid_attempts") != 0
+            or type(row.get("candidate_positive_bids")) is not int
+            or row.get("candidate_positive_bids") != 0
+            or type(row.get("bidding_inference_calls")) is not int
+            or row.get("bidding_inference_calls") != 0
+        ):
+            return None
     else:
-        seat_to_role = _recompute_full_game_seat_to_role(row, ruleset)
-        if seat_to_role is None:
+        if (
+            not isinstance(replay.seat_to_role, Mapping)
+            or not _strict_json_equal(
+                row.get("seat_to_role"), dict(replay.seat_to_role)
+            )
+            or not _strict_json_equal(
+                row.get("bidding_order"), list(replay.bidding_order)
+            )
+            or not _strict_json_equal(
+                row.get("bidding_history"),
+                [list(entry) for entry in replay.bidding_history],
+            )
+        ):
             return None
         expected_roles = tuple(
-            str(seat_to_role[str(index)])
+            str(replay.seat_to_role[str(index)])
             for index, label in enumerate(assignment)
             if label == "candidate"
         )
+        bidding_trace = row.get("bidding_trace")
+        if not isinstance(bidding_trace, list):
+            return None
+        candidate_bids = [
+            bid
+            for attempt in bidding_trace
+            for seat, bid in attempt
+            if assignment[int(seat)] == "candidate"
+        ]
+        if (
+            type(row.get("candidate_bid_attempts")) is not int
+            or row.get("candidate_bid_attempts") != len(candidate_bids)
+            or type(row.get("candidate_positive_bids")) is not int
+            or row.get("candidate_positive_bids")
+            != sum(bid > 0 for bid in candidate_bids)
+            or type(row.get("bidding_inference_calls")) is not int
+            or row.get("bidding_inference_calls") != len(candidate_bids)
+        ):
+            return None
 
     candidate_roles = row.get("candidate_roles")
     if (
@@ -523,58 +583,8 @@ def _recompute_terminal_outcome(
     ):
         return None
     candidate_team = "landlord" if expected_roles == ("landlord",) else "farmer"
-
-    bid_value = row.get("bid_value")
-    bomb_count = row.get("bomb_count")
-    rocket_count = row.get("rocket_count")
-    spring = row.get("spring")
-    anti_spring = row.get("anti_spring")
-    if (
-        type(bid_value) is not int
-        or type(bomb_count) is not int
-        or not 0 <= bomb_count <= 13
-        or type(rocket_count) is not int
-        or rocket_count not in (0, 1)
-        or type(spring) is not bool
-        or type(anti_spring) is not bool
-        or (spring and anti_spring)
-    ):
-        return None
-    if mode == "cardplay_only":
-        if bid_value != 0 or spring or anti_spring:
-            return None
-    elif (
-        bid_value not in ruleset.bid_values
-        or bid_value == 0
-        or (spring and winner_team != "landlord")
-        or (anti_spring and winner_team != "farmer")
-    ):
-        return None
-
-    score_arguments = {
-        "bomb_count": bomb_count,
-        "rocket_count": rocket_count,
-        "bid_value": bid_value,
-        "ruleset": ruleset,
-        "spring": spring,
-        "anti_spring": anti_spring,
-    }
-    landlord_magnitude = compute_team_score_magnitude(
-        team="landlord", **score_arguments
-    )
-    farmer_magnitude = compute_team_score_magnitude(
-        team="farmer", **score_arguments
-    )
-    team_scores = {
-        "landlord": float(
-            landlord_magnitude if winner_team == "landlord" else -landlord_magnitude
-        ),
-        "farmer": float(
-            farmer_magnitude if winner_team == "farmer" else -farmer_magnitude
-        ),
-    }
-    candidate_win = float(winner_team == candidate_team)
-    candidate_score = team_scores[candidate_team]
+    candidate_win = float(replay.winner_team == candidate_team)
+    candidate_score = float(replay.team_scores[candidate_team])
     candidate_log_score = (
         0.0
         if candidate_score == 0.0
@@ -583,8 +593,11 @@ def _recompute_terminal_outcome(
     expected_role_wins = {role: candidate_win for role in expected_roles}
     expected_role_scores = {role: candidate_score for role in expected_roles}
     if (
-        not _numbers_match(row.get("candidate_win"), candidate_win)
+        type(row.get("candidate_win")) is not float
+        or not _numbers_match(row.get("candidate_win"), candidate_win)
+        or type(row.get("candidate_score")) is not float
         or not _numbers_match(row.get("candidate_score"), candidate_score)
+        or type(row.get("candidate_log_score")) is not float
         or not _numbers_match(row.get("candidate_log_score"), candidate_log_score)
         or type(row.get("candidate_landlord")) is not int
         or row.get("candidate_landlord") != int(candidate_team == "landlord")
@@ -592,13 +605,289 @@ def _recompute_terminal_outcome(
         or not _mapping_numbers_match(row.get("role_scores"), expected_role_scores)
     ):
         return None
-    return expected_roles, candidate_win, candidate_score
+    return (
+        expected_roles,
+        candidate_win,
+        candidate_score,
+        replay.winner_team,
+        forced_smoke,
+    )
+
+
+_DECISION_EVIDENCE_FIELDS = {
+    "decision_id",
+    "phase",
+    "actor_role",
+    "actor_seat",
+    "latency_ns",
+    "prediction_status",
+    "prediction",
+    "forced_action",
+    "search_called",
+    "search_timed_out",
+    "search_fallback",
+}
+
+_GAME_RECORD_FIELDS = {
+    "deal_id",
+    "leg_id",
+    "mode",
+    "assignment",
+    "candidate_roles",
+    "candidate_win",
+    "candidate_score",
+    "candidate_log_score",
+    "role_wins",
+    "role_scores",
+    "winner_team",
+    "winner_position",
+    "bid_value",
+    "candidate_bid_attempts",
+    "candidate_positive_bids",
+    "candidate_landlord",
+    "bomb_count",
+    "rocket_count",
+    "spring",
+    "anti_spring",
+    "game_length",
+    "redeal_count",
+    "max_redeals_exceeded",
+    "candidate_latencies_ms",
+    "calibration",
+    "search_calls",
+    "search_timeouts",
+    "search_fallbacks",
+    "bidding_inference_calls",
+    "formal_evaluation_eligible",
+    "exclusion_reason",
+    "deal_hash",
+    "seat_to_role",
+    "bidding_order",
+    "bidding_history",
+    "candidate_latencies_ns",
+    "bidding_trace",
+    "cardplay_trace",
+    "trace_digest",
+    "candidate_decisions",
+}
+
+
+def _expected_candidate_decisions(
+    row: Mapping[str, Any],
+    *,
+    mode: str,
+    assignment: tuple[str, ...],
+    replay: Any,
+) -> list[dict[str, Any]]:
+    """Rebuild the candidate decision sequence from verified replay inputs."""
+
+    from .paired import _candidate_decision_id
+
+    deal_id = str(row["deal_id"])
+    assignment3 = (assignment[0], assignment[1], assignment[2])
+    expected: list[dict[str, Any]] = []
+    if mode == "full_game":
+        for attempt_index, attempt in enumerate(row["bidding_trace"]):
+            for action_index, (seat, _bid) in enumerate(attempt):
+                if assignment[int(seat)] != "candidate":
+                    continue
+                expected.append({
+                    "decision_id": _candidate_decision_id(
+                        mode,
+                        deal_id,
+                        assignment3,
+                        "bidding",
+                        attempt_index,
+                        action_index,
+                    ),
+                    "phase": "bidding",
+                    "actor_role": None,
+                    "actor_seat": str(seat),
+                    "forced_action": False,
+                })
+
+    role_to_seat: dict[str, str] = {}
+    if mode == "full_game":
+        if not isinstance(replay.seat_to_role, Mapping):
+            raise ValueError("full-game replay has no seat-to-role mapping")
+        role_to_seat = {
+            str(role): str(seat) for seat, role in replay.seat_to_role.items()
+        }
+    legal_action_counts = replay.cardplay_legal_action_counts
+    if len(legal_action_counts) != len(row["cardplay_trace"]):
+        raise ValueError("replay legal-action evidence is incomplete")
+    for action_index, (role, _action) in enumerate(row["cardplay_trace"]):
+        if mode == "cardplay_only":
+            is_candidate = assignment[ROLES.index(role)] == "candidate"
+            actor_seat = None
+        else:
+            actor_seat = role_to_seat[role]
+            is_candidate = assignment[int(actor_seat)] == "candidate"
+        if not is_candidate:
+            continue
+        expected.append({
+            "decision_id": _candidate_decision_id(
+                mode,
+                deal_id,
+                assignment3,
+                "cardplay",
+                action_index,
+            ),
+            "phase": "cardplay",
+            "actor_role": str(role),
+            "actor_seat": actor_seat,
+            "forced_action": legal_action_counts[action_index] == 1,
+        })
+    return expected
+
+
+def _parse_candidate_decisions(
+    row: Mapping[str, Any],
+    expected: list[dict[str, Any]],
+    *,
+    winner_team: str,
+    candidate_search_enabled: bool,
+) -> tuple[
+    list[int],
+    list[tuple[str, float, float]],
+    tuple[int, int, int],
+    int,
+    int,
+    int,
+]:
+    """Validate one complete candidate cohort and legacy summary projections."""
+
+    raw = row.get("candidate_decisions")
+    if not isinstance(raw, list) or len(raw) != len(expected):
+        raise ValueError("candidate decision count does not match replay")
+    ids = [item.get("decision_id") for item in raw if isinstance(item, Mapping)]
+    if (
+        len(ids) != len(raw)
+        or any(not isinstance(decision_id, str) for decision_id in ids)
+        or len(set(ids)) != len(ids)
+    ):
+        raise ValueError("candidate decision IDs are missing or duplicated")
+
+    latencies_ns: list[int] = []
+    calibration: list[tuple[str, float, float]] = []
+    search_calls = search_timeouts = search_fallbacks = 0
+    cardplay_decisions = 0
+    calibration_opportunities = 0
+    prediction_count = 0
+    for item, descriptor in zip(raw, expected):
+        if not isinstance(item, Mapping) or set(item) != _DECISION_EVIDENCE_FIELDS:
+            raise ValueError("candidate decision evidence has the wrong fields")
+        if type(item.get("forced_action")) is not bool:
+            raise ValueError("candidate decision forced_action must be a boolean")
+        if any(
+            not _strict_json_equal(item.get(name), value)
+            for name, value in descriptor.items()
+        ):
+            raise ValueError("candidate decision identity does not match replay")
+        latency_ns = item.get("latency_ns")
+        if type(latency_ns) is not int or latency_ns < 0:
+            raise ValueError("candidate decision latency_ns is invalid")
+        prediction_status = item.get("prediction_status")
+        prediction = item.get("prediction")
+        if prediction_status == "available":
+            if (
+                type(prediction) is not float
+                or not math.isfinite(float(prediction))
+                or not 0.0 <= float(prediction) <= 1.0
+            ):
+                raise ValueError("candidate decision prediction is invalid")
+            prediction_value: float | None = float(prediction)
+        elif prediction_status == "unavailable" and prediction is None:
+            prediction_value = None
+        else:
+            raise ValueError("candidate decision prediction status is invalid")
+
+        search_called = item.get("search_called")
+        search_timed_out = item.get("search_timed_out")
+        search_fallback = item.get("search_fallback")
+        if (
+            type(search_called) is not bool
+            or type(search_timed_out) is not bool
+            or type(search_fallback) is not bool
+            or (not search_called and (search_timed_out or search_fallback))
+            or (search_timed_out and not search_fallback)
+        ):
+            raise ValueError("candidate decision search evidence is invalid")
+        expected_search_called = bool(
+            descriptor["phase"] == "cardplay"
+            and candidate_search_enabled
+            and not descriptor["forced_action"]
+        )
+        if search_called is not expected_search_called:
+            raise ValueError("candidate decision search usage contradicts the bundle")
+        if descriptor["phase"] == "bidding" and prediction_value is not None:
+            raise ValueError("bidding decisions cannot supply p_win calibration")
+        if descriptor["forced_action"] and prediction_value is not None:
+            raise ValueError("forced card-play decisions cannot supply calibration")
+
+        latencies_ns.append(latency_ns)
+        search_calls += int(search_called)
+        search_timeouts += int(search_timed_out)
+        search_fallbacks += int(search_fallback)
+        if descriptor["phase"] == "cardplay":
+            cardplay_decisions += 1
+            if not descriptor["forced_action"]:
+                calibration_opportunities += 1
+            if prediction_value is not None:
+                prediction_count += 1
+                role = str(descriptor["actor_role"])
+                label = float(
+                    winner_team
+                    == ("landlord" if role == "landlord" else "farmer")
+                )
+                calibration.append((role, prediction_value, label))
+
+    raw_latencies_ns = row.get("candidate_latencies_ns")
+    raw_latencies_ms = row.get("candidate_latencies_ms")
+    if not _strict_json_equal(
+        raw_latencies_ns, latencies_ns
+    ) or not isinstance(raw_latencies_ms, list):
+        raise ValueError("legacy candidate latency fields do not match decisions")
+    if len(raw_latencies_ms) != len(latencies_ns) or any(
+        type(milliseconds) is not float
+        or not math.isfinite(float(milliseconds))
+        or not math.isclose(
+            float(milliseconds), nanoseconds / 1_000_000.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        for nanoseconds, milliseconds in zip(latencies_ns, raw_latencies_ms)
+    ):
+        raise ValueError("legacy millisecond latencies do not match latency_ns")
+    expected_calibration = [
+        [role, prediction] for role, prediction, _label in calibration
+    ]
+    if not _strict_json_equal(row.get("calibration"), expected_calibration):
+        raise ValueError("legacy calibration rows do not match candidate decisions")
+    expected_search = (search_calls, search_timeouts, search_fallbacks)
+    raw_search = tuple(
+        row.get(name)
+        for name in ("search_calls", "search_timeouts", "search_fallbacks")
+    )
+    if any(type(value) is not int for value in raw_search) or raw_search != expected_search:
+        raise ValueError("legacy search summaries do not match candidate decisions")
+    return (
+        latencies_ns,
+        calibration,
+        expected_search,
+        cardplay_decisions,
+        calibration_opportunities,
+        prediction_count,
+    )
 
 
 def _recompute_result_evidence(
-    result: Mapping[str, Any], *, mode: str
+    result: Mapping[str, Any],
+    *,
+    mode: str,
+    approved_deals: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Rebuild release evidence from auditable game rows, never summary claims."""
+    """Rebuild release evidence by replaying traces against approved deals."""
 
     scenario = result.get("scenario")
     metrics = result.get("metrics")
@@ -625,22 +914,65 @@ def _recompute_result_evidence(
     if not ruleset_identity_valid:
         issues.append("scenario does not use the official ruleset identity")
 
+    approved_deals_by_index: dict[int, Mapping[str, Any]] = {}
+    approved_deal_hashes: list[str] = []
+    if approved_deals is None:
+        issues.append("approved deal payloads are required for deterministic replay")
+    else:
+        try:
+            approved_deal_hashes = [
+                canonical_deal_hash(deal) for deal in approved_deals
+            ]
+            if len(set(approved_deal_hashes)) != len(approved_deal_hashes):
+                raise ValueError("duplicate approved deals")
+            approved_deals_by_index = {
+                index: deal for index, deal in enumerate(approved_deals)
+            }
+            approved_set_id = canonical_deal_set_id(
+                mode,
+                ruleset,
+                approved_deal_hashes,
+                seat_permutation_hash=OFFICIAL_PERMUTATION_HASHES[mode],
+            )
+            if scenario.get("deal_set_id") != approved_set_id:
+                issues.append(
+                    "scenario deal_set_id does not match approved deal payloads"
+                )
+        except (KeyError, TypeError, ValueError):
+            approved_deals_by_index = {}
+            approved_deal_hashes = []
+            issues.append("approved deal payloads are malformed")
+
     grouped: dict[int, list[Mapping[str, Any]]] = {}
     deal_hashes_by_index: dict[int, str] = {}
     malformed_rows = 0
     for row in games:
-        if not isinstance(row, Mapping):
+        if not isinstance(row, Mapping) or set(row) != _GAME_RECORD_FIELDS:
             malformed_rows += 1
             continue
         deal_id = row.get("deal_id")
         deal_hash = row.get("deal_hash")
         assignment = row.get("assignment")
+        try:
+            assignment_tuple = tuple(assignment)
+        except TypeError:
+            assignment_tuple = ()
         if (
             not isinstance(deal_id, str)
             or not _is_full_sha256(deal_hash)
             or row.get("mode") != mode
             or not isinstance(assignment, list)
+            or assignment_tuple not in official_permutations
         ):
+            malformed_rows += 1
+            continue
+        leg_index = official_permutations.index(assignment_tuple)
+        expected_leg_id = (
+            f"cardplay-{leg_index}"
+            if mode == "cardplay_only"
+            else f"full-game-{leg_index}"
+        )
+        if type(row.get("leg_id")) is not str or row.get("leg_id") != expected_leg_id:
             malformed_rows += 1
             continue
         match = _DEAL_ID_PATTERN.fullmatch(deal_id)
@@ -649,6 +981,12 @@ def _recompute_result_evidence(
             continue
         deal_index = int(match.group("index"))
         if deal_id != canonical_deal_id(deal_index, str(deal_hash)):
+            malformed_rows += 1
+            continue
+        if approved_deal_hashes and (
+            deal_index >= len(approved_deal_hashes)
+            or deal_hash != approved_deal_hashes[deal_index]
+        ):
             malformed_rows += 1
             continue
         prior_hash = deal_hashes_by_index.setdefault(deal_index, str(deal_hash))
@@ -693,7 +1031,16 @@ def _recompute_result_evidence(
     eligible_rows: list[Mapping[str, Any]] = []
     excluded_deals = 0
     malformed_deals = 0
-    recomputed_rows: list[tuple[Mapping[str, Any], float, float]] = []
+    recomputed_rows: list[
+        tuple[
+            Mapping[str, Any],
+            float,
+            float,
+            str,
+            tuple[str, ...],
+            list[dict[str, Any]],
+        ]
+    ] = []
     for deal_index in sorted(grouped):
         rows = grouped[deal_index]
         try:
@@ -704,35 +1051,83 @@ def _recompute_result_evidence(
         if assignments != expected_assignments:
             malformed_deals += 1
             continue
-        forced_smoke = any(
-            row.get("max_redeals_exceeded") is True
-            or row.get("formal_evaluation_eligible", True) is not True
-            for row in rows
-        )
-        if forced_smoke:
-            excluded_deals += 1
+        approved_deal = approved_deals_by_index.get(deal_index)
+        if approved_deal is None:
+            malformed_deals += 1
             continue
-        deal_rows: list[tuple[Mapping[str, Any], float, float]] = []
+        deal_rows: list[
+            tuple[
+                Mapping[str, Any],
+                float,
+                float,
+                str,
+                tuple[str, ...],
+                list[dict[str, Any]],
+            ]
+        ] = []
+        exclusion_states: list[bool] = []
         row_invalid = False
         for row in rows:
             assignment = tuple(row["assignment"])
-            outcome = _recompute_terminal_outcome(
-                row,
-                mode=mode,
-                assignment=assignment,
-                ruleset=ruleset,
-            )
+            try:
+                replay = replay_game_record(
+                    row,
+                    approved_deal,
+                    mode=mode,
+                    ruleset=ruleset,
+                    deterministic_seed=int(scenario.get("deterministic_seed", -1)),
+                )
+                outcome = _recompute_terminal_outcome(
+                    row,
+                    mode=mode,
+                    assignment=assignment,
+                    replay=replay,
+                )
+                expected_decisions = _expected_candidate_decisions(
+                    row,
+                    mode=mode,
+                    assignment=assignment,
+                    replay=replay,
+                )
+            except (KeyError, TypeError, ValueError):
+                outcome = None
             if outcome is None:
                 _append_issue(
                     issues,
-                    "reported candidate/role outcome does not match terminal rule evidence",
+                    "game trace does not replay to the reported terminal outcome",
                 )
                 row_invalid = True
                 break
-            _expected_roles, candidate_win, candidate_score = outcome
-            deal_rows.append((row, candidate_win, candidate_score))
+            (
+                expected_roles,
+                candidate_win,
+                candidate_score,
+                winner_team,
+                forced_smoke,
+            ) = outcome
+            deal_rows.append(
+                (
+                    row,
+                    candidate_win,
+                    candidate_score,
+                    winner_team,
+                    expected_roles,
+                    expected_decisions,
+                )
+            )
+            exclusion_states.append(forced_smoke)
         if row_invalid:
             malformed_deals += 1
+            continue
+        if len(set(exclusion_states)) != 1:
+            _append_issue(
+                issues,
+                "deal seat rotations disagree on replayed redeal-cap exclusion",
+            )
+            malformed_deals += 1
+            continue
+        if exclusion_states[0]:
+            excluded_deals += 1
             continue
         eligible_rows.extend(rows)
         recomputed_rows.extend(deal_rows)
@@ -778,10 +1173,16 @@ def _recompute_result_evidence(
     observations = (
         (
             str(row["deal_id"]),
-            candidate_win - 0.5
-            if mode == PROMOTION_MODE else candidate_score,
+            candidate_win - 0.5 if mode == PROMOTION_MODE else candidate_score,
         )
-        for row, candidate_win, candidate_score in recomputed_rows
+        for (
+            row,
+            candidate_win,
+            candidate_score,
+            _winner,
+            _roles,
+            _decisions,
+        ) in recomputed_rows
     )
     deal_values = deal_cluster_means(observations)
     recomputed_ci = None
@@ -819,77 +1220,322 @@ def _recompute_result_evidence(
         ):
             issues.append("reported paired_estimate_ci does not match game rows")
 
-    # Recompute every release-facing diagnostic for which raw row evidence is
-    # present. Missing raw evidence is never replaced with a caller summary.
-    latencies: list[float] = []
+    # Every candidate action in the replayed traces must have exactly one
+    # structured decision record. Legacy arrays/counters are redundant and are
+    # accepted only when they exactly project from this complete cohort.
+    latencies_ns: list[int] = []
     calibration: list[tuple[str, float, float]] = []
     search_calls = search_timeouts = search_fallbacks = 0
-    raw_diagnostics_valid = True
-    for row, _win, _score in recomputed_rows:
-        raw_latencies = row.get("candidate_latencies_ms")
-        raw_calibration = row.get("calibration")
-        if not isinstance(raw_latencies, list) or not isinstance(raw_calibration, list):
-            raw_diagnostics_valid = False
-            continue
+    cardplay_decisions = calibration_opportunities = prediction_count = 0
+    expected_decision_count = 0
+    diagnostic_cohort_valid = True
+    trusted_games: list[Any] = []
+    candidate = scenario.get("candidate")
+    candidate_backend = (
+        candidate.get("backend") if isinstance(candidate, Mapping) else None
+    )
+    candidate_search_config = (
+        candidate.get("search_config") if isinstance(candidate, Mapping) else None
+    )
+    candidate_search_enabled = bool(
+        candidate_backend in {"v2", "bc"}
+        and isinstance(candidate_search_config, Mapping)
+        and candidate_search_config.get("enabled") is True
+    )
+    from .paired import GameRecord
+
+    for (
+        row,
+        _win,
+        _score,
+        winner_team,
+        _expected_roles,
+        expected_decisions,
+    ) in recomputed_rows:
+        expected_decision_count += len(expected_decisions)
         try:
-            parsed_latencies = [float(value) for value in raw_latencies]
-            parsed_calibration = [
-                (str(role), float(prediction), float(label))
-                for role, prediction, label in raw_calibration
-            ]
-            counts = [int(row[name]) for name in (
-                "search_calls", "search_timeouts", "search_fallbacks"
-            )]
-        except (TypeError, ValueError):
-            raw_diagnostics_valid = False
-            continue
-        if (
-            not all(math.isfinite(value) and value >= 0 for value in parsed_latencies)
-            or not all(
-                role in ROLES and math.isfinite(prediction)
-                and 0 <= prediction <= 1 and label in (0.0, 1.0)
-                for role, prediction, label in parsed_calibration
+            (
+                row_latencies,
+                row_calibration,
+                row_search,
+                row_cardplay_decisions,
+                row_calibration_opportunities,
+                row_prediction_count,
+            ) = _parse_candidate_decisions(
+                row,
+                expected_decisions,
+                winner_team=winner_team,
+                candidate_search_enabled=candidate_search_enabled,
             )
-            or any(value < 0 for value in counts)
-            or counts[1] > counts[0]
-            or counts[2] > counts[0]
-        ):
-            raw_diagnostics_valid = False
+        except (KeyError, TypeError, ValueError) as exc:
+            diagnostic_cohort_valid = False
+            _append_issue(issues, f"candidate decision evidence is invalid: {exc}")
             continue
-        latencies.extend(parsed_latencies)
-        calibration.extend(parsed_calibration)
-        search_calls += counts[0]
-        search_timeouts += counts[1]
-        search_fallbacks += counts[2]
-    if not raw_diagnostics_valid:
-        issues.append("raw latency, calibration, or search evidence is unavailable")
+        latencies_ns.extend(row_latencies)
+        calibration.extend(row_calibration)
+        search_calls += row_search[0]
+        search_timeouts += row_search[1]
+        search_fallbacks += row_search[2]
+        cardplay_decisions += row_cardplay_decisions
+        calibration_opportunities += row_calibration_opportunities
+        prediction_count += row_prediction_count
+        trusted_games.append(GameRecord(
+            deal_id=str(row["deal_id"]),
+            leg_id=str(row["leg_id"]),
+            mode=mode,
+            assignment=tuple(row["assignment"]),
+            candidate_roles=tuple(_expected_roles),
+            candidate_win=float(_win),
+            candidate_score=float(_score),
+            role_wins={role: float(_win) for role in _expected_roles},
+            role_scores={role: float(_score) for role in _expected_roles},
+            winner_team=winner_team,
+            winner_position=str(row["winner_position"]),
+            bid_value=int(row["bid_value"]),
+            candidate_bid_attempts=int(row["candidate_bid_attempts"]),
+            candidate_positive_bids=int(row["candidate_positive_bids"]),
+            candidate_landlord=int(row["candidate_landlord"]),
+            bomb_count=int(row["bomb_count"]),
+            rocket_count=int(row["rocket_count"]),
+            spring=bool(row["spring"]),
+            anti_spring=bool(row["anti_spring"]),
+            game_length=int(row["game_length"]),
+            candidate_latencies_ms=tuple(
+                value / 1_000_000.0 for value in row_latencies
+            ),
+            calibration=tuple(
+                (role, prediction)
+                for role, prediction, _label in row_calibration
+            ),
+            redeal_count=int(row["redeal_count"]),
+            max_redeals_exceeded=False,
+            search_calls=row_search[0],
+            search_timeouts=row_search[1],
+            search_fallbacks=row_search[2],
+            bidding_inference_calls=int(row["bidding_inference_calls"]),
+            formal_evaluation_eligible=True,
+            exclusion_reason="",
+            deal_hash=str(row["deal_hash"]),
+            candidate_latencies_ns=tuple(row_latencies),
+        ))
+
+    if len(latencies_ns) != expected_decision_count:
+        diagnostic_cohort_valid = False
+    if not diagnostic_cohort_valid:
+        _append_issue(
+            issues,
+            "candidate decision evidence is incomplete, duplicated, reordered, "
+            "or inconsistent with replay",
+        )
+
+    if 0 < prediction_count < calibration_opportunities:
+        diagnostic_cohort_valid = False
+        _append_issue(
+            issues,
+            "candidate card-play prediction evidence is selectively unavailable",
+        )
+    if (
+        candidate_backend in {"v2", "bc"}
+        and prediction_count != calibration_opportunities
+    ):
+        diagnostic_cohort_valid = False
+        _append_issue(
+            issues,
+            "V2/BC candidate requires a prediction for every non-forced card-play decision",
+        )
 
     from .paired import _calibration_metrics
     from .statistics import percentile
 
-    recomputed_diagnostics = {
-        "calibration": _json_safe(_calibration_metrics(calibration)),
-        "inference_latency_ms": _json_safe({
+    timing = metrics.get("timing_evidence")
+    wall_elapsed_ns = (
+        timing.get("evaluation_wall_elapsed_ns")
+        if isinstance(timing, Mapping) else None
+    )
+    expected_timing = {
+        "clock": "time.perf_counter_ns",
+        "scope": "candidate_bidding_and_cardplay_inference_calls_only",
+        "inference_calls": len(latencies_ns),
+        "inference_elapsed_ns": sum(latencies_ns),
+        "evaluation_wall_elapsed_ns": wall_elapsed_ns,
+    }
+    if diagnostic_cohort_valid and (
+        not isinstance(timing, Mapping)
+        or type(wall_elapsed_ns) is not int
+        or wall_elapsed_ns <= 0
+        or wall_elapsed_ns < sum(latencies_ns)
+        or not _strict_json_equal(dict(timing), expected_timing)
+    ):
+        diagnostic_cohort_valid = False
+        _append_issue(issues, "timing evidence is unavailable or inconsistent")
+
+    calibration_available = bool(
+        diagnostic_cohort_valid
+        and calibration_opportunities > 0
+        and prediction_count == calibration_opportunities
+    )
+    if diagnostic_cohort_valid and not calibration_available:
+        _append_issue(
+            issues,
+            "formal calibration is unavailable without complete card-play predictions",
+        )
+
+    if diagnostic_cohort_valid:
+        latencies = [value / 1_000_000.0 for value in latencies_ns]
+        elapsed_seconds = sum(latencies_ns) / 1_000_000_000.0
+        instrumented_throughput = (
+            len(latencies_ns) / elapsed_seconds if elapsed_seconds > 0 else None
+        )
+        evaluation_wall_throughput = (
+            len(latencies_ns) / (wall_elapsed_ns / 1_000_000_000.0)
+            if wall_elapsed_ns > 0 else None
+        )
+        calibration_payload = _json_safe(_calibration_metrics(calibration))
+        latency_payload = _json_safe({
             "count": len(latencies),
             "p50": percentile(latencies, 0.50),
             "p95": percentile(latencies, 0.95),
             "p99": percentile(latencies, 0.99),
-        }),
-        "search": _json_safe({
+        })
+        search_payload = _json_safe({
             "calls": search_calls,
+            "timeouts": search_timeouts,
+            "fallbacks": search_fallbacks,
             "timeout_rate": (
-                search_timeouts / search_calls if search_calls else float("nan")
+                search_timeouts / search_calls
+                if search_calls else float("nan")
             ),
             "fallback_rate": (
-                search_fallbacks / search_calls if search_calls else float("nan")
+                search_fallbacks / search_calls
+                if search_calls else float("nan")
             ),
-        }),
-    }
-    for name, recomputed in recomputed_diagnostics.items():
-        if _json_safe(metrics.get(name)) != recomputed:
-            issues.append(f"reported {name} does not match raw game-row evidence")
-    candidate_wins = [win for _row, win, _score in recomputed_rows]
-    candidate_scores = [score for _row, _win, score in recomputed_rows]
+        })
+        recomputed_diagnostics = {
+            "status": "available",
+            "calibration_status": (
+                "available" if calibration_available else "unavailable"
+            ),
+            "timing_status": "available",
+            "candidate_decision_count": len(latencies_ns),
+            "candidate_cardplay_decision_count": cardplay_decisions,
+            "calibration_opportunity_count": calibration_opportunities,
+            "calibration": calibration_payload if calibration_available else None,
+            "inference_latency_ms": latency_payload,
+            "instrumented_inference_calls_per_second": instrumented_throughput,
+            "evaluation_wall_calls_per_second": evaluation_wall_throughput,
+            "search": search_payload,
+            "timing_evidence": expected_timing,
+        }
+        reported_payloads = {
+            "calibration": calibration_payload,
+            "inference_latency_ms": latency_payload,
+            "search": search_payload,
+        }
+        for name, expected in reported_payloads.items():
+            if not _strict_json_equal(_json_safe(metrics.get(name)), expected):
+                issues.append(
+                    f"reported {name} does not match candidate decision evidence"
+                )
+        if not _strict_json_equal(
+            _json_safe(metrics.get("inference_calls_per_second")),
+            _json_safe(instrumented_throughput),
+        ):
+            issues.append(
+                "reported inference_calls_per_second does not match timing evidence"
+            )
+        if not _strict_json_equal(
+            _json_safe(metrics.get("actor_fps")),
+            _json_safe(instrumented_throughput),
+        ):
+            issues.append("reported actor_fps does not match timing evidence")
+        if not _strict_json_equal(
+            _json_safe(metrics.get("evaluation_wall_calls_per_second")),
+            _json_safe(evaluation_wall_throughput),
+        ):
+            issues.append(
+                "reported evaluation_wall_calls_per_second does not match "
+                "timing evidence"
+            )
+
+        # Close the remainder of the aggregate schema over replay-derived
+        # GameRecord values. This covers every redundant rate/count/CI and
+        # rejects unknown metric keys instead of publishing unchecked fields.
+        aggregate_inputs_valid = bool(
+            bootstrap_config_valid
+            and confidence_level_in_range
+            and malformed_rows == 0
+            and malformed_deals == 0
+            and excluded_deals == 0
+            and len(trusted_games) == len(games)
+            and approved_deals is not None
+        )
+        if aggregate_inputs_valid:
+            from types import SimpleNamespace
+
+            from .paired import _aggregate
+
+            candidate_config = scenario.get("candidate")
+            baseline_config = scenario.get("baseline")
+            aggregate_scenario = SimpleNamespace(
+                confidence_level=float(confidence_level),
+                bootstrap_samples=bootstrap_samples,
+                deterministic_seed=deterministic_seed,
+                mode=mode,
+                deals=tuple(approved_deals),
+                seat_permutations=official_permutations,
+                candidate=SimpleNamespace(
+                    belief_checkpoint=(
+                        bool(candidate_config.get("belief_checkpoint"))
+                        if isinstance(candidate_config, Mapping)
+                        else False
+                    )
+                ),
+                baseline=SimpleNamespace(
+                    belief_checkpoint=(
+                        bool(baseline_config.get("belief_checkpoint"))
+                        if isinstance(baseline_config, Mapping)
+                        else False
+                    )
+                ),
+            )
+            expected_metrics = _aggregate(aggregate_scenario, trusted_games)
+            expected_metrics["timing_evidence"][
+                "evaluation_wall_elapsed_ns"
+            ] = wall_elapsed_ns
+            expected_metrics["evaluation_wall_calls_per_second"] = (
+                len(latencies_ns) / (wall_elapsed_ns / 1_000_000_000.0)
+            )
+            if not _strict_json_equal(
+                _json_safe(metrics), _json_safe(expected_metrics)
+            ):
+                issues.append(
+                    "reported metrics do not exactly match replay-derived aggregates"
+                )
+    else:
+        recomputed_diagnostics = {
+            "status": "unavailable",
+            "calibration_status": "unavailable",
+            "timing_status": "unavailable",
+            "reason": "complete strict per-decision diagnostic evidence is unavailable",
+            "candidate_decision_count": None,
+            "candidate_cardplay_decision_count": None,
+            "calibration_opportunity_count": None,
+            "calibration": None,
+            "inference_latency_ms": None,
+            "instrumented_inference_calls_per_second": None,
+            "evaluation_wall_calls_per_second": None,
+            "search": None,
+            "timing_evidence": None,
+        }
+
+    candidate_wins = [
+        win
+        for _row, win, _score, _winner, _roles, _decisions in recomputed_rows
+    ]
+    candidate_scores = [
+        score
+        for _row, _win, score, _winner, _roles, _decisions in recomputed_rows
+    ]
     recomputed_overall = (
         sum(candidate_wins) / len(candidate_wins) if candidate_wins else None
     )
@@ -904,7 +1550,7 @@ def _recompute_result_evidence(
     for role in ROLES:
         role_rows = [
             (win, score)
-            for row, win, score in recomputed_rows
+            for row, win, score, _winner, _roles, _decisions in recomputed_rows
             if role in row["candidate_roles"]
         ]
         reported_role = (
@@ -939,11 +1585,24 @@ def _recompute_result_evidence(
     }, issues
 
 
-def result_readiness(result: Mapping[str, Any], *, mode: str) -> dict[str, Any]:
-    """Apply P17 policy using evidence recomputed from auditable game rows."""
+def _result_readiness_impl(
+    result: Mapping[str, Any],
+    *,
+    mode: str,
+    approved_deals: Sequence[Mapping[str, Any]] | None = None,
+    provenance_verified: bool,
+) -> dict[str, Any]:
+    """Build readiness after the caller has established the trust boundary."""
 
     scenario = result.get("scenario", {})
-    evidence, issues = _recompute_result_evidence(result, mode=mode)
+    evidence, issues = _recompute_result_evidence(
+        result, mode=mode, approved_deals=approved_deals
+    )
+    evidence["provenance_verified"] = provenance_verified
+    if not provenance_verified:
+        issues.append(
+            "requires a verified detached GitHub OIDC/Sigstore attestation"
+        )
     bootstrap_samples = scenario.get("bootstrap_samples")
     if (
         not isinstance(bootstrap_samples, int)
@@ -975,23 +1634,116 @@ def result_readiness(result: Mapping[str, Any], *, mode: str) -> dict[str, Any]:
     }
 
 
+def result_readiness(
+    result: Mapping[str, Any],
+    *,
+    mode: str,
+    approved_deals: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return descriptive readiness for an in-memory, untrusted result.
+
+    Formal provenance is deliberately unavailable through this public helper.
+    The release gate is :func:`write_p17_artifacts`, which accepts artifact
+    paths plus an attestation policy and performs verification internally.
+    """
+
+    return _result_readiness_impl(
+        result,
+        mode=mode,
+        approved_deals=approved_deals,
+        provenance_verified=False,
+    )
+
+
 def write_p17_artifacts(
     output_dir: str | Path,
     *,
     matrix: Mapping[str, Any],
-    cardplay_result: Mapping[str, Any] | None = None,
-    full_game_result: Mapping[str, Any] | None = None,
-    ablation_results: Mapping[str, Mapping[str, Any]] | None = None,
+    cardplay_result: Any | None = None,
+    full_game_result: Any | None = None,
+    ablation_results: Mapping[str, Any] | None = None,
     expected_evaluator_git_shas: str | Iterable[str] | None = None,
     expected_cardplay_deal_set_id: str | None = None,
     expected_full_game_deal_set_id: str | None = None,
+    approved_cardplay_deals: Sequence[Mapping[str, Any]] | None = None,
+    approved_full_game_deals: Sequence[Mapping[str, Any]] | None = None,
+    allow_unverified_results: bool = False,
 ) -> dict[str, str]:
-    """Write the fixed P17 artifact set, retaining explicit NOT RUN rows."""
+    """Write P17 artifacts from replayed, detached-attested result files.
+
+    Raw mappings are rejected by default. ``allow_unverified_results`` exists
+    only for local descriptive tooling; such results are always insufficient.
+    """
+
+    from .provenance import (
+        AttestedEvaluationInput,
+        ProvenanceError,
+        VerifiedEvaluationResult,
+        verify_github_attested_result,
+    )
+
+    formal_result_requested = any(
+        isinstance(value, AttestedEvaluationInput)
+        for value in (
+            cardplay_result,
+            full_game_result,
+            *((ablation_results or {}).values()),
+        )
+    )
+    if formal_result_requested:
+        from .checkpoint_inputs import (
+            CheckpointIdentityError,
+            require_explicit_matrix_checkpoint_digests,
+        )
+
+        try:
+            require_explicit_matrix_checkpoint_digests(matrix, kind="p17")
+        except CheckpointIdentityError as exc:
+            raise P17MatrixError(
+                f"formal P17 matrix checkpoint identity is invalid: {exc}"
+            ) from exc
+
+    def unwrap_result(value: Any | None) -> tuple[Mapping[str, Any] | None, Any | None]:
+        if value is None:
+            return None, None
+        if isinstance(value, AttestedEvaluationInput):
+            try:
+                verification = verify_github_attested_result(
+                    value.result_path,
+                    value.bundle_path,
+                    value.policy,
+                )
+            except ProvenanceError as exc:
+                raise P17MatrixError(
+                    f"formal result attestation verification failed: {exc}"
+                ) from exc
+            return verification.result, verification
+        if isinstance(value, VerifiedEvaluationResult):
+            raise P17MatrixError(
+                "formal P17 collation must verify artifact paths internally"
+            )
+        if isinstance(value, Mapping) and allow_unverified_results:
+            return value, None
+        if isinstance(value, Mapping):
+            raise P17MatrixError(
+                "formal P17 collation requires a verified detached attestation"
+            )
+        raise P17MatrixError("evaluation result has an unsupported trust wrapper")
+
+    cardplay_result, cardplay_verification = unwrap_result(cardplay_result)
+    full_game_result, full_game_verification = unwrap_result(full_game_result)
+    raw_ablation_results = dict(ablation_results or {})
+    ablation_results = {}
+    ablation_verifications: dict[str, Any | None] = {}
+    for name, value in raw_ablation_results.items():
+        payload, verification = unwrap_result(value)
+        assert payload is not None
+        ablation_results[name] = payload
+        ablation_verifications[name] = verification
 
     normalized = normalize_matrix(matrix)
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
-    ablation_results = dict(ablation_results or {})
     unknown = set(ablation_results) - set(ABLATION_NAMES)
     if unknown:
         raise P17MatrixError(f"unknown ablation results: {sorted(unknown)}")
@@ -1012,6 +1764,10 @@ def write_p17_artifacts(
         "cardplay_only": expected_cardplay_deal_set_id,
         "full_game": expected_full_game_deal_set_id,
     }
+    approved_deals_by_mode = {
+        "cardplay_only": approved_cardplay_deals,
+        "full_game": approved_full_game_deals,
+    }
     required_deal_set_modes = {
         mode
         for result, mode in (
@@ -1029,8 +1785,34 @@ def write_p17_artifacts(
             raise P17MatrixError(
                 f"completed {mode} results require an approved deal_set_id"
             )
+        approved_deals = approved_deals_by_mode[mode]
+        if not isinstance(approved_deals, Sequence) or isinstance(
+            approved_deals, (str, bytes)
+        ) or not approved_deals:
+            raise P17MatrixError(
+                f"completed {mode} results require approved deal payloads for replay"
+            )
+        try:
+            replay_set_id = canonical_deal_set_id(
+                mode,
+                RuleSet.legacy() if mode == "cardplay_only" else RuleSet.standard(),
+                [canonical_deal_hash(deal) for deal in approved_deals],
+                seat_permutation_hash=OFFICIAL_PERMUTATION_HASHES[mode],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise P17MatrixError(
+                f"approved {mode} deal payloads are invalid: {exc}"
+            ) from exc
+        if replay_set_id != expected_deal_set_ids[mode]:
+            raise P17MatrixError(
+                f"approved {mode} deal payloads do not match approved deal_set_id"
+            )
 
-    def validate_result_inventory(result: Mapping[str, Any] | None, mode: str) -> None:
+    def validate_result_inventory(
+        result: Mapping[str, Any] | None,
+        mode: str,
+        verification: Any | None,
+    ) -> None:
         if result is None:
             return
         scenario = result.get("scenario")
@@ -1067,14 +1849,41 @@ def write_p17_artifacts(
                 result,
                 expected_mode=mode,
                 expected_source_git_shas=approved_evaluator_shas,
+                require_formal_source=verification is not None,
             )
         except (TypeError, ValueError) as exc:
             raise P17MatrixError(
                 f"{mode} result runtime identity is invalid: {exc}"
             ) from exc
 
-    validate_result_inventory(cardplay_result, "cardplay_only")
-    validate_result_inventory(full_game_result, "full_game")
+        if verification is not None and (
+            verification.source_git_sha != result["runtime_identity"]["source_git_sha"]
+            or verification.result_digest
+            != result["result_integrity"]["result_digest"]
+        ):
+            raise P17MatrixError(
+                f"{mode} detached attestation does not match result provenance"
+            )
+        if verification is not None:
+            execution = result["runtime_identity"].get("execution_environment")
+            if not isinstance(execution, Mapping) or (
+                execution.get("repository") != verification.repository
+                or str(execution.get("workflow_ref", "")).split("@", 1)[0]
+                != verification.signer_workflow
+                or execution.get("workflow_sha") != verification.signer_digest
+                or execution.get("source_ref") != verification.source_ref
+                or execution.get("run_url") != verification.workflow_run_url
+                or execution.get("runner_environment")
+                != verification.runner_environment
+            ):
+                raise P17MatrixError(
+                    f"{mode} signed workflow run does not match runtime identity"
+                )
+
+    validate_result_inventory(
+        cardplay_result, "cardplay_only", cardplay_verification
+    )
+    validate_result_inventory(full_game_result, "full_game", full_game_verification)
     for name, result in ablation_results.items():
         ablation_entry = normalized["ablations"][name]
         if ablation_entry["status"] != "available":
@@ -1082,7 +1891,7 @@ def write_p17_artifacts(
                 f"ablation result {name!r} was supplied for an unavailable matrix row"
             )
         mode = ablation_entry["protocol"]
-        validate_result_inventory(result, mode)
+        validate_result_inventory(result, mode, ablation_verifications[name])
         scenario = result["scenario"]
         for side, key in (
             ("candidate", "candidate_model"),
@@ -1093,7 +1902,70 @@ def write_p17_artifacts(
                     f"ablation {name!r} {side} does not match its declared {key}"
                 )
 
-    def result_block(result: Mapping[str, Any] | None, mode: str) -> dict[str, Any]:
+    def verification_summary(verification: Any | None) -> dict[str, Any]:
+        if verification is None:
+            return {"status": "unverified_local"}
+        return {
+            "status": "verified",
+            "repository": verification.repository,
+            "source_ref": verification.source_ref,
+            "source_git_sha": verification.source_git_sha,
+            "signer_workflow": verification.signer_workflow,
+            "signer_digest": verification.signer_digest,
+            "workflow_run_url": verification.workflow_run_url,
+            "runner_environment": verification.runner_environment,
+            "result_digest": verification.result_digest,
+            "artifact_sha256": verification.artifact_sha256,
+            "attestation_count": len(
+                verification.attestation_verifications
+            ),
+        }
+
+    def publishable_result(
+        result: Mapping[str, Any], readiness: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        scenario = result.get("scenario", {})
+        if not (
+            isinstance(scenario, Mapping)
+            and scenario.get("dataset_scope") == "private_holdout"
+        ):
+            return copy.deepcopy(dict(result))
+
+        # Private traces and per-decision values form a high-bandwidth oracle:
+        # a model could encode holdout cards in predictions, latency, or an
+        # otherwise unknown nested field. Build a positive allowlist rather
+        # than attempting to redact an open-ended signed result object.
+        candidate = scenario.get("candidate")
+        baseline = scenario.get("baseline")
+        evidence = readiness.get("evidence")
+        if (
+            not isinstance(candidate, Mapping)
+            or not isinstance(baseline, Mapping)
+            or not isinstance(evidence, Mapping)
+        ):
+            raise P17MatrixError("private result cannot be projected safely")
+        return {
+            "schema_version": P17_PRIVATE_RESULT_SCHEMA_VERSION,
+            "scenario": {
+                "mode": scenario.get("mode"),
+                "dataset_scope": "private_holdout",
+                "deal_set_id": scenario.get("deal_set_id"),
+                "num_deals": scenario.get("num_deals"),
+                "candidate": {"name": candidate.get("name")},
+                "baseline": {"name": baseline.get("name")},
+            },
+            "game_evidence": {
+                "status": "redacted",
+                "published_game_rows": 0,
+                "source_game_rows": evidence.get("game_rows"),
+            },
+        }
+
+    def result_block(
+        result: Mapping[str, Any] | None,
+        mode: str,
+        verification: Any | None,
+    ) -> dict[str, Any]:
         if result is None:
             return {
                 "schema_version": P17_REPORT_SCHEMA_VERSION,
@@ -1102,71 +1974,104 @@ def write_p17_artifacts(
                 "mode": mode,
                 "result": None,
             }
+        readiness = _result_readiness_impl(
+            result,
+            mode=mode,
+            approved_deals=approved_deals_by_mode[mode],
+            provenance_verified=verification is not None,
+        )
         return {
             "schema_version": P17_REPORT_SCHEMA_VERSION,
-            "status": "completed",
+            "status": readiness["status"],
+            "execution_status": "completed",
             "approved_deal_set_id": expected_deal_set_ids[mode],
-            "readiness": result_readiness(result, mode=mode),
+            "provenance": verification_summary(verification),
+            "readiness": readiness,
             "mode": mode,
-            "result": result,
+            "result": publishable_result(result, readiness),
         }
 
-    cardplay_block = result_block(cardplay_result, "cardplay_only")
-    full_game_block = result_block(full_game_result, "full_game")
+    cardplay_block = result_block(
+        cardplay_result, "cardplay_only", cardplay_verification
+    )
+    full_game_block = result_block(
+        full_game_result, "full_game", full_game_verification
+    )
+    ablation_result_blocks: dict[str, dict[str, Any]] = {}
+    for name in ABLATION_NAMES:
+        if name not in ablation_results:
+            ablation_result_blocks[name] = {
+                "status": "not_run",
+                "reason": normalized["ablations"][name]["reason"],
+                "result": None,
+            }
+            continue
+        mode = normalized["ablations"][name]["protocol"]
+        block = result_block(
+            ablation_results[name], mode, ablation_verifications[name]
+        )
+        block.pop("mode", None)
+        ablation_result_blocks[name] = block
     ablation_block = {
         "schema_version": P17_REPORT_SCHEMA_VERSION,
-        "results": {
-            name: (
-                {
-                    "status": "completed",
-                    "approved_deal_set_id": expected_deal_set_ids[
-                        normalized["ablations"][name]["protocol"]
-                    ],
-                    "readiness": result_readiness(
-                        ablation_results[name],
-                        mode=normalized["ablations"][name]["protocol"],
-                    ),
-                    "result": ablation_results[name],
-                }
-                if name in ablation_results
-                else {
-                    "status": "not_run",
-                    "reason": normalized["ablations"][name]["reason"],
-                    "result": None,
-                }
-            )
-            for name in ABLATION_NAMES
-        },
+        "results": ablation_result_blocks,
     }
-    supplied = [result for result in (cardplay_result, full_game_result) if result]
+    supplied_blocks = [
+        block for block in (cardplay_block, full_game_block)
+        if block["status"] != "not_run"
+    ]
+
+    def diagnostic_results(name: str) -> list[dict[str, Any]]:
+        rows = []
+        for block in supplied_blocks:
+            result = block["result"]
+            evidence = block["readiness"]["evidence"]["recomputed_diagnostics"]
+            rows.append({
+                "mode": block["mode"],
+                "candidate": result["scenario"]["candidate"]["name"],
+                "status": evidence.get(
+                    f"{name}_status", evidence.get("status", "unavailable")
+                ),
+                name: evidence.get(name),
+            })
+        return rows
+
+    aggregate_status = (
+        "not_run"
+        if not supplied_blocks
+        else (
+            "eligible"
+            if all(block["status"] == "eligible" for block in supplied_blocks)
+            else "insufficient"
+        )
+    )
     calibration = {
         "schema_version": P17_REPORT_SCHEMA_VERSION,
-        "results": [
-            {
-                "mode": result["scenario"]["mode"],
-                "candidate": result["scenario"]["candidate"]["name"],
-                "calibration": result["metrics"]["calibration"],
-            }
-            for result in supplied
-        ],
-        "status": "completed" if supplied else "not_run",
+        "results": diagnostic_results("calibration"),
+        "status": aggregate_status,
     }
     latency = {
         "schema_version": P17_REPORT_SCHEMA_VERSION,
-        "results": [
-            {
-                "mode": result["scenario"]["mode"],
-                "candidate": result["scenario"]["candidate"]["name"],
-                "inference_latency_ms": result["metrics"]["inference_latency_ms"],
-                "inference_calls_per_second": result["metrics"][
-                    "inference_calls_per_second"
-                ],
-                "search": result["metrics"].get("search"),
-            }
-            for result in supplied
-        ],
-        "status": "completed" if supplied else "not_run",
+        "results": [],
+        "status": aggregate_status,
     }
+    for block in supplied_blocks:
+        result = block["result"]
+        evidence = block["readiness"]["evidence"]["recomputed_diagnostics"]
+        latency["results"].append({
+            "mode": block["mode"],
+            "candidate": result["scenario"]["candidate"]["name"],
+            "status": evidence.get("timing_status", "unavailable"),
+            "inference_latency_ms": evidence.get("inference_latency_ms"),
+            "instrumented_inference_calls_per_second": evidence.get(
+                "instrumented_inference_calls_per_second"
+            ),
+            "evaluation_wall_calls_per_second": evidence.get(
+                "evaluation_wall_calls_per_second"
+            ),
+            "timing_evidence": evidence.get("timing_evidence"),
+            "search": evidence.get("search"),
+        })
 
     payloads = {
         "model_matrix.json": normalized,
@@ -1194,6 +2099,45 @@ def write_p17_artifacts(
         encoding="utf-8",
     )
     paths["report.md"] = str(report_path.resolve())
+    def artifact_identity(path: str) -> dict[str, Any]:
+        payload = Path(path).read_bytes()
+        return {
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size_bytes": len(payload),
+        }
+
+    manifest_payload = {
+        "schema_version": P17_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+        "report_schema_version": P17_REPORT_SCHEMA_VERSION,
+        "files": {
+            name: artifact_identity(path)
+            for name, path in sorted(paths.items())
+        },
+        "release_status": {
+            "cardplay_only": cardplay_block["status"],
+            "full_game": full_game_block["status"],
+            "ablations": {
+                name: block["status"]
+                for name, block in sorted(ablation_result_blocks.items())
+            },
+        },
+        "source_result_provenance": {
+            "cardplay_only": cardplay_block.get("provenance"),
+            "full_game": full_game_block.get("provenance"),
+            "ablations": {
+                name: block.get("provenance")
+                for name, block in sorted(ablation_result_blocks.items())
+                if block.get("provenance") is not None
+            },
+        },
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest_payload, indent=2, sort_keys=True, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    paths["manifest.json"] = str(manifest_path.resolve())
     return paths
 
 
@@ -1216,8 +2160,9 @@ def render_p17_markdown(
     ]
     for block in (cardplay, full_game):
         readiness = block.get("readiness", {"status": "not_run"})
+        execution_status = block.get("execution_status", block["status"])
         lines.append(
-            f"| {block['mode']} | {block['status']} | {readiness['status']} |"
+            f"| {block['mode']} | {execution_status} | {readiness['status']} |"
         )
     lines.extend([
         "", "## Model Matrix", "", "| Model | Card-play | Full game |",

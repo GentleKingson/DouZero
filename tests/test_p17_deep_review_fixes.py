@@ -25,7 +25,7 @@ from douzero.env.scoring import compute_team_score_magnitude
 from douzero.evaluation.agents import RuleAgent
 from douzero.evaluation.legacy_data_adapter import deal_standard_deck
 from douzero.evaluation.p17 import result_readiness
-from douzero.evaluation.paired import evaluate_scenario
+from douzero.evaluation.paired import _calibration_metrics, evaluate_scenario
 from douzero.evaluation.scenario import (
     BundleSpec,
     EvaluationScenario,
@@ -121,14 +121,18 @@ def test_ordered_full_deal_hashes_drive_deal_set_readiness():
     )
     forged_id = copy.deepcopy(payload)
     forged_id["scenario"]["deal_set_id"] = "0" * 64
-    readiness = result_readiness(forged_id, mode="cardplay_only")
+    readiness = result_readiness(
+        forged_id, mode="cardplay_only", approved_deals=first.deals
+    )
     assert any("deal_set_id" in issue for issue in readiness["issues"])
 
     forged_row_hash = copy.deepcopy(payload)
     row = forged_row_hash["games"][0]
     replacement = "f" if row["deal_hash"][0] != "f" else "e"
     row["deal_hash"] = replacement + row["deal_hash"][1:]
-    readiness = result_readiness(forged_row_hash, mode="cardplay_only")
+    readiness = result_readiness(
+        forged_row_hash, mode="cardplay_only", approved_deals=first.deals
+    )
     assert readiness["evidence"]["malformed_rows"] == 1
 
     forged_whole_deal = copy.deepcopy(payload)
@@ -139,8 +143,10 @@ def test_ordered_full_deal_hashes_drive_deal_set_readiness():
         if row["deal_id"].startswith("000000-"):
             row["deal_hash"] = replacement_hash
             row["deal_id"] = canonical_deal_id(0, replacement_hash)
-    readiness = result_readiness(forged_whole_deal, mode="cardplay_only")
-    assert any("deal_set_id" in issue for issue in readiness["issues"])
+    readiness = result_readiness(
+        forged_whole_deal, mode="cardplay_only", approved_deals=first.deals
+    )
+    assert readiness["evidence"]["malformed_rows"] == 2
 
     reordered_rows = copy.deepcopy(payload)
     deal_hashes = {
@@ -152,13 +158,17 @@ def test_ordered_full_deal_hashes_drive_deal_set_readiness():
         swapped_hash = deal_hashes[1 - index]
         row["deal_hash"] = swapped_hash
         row["deal_id"] = canonical_deal_id(index, swapped_hash)
-    readiness = result_readiness(reordered_rows, mode="cardplay_only")
-    assert any("deal_set_id" in issue for issue in readiness["issues"])
+    readiness = result_readiness(
+        reordered_rows, mode="cardplay_only", approved_deals=first.deals
+    )
+    assert readiness["evidence"]["malformed_rows"] == 4
 
     serialization_only_reorder = copy.deepcopy(payload)
     serialization_only_reorder["games"].reverse()
     readiness = result_readiness(
-        serialization_only_reorder, mode="cardplay_only"
+        serialization_only_reorder,
+        mode="cardplay_only",
+        approved_deals=first.deals,
     )
     assert not any(
         "deal_set_id" in issue or "deal indices" in issue
@@ -220,9 +230,269 @@ def test_terminal_outcome_redundancies_are_rejected(mode, field):
     else:
         role = next(iter(row[field]))
         row[field][role] += 1.0
-    readiness = result_readiness(payload, mode=mode)
+    readiness = result_readiness(
+        payload, mode=mode, approved_deals=_scenario.deals
+    )
     assert readiness["evidence"]["malformed_deals"] == 1
-    assert any("terminal rule evidence" in issue for issue in readiness["issues"])
+    assert any("trace does not replay" in issue for issue in readiness["issues"])
+
+
+def test_forged_redeal_cap_exclusion_is_malformed_after_replay():
+    scenario, payload = _evaluation_payload("full_game", deals=2, seed=1915)
+    deal_ids = {row["deal_id"] for row in payload["games"]}
+    target_deal = min(
+        deal_ids,
+        key=lambda deal_id: sum(
+            row["candidate_score"]
+            for row in payload["games"]
+            if row["deal_id"] == deal_id
+        ),
+    )
+    for row in payload["games"]:
+        if row["deal_id"] == target_deal:
+            row.update({
+                "max_redeals_exceeded": True,
+                "formal_evaluation_eligible": False,
+                "exclusion_reason": (
+                    "redeal_cap_exhausted_forced_smoke_fallback"
+                ),
+            })
+
+    readiness = result_readiness(
+        payload, mode="full_game", approved_deals=scenario.deals
+    )
+
+    assert readiness["evidence"]["excluded_deals"] == 0
+    assert readiness["evidence"]["malformed_deals"] == 1
+    assert any("trace does not replay" in issue for issue in readiness["issues"])
+
+
+def test_mixed_replayed_redeal_cap_state_across_rotations_is_malformed():
+    ruleset = RuleSet.standard()
+    deals = generate_deals("full_game", 1, 1916, ruleset)
+
+    def scenario_with_bidding(policy: str) -> EvaluationScenario:
+        return EvaluationScenario(
+            mode="full_game",
+            ruleset=ruleset,
+            candidate=BundleSpec(
+                name=f"candidate-{policy}",
+                backend="rule",
+                bidding_policy=policy,
+            ),
+            baseline=BundleSpec(
+                name=f"baseline-{policy}",
+                backend="rule",
+                bidding_policy=policy,
+            ),
+            deals=deals,
+            deterministic_seed=1916,
+            bootstrap_samples=2000,
+        )
+
+    pass_scenario = scenario_with_bidding("pass")
+    mixed = evaluate_scenario(pass_scenario).to_dict()
+    successful = evaluate_scenario(scenario_with_bidding("max")).to_dict()
+    replacement = successful["games"][0]
+    replacement_assignment = replacement["assignment"]
+    index = next(
+        index
+        for index, row in enumerate(mixed["games"])
+        if row["assignment"] == replacement_assignment
+    )
+    mixed["games"][index] = copy.deepcopy(replacement)
+
+    readiness = result_readiness(
+        mixed, mode="full_game", approved_deals=pass_scenario.deals
+    )
+
+    assert readiness["evidence"]["excluded_deals"] == 0
+    assert readiness["evidence"]["malformed_deals"] == 1
+    assert any(
+        "seat rotations disagree" in issue for issue in readiness["issues"]
+    )
+
+
+def test_coordinated_terminal_and_metric_forgery_is_rejected_by_original_trace():
+    scenario, payload = _evaluation_payload("full_game", deals=1, seed=1911)
+    original_trace_digests = [row["trace_digest"] for row in payload["games"]]
+    for row in payload["games"]:
+        forged_winner_team = (
+            "farmer" if row["winner_team"] == "landlord" else "landlord"
+        )
+        forged_winner_position = (
+            "landlord_up" if forged_winner_team == "farmer" else "landlord"
+        )
+        forged_bombs = row["bomb_count"] + 1
+        forged_spring = forged_winner_team == "landlord"
+        forged_anti_spring = forged_winner_team == "farmer"
+        candidate_role = row["candidate_roles"][0]
+        candidate_team = (
+            "landlord" if candidate_role == "landlord" else "farmer"
+        )
+        magnitude = compute_team_score_magnitude(
+            team=candidate_team,
+            bomb_count=forged_bombs,
+            rocket_count=row["rocket_count"],
+            bid_value=row["bid_value"],
+            ruleset=RuleSet.standard(),
+            spring=forged_spring,
+            anti_spring=forged_anti_spring,
+        )
+        candidate_win = float(forged_winner_team == candidate_team)
+        candidate_score = float(
+            magnitude if candidate_win else -magnitude
+        )
+        row.update({
+            "winner_team": forged_winner_team,
+            "winner_position": forged_winner_position,
+            "bomb_count": forged_bombs,
+            "spring": forged_spring,
+            "anti_spring": forged_anti_spring,
+            "candidate_win": candidate_win,
+            "candidate_score": candidate_score,
+            "candidate_log_score": math.copysign(
+                math.log1p(abs(candidate_score)), candidate_score
+            ),
+            "role_wins": {candidate_role: candidate_win},
+            "role_scores": {candidate_role: candidate_score},
+        })
+
+    forged_games = payload["games"]
+    payload["metrics"].update({
+        "overall_win_percentage": sum(
+            row["candidate_win"] for row in forged_games
+        ) / len(forged_games),
+        "mean_score": sum(
+            row["candidate_score"] for row in forged_games
+        ) / len(forged_games),
+        "mean_raw_score": sum(
+            row["candidate_score"] for row in forged_games
+        ) / len(forged_games),
+        "mean_log_score": sum(
+            row["candidate_log_score"] for row in forged_games
+        ) / len(forged_games),
+        "bomb_rate": 1.0,
+        "spring_rate": sum(row["spring"] for row in forged_games)
+        / len(forged_games),
+        "anti_spring_rate": sum(
+            row["anti_spring"] for row in forged_games
+        ) / len(forged_games),
+    })
+    for role in ("landlord", "landlord_up", "landlord_down"):
+        role_rows = [row for row in forged_games if role in row["candidate_roles"]]
+        payload["metrics"]["by_role"][role].update({
+            "games": len(role_rows),
+            "win_percentage": sum(row["candidate_win"] for row in role_rows)
+            / len(role_rows),
+            "mean_score": sum(row["candidate_score"] for row in role_rows)
+            / len(role_rows),
+        })
+    payload["metrics"]["paired_estimate_ci"] = paired_bootstrap_ci(
+        deal_cluster_means(
+            (row["deal_id"], row["candidate_score"]) for row in forged_games
+        ),
+        confidence_level=0.95,
+        samples=scenario.bootstrap_samples,
+        seed=scenario.deterministic_seed + 1,
+    ).to_dict()
+
+    assert [row["trace_digest"] for row in forged_games] == original_trace_digests
+    readiness = result_readiness(
+        payload, mode="full_game", approved_deals=scenario.deals
+    )
+    assert readiness["evidence"]["paired_deals"] == 0
+    assert readiness["evidence"]["malformed_deals"] == 1
+    assert any("trace does not replay" in issue for issue in readiness["issues"])
+
+
+def test_legacy_calibration_triple_with_forged_label_is_rejected():
+    scenario, payload = _evaluation_payload("cardplay_only", deals=1, seed=1912)
+    row = payload["games"][0]
+    role = row["candidate_roles"][0]
+    true_label = float(
+        row["winner_team"]
+        == ("landlord" if role == "landlord" else "farmer")
+    )
+    forged_label = 1.0 - true_label
+    row["calibration"] = [[role, forged_label, forged_label]]
+    payload["metrics"]["calibration"] = _calibration_metrics(
+        [(role, forged_label, forged_label)]
+    )
+
+    readiness = result_readiness(
+        payload, mode="cardplay_only", approved_deals=scenario.deals
+    )
+    diagnostics = readiness["evidence"]["recomputed_diagnostics"]
+    assert readiness["evidence"]["paired_deals"] == 1
+    assert diagnostics["status"] == "unavailable"
+    assert diagnostics["calibration"] is None
+    assert any("calibration" in issue for issue in readiness["issues"])
+
+
+def test_forged_prediction_summary_cannot_replace_replay_derived_label():
+    scenario, payload = _evaluation_payload("full_game", deals=1, seed=1913)
+    forged_calibration = []
+    prediction_count = 0
+    for row in payload["games"]:
+        row["calibration"] = []
+        for decision in row["candidate_decisions"]:
+            if decision["phase"] != "cardplay" or decision["forced_action"]:
+                continue
+            role = decision["actor_role"]
+            true_label = float(
+                row["winner_team"]
+                == ("landlord" if role == "landlord" else "farmer")
+            )
+            forged_prediction = 1.0 - true_label
+            decision["prediction_status"] = "available"
+            decision["prediction"] = forged_prediction
+            row["calibration"].append([role, forged_prediction])
+            forged_calibration.append(
+                (role, forged_prediction, forged_prediction)
+            )
+            prediction_count += 1
+    # This is the perfect aggregate an attacker would obtain by treating the
+    # prediction itself as the label. The collator must instead use replay.
+    payload["metrics"]["calibration"] = _calibration_metrics(
+        forged_calibration
+    )
+    payload["metrics"]["sample_counts"]["calibration_decisions"] = (
+        prediction_count
+    )
+
+    readiness = result_readiness(
+        payload, mode="full_game", approved_deals=scenario.deals
+    )
+    diagnostics = readiness["evidence"]["recomputed_diagnostics"]
+    assert diagnostics["status"] == "available"
+    assert diagnostics["calibration"]["overall"]["count"] == prediction_count
+    assert diagnostics["calibration"]["overall"]["brier"] == pytest.approx(1.0)
+    assert payload["metrics"]["calibration"]["overall"]["brier"] == 0.0
+    assert any(
+        "reported calibration does not match" in issue
+        for issue in readiness["issues"]
+    )
+
+
+def test_calibration_role_must_be_replay_verified_candidate_role():
+    scenario, payload = _evaluation_payload("full_game", deals=1, seed=1914)
+    row = payload["games"][0]
+    baseline_role = next(
+        role
+        for role in ("landlord", "landlord_up", "landlord_down")
+        if role not in row["candidate_roles"]
+    )
+    row["calibration"] = [[baseline_role, 0.5]]
+
+    readiness = result_readiness(
+        payload, mode="full_game", approved_deals=scenario.deals
+    )
+    diagnostics = readiness["evidence"]["recomputed_diagnostics"]
+    assert readiness["evidence"]["paired_deals"] == 1
+    assert diagnostics["status"] == "unavailable"
+    assert diagnostics["calibration"] is None
+    assert any("calibration" in issue for issue in readiness["issues"])
 
 
 def test_synchronized_derived_score_and_ci_tampering_is_rejected():
@@ -244,13 +514,15 @@ def test_synchronized_derived_score_and_ci_tampering_is_rejected():
         samples=scenario.bootstrap_samples,
         seed=scenario.deterministic_seed + 1,
     ).to_dict()
-    readiness = result_readiness(payload, mode="full_game")
+    readiness = result_readiness(
+        payload, mode="full_game", approved_deals=scenario.deals
+    )
     assert readiness["evidence"]["paired_deals"] == 0
-    assert any("terminal rule evidence" in issue for issue in readiness["issues"])
+    assert any("trace does not replay" in issue for issue in readiness["issues"])
 
 
 def test_full_game_roles_are_bound_to_the_bidding_transcript():
-    _scenario, payload = _evaluation_payload("full_game", deals=1, seed=1905)
+    scenario, payload = _evaluation_payload("full_game", deals=1, seed=1905)
     row = payload["games"][0]
     order = row["bidding_order"]
     original_roles = [row["seat_to_role"][seat] for seat in order]
@@ -283,13 +555,19 @@ def test_full_game_roles_are_bound_to_the_bidding_transcript():
         "role_wins": {candidate_role: candidate_win},
         "role_scores": {candidate_role: candidate_score},
     })
-    readiness = result_readiness(payload, mode="full_game")
+    readiness = result_readiness(
+        payload, mode="full_game", approved_deals=scenario.deals
+    )
     assert readiness["evidence"]["malformed_deals"] == 1
-    assert any("terminal rule evidence" in issue for issue in readiness["issues"])
+    assert any("trace does not replay" in issue for issue in readiness["issues"])
 
     malformed_json_value = copy.deepcopy(payload)
     malformed_json_value["games"][0]["seat_to_role"]["0"] = []
-    readiness = result_readiness(malformed_json_value, mode="full_game")
+    readiness = result_readiness(
+        malformed_json_value,
+        mode="full_game",
+        approved_deals=scenario.deals,
+    )
     assert readiness["evidence"]["malformed_deals"] == 1
 
 
@@ -305,16 +583,20 @@ def test_custom_ruleset_p15_result_is_not_formal_p17_evidence():
         bootstrap_samples=2000,
     )
     readiness = result_readiness(
-        evaluate_scenario(scenario).to_dict(), mode="full_game"
+        evaluate_scenario(scenario).to_dict(),
+        mode="full_game",
+        approved_deals=scenario.deals,
     )
     assert any("official ruleset identity" in issue for issue in readiness["issues"])
 
 
 @pytest.mark.parametrize("confidence_level", [0.01, 0.90, 0.99])
 def test_p17_rejects_non_official_confidence_levels(confidence_level):
-    _scenario, payload = _evaluation_payload("cardplay_only", deals=1)
+    scenario, payload = _evaluation_payload("cardplay_only", deals=1)
     payload["scenario"]["confidence_level"] = confidence_level
-    readiness = result_readiness(payload, mode="cardplay_only")
+    readiness = result_readiness(
+        payload, mode="cardplay_only", approved_deals=scenario.deals
+    )
     assert any("confidence_level=0.95" in issue for issue in readiness["issues"])
     assert (
         readiness["evidence"]["recomputed_paired_estimate_ci"]["confidence_level"]

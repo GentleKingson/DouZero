@@ -84,10 +84,10 @@ on four generated deals and 2,000 deal-level bootstrap samples:
   --output /tmp/douzero-p17-bc-before-after
 ```
 
-Observed current-schema smoke estimate: -0.1250 with CI [-0.5000, 0.2500].
-The result uses `p15-paired-result-v2` and binds the full source SHA, evaluator
-configuration, legacy ruleset, checkpoint identities, and both V2 feature
-schemas. Four synthetic
+Observed historical smoke estimate: -0.1250 with CI [-0.5000, 0.2500].
+That pre-v3 result bound the source/configuration, ruleset, checkpoint, and V2
+feature identities, but it predates complete trace replay and detached
+attestation and is not accepted by current formal P17 collation. Four synthetic
 deals are far below the 1,000-deal promotion gate; the number is recorded only
 to prove the paired path executed and must not be interpreted as improvement.
 

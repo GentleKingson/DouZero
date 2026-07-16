@@ -24,8 +24,9 @@ model bidding.
 
 `cardplay_only` uses common random streams derived from scenario seed, deal ID,
 and role. `full_game` derives them from deal ID and physical seat. Inference
-timing is measured and is therefore the only field expected to vary slightly
-between identical runs.
+timing is measured with `time.perf_counter_ns` and is therefore the only field
+expected to vary slightly between identical runs. Bidding and card-play action
+traces remain deterministic for a fixed scenario and policy.
 
 The protocol identity is closed over its seat schedule. `cardplay_only` must
 contain exactly the candidate-landlord and candidate-two-farmers legs once
@@ -60,6 +61,11 @@ P17 release collation applies a distinct readiness policy,
 bootstrap samples and 1,000 paired deals. This stricter release bar does not
 change or relabel the underlying P15 protocol result.
 
+Current paired results use `p15-paired-result-v3`. Result-v3 is not merely a
+summary schema: each game includes the complete bidding/card-play action trace,
+the full deal hash, a canonical trace digest, and per-call nanosecond timing
+evidence needed by formal P17 collation.
+
 ## Metrics And Outputs
 
 Every run writes JSON, per-game CSV, and Markdown. The report includes:
@@ -69,17 +75,27 @@ Every run writes JSON, per-game CSV, and Markdown. The report includes:
 - bid and landlord-acquisition rate plus per-bid win/score in full-game mode;
 - bomb, rocket, spring, anti-spring, and game-length rates;
 - selected-action `p_win` Brier, NLL, and 15-bin ECE when a V2 agent exposes
-  predictions;
+  predictions; raw rows store `(role, prediction)`, never a caller-supplied
+  outcome label;
 - candidate inference p50/p95/p99 and candidate inference calls/s;
 - search timeout/fallback rates and all-pass redeal/max-redeal audit counts;
 - deal/game/decision sample counts and paired 95% confidence intervals.
 
 Unavailable metrics are JSON `null` and Markdown `n/a`, not invented zeros.
-Inference calls/s divides calls by summed inference latency; it is not actor
-wall-clock FPS. The JSON retains the deprecated P15 `actor_fps` key as an
-exact alias for compatibility, but its value is still inference calls/s;
-actual actor FPS requires separate rollout wall-time instrumentation.
-The raw game rows remain in JSON/CSV so headline results are auditable.
+Every candidate bidding/card-play call stores one non-negative integer
+in `candidate_latencies_ns`; the matching compatibility value in
+`candidate_latencies_ms` must equal that same integer divided by 1,000,000.
+Percentiles are recomputed from nanoseconds. Instrumented calls/s divides the
+exact call count by summed inference nanoseconds, while the timing envelope
+separately records total evaluation wall nanoseconds and its scope. It is not
+end-to-end actor/evaluation FPS. The deprecated P15 `actor_fps` key is an exact
+alias only. Missing, malformed, or inconsistent timing makes the diagnostic
+unavailable.
+
+Formal calibration labels are derived by the collator from each replayed
+winner and the recorded candidate role. A result file cannot improve Brier,
+NLL, or ECE by supplying or changing labels. Raw game rows and traces remain in
+the signed result so headline results can be independently reconstructed.
 
 ## Model Matrix And Ablations
 
@@ -97,12 +113,16 @@ from a role path.
 
 P17 matrix normalization hashes every role, bidding, and belief checkpoint
 after strict manifest loading. Result scenarios carry those path-free hashes,
-and collation requires an exact match. Release readiness is recomputed from
-the auditable game rows, including official seat-rotation completeness,
-unique deal count, paired confidence interval, and redeal-cap exclusions;
-headline summary fields are not trusted on their own. A bounded forced
-all-pass fallback remains visible only as a smoke row and is excluded from
-every formal deal statistic.
+and collation requires an exact match. Formal release readiness is rebuilt by
+deterministically replaying every complete result-v3 trace against the
+separately supplied approved deal payload at the same ordered index. The
+collator derives bidding history, role mapping, winner, bombs/rockets,
+spring/anti-spring, game length, score, calibration labels, paired confidence
+intervals, latency, and search diagnostics. It rejects an action that is
+illegal, out of turn, post-terminal, incomplete, or inconsistent with the
+approved deal and ruleset. Deal hashes or internally consistent terminal
+summaries alone are never sufficient. A bounded forced all-pass fallback
+remains visible only as a smoke row and is excluded from formal statistics.
 
 ```json
 {
@@ -153,6 +173,141 @@ Candidate and baseline bundles for that row must therefore carry legacy-
 ruleset-compatible checkpoints; the optional object form above supplies a
 different compatible baseline when needed.
 
+## Formal P17 Trust Boundary
+
+Formal evaluation starts only from a real Git checkout. `--formal-release`
+rejects a dirty tree (including untracked files), an index or tracked byte that
+does not match HEAD, an unstable checkout that changes between identity
+samples, an unsupported submodule, and a HEAD that differs from
+`--expected-source-git-sha`. Runtime identity records the real commit/tree,
+tracked-tree SHA-256, ref, and file count. `DOUZERO_GIT_SHA` and package
+metadata remain available only to local descriptive runs and cannot establish
+formal identity.
+
+Formal deal inputs use the safe `douzero-formal-eval-data-v1` JSON schema and
+must contain exactly `schema_version`, `mode`, `ruleset`, and `deals`. The
+loader rejects duplicate object keys, `NaN`/infinities, extra keys,
+non-canonical field types, mismatched rule identity, malformed cards, and
+duplicate deals. It never invokes pickle. A `.pkl` path is rejected before its
+contents can be deserialized, both by `evaluate_paired.py --formal-release`
+and by the P17 collator. Generate an approved input candidate with:
+
+```bash
+python generate_eval_data.py \
+  --output /trusted/holdout/cardplay \
+  --num_games 1000 \
+  --ruleset legacy \
+  --output-format formal-json
+```
+
+The protected `.github/workflows/formal-evaluation.yml` job executes:
+
+```bash
+python evaluate_paired.py \
+  --mode cardplay_only \
+  --candidate "$CANDIDATE" --baseline "$BASELINE" \
+  --model-matrix "$MODEL_MATRIX" \
+  --eval-data "$APPROVED_CARDPLAY_DATA" \
+  --dataset-scope private_holdout \
+  --bootstrap-samples 2000 \
+  --formal-release \
+  --expected-source-git-sha "$APPROVED_EVALUATOR_SHA" \
+  --output /trusted/results/cardplay
+```
+
+This is not a local formal-mode recipe. Formal validation also requires the
+GitHub workflow/run identity, a protected self-hosted runner, the immutable OCI
+`repo@sha256:<digest>` configured as the protected
+`FORMAL_EVALUATOR_IMAGE` environment variable, an exact sorted `pip freeze`
+digest configured as protected `FORMAL_PYTHON_PACKAGES_SHA256`, and a recorded
+hardware/runtime inventory. The workflow verifies the image's `RepoDigests`
+and actually runs evaluation in that image with networking disabled, the source
+and evidence snapshots mounted read-only, and only the result directory
+writable. Setting lookalike environment variables locally cannot produce the
+detached attestation required by collation.
+
+The dispatch surface accepts only `source_sha`, which must equal the protected
+`main` ref, workflow SHA, and checked-out HEAD. All other run selection comes
+from one request file selected by the protected environment variables
+`FORMAL_EVALUATION_REQUEST_PATH` and
+`FORMAL_EVALUATION_REQUEST_SHA256`. The workflow snapshots and hash-checks that
+file, then parses it offline in the immutable evaluator image. Its strict
+`formal-evaluation-request-v1` JSON object contains exactly:
+
+```json
+{
+  "schema_version": "formal-evaluation-request-v1",
+  "mode": "full_game",
+  "dataset_scope": "private_holdout",
+  "eval_data_path": "/protected/evaluation/deals.json",
+  "eval_data_sha256": "<64 lowercase hex characters>",
+  "deal_set_id": "<64 lowercase hex characters>",
+  "model_matrix_path": "/protected/evaluation/models.json",
+  "model_matrix_sha256": "<64 lowercase hex characters>",
+  "p17_matrix_path": "/protected/evaluation/p17-models.json",
+  "p17_matrix_sha256": "<64 lowercase hex characters>",
+  "candidate": "candidate-v1",
+  "baseline": "baseline-v1",
+  "bootstrap_samples": 2000
+}
+```
+
+Missing or extra fields, duplicate keys, non-finite numbers, wrong JSON types,
+unsafe/non-canonical paths, embedded newlines, unsupported modes/scopes, and
+malformed identities fail before any evidence file is opened. Publication
+scope is taken from the validated request step output, so a dispatch caller
+cannot route a private holdout through the public artifact path.
+
+The protected GitHub Actions evaluator signs the exact result JSON with its
+OIDC identity/Sigstore-backed GitHub artifact attestation. The canonical
+result digest covers exactly `protocol`, `ablation`, `scenario`, `metrics`,
+`games`, and `runtime_identity`; changing a trace, summary, timing sample,
+configuration, or provenance field changes the digest and signed artifact.
+The protected workflow snapshots both evaluator and P17 matrices plus the
+strict JSON deal file by SHA-256 identities in that approved request, runs at
+least 1,000 deals and 2,000 bootstraps, replays/collates before private cleanup,
+and uploads no private per-game or per-decision evidence.
+
+Formal collation requires all trust inputs explicitly:
+
+```bash
+python tools/prepare_p17_evaluation.py \
+  --matrix "$P17_MATRIX" \
+  --cardplay-result /trusted/results/cardplay.json \
+  --cardplay-attestation "$CARDPLAY_ATTESTATION_BUNDLE" \
+  --expected-evaluator-git-sha "$APPROVED_EVALUATOR_SHA" \
+  --expected-cardplay-deal-set-id "$APPROVED_CARDPLAY_SET_ID" \
+  --approved-cardplay-eval-data "$APPROVED_CARDPLAY_DATA" \
+  --attestation-repository "$ATTESTATION_REPOSITORY" \
+  --attestation-signer-workflow "$ATTESTATION_SIGNER_WORKFLOW" \
+  --attestation-signer-digest "$ATTESTATION_SIGNER_DIGEST" \
+  --attestation-source-ref "$ATTESTATION_SOURCE_REF" \
+  --output artifacts/evaluation/p17
+```
+
+Use the equivalent `full-game` options for that mode. Each ablation requires a
+matched `--ablation-result NAME=PATH` and
+`--ablation-attestation NAME=PATH`. The verifier pins the exact repository,
+source commit/ref, protected workflow path and workflow Git digest, result-file
+SHA-256, and canonical result digest. It also records the immutable GitHub
+workflow-run URL and the attested hosted/self-hosted runner class. A
+missing/failed attestation, missing approved deal payload, replay failure, or
+raw unverified result can never be `eligible`; descriptive library output
+remains `insufficient`.
+
+For a private holdout, approved deals and every per-game/per-decision field
+stay in the trusted evaluation/collation environment. Replay and attestation
+verification happen there. The public P17 result block is reconstructed from
+a strict allowlist containing only the mode, deal-set hash, deal count, model
+names, and a zero-row redaction marker. It never copies traces, predictions,
+roles/seats, per-call latency, raw metrics, or unknown nested fields. Separate
+fixed-schema artifacts publish recomputed aggregate diagnostics and the
+verified source digest/attestation summary. The projection does not expose the
+cards or claim to be the original signed artifact. A canonical
+`manifest.json` hashes every projection/report file, and the protected
+workflow creates and verifies a second detached attestation for that manifest
+before upload.
+
 ## Reproducible CPU Smoke
 
 ```bash
@@ -165,14 +320,24 @@ python evaluate_paired.py \
   --output artifacts/evaluation/p15-smoke
 ```
 
-Use `--mode full_game` for bidding and seat rotation. Use `--eval-data` for a
-fixed trusted pickle generated by `generate_eval_data.py`. Pickle files must
-come from a trusted source because loading pickle can execute code.
+This command is intentionally a local smoke. Without `--formal-release`, an
+approved deal file, and detached attestation it cannot produce formal P17
+evidence regardless of its sample count.
+
+Use `--mode full_game` for bidding and seat rotation. A local, non-formal run
+may still use a trusted historical pickle generated by
+`generate_eval_data.py`; pickle can execute code and is retained only for
+backward compatibility. Formal evaluation accepts only strict `.json` deal
+sets generated with `--output-format formal-json`.
 
 Public eval sets may be versioned outside the code package and identified by
 their content hash. Private holdouts require `--dataset-scope private_holdout`
-and an explicit `--eval-data`; their path/name is redacted from reports. Private
-deal contents are never written to the repository by the evaluator.
+with `--formal-release` and an explicit formal JSON `--eval-data`; their
+path/name is redacted from reports. The signed source result contains the
+traces needed for trusted replay and must remain in protected storage. Only the
+post-verification P17 strict-allowlist projection may leave that environment;
+private deal contents and per-decision evidence must never be committed or
+exported.
 
 Regression gates should be configured outside the holdout run and cover legacy
 behavior, rules, latency, calibration, and a minimum for each role. Failed

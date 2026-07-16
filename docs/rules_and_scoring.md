@@ -198,6 +198,22 @@ ruleset.
 python generate_eval_data.py --output eval_standard --num_games 100 --ruleset standard
 ```
 
+The command above preserves the historical local pickle output. Formal paired
+evaluation instead requires the safe exact-schema JSON format:
+
+```bash
+python generate_eval_data.py \
+  --output eval_standard_formal \
+  --num_games 100 \
+  --ruleset standard \
+  --output-format formal-json
+```
+
+This writes `eval_standard_formal.json` with schema
+`douzero-formal-eval-data-v1`. Formal evaluator and P17 collation paths reject
+pickle without deserializing it; local legacy tooling remains compatible with
+trusted `.pkl` inputs.
+
 ### Running standard evaluation
 
 ```bash

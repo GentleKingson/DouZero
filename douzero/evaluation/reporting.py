@@ -25,7 +25,9 @@ def render_markdown(result: PairedEvaluationResult) -> str:
     """Render a compact, auditable report that never hides the scenario mode."""
     scenario = result.scenario
     metrics = result.metrics
-    runtime_identity = result.to_dict()["runtime_identity"]
+    payload = result.to_dict()
+    runtime_identity = payload["runtime_identity"]
+    execution_identity = runtime_identity["execution_environment"]
     ci = metrics["paired_estimate_ci"]
     estimate_label = (
         "Paired WP delta"
@@ -49,6 +51,18 @@ def render_markdown(result: PairedEvaluationResult) -> str:
         f"- Seed: `{scenario['deterministic_seed']}`",
         f"- Result schema: `{runtime_identity['schema_version']}`",
         f"- Source Git SHA: `{runtime_identity['source_git_sha']}`",
+        f"- Source Git tree: `{runtime_identity['source_git_tree_oid']}`",
+        f"- Tracked source SHA-256: "
+        f"`{runtime_identity['source_tracked_tree_sha256']}`",
+        f"- Clean/stable source: `{runtime_identity['source_worktree_clean']}` / "
+        f"`{runtime_identity['source_identity_stable']}`",
+        f"- Execution provider/run: `{execution_identity['provider']}` / "
+        f"`{execution_identity['run_url']}`",
+        f"- Evaluator image: `{execution_identity['container_image_digest']}`",
+        f"- Hardware identity: "
+        f"`{json.dumps(execution_identity['hardware'], sort_keys=True)}`",
+        f"- Complete result SHA-256: "
+        f"`{payload['result_integrity']['result_digest']}`",
         f"- Evaluation config SHA-256: "
         f"`{runtime_identity['evaluation_config_hash']}`",
         f"- Feature schemas: "
@@ -157,10 +171,18 @@ def write_report(
         "redeal_count", "max_redeals_exceeded", "search_calls",
         "search_timeouts", "search_fallbacks",
         "bidding_inference_calls",
+        "trace_digest", "formal_evaluation_eligible", "exclusion_reason",
     ]
     provenance_fields = [
         "result_schema_version",
         "source_git_sha",
+        "source_git_tree_oid",
+        "source_tracked_tree_sha256",
+        "source_worktree_clean",
+        "workflow_run_url",
+        "evaluator_image_digest",
+        "hardware_identity",
+        "result_digest",
         "evaluation_config_hash",
         "ruleset_hash",
         "model_feature_schemas",
@@ -173,6 +195,12 @@ def write_report(
         "seat_to_role",
         "bidding_order",
         "bidding_history",
+        "bidding_trace",
+        "cardplay_trace",
+        "candidate_latencies_ms",
+        "candidate_latencies_ns",
+        "candidate_decisions",
+        "calibration",
     ]
     with open(paths["csv"], "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
@@ -187,6 +215,22 @@ def write_report(
             output.update({
                 "result_schema_version": runtime_identity["schema_version"],
                 "source_git_sha": runtime_identity["source_git_sha"],
+                "source_git_tree_oid": runtime_identity["source_git_tree_oid"],
+                "source_tracked_tree_sha256": runtime_identity[
+                    "source_tracked_tree_sha256"
+                ],
+                "source_worktree_clean": runtime_identity["source_worktree_clean"],
+                "workflow_run_url": runtime_identity["execution_environment"][
+                    "run_url"
+                ],
+                "evaluator_image_digest": runtime_identity[
+                    "execution_environment"
+                ]["container_image_digest"],
+                "hardware_identity": json.dumps(
+                    runtime_identity["execution_environment"]["hardware"],
+                    sort_keys=True,
+                ),
+                "result_digest": payload["result_integrity"]["result_digest"],
                 "evaluation_config_hash": runtime_identity["evaluation_config_hash"],
                 "ruleset_hash": runtime_identity["ruleset_hash"],
                 "model_feature_schemas": json.dumps(

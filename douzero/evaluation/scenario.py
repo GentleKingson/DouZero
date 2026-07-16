@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from douzero.env.rules import RuleSet
 
+from .checkpoint_inputs import checkpoint_sha256, validate_sha256
 from .protocol import (
     EVALUATION_PROTOCOL,
     OFFICIAL_CI_METHOD,
@@ -125,6 +125,15 @@ class BundleSpec:
     tags: tuple[str, ...] = ()
     # P17 field appended after every pre-P17 positional field.
     bidding_checkpoint: str = ""
+    # File identities are separate from paths so a formal matrix can declare
+    # the approved bytes before anything is loaded. They remain appended for
+    # compatibility with the historical positional constructor contract.
+    checkpoint_sha256: Mapping[str, str] = field(default_factory=dict)
+    belief_checkpoint_sha256: str = ""
+    bidding_checkpoint_sha256: str = ""
+    checkpoint_digests_explicit: bool = field(
+        init=False, repr=False, compare=False, default=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not isinstance(self.backend, str):
@@ -138,7 +147,12 @@ class BundleSpec:
                 f"bidding_policy must be one of {BIDDING_POLICIES}, "
                 f"got {self.bidding_policy!r}"
             )
-        for field_name in ("checkpoints", "model_config", "search_config"):
+        for field_name in (
+            "checkpoints",
+            "checkpoint_sha256",
+            "model_config",
+            "search_config",
+        ):
             if not isinstance(getattr(self, field_name), Mapping):
                 raise TypeError(f"bundle {field_name} must be a mapping")
         if any(
@@ -165,39 +179,104 @@ class BundleSpec:
             raise ValueError(
                 "bidding_checkpoint is only valid with bidding_policy='learned'"
             )
+        if not isinstance(self.belief_checkpoint_sha256, str) or not isinstance(
+            self.bidding_checkpoint_sha256, str
+        ):
+            raise TypeError(
+                "belief and bidding checkpoint SHA-256 values must be strings"
+            )
 
-    @staticmethod
-    def _checkpoint_sha256(path: str) -> str | None:
-        """Hash a checkpoint without exposing its local filesystem path.
+        paths = {role: path for role, path in self.checkpoints.items() if path}
+        declared_roles = dict(self.checkpoint_sha256)
+        supplied_values = [
+            *declared_roles.values(),
+            self.belief_checkpoint_sha256,
+            self.bidding_checkpoint_sha256,
+        ]
+        any_declared = any(bool(value) for value in supplied_values)
+        all_declared = (
+            set(declared_roles) == set(paths)
+            and all(bool(declared_roles[role]) for role in paths)
+            and bool(self.belief_checkpoint)
+            == bool(self.belief_checkpoint_sha256)
+            and bool(self.bidding_checkpoint)
+            == bool(self.bidding_checkpoint_sha256)
+        )
+        if any_declared and not all_declared:
+            raise ValueError(
+                "checkpoint SHA-256 declarations must cover every role, belief, "
+                "and bidding checkpoint exactly"
+            )
+        if any_declared:
+            normalized_roles = {
+                role: validate_sha256(
+                    declared_roles[role],
+                    label=f"bundle {self.name!r} {role} checkpoint_sha256",
+                )
+                for role in sorted(paths)
+            }
+            belief_digest = (
+                validate_sha256(
+                    self.belief_checkpoint_sha256,
+                    label=f"bundle {self.name!r} belief_checkpoint_sha256",
+                )
+                if self.belief_checkpoint
+                else ""
+            )
+            bidding_digest = (
+                validate_sha256(
+                    self.bidding_checkpoint_sha256,
+                    label=f"bundle {self.name!r} bidding_checkpoint_sha256",
+                )
+                if self.bidding_checkpoint
+                else ""
+            )
+            explicit = True
+        else:
+            # Backward-compatible local construction snapshots identities once.
+            # Missing files stay unbound and will be rejected if loading is tried.
+            def local_digest(path: str) -> str:
+                try:
+                    return checkpoint_sha256(path)
+                except ValueError:
+                    return ""
 
-        P17 model-matrix validation separately verifies the embedded checkpoint
-        manifest. Hashing the complete file here then binds that verified
-        manifest and its weights to an evaluation result with one immutable
-        identity.
-        """
-
-        if not path:
-            return None
-        checkpoint = Path(path)
-        if not checkpoint.is_file():
-            return None
-        digest = hashlib.sha256()
-        with checkpoint.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-        return digest.hexdigest()
+            normalized_roles = {
+                role: local_digest(path) for role, path in sorted(paths.items())
+            }
+            belief_digest = (
+                local_digest(self.belief_checkpoint) if self.belief_checkpoint else ""
+            )
+            bidding_digest = (
+                local_digest(self.bidding_checkpoint) if self.bidding_checkpoint else ""
+            )
+            explicit = (
+                not paths
+                and not self.belief_checkpoint
+                and not self.bidding_checkpoint
+            )
+        object.__setattr__(
+            self, "checkpoints", MappingProxyType(dict(self.checkpoints))
+        )
+        object.__setattr__(
+            self, "checkpoint_sha256", MappingProxyType(normalized_roles)
+        )
+        object.__setattr__(self, "belief_checkpoint_sha256", belief_digest)
+        object.__setattr__(self, "bidding_checkpoint_sha256", bidding_digest)
+        object.__setattr__(self, "checkpoint_digests_explicit", explicit)
 
     def checkpoint_identities(self) -> dict[str, Any]:
         """Return path-free identities for every checkpoint in this bundle."""
 
         return {
-            "scheme": "sha256-file-including-embedded-manifest-v1",
+            "scheme": "predeclared-sha256-file-including-manifest-v1",
+            "explicitly_predeclared": self.checkpoint_digests_explicit,
             "roles": {
-                role: self._checkpoint_sha256(path)
-                for role, path in sorted(self.checkpoints.items())
+                role: self.checkpoint_sha256.get(role) or None
+                for role in sorted(self.checkpoints)
             },
-            "belief": self._checkpoint_sha256(self.belief_checkpoint),
-            "bidding": self._checkpoint_sha256(self.bidding_checkpoint),
+            "belief": self.belief_checkpoint_sha256 or None,
+            "bidding": self.bidding_checkpoint_sha256 or None,
         }
 
     def to_dict(self, *, include_paths: bool = False) -> dict[str, Any]:
@@ -224,6 +303,12 @@ class BundleSpec:
             "search_config": dict(self.search_config),
             "tags": list(self.tags),
         }
+        if include_paths:
+            payload.update({
+                "checkpoint_sha256": dict(self.checkpoint_sha256),
+                "belief_checkpoint_sha256": self.belief_checkpoint_sha256,
+                "bidding_checkpoint_sha256": self.bidding_checkpoint_sha256,
+            })
         if not include_paths:
             payload["checkpoint_identities"] = self.checkpoint_identities()
         return payload
@@ -333,34 +418,10 @@ class EvaluationScenario:
                         "formal paired evaluation does not support bidding_script"
                     )
         else:
-            expected_counts = Counter(list(range(3, 15)) * 4 + [17] * 4 + [20, 30])
+            from .legacy_data_adapter import _validate_legacy_record
+
             for index, deal in enumerate(self.deals):
-                required = {
-                    "landlord", "landlord_up", "landlord_down",
-                    "three_landlord_cards",
-                }
-                if set(deal) != required:
-                    raise ValueError(
-                        f"legacy deal {index} must contain exactly {sorted(required)}"
-                    )
-                cards = (
-                    list(deal["landlord"])
-                    + list(deal["landlord_up"])
-                    + list(deal["landlord_down"])
-                )
-                if Counter(cards) != expected_counts:
-                    raise ValueError(f"legacy deal {index} is not a valid 54-card deal")
-                if not (
-                    len(deal["landlord"]) == 20
-                    and len(deal["landlord_up"]) == 17
-                    and len(deal["landlord_down"]) == 17
-                    and len(deal["three_landlord_cards"]) == 3
-                ):
-                    raise ValueError(f"legacy deal {index} has invalid hand sizes")
-                if Counter(deal["three_landlord_cards"]) - Counter(deal["landlord"]):
-                    raise ValueError(
-                        f"legacy deal {index} bottom cards are not in landlord hand"
-                    )
+                _validate_legacy_record(deal, index)
         deal_hashes = [canonical_deal_hash(deal) for deal in self.deals]
         if len(set(deal_hashes)) != len(deal_hashes):
             raise ValueError("formal evaluation deals must be unique")
@@ -403,13 +464,25 @@ class EvaluationScenario:
         }
 
 
-def bundle_from_dict(data: Mapping[str, Any]) -> BundleSpec:
+def bundle_from_dict(
+    data: Mapping[str, Any], *, require_checkpoint_digests: bool = False
+) -> BundleSpec:
     """Parse a model-matrix bundle entry with strict unknown-key checking."""
-    allowed = {field.name for field in BundleSpec.__dataclass_fields__.values()}
+    allowed = {
+        field.name
+        for field in BundleSpec.__dataclass_fields__.values()
+        if field.init
+    }
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(f"unknown bundle fields: {sorted(unknown)}")
     converted = dict(data)
     if "tags" in converted:
         converted["tags"] = tuple(converted["tags"])
-    return BundleSpec(**converted)
+    bundle = BundleSpec(**converted)
+    if require_checkpoint_digests and not bundle.checkpoint_digests_explicit:
+        raise ValueError(
+            f"bundle {bundle.name!r} requires explicit predeclared checkpoint "
+            "SHA-256 values"
+        )
+    return bundle
