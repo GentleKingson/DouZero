@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -194,6 +196,44 @@ def test_evaluator_matrix_snapshot_rewrites_every_role_to_read_only_bytes(
     _load_matrix(str(output), require_checkpoint_digests=True)
 
 
+def test_snapshot_cli_runs_as_an_isolated_installed_module(tmp_path: Path) -> None:
+    checkpoint, approved = _checkpoint(tmp_path)
+    matrix = {
+        "bundles": {"candidate": _bundle_payload(checkpoint, approved)},
+        "ablations": {},
+    }
+    source = tmp_path / "matrix.json"
+    output = tmp_path / "snapshot" / "matrix.json"
+    source.write_text(json.dumps(matrix), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-m",
+            "douzero.evaluation.snapshot_cli",
+            "--matrix",
+            str(source),
+            "--kind",
+            "evaluator",
+            "--source-root",
+            str(tmp_path),
+            "--checkpoint-dir",
+            str(tmp_path / "snapshot" / "checkpoints"),
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"snapshot_matrix": str(output.resolve())}
+    assert output.is_file()
+
+
 def test_snapshot_rejects_wrong_declared_digest_without_writing_matrix(
     tmp_path: Path,
 ) -> None:
@@ -215,6 +255,53 @@ def test_snapshot_rejects_wrong_declared_digest_without_writing_matrix(
         )
     assert not output.exists()
     assert not list((tmp_path / "snapshot" / "checkpoints").glob("*.checkpoint"))
+
+
+def test_snapshot_rejects_checkpoint_outside_approved_source_root(
+    tmp_path: Path,
+) -> None:
+    approved_root = tmp_path / "approved-checkpoints"
+    approved_root.mkdir()
+    checkpoint, approved = _checkpoint(tmp_path, name="outside.pt")
+    matrix = {
+        "bundles": {"candidate": _bundle_payload(checkpoint, approved)},
+        "ablations": {},
+    }
+    source = tmp_path / "matrix.json"
+    output = tmp_path / "snapshot" / "matrix.json"
+    source.write_text(json.dumps(matrix), encoding="utf-8")
+
+    with pytest.raises(CheckpointIdentityError, match="outside the approved root"):
+        snapshot_model_matrix_file(
+            source,
+            output,
+            tmp_path / "snapshot" / "checkpoints",
+            kind="evaluator",
+            source_root=approved_root,
+        )
+
+
+def test_snapshot_source_root_rejects_symlinks(tmp_path: Path) -> None:
+    approved_root = tmp_path / "approved-checkpoints"
+    approved_root.mkdir()
+    checkpoint, approved = _checkpoint(approved_root)
+    linked_root = tmp_path / "linked-checkpoints"
+    linked_root.symlink_to(approved_root, target_is_directory=True)
+    matrix = {
+        "bundles": {"candidate": _bundle_payload(checkpoint, approved)},
+        "ablations": {},
+    }
+    source = tmp_path / "matrix.json"
+    source.write_text(json.dumps(matrix), encoding="utf-8")
+
+    with pytest.raises(CheckpointIdentityError, match="non-symlink directory"):
+        snapshot_model_matrix_file(
+            source,
+            tmp_path / "snapshot" / "matrix.json",
+            tmp_path / "snapshot" / "checkpoints",
+            kind="evaluator",
+            source_root=linked_root,
+        )
 
 
 def test_p17_matrix_snapshot_rewrites_available_bundle_paths(tmp_path: Path) -> None:
@@ -345,10 +432,17 @@ def test_workflow_snapshots_evaluator_and_p17_checkpoint_paths() -> None:
         / "workflows"
         / "formal-evaluation.yml"
     ).read_text(encoding="utf-8")
-    assert workflow.count("tools/snapshot_evaluation_checkpoints.py") == 2
+    assert workflow.count("python -I -B -m douzero.evaluation.snapshot_cli") == 2
     assert "--kind evaluator" in workflow
     assert "--kind p17" in workflow
-    assert 'FORMAL_MODEL_MATRIX=$run_root/inputs/model-matrix.json' in workflow
-    assert 'FORMAL_P17_MATRIX=$run_root/inputs/p17-matrix.json' in workflow
+    assert '--source-root "$model_checkpoint_root"' in workflow
+    assert '--source-root "$p17_checkpoint_root"' in workflow
+    assert (
+        "FORMAL_MODEL_MATRIX=$run_root/evaluator-snapshot/model-matrix.json"
+        in workflow
+    )
+    assert (
+        "FORMAL_P17_MATRIX=$run_root/p17-snapshot/p17-matrix.json" in workflow
+    )
     assert "SNAPSHOT_MODEL_MATRIX_SHA256" in workflow
     assert "SNAPSHOT_P17_MATRIX_SHA256" in workflow

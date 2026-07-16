@@ -200,7 +200,8 @@ python generate_eval_data.py \
   --output-format formal-json
 ```
 
-The protected `.github/workflows/formal-evaluation.yml` job executes:
+Inside its immutable evaluator image, the protected
+`.github/workflows/formal-evaluation.yml` job executes the equivalent of:
 
 ```bash
 python evaluate_paired.py \
@@ -221,22 +222,55 @@ GitHub workflow/run identity, a protected self-hosted runner, the immutable OCI
 `FORMAL_EVALUATOR_IMAGE` environment variable, an exact sorted `pip freeze`
 digest configured as protected `FORMAL_PYTHON_PACKAGES_SHA256`, and a recorded
 hardware/runtime inventory. The workflow verifies the image's `RepoDigests`
-and actually runs evaluation in that image with networking disabled, the source
-and evidence snapshots mounted read-only, and only the result directory
-writable. Setting lookalike environment variables locally cannot produce the
-detached attestation required by collation.
+and actually runs evaluation and collation in that image with networking
+disabled, a read-only root filesystem, all Linux capabilities dropped,
+`no-new-privileges`, and source/input/checkpoint mounts read-only. The output
+for each stage is a dedicated persistent writable mount; `/tmp` is an
+ephemeral size-bounded tmpfs. `control`, `audit`, `result`, and `p17` are
+separate sibling directories. Approved-source containers never receive the
+audit or control directory, and the collator receives the signed result only
+as a read-only file. Setting lookalike environment variables locally cannot
+produce the detached attestation required by collation.
+
+Image pull, GitHub attestation publication/verification, and artifact upload are
+host-orchestration steps and therefore use network access. Their pinned action
+SHAs, protected-environment configuration, self-hosted runner administration,
+and upload allowlists are part of the trust boundary. The workflow file alone
+does not prove that required reviewers, runner isolation, protected variables,
+or holdout access controls were configured correctly; each formal run must
+audit those external controls. For private holdouts, the upload steps exclude
+the raw result, deals, traces, and per-decision evidence and publish only the
+strict projection, aggregate reports, manifests, and attestation audit data.
+
+Control-plane helpers are separated from approved-source execution. Strict
+request, private-projection, and manifest validators use isolated stdlib Python
+(`python -I -S -`) without the checkout mounted and without `PYTHONPATH`.
+Dependency inventory likewise runs from the pinned image without the checkout
+using isolated module execution, and its protected digest is checked before
+the image receives any checkpoint root. Only the core evaluator, result-identity
+binder, and P17 collator intentionally mount and execute the exact approved
+source commit, read-only and offline. This distinction prevents checkout
+startup hooks from influencing the validators that decide which protected
+inputs or private outputs cross the boundary.
+
+The host side is limited to system-level checkout/hash/install/path, Docker,
+GitHub CLI/attestation, permission, and upload orchestration. It does not run a
+Python module, shell script, or executable from the checkout against protected
+inputs. Approved-source Python starts only inside the isolated evaluator
+containers described above.
 
 The dispatch surface accepts only `source_sha`, which must equal the protected
 `main` ref, workflow SHA, and checked-out HEAD. All other run selection comes
 from one request file selected by the protected environment variables
 `FORMAL_EVALUATION_REQUEST_PATH` and
 `FORMAL_EVALUATION_REQUEST_SHA256`. The workflow snapshots and hash-checks that
-file, then parses it offline in the immutable evaluator image. Its strict
-`formal-evaluation-request-v1` JSON object contains exactly:
+file in a step-scoped environment, then passes only the run-local snapshot to
+the immutable evaluator image. The original path is not job-wide. Its strict
+`formal-evaluation-request-v2` JSON object contains exactly:
 
 ```json
 {
-  "schema_version": "formal-evaluation-request-v1",
+  "schema_version": "formal-evaluation-request-v2",
   "mode": "full_game",
   "dataset_scope": "private_holdout",
   "eval_data_path": "/protected/evaluation/deals.json",
@@ -244,8 +278,10 @@ file, then parses it offline in the immutable evaluator image. Its strict
   "deal_set_id": "<64 lowercase hex characters>",
   "model_matrix_path": "/protected/evaluation/models.json",
   "model_matrix_sha256": "<64 lowercase hex characters>",
+  "model_checkpoint_root": "/protected/evaluation/model-checkpoints",
   "p17_matrix_path": "/protected/evaluation/p17-models.json",
   "p17_matrix_sha256": "<64 lowercase hex characters>",
+  "p17_checkpoint_root": "/protected/evaluation/p17-checkpoints",
   "candidate": "candidate-v1",
   "baseline": "baseline-v1",
   "bootstrap_samples": 2000
@@ -257,6 +293,36 @@ unsafe/non-canonical paths, embedded newlines, unsupported modes/scopes, and
 malformed identities fail before any evidence file is opened. Publication
 scope is taken from the validated request step output, so a dispatch caller
 cannot route a private holdout through the public artifact path.
+Version 1 requests are rejected because they do not declare the two protected
+checkpoint roots. The parser's raw asset paths exist only in a private,
+strictly generated handoff file for the immediately following snapshot step;
+that file is deleted after use. Later steps receive only run-local snapshot
+paths and non-secret hashes, names, mode, scope, and count identities.
+
+The two checkpoint roots are canonical absolute non-symlink directories,
+disjoint from the checkout and run/output directories. Every matrix checkpoint
+path must resolve beneath its corresponding approved root. Snapshotting runs in
+the pinned evaluator image through its installed
+`douzero.evaluation.snapshot_cli` module with `python -I -B -m`; that container
+does not mount the checkout and does not receive `PYTHONPATH`. It sees only the
+approved matrix inputs read-only, one approved checkpoint root read-only, and
+one snapshot directory writable. The rewritten matrices point only to the
+verified snapshots subsequently mounted read-only for evaluation/collation.
+This image-owned step prevents an approved matrix from turning arbitrary host
+paths into evidence or executing checkout-controlled snapshot helpers.
+
+The protected image digest, protected GitHub environment, isolated self-hosted
+runner, and approved source SHA are explicit trust roots. Mount isolation and
+fixed-schema projection reduce accidental or opportunistic disclosure, but
+cannot prove that a deliberately malicious approved evaluator or collator has
+no covert encoding. Independent source approval and protected-run review remain
+required.
+
+Because `source_sha` must already be the protected `main` commit containing the
+same workflow, a Draft PR branch cannot create formal evidence under this
+contract. The implementation may be reviewed and merged as fail-closed
+infrastructure, but release evidence is generated only from a subsequently
+approved `main` commit. A green PR matrix is not a substitute for that run.
 
 The protected GitHub Actions evaluator signs the exact result JSON with its
 OIDC identity/Sigstore-backed GitHub artifact attestation. The canonical

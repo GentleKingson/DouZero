@@ -40,16 +40,159 @@ def _all_run_scripts() -> str:
     )
 
 
+def _logical_shell_commands(script: str) -> list[str]:
+    """Join backslash continuations without trying to interpret Bash."""
+
+    commands: list[str] = []
+    pending: list[str] = []
+    for raw_line in script.splitlines():
+        line = raw_line.strip()
+        if not pending and (not line or line.startswith("#")):
+            continue
+        continued = raw_line.rstrip().endswith("\\")
+        pending.append(line[:-1].rstrip() if continued else line)
+        if not continued:
+            commands.append(" ".join(part for part in pending if part))
+            pending = []
+    if pending:
+        commands.append(" ".join(part for part in pending if part))
+    return commands
+
+
+def _docker_array_spans(script: str) -> tuple[set[str], dict[int, int]]:
+    """Return Docker command-array names and their raw-line spans."""
+
+    lines = script.splitlines()
+    names: set[str] = set()
+    spans: dict[int, int] = {}
+    index = 0
+    while index < len(lines):
+        match = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)=\(\s*", lines[index])
+        if match is None:
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines) and lines[end].strip() != ")":
+            end += 1
+        if end == len(lines):
+            index += 1
+            continue
+        block = "\n".join(lines[index : end + 1])
+        if re.search(r"(?m)^\s*docker\s+run\b", block):
+            names.add(match.group(1))
+            spans[index] = end
+        index = end + 1
+    return names, spans
+
+
+def _host_visible_commands(script: str) -> list[str]:
+    """Exclude commands and inline programs that are unambiguously in Docker."""
+
+    lines = script.splitlines()
+    docker_arrays, array_spans = _docker_array_spans(script)
+    commands: list[str] = []
+    index = 0
+    while index < len(lines):
+        if index in array_spans:
+            index = array_spans[index] + 1
+            continue
+        raw_parts: list[str] = []
+        while index < len(lines):
+            raw_line = lines[index]
+            index += 1
+            line = raw_line.strip()
+            if not raw_parts and (not line or line.startswith("#")):
+                continue
+            continued = raw_line.rstrip().endswith("\\")
+            raw_parts.append(line[:-1].rstrip() if continued else line)
+            if not continued:
+                break
+        if not raw_parts:
+            continue
+        command = " ".join(part for part in raw_parts if part)
+        in_container = command.startswith("docker run ") or any(
+            command.startswith(f'"${{{name}[@]}}"')
+            or command.startswith(f"${{{name}[@]}}")
+            for name in docker_arrays
+        )
+        chained_after_container = bool(
+            in_container and re.search(r"\s(?:;|&&|\|\||[|&])\s", command)
+        )
+
+        heredoc = re.search(
+            r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", command
+        )
+        if not in_container or chained_after_container:
+            commands.append(command)
+        if heredoc is not None:
+            delimiter = heredoc.group(2)
+            while index < len(lines):
+                closing = lines[index].strip()
+                index += 1
+                if closing == delimiter:
+                    break
+            continue
+        if (
+            in_container
+            and re.search(r"\b(?:ba)?sh\s+-[^\s]*c\s+'", command)
+            and command.count("'") % 2 == 1
+        ):
+            while index < len(lines):
+                closing = lines[index].strip()
+                index += 1
+                if closing == "'":
+                    break
+    return commands
+
+
+def _command_substitutions(script: str) -> list[str]:
+    """Extract balanced command substitutions, including nested forms."""
+
+    substitutions: list[str] = []
+    index = 0
+    while index < len(script) - 1:
+        if script[index] == "\\":
+            index += 2
+            continue
+        if script[index : index + 2] != "$(":
+            index += 1
+            continue
+        start = index + 2
+        cursor = start
+        depth = 1
+        while cursor < len(script) and depth:
+            if script[cursor] == "\\":
+                cursor += 2
+                continue
+            if script[cursor] == "(":
+                depth += 1
+            elif script[cursor] == ")":
+                depth -= 1
+            cursor += 1
+        if depth:
+            substitutions.append(script[start:])
+            break
+        content = script[start : cursor - 1]
+        substitutions.append(content)
+        substitutions.extend(_command_substitutions(content))
+        index = cursor
+    return substitutions
+
+
+def _mounts(script: str) -> set[str]:
+    return set(re.findall(r'--mount\s+"([^"]+)"', script))
+
+
 def _request_parser() -> str:
     script = _steps_by_name()[
         "Validate protected evaluation request in immutable image"
     ]["run"]
-    return script.split("python - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    return script.split("python -I -S - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
 
 
 def _valid_request() -> dict:
     return {
-        "schema_version": "formal-evaluation-request-v1",
+        "schema_version": "formal-evaluation-request-v2",
         "mode": "full_game",
         "dataset_scope": "private_holdout",
         "eval_data_path": "/protected/evaluation/eval-data.json",
@@ -57,8 +200,10 @@ def _valid_request() -> dict:
         "deal_set_id": "2" * 64,
         "model_matrix_path": "/protected/evaluation/model-matrix.json",
         "model_matrix_sha256": "3" * 64,
+        "model_checkpoint_root": "/protected/evaluation/model-checkpoints",
         "p17_matrix_path": "/protected/evaluation/p17-matrix.json",
         "p17_matrix_sha256": "4" * 64,
+        "p17_checkpoint_root": "/protected/evaluation/p17-checkpoints",
         "candidate": "candidate-v1",
         "baseline": "baseline-v1",
         "bootstrap_samples": 2000,
@@ -68,13 +213,13 @@ def _valid_request() -> dict:
 def _run_request_parser(tmp_path: Path, raw: bytes) -> subprocess.CompletedProcess:
     request_path = tmp_path / "evaluation-request.json"
     request_path.write_bytes(raw)
-    (tmp_path / "output").mkdir()
+    (tmp_path / "control").mkdir()
     env = dict(os.environ)
     env.update(
         {
             "FORMAL_EVALUATION_REQUEST": str(request_path),
             "FORMAL_EVALUATION_REQUEST_SHA256": hashlib.sha256(raw).hexdigest(),
-            "FORMAL_RUN_ROOT": str(tmp_path),
+            "FORMAL_CONTROL_ROOT": str(tmp_path / "control"),
         }
     )
     return subprocess.run(
@@ -102,10 +247,13 @@ def test_workflow_dispatch_accepts_only_the_protected_source_commit() -> None:
 
 def test_all_evaluation_identities_come_from_one_protected_request() -> None:
     env = _job()["env"]
-    assert env["FORMAL_EVALUATION_REQUEST_PATH"] == (
+    assert "FORMAL_EVALUATION_REQUEST_PATH" not in env
+    assert "FORMAL_EVALUATION_REQUEST_SHA256" not in env
+    snapshot = _steps_by_name()["Snapshot protected evaluation request"]
+    assert snapshot["env"]["FORMAL_EVALUATION_REQUEST_PATH"] == (
         "${{ vars.FORMAL_EVALUATION_REQUEST_PATH }}"
     )
-    assert env["FORMAL_EVALUATION_REQUEST_SHA256"] == (
+    assert snapshot["env"]["FORMAL_EVALUATION_REQUEST_SHA256"] == (
         "${{ vars.FORMAL_EVALUATION_REQUEST_SHA256 }}"
     )
     caller_controlled = {
@@ -116,8 +264,10 @@ def test_all_evaluation_identities_come_from_one_protected_request() -> None:
         "APPROVED_DEAL_SET_ID",
         "APPROVED_MODEL_MATRIX_PATH",
         "APPROVED_MODEL_MATRIX_SHA256",
+        "APPROVED_MODEL_CHECKPOINT_ROOT",
         "APPROVED_P17_MATRIX_PATH",
         "APPROVED_P17_MATRIX_SHA256",
+        "APPROVED_P17_CHECKPOINT_ROOT",
         "CANDIDATE_BUNDLE",
         "BASELINE_BUNDLE",
         "BOOTSTRAP_SAMPLES",
@@ -128,13 +278,19 @@ def test_all_evaluation_identities_come_from_one_protected_request() -> None:
         "Validate protected evaluation request in immutable image"
     ]
     assert request["id"] == "request"
+    assert request["env"] == {
+        "FORMAL_EVALUATION_REQUEST": "${{ steps.request_snapshot.outputs.path }}",
+        "FORMAL_EVALUATION_REQUEST_SHA256": (
+            "${{ steps.request_snapshot.outputs.sha256 }}"
+        ),
+    }
     script = request["run"]
     assert "docker run --rm --interactive" in script
     assert "--pull never" in script
     assert '--entrypoint ""' in script
     assert "--network none" in script
     assert '"$FORMAL_EVALUATOR_IMAGE"' in script
-    assert 'SCHEMA = "formal-evaluation-request-v1"' in script
+    assert 'SCHEMA = "formal-evaluation-request-v2"' in script
     for field in (
         "mode",
         "dataset_scope",
@@ -143,8 +299,10 @@ def test_all_evaluation_identities_come_from_one_protected_request() -> None:
         "deal_set_id",
         "model_matrix_path",
         "model_matrix_sha256",
+        "model_checkpoint_root",
         "p17_matrix_path",
         "p17_matrix_sha256",
+        "p17_checkpoint_root",
         "candidate",
         "baseline",
         "bootstrap_samples",
@@ -161,8 +319,34 @@ def test_all_evaluation_identities_come_from_one_protected_request() -> None:
     assert "str(parsed) != value" in script
     assert "type(samples) is not int" in script
     assert "2000 <= samples <= 100_000" in script
-    assert 'cat "$env_file" >>"$GITHUB_ENV"' in script
+    assert 'cat "$env_file" >>"$GITHUB_ENV"' not in script
     assert 'cat "$outputs_file" >>"$GITHUB_OUTPUT"' in script
+    assert _mounts(script) == {
+        "type=bind,src=$FORMAL_EVALUATION_REQUEST,"
+        "dst=$FORMAL_EVALUATION_REQUEST,readonly",
+        "type=bind,src=$FORMAL_CONTROL_ROOT,dst=$FORMAL_CONTROL_ROOT",
+    }
+    input_snapshot = _steps_by_name()[
+        "Validate and snapshot approved evaluation inputs"
+    ]["run"]
+    assert 'source "$validated_env"' in input_snapshot
+    assert "rm -f -- \\" in input_snapshot
+    for removed in (
+        '"$validated_env"',
+        '"$validated_outputs"',
+        '"$run_root/inputs/evaluation-request.json"',
+        '"$run_root/inputs/model-matrix.approved.json"',
+        '"$run_root/inputs/p17-matrix.approved.json"',
+    ):
+        assert removed in input_snapshot
+    for raw_path in (
+        "APPROVED_EVAL_DATA_PATH",
+        "APPROVED_MODEL_MATRIX_PATH",
+        "APPROVED_MODEL_CHECKPOINT_ROOT",
+        "APPROVED_P17_MATRIX_PATH",
+        "APPROVED_P17_CHECKPOINT_ROOT",
+    ):
+        assert f'echo "{raw_path}=' not in input_snapshot
 
 
 def test_embedded_request_parser_emits_only_validated_values(tmp_path: Path) -> None:
@@ -172,16 +356,24 @@ def test_embedded_request_parser_emits_only_validated_values(tmp_path: Path) -> 
     result = _run_request_parser(tmp_path, raw)
     assert result.returncode == 0, result.stderr
 
-    env_lines = (tmp_path / "output" / "validated-request.env").read_text(
+    env_lines = (tmp_path / "control" / "validated-request.env").read_text(
         encoding="utf-8"
     ).splitlines()
-    assert len(env_lines) == 13
+    assert len(env_lines) == 15
     assert "EVALUATION_MODE=full_game" in env_lines
     assert "DATASET_SCOPE=private_holdout" in env_lines
     assert "APPROVED_DEAL_SET_ID=" + "2" * 64 in env_lines
+    assert (
+        "APPROVED_MODEL_CHECKPOINT_ROOT=/protected/evaluation/model-checkpoints"
+        in env_lines
+    )
+    assert (
+        "APPROVED_P17_CHECKPOINT_ROOT=/protected/evaluation/p17-checkpoints"
+        in env_lines
+    )
     assert "BOOTSTRAP_SAMPLES=2000" in env_lines
     outputs = (
-        tmp_path / "output" / "validated-request.outputs"
+        tmp_path / "control" / "validated-request.outputs"
     ).read_text(encoding="utf-8")
     assert outputs == "mode=full_game\ndataset_scope=private_holdout\n"
 
@@ -198,6 +390,12 @@ def test_embedded_request_parser_rejects_untrusted_json_forms(
     newline["candidate"] = "candidate\nDATASET_SCOPE=public"
     noncanonical_path = dict(valid)
     noncanonical_path["eval_data_path"] = "//protected/evaluation/deals.json"
+    noncanonical_root = dict(valid)
+    noncanonical_root["model_checkpoint_root"] = (
+        "/protected/evaluation/../model-checkpoints"
+    )
+    relative_root = dict(valid)
+    relative_root["p17_checkpoint_root"] = "protected/p17-checkpoints"
     wrong_type = dict(valid)
     wrong_type["bootstrap_samples"] = True
     too_many_bootstraps = dict(valid)
@@ -217,6 +415,8 @@ def test_embedded_request_parser_rejects_untrusted_json_forms(
         ).encode("utf-8"),
         json.dumps(newline, separators=(",", ":")).encode("utf-8"),
         json.dumps(noncanonical_path, separators=(",", ":")).encode("utf-8"),
+        json.dumps(noncanonical_root, separators=(",", ":")).encode("utf-8"),
+        json.dumps(relative_root, separators=(",", ":")).encode("utf-8"),
         json.dumps(wrong_type, separators=(",", ":")).encode("utf-8"),
         json.dumps(too_many_bootstraps, separators=(",", ":")).encode("utf-8"),
         json.dumps(invalid_scope, separators=(",", ":")).encode("utf-8"),
@@ -276,10 +476,18 @@ def test_evaluator_image_and_dependencies_come_only_from_protected_environment()
         "${{ vars.FORMAL_PYTHON_PACKAGES_SHA256 }}"
     )
     assert env["PYTHONNOUSERSITE"] == "1"
-    assert env["PYTHONPATH"] == "${{ github.workspace }}"
+    assert "PYTHONPATH" not in env
     assert "DOUZERO_EVALUATOR_IMAGE_DIGEST" not in env
 
     steps = _steps_by_name()
+    for name in (
+        "Run formal paired evaluation in the immutable image",
+        "Bind run, input, dependency, and hardware identity into result",
+        "Collate replayed P17 artifacts inside protected boundary",
+    ):
+        assert '--env PYTHONPATH="$GITHUB_WORKSPACE"' in steps[name]["run"]
+        assert "--env DOUZERO_GIT_SHA=" in steps[name]["run"]
+
     image = steps["Pull and verify protected immutable evaluator image"]["run"]
     assert 'docker pull --quiet "$FORMAL_EVALUATOR_IMAGE"' in image
     assert ".RepoDigests" in image
@@ -294,10 +502,19 @@ def test_evaluator_image_and_dependencies_come_only_from_protected_environment()
     assert "douzero-formal-venv" not in raw
 
     scripts = _all_run_scripts()
-    assert scripts.count("docker run") == 7
-    assert scripts.count('--entrypoint ""') == 7
-    assert scripts.count("--network none") == 7
+    docker_run_definitions = scripts.count("docker run")
+    assert docker_run_definitions == 8
+    assert scripts.count('--entrypoint ""') == docker_run_definitions
+    assert scripts.count("--network none") == docker_run_definitions
     assert "--network bridge" not in scripts
+    assert "--volume" not in scripts
+    short_volume = r"(?:-v|\"-v\"|'-v')"
+    assert re.search(rf"(?m)^\s*{short_volume}(?:\s|=)", scripts) is None
+    assert re.search(
+        rf"docker\s+run[^\n]*\s{short_volume}(?:\s|=)", scripts
+    ) is None
+    mount_tokens = re.findall(r"(?<!\S)--mount(?:\s|=)", scripts)
+    assert len(mount_tokens) == scripts.count('--mount "')
 
 
 def test_evaluation_runs_offline_in_exact_image_with_read_only_evidence() -> None:
@@ -315,14 +532,22 @@ def test_evaluation_runs_offline_in_exact_image_with_read_only_evidence() -> Non
         '--mount "type=bind,src=$GITHUB_WORKSPACE,'
         'dst=$GITHUB_WORKSPACE,readonly"'
     ) in evaluation
-    for directory in ("inputs", "evaluator-checkpoints", "p17-checkpoints"):
-        assert (
-            f'src=$FORMAL_RUN_ROOT/{directory},'
-            f'dst=$FORMAL_RUN_ROOT/{directory},readonly'
-        ) in evaluation
+    assert 'src=$FORMAL_EVAL_DATA,dst=$FORMAL_EVAL_DATA,readonly' in evaluation
     assert (
-        'src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output"'
+        "src=$FORMAL_RUN_ROOT/evaluator-snapshot,"
+        "dst=$FORMAL_RUN_ROOT/evaluator-snapshot,readonly" in evaluation
+    )
+    assert "$FORMAL_RUN_ROOT/p17-snapshot" not in evaluation
+    assert (
+        'src=$FORMAL_RUN_ROOT/result,dst=$FORMAL_RUN_ROOT/result"'
     ) in evaluation
+    assert _mounts(evaluation) == {
+        "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly",
+        "type=bind,src=$FORMAL_EVAL_DATA,dst=$FORMAL_EVAL_DATA,readonly",
+        "type=bind,src=$FORMAL_RUN_ROOT/evaluator-snapshot,"
+        "dst=$FORMAL_RUN_ROOT/evaluator-snapshot,readonly",
+        "type=bind,src=$FORMAL_RUN_ROOT/result,dst=$FORMAL_RUN_ROOT/result",
+    }
     for identity in (
         "GITHUB_ACTIONS",
         "GITHUB_REPOSITORY",
@@ -338,6 +563,91 @@ def test_evaluation_runs_offline_in_exact_image_with_read_only_evidence() -> Non
         assert f"--env {identity}" in evaluation
 
 
+def test_checkout_code_cannot_write_trusted_audit_or_other_stage_outputs() -> None:
+    steps = _steps_by_name()
+    evaluation = steps[
+        "Run formal paired evaluation in the immutable image"
+    ]["run"]
+    binder = steps[
+        "Bind run, input, dependency, and hardware identity into result"
+    ]["run"]
+    collation = steps[
+        "Collate replayed P17 artifacts inside protected boundary"
+    ]["run"]
+
+    for script in (evaluation, binder, collation):
+        assert "FORMAL_AUDIT_ROOT" not in script
+    assert "FORMAL_P17_OUTPUT" not in evaluation
+    assert "$FORMAL_RUN_ROOT/p17-snapshot" not in evaluation
+
+    assert "src=$FORMAL_RUN_ROOT/result,dst=$FORMAL_RUN_ROOT/result" in binder
+    assert _mounts(binder) == {
+        "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly",
+        "type=bind,src=$FORMAL_RUN_ROOT/result,dst=$FORMAL_RUN_ROOT/result",
+    }
+    for forbidden in (
+        "FORMAL_RUN_ROOT/inputs",
+        "evaluator-snapshot",
+        "p17-snapshot",
+        "FORMAL_P17_OUTPUT",
+    ):
+        assert forbidden not in binder
+    assert '[[ -f "$FORMAL_RESULT_JSON" && ! -L "$FORMAL_RESULT_JSON" ]]' in binder
+    assert 'realpath -e -- "$FORMAL_RESULT_JSON"' in binder
+    assert 'stat -c \'%F\' "$FORMAL_RESULT_JSON"' in binder
+
+    for readonly_input in (
+        "src=$FORMAL_EVAL_DATA,dst=$FORMAL_EVAL_DATA,readonly",
+        "src=$FORMAL_RESULT_JSON,dst=$FORMAL_RESULT_JSON,readonly",
+        "src=$attestation_snapshot,dst=$attestation_snapshot,readonly",
+        "src=$FORMAL_RUN_ROOT/p17-snapshot,"
+        "dst=$FORMAL_RUN_ROOT/p17-snapshot,readonly",
+    ):
+        assert readonly_input in collation
+    assert "src=$FORMAL_P17_OUTPUT,dst=$FORMAL_P17_OUTPUT" in collation
+    assert "src=$FORMAL_RUN_ROOT/inputs" not in collation
+    assert "src=$FORMAL_RUN_ROOT/result,dst=$FORMAL_RUN_ROOT/result" not in collation
+
+    collation_lines = collation.splitlines()
+    docker_arrays, spans = _docker_array_spans(collation)
+    assert docker_arrays == {"container"}
+    container_start = next(
+        index
+        for index, line in enumerate(collation_lines)
+        if re.fullmatch(r"\s*container=\(\s*", line)
+    )
+    container = "\n".join(
+        collation_lines[container_start : spans[container_start] + 1]
+    )
+    assert _mounts(container) == {
+        "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly",
+        "type=bind,src=$FORMAL_EVAL_DATA,dst=$FORMAL_EVAL_DATA,readonly",
+        "type=bind,src=$FORMAL_RESULT_JSON,dst=$FORMAL_RESULT_JSON,readonly",
+        "type=bind,src=$attestation_snapshot,dst=$attestation_snapshot,readonly",
+        "type=bind,src=$FORMAL_RUN_ROOT/p17-snapshot,"
+        "dst=$FORMAL_RUN_ROOT/p17-snapshot,readonly",
+        "type=bind,src=$FORMAL_P17_OUTPUT,dst=$FORMAL_P17_OUTPUT",
+    }
+    private_commands = [
+        command
+        for command in _logical_shell_commands(collation)
+        if 'python -I -S - "$release_result" "$FORMAL_RESULT_JSON"' in command
+    ]
+    assert len(private_commands) == 1
+    assert _mounts(private_commands[0]) == {
+        "type=bind,src=$release_result,dst=$release_result,readonly",
+        "type=bind,src=$FORMAL_RESULT_JSON,dst=$FORMAL_RESULT_JSON,readonly",
+    }
+
+    recheck = steps[
+        "Recheck immutable upload subjects and audit material"
+    ]["run"]
+    assert "require_regular" in recheck
+    assert "PYTHON_PACKAGES_SHA256" in recheck
+    assert "EXPECTED_RESULT_SHA256" in recheck
+    assert "EXPECTED_MANIFEST_SHA256" in recheck
+
+
 def test_container_dependency_manifest_must_match_protected_digest() -> None:
     dependency = _steps_by_name()[
         "Verify the immutable image dependency set"
@@ -345,13 +655,35 @@ def test_container_dependency_manifest_must_match_protected_digest() -> None:
     assert "--network none" in dependency
     assert '"$FORMAL_EVALUATOR_IMAGE"' in dependency
     assert "command -v gh" in dependency
-    assert "python -m pip freeze --all" in dependency
+    assert "python -I -B -m pip freeze --all" in dependency
     assert "LC_ALL=C sort" in dependency
     assert (
         '[[ "$package_sha" == "$APPROVED_PYTHON_PACKAGES_SHA256" ]]'
         in dependency
     )
     assert "PYTHON_PACKAGES_SHA256=$package_sha" in dependency
+    names = [step["name"] for step in _job()["steps"]]
+    package_index = names.index("Verify the immutable image dependency set")
+    request_snapshot_index = names.index("Snapshot protected evaluation request")
+    assert package_index == request_snapshot_index + 1
+    assert package_index < names.index(
+        "Validate protected evaluation request in immutable image"
+    )
+    assert package_index < names.index(
+        "Validate and snapshot approved evaluation inputs"
+    )
+    assert "--workdir /tmp" in dependency
+    assert "FORMAL_AUDIT_ROOT" in dependency
+    for forbidden_mount in (
+        "GITHUB_WORKSPACE",
+        "FORMAL_EVALUATION_REQUEST",
+        "FORMAL_RUN_ROOT/inputs",
+        "PYTHONPATH",
+    ):
+        assert forbidden_mount not in dependency
+    assert _mounts(dependency) == {
+        "type=bind,src=$FORMAL_AUDIT_ROOT,dst=$FORMAL_AUDIT_ROOT"
+    }
 
 
 def test_inputs_are_hash_checked_snapshots_not_shell_interpolation() -> None:
@@ -369,17 +701,250 @@ def test_inputs_are_hash_checked_snapshots_not_shell_interpolation() -> None:
     assert '"$APPROVED_EVAL_DATA_PATH" == /*' in script
     assert '"$APPROVED_MODEL_MATRIX_PATH" == /*' in script
     assert '"$APPROVED_P17_MATRIX_PATH" == /*' in script
+    assert '"$APPROVED_MODEL_CHECKPOINT_ROOT" == /*' in script
+    assert '"$APPROVED_P17_CHECKPOINT_ROOT" == /*' in script
+    assert (
+        '[[ -d "$APPROVED_MODEL_CHECKPOINT_ROOT" '
+        '&& ! -L "$APPROVED_MODEL_CHECKPOINT_ROOT" ]]' in script
+    )
+    assert (
+        '[[ -d "$APPROVED_P17_CHECKPOINT_ROOT" '
+        '&& ! -L "$APPROVED_P17_CHECKPOINT_ROOT" ]]' in script
+    )
+    assert 'realpath -e -- "$APPROVED_MODEL_CHECKPOINT_ROOT"' in script
+    assert 'realpath -e -- "$APPROVED_P17_CHECKPOINT_ROOT"' in script
+    assert '[[ "$checkpoint_root" != "$GITHUB_WORKSPACE" ]]' in script
+    assert '[[ "$checkpoint_root" != "$FORMAL_RUN_ROOT" ]]' in script
     assert '"$APPROVED_DEAL_SET_ID" =~ ^[0-9a-f]{64}$' in script
     assert 'scenario.get("num_deals", 0) < 1000' in script
     assert 'scenario.get("bootstrap_samples", 0) < 2000' in script
     assert 'run_root="$RUNNER_TEMP/douzero-formal-' in script
     assert '[[ ! -e "$run_root" ]]' in script
     assert "FORMAL_EVAL_DATA=$run_root/inputs/eval-data.json" in script
+    assert "FORMAL_MODEL_MATRIX=$run_root/evaluator-snapshot/model-matrix.json" in script
+    assert "FORMAL_P17_MATRIX=$run_root/p17-snapshot/p17-matrix.json" in script
     assert "eval-data.pkl" not in script
-    assert "FORMAL_RESULT_JSON=$run_root/output/formal-evaluation-result.json" in script
+    assert "FORMAL_RESULT_JSON=$run_root/result/formal-evaluation-result.json" in script
+    assert "FORMAL_P17_OUTPUT=$run_root/p17" in script
     for step in _job()["steps"]:
         if "run" in step:
             assert "${{ inputs." not in step["run"]
+
+
+def test_both_checkpoint_snapshots_run_in_one_hardened_container_contract() -> None:
+    snapshot = _steps_by_name()[
+        "Validate and snapshot approved evaluation inputs"
+    ]["run"]
+    lines = snapshot.splitlines()
+    docker_arrays, spans = _docker_array_spans(snapshot)
+    assert "snapshot_container" in docker_arrays
+    start = next(
+        index
+        for index, line in enumerate(lines)
+        if re.fullmatch(r"\s*snapshot_container=\(\s*", line)
+    )
+    container = "\n".join(lines[start : spans[start] + 1])
+    for hardening in (
+        "docker run --rm",
+        "--pull never",
+        '--entrypoint ""',
+        "--network none",
+        "--read-only",
+        '--user "$(id -u):$(id -g)"',
+        "--security-opt no-new-privileges",
+        "--cap-drop ALL",
+    ):
+        assert hardening in container
+    assert "GITHUB_WORKSPACE" not in container
+    assert "PYTHONPATH" not in container
+    assert "$run_root/inputs" not in container
+    assert "--workdir /tmp" in container
+    assert "tools/snapshot_evaluation_checkpoints.py" not in snapshot
+
+    snapshot_commands = [
+        command
+        for command in _logical_shell_commands(snapshot)
+        if "python -I -B -m douzero.evaluation.snapshot_cli" in command
+    ]
+    assert len(snapshot_commands) == 2
+    assert all(
+        command.startswith('"${snapshot_container[@]}" ')
+        for command in snapshot_commands
+    )
+
+    evaluator = next(
+        command for command in snapshot_commands if "--kind evaluator" in command
+    )
+    p17 = next(
+        command for command in snapshot_commands if "--kind p17" in command
+    )
+    for command, root, checkpoint_dir, matrix, output in (
+        (
+            evaluator,
+            "model_checkpoint_root",
+            "evaluator-snapshot",
+            "model-matrix.approved.json",
+            "model-matrix.json",
+        ),
+        (
+            p17,
+            "p17_checkpoint_root",
+            "p17-snapshot",
+            "p17-matrix.approved.json",
+            "p17-matrix.json",
+        ),
+    ):
+        assert (
+            f'src=${root},dst=${root},readonly"' in command
+        )
+        assert (
+            f"src=$run_root/{checkpoint_dir},"
+            f'dst=$run_root/{checkpoint_dir}"' in command
+        )
+        assert f'--matrix "$run_root/inputs/{matrix}"' in command
+        assert (
+            f"src=$run_root/inputs/{matrix},"
+            f"dst=$run_root/inputs/{matrix},readonly" in command
+        )
+        assert f'--source-root "${root}"' in command
+        assert (
+            f'--checkpoint-dir "$run_root/{checkpoint_dir}/checkpoints"'
+            in command
+        )
+        assert f'--output "$run_root/{checkpoint_dir}/{output}"' in command
+        assert (
+            '"$FORMAL_EVALUATOR_IMAGE" '
+            "python -I -B -m douzero.evaluation.snapshot_cli" in command
+        )
+        assert _mounts(command) == {
+            f"type=bind,src=$run_root/inputs/{matrix},"
+            f"dst=$run_root/inputs/{matrix},readonly",
+            f"type=bind,src=${root},dst=${root},readonly",
+            f"type=bind,src=$run_root/{checkpoint_dir},"
+            f"dst=$run_root/{checkpoint_dir}",
+        }
+
+
+def test_protected_inputs_never_reach_checkout_code_on_the_host() -> None:
+    assert set(_workflow()["jobs"]) == {"evaluate-and-attest"}
+    steps = _job()["steps"]
+    interpreter = re.compile(
+        r"(?<![A-Za-z0-9_])(?:"
+        r"python(?:3(?:\.[0-9]+)?)?|bash|sh|make|pytest|tox|node|npm|npx|"
+        r"yarn|pnpm|uv|perl|ruby"
+        r")(?:\s|$)"
+    )
+    repo_executable = re.compile(
+        r"(?:^|&&|\|\||[;|&]|\bthen\b|\bdo\b)\s*"
+        r"(?:(?:command|exec|env)\s+)*"
+        r"(?:(?:source|\.)\s+)?"
+        r"['\"]?(?:\./|\$\{?GITHUB_WORKSPACE\}?/|\$PWD/|\.github/|"
+        r"tools/|scripts/|douzero/|evaluate_paired\.py|generate_eval_data\.py)"
+    )
+    checkout_literal = re.compile(
+        r"(?:\./|\$\{?GITHUB_WORKSPACE\}?/|\$PWD/|"
+        r"(?<![A-Za-z0-9_/])\.github/|tools/|scripts/|douzero/|"
+        r"evaluate_paired\.py|generate_eval_data\.py)"
+    )
+    assignment = re.compile(
+        r"^(?:(?:export|readonly|local)\s+)?[A-Za-z_][A-Za-z0-9_]*="
+    )
+    forbidden_examples = (
+        "python tools/checkout_tool.py",
+        "python -m douzero.checkout_module",
+        "bash scripts/from_checkout.sh",
+        'sh "$GITHUB_WORKSPACE/scripts/from_checkout.sh"',
+        "make release",
+        "node tools/from_checkout.js",
+        "uv run pytest",
+        "./tools/checkout_executable",
+        '"${GITHUB_WORKSPACE}/tools/checkout_executable"',
+        "source scripts/from_checkout.sh",
+        "docker run image true | ./tools/checkout_executable",
+        "docker run image true & ./tools/checkout_executable",
+    )
+    assert all(
+        _host_visible_commands(command) == [command]
+        and (
+            interpreter.search(command) is not None
+            or repo_executable.search(command) is not None
+        )
+        for command in forbidden_examples
+    )
+    for substitution in (
+        "./tools/checkout_executable",
+        "python tools/checkout_tool.py",
+    ):
+        assert (
+            interpreter.search(substitution) is not None
+            or repo_executable.search(substitution) is not None
+        )
+    nested = (
+        'docker run --env X="$(./tools/checkout_executable "'
+        '"$(id -u)")" image true'
+    )
+    assert any(
+        repo_executable.search(substitution) is not None
+        for substitution in _command_substitutions(nested)
+    )
+    indirect = 'runner=./tools/checkout_executable\n"$runner"'
+    assert any(
+        assignment.search(command) is not None
+        and checkout_literal.search(command) is not None
+        for command in _host_visible_commands(indirect)
+    )
+
+    for step in steps:
+        if "uses" in step:
+            assert not step["uses"].startswith("./"), (
+                f"{step['name']} executes a checkout-owned local action"
+            )
+        if "run" not in step:
+            continue
+        assert step.get("shell") == "bash", (
+            f"{step['name']} uses an unapproved host shell"
+        )
+        assert (
+            "<(" not in step["run"] and ">(" not in step["run"]
+        ), f"{step['name']} uses process substitution"
+        for substitution in _command_substitutions(step["run"]):
+            assert interpreter.search(substitution) is None, (
+                f"{step['name']} executes an interpreter in a host command "
+                f"substitution: {substitution}"
+            )
+            assert repo_executable.search(substitution) is None, (
+                f"{step['name']} executes checkout content in a host command "
+                f"substitution: {substitution}"
+            )
+            assert checkout_literal.search(substitution) is None, (
+                f"{step['name']} references checkout content in a host command "
+                f"substitution: {substitution}"
+            )
+        for substitution in re.findall(r"(?<!\\)`([^`]*)`", step["run"]):
+            assert interpreter.search(substitution) is None, (
+                f"{step['name']} executes an interpreter in host backticks: "
+                f"{substitution}"
+            )
+            assert repo_executable.search(substitution) is None, (
+                f"{step['name']} executes checkout content in host backticks: "
+                f"{substitution}"
+            )
+            assert checkout_literal.search(substitution) is None, (
+                f"{step['name']} references checkout content in host backticks: "
+                f"{substitution}"
+            )
+        for command in _host_visible_commands(step["run"]):
+            assert interpreter.search(command) is None, (
+                f"{step['name']} executes an interpreter on the host: {command}"
+            )
+            assert repo_executable.search(command) is None, (
+                f"{step['name']} executes checkout content on the host: {command}"
+            )
+            if assignment.search(command) is not None:
+                assert checkout_literal.search(command) is None, (
+                    f"{step['name']} assigns checkout content on the host: "
+                    f"{command}"
+                )
 
 
 def test_complete_result_binds_run_hardware_inputs_and_dependencies() -> None:
@@ -459,6 +1024,8 @@ def test_exact_result_is_sigstore_attested_verified_and_uploaded() -> None:
     assert "${{ steps.p17-attest.outputs.bundle-path }}" in public_upload[
         "with"
     ]["path"]
+    assert "${{ env.FORMAL_AUDIT_ROOT }}/" in public_upload["with"]["path"]
+    assert "${{ env.FORMAL_RUN_ROOT }}/output/" not in public_upload["with"]["path"]
 
     private_upload = steps[
         "Upload private attestation audit without game traces"
@@ -472,6 +1039,8 @@ def test_exact_result_is_sigstore_attested_verified_and_uploaded() -> None:
     assert "${{ steps.p17-attest.outputs.bundle-path }}" in private_upload[
         "with"
     ]["path"]
+    assert "${{ env.FORMAL_AUDIT_ROOT }}/" in private_upload["with"]["path"]
+    assert "${{ env.FORMAL_RUN_ROOT }}/output/" not in private_upload["with"]["path"]
 
     collation = steps[
         "Collate replayed P17 artifacts inside protected boundary"
@@ -488,6 +1057,9 @@ def test_exact_result_is_sigstore_attested_verified_and_uploaded() -> None:
     assert 'set(scenario) != {' in collation
     assert 'set(evidence) != {' in collation
     assert 'evidence["published_game_rows"] != 0' in collation
+    assert 'signed = json.loads(Path(sys.argv[2])' in collation
+    assert 'scenario[key] != signed_scenario.get(key)' in collation
+    assert 'evidence["source_game_rows"] != len(signed_games)' in collation
     p17_verification = steps[
         "Verify P17 artifact manifest attestation"
     ]["run"]

@@ -149,16 +149,34 @@ Its dispatch surface accepts only the source SHA. A single strict JSON request,
 selected and hash-bound by protected `FORMAL_EVALUATION_REQUEST_PATH` and
 `FORMAL_EVALUATION_REQUEST_SHA256` environment variables, supplies the mode,
 dataset scope, deal path/digest/set ID, evaluator and P17 matrix paths/digests,
-candidate, baseline, and bootstrap count. The request is snapshotted and parsed
-offline in the immutable image with exact schema/type/format checks; publication
-conditions use the validated scope output rather than caller input. It pins the
+separate approved checkpoint roots, candidate, baseline, and bootstrap count.
+The request is snapshotted and parsed offline in the immutable image with exact
+schema/type/format checks. Its original path is step-scoped, and the raw path
+handoff is deleted after the approved files are snapshotted. Publication uses
+the validated scope output rather than caller input. It pins the
 source/workflow commit, snapshots the strict JSON deal file and both matrices by
 those approved SHA-256 identities, verifies and executes an immutable protected
 `repo@sha256:<digest>` OCI image, and requires that image's sorted package
-manifest to match a second protected digest. Evaluation runs offline with
-read-only source/input/checkpoint mounts. The workflow records those identities,
-its run and hardware inventory, then attests the exact result. Private results
-are replayed and collated offline in the same image before cleanup; detached
+manifest to match a second protected digest. Checkpoints must resolve below the
+declared roots and are copied by an installed image-owned module running with
+isolated Python, no checkout mount, and only root-read/snapshot-write access.
+The package digest is checked before either checkpoint root is mounted, and
+later containers receive only the files and snapshot directories required by
+their stage.
+Strict request/private-projection/manifest validators and dependency inventory
+also run from the image without mounting the checkout; only evaluation,
+result-identity binding, and collation intentionally execute the exact approved
+source. Host orchestration performs system-level hashing/copying, Docker, GitHub
+attestation, and upload operations but does not execute checkout Python, shell,
+or binaries against protected inputs.
+Control, audit, signed-result, and P17 output directories are disjoint. The
+audit directory is never mounted into approved-source containers; the collator
+sees the signed result read-only and can write only the P17 directory. Uploads
+recheck the package, result, and manifest digests immediately before transfer.
+Evaluation runs offline with read-only source/input/checkpoint mounts. The
+workflow records those identities, its run and hardware inventory, then attests
+the exact result. Private results are replayed and collated offline in the same
+image before cleanup; detached
 bundle verification does not expose holdout evidence to the network, and the
 raw trace result is never included in the uploaded private artifact.
 

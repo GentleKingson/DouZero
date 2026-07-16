@@ -35,12 +35,6 @@ jobs:
       EXPECTED_WORKFLOW_REF: >-
         GentleKingson/DouZero/.github/workflows/formal-evaluation.yml@refs/heads/main
       APPROVED_SOURCE_SHA: ${{ inputs.source_sha }}
-      # The request and its digest come from the protected environment. The
-      # dispatch caller cannot choose any evaluation or publication identity.
-      FORMAL_EVALUATION_REQUEST_PATH: >-
-        ${{ vars.FORMAL_EVALUATION_REQUEST_PATH }}
-      FORMAL_EVALUATION_REQUEST_SHA256: >-
-        ${{ vars.FORMAL_EVALUATION_REQUEST_SHA256 }}
       # These values also come from the protected environment, never dispatch.
       # The image must be a fully qualified immutable repository digest.
       FORMAL_EVALUATOR_IMAGE: ${{ vars.FORMAL_EVALUATOR_IMAGE }}
@@ -49,7 +43,6 @@ jobs:
       DOUZERO_GIT_SHA: ""
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONNOUSERSITE: "1"
-      PYTHONPATH: ${{ github.workspace }}
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
     steps:
@@ -89,11 +82,12 @@ jobs:
         run: |
           set -euo pipefail
           docker pull --quiet "$FORMAL_EVALUATOR_IMAGE"
-          mapfile -t repo_digests < <(
+          repo_digest_output="$(
             docker image inspect \
               --format '{{range .RepoDigests}}{{println .}}{{end}}' \
               "$FORMAL_EVALUATOR_IMAGE"
-          )
+          )"
+          mapfile -t repo_digests <<<"$repo_digest_output"
           matched=false
           for repo_digest in "${repo_digests[@]}"; do
             if [[ "$repo_digest" == "$FORMAL_EVALUATOR_IMAGE" ]]; then
@@ -113,7 +107,14 @@ jobs:
           } >>"$GITHUB_ENV"
 
       - name: Snapshot protected evaluation request
+        id: request_snapshot
         shell: bash
+        env:
+          # Keep the original protected path scoped to this system-only step.
+          FORMAL_EVALUATION_REQUEST_PATH: >-
+            ${{ vars.FORMAL_EVALUATION_REQUEST_PATH }}
+          FORMAL_EVALUATION_REQUEST_SHA256: >-
+            ${{ vars.FORMAL_EVALUATION_REQUEST_SHA256 }}
         run: |
           set -euo pipefail
           umask 077
@@ -129,22 +130,77 @@ jobs:
 
           run_root="$RUNNER_TEMP/douzero-formal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           [[ ! -e "$run_root" ]]
-          mkdir -m 0700 "$run_root" "$run_root/inputs" "$run_root/output"
+          mkdir -m 0700 \
+            "$run_root" \
+            "$run_root/inputs" \
+            "$run_root/control" \
+            "$run_root/audit" \
+            "$run_root/result" \
+            "$run_root/p17"
           request_snapshot="$run_root/inputs/evaluation-request.json"
           install -m 0400 "$FORMAL_EVALUATION_REQUEST_PATH" "$request_snapshot"
           [[ "$(sha256sum "$request_snapshot" | cut -d' ' -f1)" == "$request_sha" ]]
           [[ "$(sha256sum "$FORMAL_EVALUATION_REQUEST_PATH" | cut -d' ' -f1)" == "$request_sha" ]]
           {
             echo "FORMAL_RUN_ROOT=$run_root"
-            echo "FORMAL_EVALUATION_REQUEST=$request_snapshot"
-            echo "FORMAL_RESULT_PREFIX=$run_root/output/formal-evaluation-result"
-            echo "FORMAL_RESULT_JSON=$run_root/output/formal-evaluation-result.json"
-            echo "FORMAL_P17_OUTPUT=$run_root/output/p17"
+            echo "FORMAL_CONTROL_ROOT=$run_root/control"
+            echo "FORMAL_AUDIT_ROOT=$run_root/audit"
+            echo "FORMAL_RESULT_PREFIX=$run_root/result/formal-evaluation-result"
+            echo "FORMAL_RESULT_JSON=$run_root/result/formal-evaluation-result.json"
+            echo "FORMAL_P17_OUTPUT=$run_root/p17"
           } >>"$GITHUB_ENV"
+          {
+            echo "path=$request_snapshot"
+            echo "sha256=$request_sha"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Verify the immutable image dependency set
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=(
+            docker run --rm
+            --pull never
+            --entrypoint ""
+            --network none
+            --read-only
+            --user "$(id -u):$(id -g)"
+            --security-opt no-new-privileges
+            --cap-drop ALL
+            --tmpfs "/tmp:rw,nosuid,nodev,size=1g"
+            --workdir /tmp
+            --mount "type=bind,src=$FORMAL_AUDIT_ROOT,dst=$FORMAL_AUDIT_ROOT"
+            --env FORMAL_AUDIT_ROOT
+            --env PIP_DISABLE_PIP_VERSION_CHECK
+            --env HOME=/tmp/formal-home
+            "$FORMAL_EVALUATOR_IMAGE"
+          )
+          # The quoted program is expanded by the container shell, not here.
+          # shellcheck disable=SC2016
+          "${container[@]}" sh -ec '
+            mkdir -p "$HOME"
+            command -v gh >/dev/null
+            python -I -B -m pip freeze --all \
+              | LC_ALL=C sort \
+              >"$FORMAL_AUDIT_ROOT/python-packages.txt"
+          '
+          package_manifest="$FORMAL_AUDIT_ROOT/python-packages.txt"
+          [[ -f "$package_manifest" && ! -L "$package_manifest" ]]
+          [[ "$(realpath -e -- "$package_manifest")" == "$package_manifest" ]]
+          [[ "$(stat -c '%F' "$package_manifest")" == "regular file" ]]
+          package_sha="$(sha256sum "$package_manifest" | cut -d' ' -f1)"
+          [[ "$package_sha" == "$APPROVED_PYTHON_PACKAGES_SHA256" ]]
+          chmod 0444 "$package_manifest"
+          echo "PYTHON_PACKAGES_SHA256=$package_sha" >>"$GITHUB_ENV"
 
       - name: Validate protected evaluation request in immutable image
         id: request
         shell: bash
+        env:
+          FORMAL_EVALUATION_REQUEST: >-
+            ${{ steps.request_snapshot.outputs.path }}
+          FORMAL_EVALUATION_REQUEST_SHA256: >-
+            ${{ steps.request_snapshot.outputs.sha256 }}
         run: |
           set -euo pipefail
           docker run --rm --interactive \
@@ -156,26 +212,22 @@ jobs:
             --security-opt no-new-privileges \
             --cap-drop ALL \
             --tmpfs /tmp:rw,nosuid,nodev,size=64m \
-            --workdir "$GITHUB_WORKSPACE" \
-            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output" \
+            --workdir /tmp \
+            --mount "type=bind,src=$FORMAL_EVALUATION_REQUEST,dst=$FORMAL_EVALUATION_REQUEST,readonly" \
+            --mount "type=bind,src=$FORMAL_CONTROL_ROOT,dst=$FORMAL_CONTROL_ROOT" \
             --env FORMAL_EVALUATION_REQUEST \
             --env FORMAL_EVALUATION_REQUEST_SHA256 \
-            --env FORMAL_RUN_ROOT \
-            --env PYTHONDONTWRITEBYTECODE \
-            --env PYTHONNOUSERSITE \
-            --env PYTHONPATH="$GITHUB_WORKSPACE" \
+            --env FORMAL_CONTROL_ROOT \
             --env HOME=/tmp/formal-home \
             "$FORMAL_EVALUATOR_IMAGE" \
-            python - <<'PY'
+            python -I -S - <<'PY'
           import hashlib
           import json
           import os
           import re
           from pathlib import Path, PurePosixPath
 
-          SCHEMA = "formal-evaluation-request-v1"
+          SCHEMA = "formal-evaluation-request-v2"
           FIELDS = {
               "schema_version",
               "mode",
@@ -185,8 +237,10 @@ jobs:
               "deal_set_id",
               "model_matrix_path",
               "model_matrix_sha256",
+              "model_checkpoint_root",
               "p17_matrix_path",
               "p17_matrix_sha256",
+              "p17_checkpoint_root",
               "candidate",
               "baseline",
               "bootstrap_samples",
@@ -250,7 +304,9 @@ jobs:
           for key in (
               "eval_data_path",
               "model_matrix_path",
+              "model_checkpoint_root",
               "p17_matrix_path",
+              "p17_checkpoint_root",
           ):
               value = require_string(payload, key, SAFE_PATH)
               parsed = PurePosixPath(value)
@@ -274,13 +330,19 @@ jobs:
               "APPROVED_DEAL_SET_ID": payload["deal_set_id"],
               "APPROVED_MODEL_MATRIX_PATH": payload["model_matrix_path"],
               "APPROVED_MODEL_MATRIX_SHA256": payload["model_matrix_sha256"],
+              "APPROVED_MODEL_CHECKPOINT_ROOT": payload[
+                  "model_checkpoint_root"
+              ],
               "APPROVED_P17_MATRIX_PATH": payload["p17_matrix_path"],
               "APPROVED_P17_MATRIX_SHA256": payload["p17_matrix_sha256"],
+              "APPROVED_P17_CHECKPOINT_ROOT": payload[
+                  "p17_checkpoint_root"
+              ],
               "CANDIDATE_BUNDLE": payload["candidate"],
               "BASELINE_BUNDLE": payload["baseline"],
               "BOOTSTRAP_SAMPLES": str(samples),
           }
-          output_root = Path(os.environ["FORMAL_RUN_ROOT"]) / "output"
+          output_root = Path(os.environ["FORMAL_CONTROL_ROOT"])
           env_path = output_root / "validated-request.env"
           outputs_path = output_root / "validated-request.outputs"
           env_path.write_text(
@@ -293,13 +355,12 @@ jobs:
               encoding="utf-8",
           )
           PY
-          env_file="$FORMAL_RUN_ROOT/output/validated-request.env"
-          outputs_file="$FORMAL_RUN_ROOT/output/validated-request.outputs"
+          env_file="$FORMAL_CONTROL_ROOT/validated-request.env"
+          outputs_file="$FORMAL_CONTROL_ROOT/validated-request.outputs"
           [[ -f "$env_file" && ! -L "$env_file" ]]
           [[ -f "$outputs_file" && ! -L "$outputs_file" ]]
-          [[ "$(wc -l <"$env_file")" -eq 13 ]]
+          [[ "$(wc -l <"$env_file")" -eq 15 ]]
           [[ "$(wc -l <"$outputs_file")" -eq 2 ]]
-          cat "$env_file" >>"$GITHUB_ENV"
           cat "$outputs_file" >>"$GITHUB_OUTPUT"
           chmod 0400 "$env_file" "$outputs_file"
 
@@ -308,6 +369,14 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          validated_env="$FORMAL_CONTROL_ROOT/validated-request.env"
+          validated_outputs="$FORMAL_CONTROL_ROOT/validated-request.outputs"
+          [[ -f "$validated_env" && ! -L "$validated_env" ]]
+          # Values were emitted by the strict parser and exclude shell syntax.
+          set -a
+          # shellcheck disable=SC1090
+          source "$validated_env"
+          set +a
           [[ "$APPROVED_EVAL_DATA_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$APPROVED_MODEL_MATRIX_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$APPROVED_P17_MATRIX_SHA256" =~ ^[0-9a-f]{64}$ ]]
@@ -319,9 +388,27 @@ jobs:
           [[ "$APPROVED_EVAL_DATA_PATH" == /* ]]
           [[ "$APPROVED_MODEL_MATRIX_PATH" == /* ]]
           [[ "$APPROVED_P17_MATRIX_PATH" == /* ]]
+          [[ "$APPROVED_MODEL_CHECKPOINT_ROOT" == /* ]]
+          [[ "$APPROVED_P17_CHECKPOINT_ROOT" == /* ]]
           [[ -f "$APPROVED_EVAL_DATA_PATH" && ! -L "$APPROVED_EVAL_DATA_PATH" ]]
           [[ -f "$APPROVED_MODEL_MATRIX_PATH" && ! -L "$APPROVED_MODEL_MATRIX_PATH" ]]
           [[ -f "$APPROVED_P17_MATRIX_PATH" && ! -L "$APPROVED_P17_MATRIX_PATH" ]]
+          [[ -d "$APPROVED_MODEL_CHECKPOINT_ROOT" && ! -L "$APPROVED_MODEL_CHECKPOINT_ROOT" ]]
+          [[ -d "$APPROVED_P17_CHECKPOINT_ROOT" && ! -L "$APPROVED_P17_CHECKPOINT_ROOT" ]]
+
+          model_checkpoint_root="$(realpath -e -- "$APPROVED_MODEL_CHECKPOINT_ROOT")"
+          p17_checkpoint_root="$(realpath -e -- "$APPROVED_P17_CHECKPOINT_ROOT")"
+          [[ "$model_checkpoint_root" == "$APPROVED_MODEL_CHECKPOINT_ROOT" ]]
+          [[ "$p17_checkpoint_root" == "$APPROVED_P17_CHECKPOINT_ROOT" ]]
+          for checkpoint_root in "$model_checkpoint_root" "$p17_checkpoint_root"; do
+            [[ "$checkpoint_root" != / ]]
+            [[ "$checkpoint_root" != "$GITHUB_WORKSPACE" ]]
+            [[ "$checkpoint_root" != "$GITHUB_WORKSPACE/"* ]]
+            [[ "$GITHUB_WORKSPACE" != "$checkpoint_root/"* ]]
+            [[ "$checkpoint_root" != "$FORMAL_RUN_ROOT" ]]
+            [[ "$checkpoint_root" != "$FORMAL_RUN_ROOT/"* ]]
+            [[ "$FORMAL_RUN_ROOT" != "$checkpoint_root/"* ]]
+          done
 
           eval_sha="$(sha256sum "$APPROVED_EVAL_DATA_PATH" | cut -d' ' -f1)"
           matrix_sha="$(sha256sum "$APPROVED_MODEL_MATRIX_PATH" | cut -d' ' -f1)"
@@ -338,32 +425,10 @@ jobs:
           [[ "$(sha256sum "$run_root/inputs/model-matrix.approved.json" | cut -d' ' -f1)" == "$matrix_sha" ]]
           [[ "$(sha256sum "$run_root/inputs/p17-matrix.approved.json" | cut -d' ' -f1)" == "$p17_matrix_sha" ]]
 
-          python tools/snapshot_evaluation_checkpoints.py \
-            --matrix "$run_root/inputs/model-matrix.approved.json" \
-            --kind evaluator \
-            --checkpoint-dir "$run_root/evaluator-checkpoints" \
-            --output "$run_root/inputs/model-matrix.json"
-          python tools/snapshot_evaluation_checkpoints.py \
-            --matrix "$run_root/inputs/p17-matrix.approved.json" \
-            --kind p17 \
-            --checkpoint-dir "$run_root/p17-checkpoints" \
-            --output "$run_root/inputs/p17-matrix.json"
-          model_snapshot_sha="$(sha256sum "$run_root/inputs/model-matrix.json" | cut -d' ' -f1)"
-          p17_snapshot_sha="$(sha256sum "$run_root/inputs/p17-matrix.json" | cut -d' ' -f1)"
-
-          {
-            echo "FORMAL_EVAL_DATA=$run_root/inputs/eval-data.json"
-            echo "FORMAL_MODEL_MATRIX=$run_root/inputs/model-matrix.json"
-            echo "FORMAL_P17_MATRIX=$run_root/inputs/p17-matrix.json"
-            echo "SNAPSHOT_MODEL_MATRIX_SHA256=$model_snapshot_sha"
-            echo "SNAPSHOT_P17_MATRIX_SHA256=$p17_snapshot_sha"
-          } >>"$GITHUB_ENV"
-
-      - name: Verify the immutable image dependency set
-        shell: bash
-        run: |
-          set -euo pipefail
-          container=(
+          mkdir -m 0700 \
+            "$run_root/evaluator-snapshot" \
+            "$run_root/p17-snapshot"
+          snapshot_container=(
             docker run --rm
             --pull never
             --entrypoint ""
@@ -372,34 +437,59 @@ jobs:
             --user "$(id -u):$(id -g)"
             --security-opt no-new-privileges
             --cap-drop ALL
-            --tmpfs "/tmp:rw,nosuid,nodev,size=1g"
-            --workdir "$GITHUB_WORKSPACE"
-            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly"
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly"
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/evaluator-checkpoints,dst=$FORMAL_RUN_ROOT/evaluator-checkpoints,readonly"
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-checkpoints,dst=$FORMAL_RUN_ROOT/p17-checkpoints,readonly"
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output"
-            --env FORMAL_RUN_ROOT
-            --env PYTHONDONTWRITEBYTECODE
-            --env PYTHONNOUSERSITE
-            --env PYTHONPATH="$GITHUB_WORKSPACE"
-            --env PIP_DISABLE_PIP_VERSION_CHECK
+            --tmpfs "/tmp:rw,nosuid,nodev,size=256m"
+            --workdir /tmp
             --env HOME=/tmp/formal-home
-            "$FORMAL_EVALUATOR_IMAGE"
           )
-          # The quoted program is expanded by the container shell, not here.
-          # shellcheck disable=SC2016
-          "${container[@]}" sh -ec '
-            mkdir -p "$HOME"
-            command -v gh >/dev/null
-            python -m pip freeze --all \
-              | LC_ALL=C sort \
-              >"$FORMAL_RUN_ROOT/output/python-packages.txt"
-          '
-          package_sha="$(sha256sum "$FORMAL_RUN_ROOT/output/python-packages.txt" | cut -d' ' -f1)"
-          [[ "$package_sha" == "$APPROVED_PYTHON_PACKAGES_SHA256" ]]
-          chmod 0444 "$FORMAL_RUN_ROOT/output/python-packages.txt"
-          echo "PYTHON_PACKAGES_SHA256=$package_sha" >>"$GITHUB_ENV"
+          "${snapshot_container[@]}" \
+            --mount "type=bind,src=$run_root/inputs/model-matrix.approved.json,dst=$run_root/inputs/model-matrix.approved.json,readonly" \
+            --mount "type=bind,src=$model_checkpoint_root,dst=$model_checkpoint_root,readonly" \
+            --mount "type=bind,src=$run_root/evaluator-snapshot,dst=$run_root/evaluator-snapshot" \
+            "$FORMAL_EVALUATOR_IMAGE" \
+            python -I -B -m douzero.evaluation.snapshot_cli \
+            --matrix "$run_root/inputs/model-matrix.approved.json" \
+            --kind evaluator \
+            --source-root "$model_checkpoint_root" \
+            --checkpoint-dir "$run_root/evaluator-snapshot/checkpoints" \
+            --output "$run_root/evaluator-snapshot/model-matrix.json"
+          "${snapshot_container[@]}" \
+            --mount "type=bind,src=$run_root/inputs/p17-matrix.approved.json,dst=$run_root/inputs/p17-matrix.approved.json,readonly" \
+            --mount "type=bind,src=$p17_checkpoint_root,dst=$p17_checkpoint_root,readonly" \
+            --mount "type=bind,src=$run_root/p17-snapshot,dst=$run_root/p17-snapshot" \
+            "$FORMAL_EVALUATOR_IMAGE" \
+            python -I -B -m douzero.evaluation.snapshot_cli \
+            --matrix "$run_root/inputs/p17-matrix.approved.json" \
+            --kind p17 \
+            --source-root "$p17_checkpoint_root" \
+            --checkpoint-dir "$run_root/p17-snapshot/checkpoints" \
+            --output "$run_root/p17-snapshot/p17-matrix.json"
+          model_snapshot_sha="$(sha256sum "$run_root/evaluator-snapshot/model-matrix.json" | cut -d' ' -f1)"
+          p17_snapshot_sha="$(sha256sum "$run_root/p17-snapshot/p17-matrix.json" | cut -d' ' -f1)"
+
+          {
+            echo "APPROVED_EVALUATION_REQUEST_SHA256=$APPROVED_EVALUATION_REQUEST_SHA256"
+            echo "EVALUATION_MODE=$EVALUATION_MODE"
+            echo "DATASET_SCOPE=$DATASET_SCOPE"
+            echo "APPROVED_EVAL_DATA_SHA256=$APPROVED_EVAL_DATA_SHA256"
+            echo "APPROVED_DEAL_SET_ID=$APPROVED_DEAL_SET_ID"
+            echo "APPROVED_MODEL_MATRIX_SHA256=$APPROVED_MODEL_MATRIX_SHA256"
+            echo "APPROVED_P17_MATRIX_SHA256=$APPROVED_P17_MATRIX_SHA256"
+            echo "CANDIDATE_BUNDLE=$CANDIDATE_BUNDLE"
+            echo "BASELINE_BUNDLE=$BASELINE_BUNDLE"
+            echo "BOOTSTRAP_SAMPLES=$BOOTSTRAP_SAMPLES"
+            echo "FORMAL_EVAL_DATA=$run_root/inputs/eval-data.json"
+            echo "FORMAL_MODEL_MATRIX=$run_root/evaluator-snapshot/model-matrix.json"
+            echo "FORMAL_P17_MATRIX=$run_root/p17-snapshot/p17-matrix.json"
+            echo "SNAPSHOT_MODEL_MATRIX_SHA256=$model_snapshot_sha"
+            echo "SNAPSHOT_P17_MATRIX_SHA256=$p17_snapshot_sha"
+          } >>"$GITHUB_ENV"
+          rm -f -- \
+            "$validated_env" \
+            "$validated_outputs" \
+            "$run_root/inputs/evaluation-request.json" \
+            "$run_root/inputs/model-matrix.approved.json" \
+            "$run_root/inputs/p17-matrix.approved.json"
+          rmdir -- "$FORMAL_CONTROL_ROOT"
 
       - name: Run formal paired evaluation in the immutable image
         shell: bash
@@ -417,10 +507,9 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=4g \
             --workdir "$GITHUB_WORKSPACE" \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/evaluator-checkpoints,dst=$FORMAL_RUN_ROOT/evaluator-checkpoints,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-checkpoints,dst=$FORMAL_RUN_ROOT/p17-checkpoints,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output" \
+            --mount "type=bind,src=$FORMAL_EVAL_DATA,dst=$FORMAL_EVAL_DATA,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/evaluator-snapshot,dst=$FORMAL_RUN_ROOT/evaluator-snapshot,readonly" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/result,dst=$FORMAL_RUN_ROOT/result" \
             --env GITHUB_ACTIONS \
             --env GITHUB_REPOSITORY \
             --env GITHUB_WORKFLOW_REF \
@@ -466,10 +555,7 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=1g \
             --workdir "$GITHUB_WORKSPACE" \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/evaluator-checkpoints,dst=$FORMAL_RUN_ROOT/evaluator-checkpoints,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-checkpoints,dst=$FORMAL_RUN_ROOT/p17-checkpoints,readonly" \
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output" \
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/result,dst=$FORMAL_RUN_ROOT/result" \
             --env APPROVED_SOURCE_SHA \
             --env APPROVED_EVALUATION_REQUEST_SHA256 \
             --env APPROVED_EVAL_DATA_SHA256 \
@@ -493,6 +579,7 @@ jobs:
             --env RUNNER_OS \
             --env RUNNER_ARCH \
             --env DOUZERO_EVALUATOR_IMAGE_DIGEST \
+            --env DOUZERO_GIT_SHA= \
             --env FORMAL_EVALUATOR_IMAGE \
             --env FORMAL_EVALUATOR_IMAGE_ID \
             --env EVALUATION_STARTED_AT \
@@ -631,7 +718,10 @@ jobs:
           temporary.replace(path)
           verify_result_integrity(json.loads(path.read_text(encoding="utf-8")))
           PY
-          chmod 0444 "$FORMAL_RESULT_JSON" "$FORMAL_RUN_ROOT/output/python-packages.txt"
+          [[ -f "$FORMAL_RESULT_JSON" && ! -L "$FORMAL_RESULT_JSON" ]]
+          [[ "$(realpath -e -- "$FORMAL_RESULT_JSON")" == "$FORMAL_RESULT_JSON" ]]
+          [[ "$(stat -c '%F' "$FORMAL_RESULT_JSON")" == "regular file" ]]
+          chmod 0444 "$FORMAL_RESULT_JSON"
 
       - name: Calculate exact result digest
         id: result-digest
@@ -661,6 +751,9 @@ jobs:
           set -euo pipefail
           [[ "$(sha256sum "$FORMAL_RESULT_JSON" | cut -d' ' -f1)" == "$EXPECTED_RESULT_SHA256" ]]
           [[ -f "$ATTESTATION_BUNDLE" ]]
+          verification="$FORMAL_AUDIT_ROOT/attestation-verification.json"
+          [[ ! -e "$verification" && ! -L "$verification" ]]
+          set -o noclobber
           gh attestation verify "$FORMAL_RESULT_JSON" \
             --bundle "$ATTESTATION_BUNDLE" \
             --repo "$EXPECTED_REPOSITORY" \
@@ -669,7 +762,9 @@ jobs:
             --source-digest "$GITHUB_SHA" \
             --source-ref "$GITHUB_REF" \
             --format json \
-            >"$FORMAL_RUN_ROOT/output/attestation-verification.json"
+            >"$verification"
+          set +o noclobber
+          chmod 0444 "$verification"
 
       - name: Collate replayed P17 artifacts inside protected boundary
         shell: bash
@@ -705,10 +800,12 @@ jobs:
             --tmpfs "/tmp:rw,nosuid,nodev,size=1g"
             --workdir "$GITHUB_WORKSPACE"
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly"
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/inputs,dst=$FORMAL_RUN_ROOT/inputs,readonly"
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/evaluator-checkpoints,dst=$FORMAL_RUN_ROOT/evaluator-checkpoints,readonly"
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-checkpoints,dst=$FORMAL_RUN_ROOT/p17-checkpoints,readonly"
-            --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output"
+            --mount "type=bind,src=$FORMAL_EVAL_DATA,dst=$FORMAL_EVAL_DATA,readonly"
+            --mount "type=bind,src=$FORMAL_RESULT_JSON,dst=$FORMAL_RESULT_JSON,readonly"
+            --mount "type=bind,src=$attestation_snapshot,dst=$attestation_snapshot,readonly"
+            --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-snapshot,dst=$FORMAL_RUN_ROOT/p17-snapshot,readonly"
+            --mount "type=bind,src=$FORMAL_P17_OUTPUT,dst=$FORMAL_P17_OUTPUT"
+            --env DOUZERO_GIT_SHA=
             --env PYTHONDONTWRITEBYTECODE
             --env PYTHONNOUSERSITE
             --env PYTHONPATH="$GITHUB_WORKSPACE"
@@ -743,20 +840,18 @@ jobs:
               --security-opt no-new-privileges \
               --cap-drop ALL \
               --tmpfs /tmp:rw,nosuid,nodev,size=64m \
-              --workdir "$GITHUB_WORKSPACE" \
-              --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
-              --mount "type=bind,src=$FORMAL_RUN_ROOT/output,dst=$FORMAL_RUN_ROOT/output,readonly" \
-              --env PYTHONDONTWRITEBYTECODE \
-              --env PYTHONNOUSERSITE \
-              --env PYTHONPATH="$GITHUB_WORKSPACE" \
+              --workdir /tmp \
+              --mount "type=bind,src=$release_result,dst=$release_result,readonly" \
+              --mount "type=bind,src=$FORMAL_RESULT_JSON,dst=$FORMAL_RESULT_JSON,readonly" \
               --env HOME=/tmp/formal-home \
               "$FORMAL_EVALUATOR_IMAGE" \
-              python - "$release_result" <<'PY'
+              python -I -S - "$release_result" "$FORMAL_RESULT_JSON" <<'PY'
           import json
           import sys
           from pathlib import Path
 
           block = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          signed = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
           result = block.get("result")
           if not isinstance(result, dict) or set(result) != {
               "schema_version",
@@ -785,12 +880,24 @@ jobs:
               or scenario["num_deals"] < 1
           ):
               raise SystemExit("private P17 scenario identity is invalid")
+          signed_scenario = signed.get("scenario")
+          if not isinstance(signed_scenario, dict):
+              raise SystemExit("signed result scenario is malformed")
+          for key in ("mode", "dataset_scope", "deal_set_id", "num_deals"):
+              if scenario[key] != signed_scenario.get(key):
+                  raise SystemExit(f"private projection changed scenario {key}")
           for side in ("candidate", "baseline"):
               identity = scenario[side]
               if not isinstance(identity, dict) or set(identity) != {"name"}:
                   raise SystemExit("private P17 model projection is malformed")
               if not isinstance(identity["name"], str) or not identity["name"]:
                   raise SystemExit("private P17 model identity is invalid")
+              signed_identity = signed_scenario.get(side)
+              if (
+                  not isinstance(signed_identity, dict)
+                  or identity["name"] != signed_identity.get("name")
+              ):
+                  raise SystemExit(f"private projection changed {side} identity")
           evidence = result.get("game_evidence")
           if not isinstance(evidence, dict) or set(evidence) != {
               "status",
@@ -805,6 +912,12 @@ jobs:
               or evidence["source_game_rows"] < 1
           ):
               raise SystemExit("private per-game evidence escaped redaction")
+          signed_games = signed.get("games")
+          if (
+              not isinstance(signed_games, list)
+              or evidence["source_game_rows"] != len(signed_games)
+          ):
+              raise SystemExit("private projection changed source game count")
           PY
           fi
 
@@ -837,6 +950,9 @@ jobs:
           manifest="$FORMAL_P17_OUTPUT/manifest.json"
           [[ "$(sha256sum "$manifest" | cut -d' ' -f1)" == "$EXPECTED_MANIFEST_SHA256" ]]
           [[ -f "$P17_ATTESTATION_BUNDLE" ]]
+          verification="$FORMAL_AUDIT_ROOT/p17-manifest-attestation-verification.json"
+          [[ ! -e "$verification" && ! -L "$verification" ]]
+          set -o noclobber
           gh attestation verify "$manifest" \
             --bundle "$P17_ATTESTATION_BUNDLE" \
             --repo "$EXPECTED_REPOSITORY" \
@@ -845,7 +961,9 @@ jobs:
             --source-digest "$GITHUB_SHA" \
             --source-ref "$GITHUB_REF" \
             --format json \
-            >"$FORMAL_RUN_ROOT/output/p17-manifest-attestation-verification.json"
+            >"$verification"
+          set +o noclobber
+          chmod 0444 "$verification"
 
       - name: Recheck signed P17 manifest closure before upload
         shell: bash
@@ -863,16 +981,12 @@ jobs:
             --security-opt no-new-privileges \
             --cap-drop ALL \
             --tmpfs /tmp:rw,nosuid,nodev,size=64m \
-            --workdir "$GITHUB_WORKSPACE" \
-            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+            --workdir /tmp \
             --mount "type=bind,src=$FORMAL_P17_OUTPUT,dst=$FORMAL_P17_OUTPUT,readonly" \
             --env EXPECTED_MANIFEST_SHA256 \
-            --env PYTHONDONTWRITEBYTECODE \
-            --env PYTHONNOUSERSITE \
-            --env PYTHONPATH="$GITHUB_WORKSPACE" \
             --env HOME=/tmp/formal-home \
             "$FORMAL_EVALUATOR_IMAGE" \
-            python - "$FORMAL_P17_OUTPUT/manifest.json" <<'PY'
+            python -I -S - "$FORMAL_P17_OUTPUT/manifest.json" <<'PY'
           import hashlib
           import json
           import os
@@ -1004,6 +1118,39 @@ jobs:
                   raise SystemExit(f"artifact does not match manifest: {name}")
           PY
 
+      - name: Recheck immutable upload subjects and audit material
+        shell: bash
+        env:
+          EXPECTED_RESULT_SHA256: ${{ steps.result-digest.outputs.sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.p17-manifest-digest.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          require_regular() {
+            local path="$1"
+            [[ -f "$path" && ! -L "$path" ]]
+            [[ "$(realpath -e -- "$path")" == "$path" ]]
+            [[ "$(stat -c '%F' "$path")" == "regular file" ]]
+          }
+
+          package_manifest="$FORMAL_AUDIT_ROOT/python-packages.txt"
+          result_verification="$FORMAL_AUDIT_ROOT/attestation-verification.json"
+          manifest_verification="$FORMAL_AUDIT_ROOT/p17-manifest-attestation-verification.json"
+          manifest="$FORMAL_P17_OUTPUT/manifest.json"
+          for path in \
+            "$package_manifest" \
+            "$result_verification" \
+            "$manifest_verification" \
+            "$FORMAL_RESULT_JSON" \
+            "$manifest"; do
+            require_regular "$path"
+          done
+          [[ "$(sha256sum "$package_manifest" | cut -d' ' -f1)" == \
+            "$PYTHON_PACKAGES_SHA256" ]]
+          [[ "$(sha256sum "$FORMAL_RESULT_JSON" | cut -d' ' -f1)" == \
+            "$EXPECTED_RESULT_SHA256" ]]
+          [[ "$(sha256sum "$manifest" | cut -d' ' -f1)" == \
+            "$EXPECTED_MANIFEST_SHA256" ]]
+
       # Public deals may publish the exact attested trace result for audit.
       # actions/upload-artifact@v4.6.2
       - name: Upload public result, detached bundle, and audit material
@@ -1013,9 +1160,9 @@ jobs:
           name: formal-p17-${{ steps.request.outputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.FORMAL_RESULT_JSON }}
-            ${{ env.FORMAL_RUN_ROOT }}/output/python-packages.txt
-            ${{ env.FORMAL_RUN_ROOT }}/output/attestation-verification.json
-            ${{ env.FORMAL_RUN_ROOT }}/output/p17-manifest-attestation-verification.json
+            ${{ env.FORMAL_AUDIT_ROOT }}/python-packages.txt
+            ${{ env.FORMAL_AUDIT_ROOT }}/attestation-verification.json
+            ${{ env.FORMAL_AUDIT_ROOT }}/p17-manifest-attestation-verification.json
             ${{ env.FORMAL_P17_OUTPUT }}/
             ${{ steps.attest.outputs.bundle-path }}
             ${{ steps.p17-attest.outputs.bundle-path }}
@@ -1032,9 +1179,9 @@ jobs:
         with:
           name: formal-p17-private-audit-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ env.FORMAL_RUN_ROOT }}/output/python-packages.txt
-            ${{ env.FORMAL_RUN_ROOT }}/output/attestation-verification.json
-            ${{ env.FORMAL_RUN_ROOT }}/output/p17-manifest-attestation-verification.json
+            ${{ env.FORMAL_AUDIT_ROOT }}/python-packages.txt
+            ${{ env.FORMAL_AUDIT_ROOT }}/attestation-verification.json
+            ${{ env.FORMAL_AUDIT_ROOT }}/p17-manifest-attestation-verification.json
             ${{ env.FORMAL_P17_OUTPUT }}/
             ${{ steps.attest.outputs.bundle-path }}
             ${{ steps.p17-attest.outputs.bundle-path }}

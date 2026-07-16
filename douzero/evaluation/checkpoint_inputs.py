@@ -201,7 +201,25 @@ def _snapshot_file(
     expected_sha256: str,
     destination_directory: Path,
     cache: dict[tuple[str, str], str],
+    source_root: Path | None,
 ) -> str:
+    if source_root is not None:
+        source_path = Path(source)
+        if not source_path.is_absolute():
+            raise CheckpointIdentityError(
+                "checkpoint snapshot source must be absolute"
+            )
+        try:
+            resolved_source = source_path.resolve(strict=True)
+            resolved_source.relative_to(source_root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise CheckpointIdentityError(
+                f"checkpoint snapshot source is outside the approved root: {source}"
+            ) from exc
+        if resolved_source != source_path:
+            raise CheckpointIdentityError(
+                f"checkpoint snapshot source must be canonical: {source}"
+            )
     cache_key = (source, expected_sha256)
     if cache_key in cache:
         return cache[cache_key]
@@ -293,6 +311,7 @@ def snapshot_model_matrix(
     checkpoint_directory: str | os.PathLike[str],
     *,
     kind: str = "auto",
+    source_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
     """Snapshot all declared checkpoints and return a path-rewritten matrix."""
 
@@ -303,6 +322,28 @@ def snapshot_model_matrix(
     rewritten = copy.deepcopy(dict(matrix))
     nodes = _bundle_nodes(rewritten, kind=kind)
     destination = Path(checkpoint_directory)
+    approved_source_root: Path | None = None
+    if source_root is not None:
+        source_root_path = Path(source_root)
+        try:
+            source_root_stat = os.lstat(source_root_path)
+            if stat.S_ISLNK(source_root_stat.st_mode) or not stat.S_ISDIR(
+                source_root_stat.st_mode
+            ):
+                raise CheckpointIdentityError(
+                    "approved checkpoint source root must be a non-symlink directory"
+                )
+            approved_source_root = source_root_path.resolve(strict=True)
+        except CheckpointIdentityError:
+            raise
+        except (OSError, RuntimeError) as exc:
+            raise CheckpointIdentityError(
+                "approved checkpoint source root is not accessible"
+            ) from exc
+        if approved_source_root != source_root_path:
+            raise CheckpointIdentityError(
+                "approved checkpoint source root must be canonical"
+            )
     try:
         destination.mkdir(mode=0o700, parents=True, exist_ok=False)
     except OSError as exc:
@@ -323,6 +364,7 @@ def snapshot_model_matrix(
                 bundle.checkpoint_sha256[role],
                 destination,
                 cache,
+                approved_source_root,
             )
         raw_bundle["checkpoints"] = rewritten_roles
         if bundle.belief_checkpoint:
@@ -331,6 +373,7 @@ def snapshot_model_matrix(
                 bundle.belief_checkpoint_sha256,
                 destination,
                 cache,
+                approved_source_root,
             )
         if bundle.bidding_checkpoint:
             raw_bundle["bidding_checkpoint"] = _snapshot_file(
@@ -338,6 +381,7 @@ def snapshot_model_matrix(
                 bundle.bidding_checkpoint_sha256,
                 destination,
                 cache,
+                approved_source_root,
             )
     return rewritten
 
@@ -348,6 +392,7 @@ def snapshot_model_matrix_file(
     checkpoint_directory: str | os.PathLike[str],
     *,
     kind: str = "auto",
+    source_root: str | os.PathLike[str] | None = None,
 ) -> Path:
     """Read, snapshot, and atomically write a structured model matrix."""
 
@@ -373,7 +418,12 @@ def snapshot_model_matrix_file(
         ) from exc
     if not isinstance(matrix, Mapping):
         raise CheckpointIdentityError("model matrix must contain an object")
-    rewritten = snapshot_model_matrix(matrix, checkpoint_directory, kind=kind)
+    rewritten = snapshot_model_matrix(
+        matrix,
+        checkpoint_directory,
+        kind=kind,
+        source_root=source_root,
+    )
     try:
         output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         temporary = output.with_name(f".{output.name}.tmp")
