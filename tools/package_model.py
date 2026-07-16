@@ -29,7 +29,10 @@ def main() -> int:
     parser.add_argument("--output", required=True)
     parser.add_argument("--ruleset", choices=("legacy", "standard"), default="legacy")
     parser.add_argument("--model-config", help="JSON ModelV2Config object")
-    parser.add_argument("--training-config", help="JSON training config for audit hash")
+    parser.add_argument(
+        "--training-config",
+        help="JSON training config to cross-check against source checkpoint provenance",
+    )
     parser.add_argument("--model-card", help="reviewed Markdown model card")
     parser.add_argument("--evaluation-summary", help="reviewed Markdown evaluation summary")
     parser.add_argument("--gpu-validation-summary", help="reviewed Markdown GPU validation summary")
@@ -63,6 +66,7 @@ def main() -> int:
         gpu_validation_summary=markdown(args.gpu_validation_summary),
         rollback_instructions=markdown(args.rollback),
         belief_checkpoint=args.belief_checkpoint,
+        source_checkpoint=args.checkpoint,
     )
     print(json.dumps(manifest.to_dict(), indent=2, sort_keys=True))
     return 0

@@ -254,6 +254,7 @@ def create_model_package(
     gpu_validation_summary: str | None = None,
     rollback_instructions: str | None = None,
     belief_checkpoint: str | Path | None = None,
+    source_checkpoint: str | Path | None = None,
 ) -> ModelManifest:
     """Write a checksummed public Model V2 package.
 
@@ -298,6 +299,56 @@ def create_model_package(
         raise ModelPackageError(
             "belief_checkpoint was supplied for a belief-disabled model"
         )
+    source_provenance = None
+    if source_checkpoint is not None:
+        source_path = Path(source_checkpoint)
+        if not source_path.is_file():
+            raise ModelPackageError(f"source checkpoint is not a file: {source_path}")
+        from douzero.checkpoint import load_v2_position_weights
+
+        try:
+            source_state, source_manifest = load_v2_position_weights(
+                str(source_path),
+                expected_schema_hash=model.schema.stable_hash(),
+                expected_model_config_hash=model.config.stable_hash(),
+                expected_ruleset=ruleset,
+                runtime_model_config=model.config,
+                training_device="cpu",
+            )
+            model_state = model.state_dict()
+            if set(source_state) != set(model_state) or any(
+                not torch.equal(source_state[name].cpu(), model_state[name].detach().cpu())
+                for name in model_state
+            ):
+                raise ValueError("source checkpoint weights do not match the supplied model")
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise ModelPackageError(f"invalid source checkpoint provenance: {exc}") from exc
+        source_effective = dict(source_manifest.effective_config)
+        declared_hash = source_effective.get("training_config_hash")
+        if (
+            isinstance(declared_hash, str)
+            and len(declared_hash) == 64
+            and all(char in "0123456789abcdef" for char in declared_hash)
+        ):
+            source_training_hash = declared_hash
+        else:
+            source_training_hash = canonical_hash(source_effective)
+        if training_config is not None and canonical_hash(training_config) != source_training_hash:
+            raise ModelPackageError(
+                "training_config does not match the source checkpoint manifest"
+            )
+        source_manifest_payload = source_manifest.to_dict()
+        source_provenance = {
+            "source_checkpoint_sha256": _sha256(source_path),
+            "source_checkpoint_manifest_sha256": canonical_hash(source_manifest_payload),
+            "source_git_sha": source_manifest.git_sha,
+            "source_training_config_hash": source_training_hash,
+            "source_ruleset_hash": source_manifest.ruleset_hash,
+            "source_feature_schema_hash": model.schema.stable_hash(),
+            "source_model_config_hash": model.config.stable_hash(),
+            "source_checkpoint_kind": source_manifest.checkpoint_kind,
+            "release_eligible": True,
+        }
     root.mkdir(parents=True, exist_ok=True)
 
     manifest = build_model_manifest(
@@ -307,6 +358,7 @@ def create_model_package(
         belief_config=belief_model.config if belief_model is not None else None,
         search_compatible=search_compatible,
         public_or_privileged=PUBLIC_MODEL,
+        source_provenance=source_provenance,
     )
     weights_path = root / "weights.pt"
     save_v2_position_weights(
@@ -316,6 +368,14 @@ def create_model_package(
         flags={
             "training_config_hash": manifest.training_config_hash,
             "training_config_payload_policy": "hash_only",
+            "source_checkpoint_sha256": manifest.source_checkpoint_sha256,
+            "source_checkpoint_manifest_sha256": manifest.source_checkpoint_manifest_sha256,
+            "source_git_sha": manifest.source_git_sha,
+            "source_ruleset_hash": manifest.source_ruleset_hash,
+            "source_feature_schema_hash": manifest.source_feature_schema_hash,
+            "source_model_config_hash": manifest.source_model_config_hash,
+            "source_checkpoint_kind": manifest.source_checkpoint_kind,
+            "release_eligible": manifest.release_eligible,
         },
     )
     manifest = replace(manifest, weights_sha256=_sha256(weights_path))
@@ -718,12 +778,27 @@ def verify_model_package(
     expected_inner_config = {
         "training_config_hash": manifest.training_config_hash,
         "training_config_payload_policy": "hash_only",
+        "source_checkpoint_sha256": manifest.source_checkpoint_sha256,
+        "source_checkpoint_manifest_sha256": manifest.source_checkpoint_manifest_sha256,
+        "source_git_sha": manifest.source_git_sha,
+        "source_ruleset_hash": manifest.source_ruleset_hash,
+        "source_feature_schema_hash": manifest.source_feature_schema_hash,
+        "source_model_config_hash": manifest.source_model_config_hash,
+        "source_checkpoint_kind": manifest.source_checkpoint_kind,
+        "release_eligible": manifest.release_eligible,
     }
     if checkpoint_manifest.effective_config != expected_inner_config:
         raise ModelPackageError(
             "weights.pt training configuration identity does not match the "
             "outer package hash-only policy"
         )
+    if (
+        manifest.source_ruleset_hash != manifest.ruleset_hash
+        or manifest.source_feature_schema_hash != manifest.feature_schema_hash
+        or manifest.source_model_config_hash != manifest.model_config_hash
+        or manifest.source_training_config_hash != manifest.training_config_hash
+    ):
+        raise ModelPackageError("source checkpoint provenance does not match the package")
     floating_dtypes = {
         str(tensor.dtype).removeprefix("torch.")
         for tensor in state_dict.values()
@@ -734,6 +809,36 @@ def verify_model_package(
             f"weights dtype {sorted(floating_dtypes)} does not match manifest "
             f"dtype {manifest.dtype!r}"
         )
+    non_tensors = [
+        name for name, value in state_dict.items()
+        if not isinstance(name, str) or not isinstance(value, torch.Tensor)
+    ]
+    if non_tensors:
+        raise ModelPackageError(
+            "weights.pt state_dict must map parameter names to tensors"
+        )
+    nonfinite = [
+        name for name, tensor in state_dict.items()
+        if (tensor.is_floating_point() or tensor.is_complex())
+        and not bool(torch.isfinite(tensor).all().item())
+    ]
+    if nonfinite:
+        raise ModelPackageError(
+            f"weights.pt contains non-finite tensors: {sorted(nonfinite)}"
+        )
+    # Verification and loading share the same architectural compatibility
+    # boundary: a package is not verified until strict runtime construction and
+    # state loading have succeeded. Checksums alone cannot establish loadability.
+    from douzero.models_v2.model import ModelV2
+
+    try:
+        checked_model = ModelV2(packaged_schema, packaged_model_config)
+        checked_model.load_state_dict(state_dict, strict=True)
+        checked_model.eval()
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ModelPackageError(
+            f"weights.pt cannot strict-load into the packaged runtime model: {exc}"
+        ) from exc
     if expected_schema_hash and expected_schema_hash != manifest.feature_schema_hash:
         raise ModelPackageError("runtime feature schema does not match packaged model")
     if expected_feature_version and expected_feature_version != manifest.feature_version:

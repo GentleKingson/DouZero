@@ -7,12 +7,14 @@ import json
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from douzero.env.rules import RuleSet
 
 from .protocol import (
     EVALUATION_PROTOCOL,
+    OFFICIAL_CI_METHOD,
+    OFFICIAL_STATISTICAL_UNIT,
     OFFICIAL_PERMUTATIONS,
     OFFICIAL_PERMUTATION_HASHES,
 )
@@ -24,6 +26,83 @@ BACKENDS = ("random", "rule", "legacy", "legacy_factorized", "v2", "bc")
 BIDDING_POLICIES = ("rule", "random", "pass", "max", "learned")
 SEATS = ("0", "1", "2")
 ROLES = ("landlord", "landlord_up", "landlord_down")
+DEAL_SET_IDENTITY_SCHEMA = "canonical-evaluation-deal-set-v1"
+
+
+def _canonical_mapping_hash(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def canonical_deal_hash(deal: Mapping[str, Any]) -> str:
+    """Hash only canonical fields that affect the evaluated game."""
+
+    if deal.get("format_version") == 2:
+        payload = {
+            "format_version": 2,
+            "schema_version": deal["schema_version"],
+            "ruleset_id": deal["ruleset_id"],
+            "ruleset_version": deal["ruleset_version"],
+            "ruleset_hash": deal["ruleset_hash"],
+            "deck": list(deal["deck"]),
+            "first_bidder": deal["first_bidder"],
+            "bidding_order": list(deal["bidding_order"]),
+            "bidding_script": None,
+        }
+    else:
+        payload = {
+            "landlord": sorted(deal["landlord"]),
+            "landlord_up": sorted(deal["landlord_up"]),
+            "landlord_down": sorted(deal["landlord_down"]),
+            "three_landlord_cards": sorted(deal["three_landlord_cards"]),
+        }
+    return _canonical_mapping_hash(payload)
+
+
+def canonical_deal_id(index: int, deal_hash: str) -> str:
+    """Return the stable human-readable ID for one ordered deal."""
+
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("deal index must be a non-negative integer")
+    if (
+        not isinstance(deal_hash, str)
+        or len(deal_hash) != 64
+        or any(char not in "0123456789abcdef" for char in deal_hash)
+    ):
+        raise ValueError("deal_hash must be a full lowercase SHA-256")
+    return f"{index:06d}-{deal_hash[:12]}"
+
+
+def canonical_deal_set_id(
+    mode: str,
+    ruleset: RuleSet | Mapping[str, Any],
+    deal_hashes: Sequence[str],
+    *,
+    seat_permutation_hash: str,
+) -> str:
+    """Hash the ordered real deals and required experiment arrangement."""
+
+    if any(
+        not isinstance(deal_hash, str)
+        or len(deal_hash) != 64
+        or any(char not in "0123456789abcdef" for char in deal_hash)
+        for deal_hash in deal_hashes
+    ):
+        raise ValueError("deal hashes must be full lowercase SHA-256 values")
+    if len(set(deal_hashes)) != len(deal_hashes):
+        raise ValueError("formal evaluation deal sets must not contain duplicates")
+    ruleset_identity = (
+        ruleset.identity() if isinstance(ruleset, RuleSet) else dict(ruleset)
+    )
+    payload = {
+        "schema_version": DEAL_SET_IDENTITY_SCHEMA,
+        "mode": mode,
+        "ruleset": ruleset_identity,
+        "deal_hashes": list(deal_hashes),
+        "seat_permutation_hash": seat_permutation_hash,
+        "permutations_per_deal": len(default_seat_permutations(mode)),
+    }
+    return _canonical_mapping_hash(payload)
 
 
 @dataclass(frozen=True)
@@ -249,6 +328,10 @@ class EvaluationScenario:
 
             for index, deal in enumerate(self.deals):
                 _validate_standard_record(deal, index, self.ruleset)
+                if deal.get("bidding_script") is not None:
+                    raise ValueError(
+                        "formal paired evaluation does not support bidding_script"
+                    )
         else:
             expected_counts = Counter(list(range(3, 15)) * 4 + [17] * 4 + [20, 30])
             for index, deal in enumerate(self.deals):
@@ -278,12 +361,20 @@ class EvaluationScenario:
                     raise ValueError(
                         f"legacy deal {index} bottom cards are not in landlord hand"
                     )
+        deal_hashes = [canonical_deal_hash(deal) for deal in self.deals]
+        if len(set(deal_hashes)) != len(deal_hashes):
+            raise ValueError("formal evaluation deals must be unique")
 
     @property
     def deal_set_id(self) -> str:
-        """Content identity; never includes the private holdout path/name."""
-        payload = json.dumps(self.deals, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        """Order-sensitive identity of the real deals and row arrangement."""
+        deal_hashes = [canonical_deal_hash(deal) for deal in self.deals]
+        return canonical_deal_set_id(
+            self.mode,
+            self.ruleset,
+            deal_hashes,
+            seat_permutation_hash=OFFICIAL_PERMUTATION_HASHES[self.mode],
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -306,6 +397,9 @@ class EvaluationScenario:
             "seat_permutation_hash": OFFICIAL_PERMUTATION_HASHES[self.mode],
             "bootstrap_samples": self.bootstrap_samples,
             "confidence_level": self.confidence_level,
+            "statistical_unit": OFFICIAL_STATISTICAL_UNIT,
+            "ci_method": OFFICIAL_CI_METHOD,
+            "release_protocol_id": EVALUATION_PROTOCOL,
         }
 
 

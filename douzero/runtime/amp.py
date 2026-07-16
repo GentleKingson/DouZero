@@ -47,6 +47,35 @@ class SafeMixedPrecision:
             return nullcontext()
         return torch.autocast(device_type=self.device.type, dtype=self.dtype)
 
+    def state_dict(self) -> dict:
+        """Return every mutable AMP decision needed for exact resume."""
+        return {
+            "enabled": self.enabled,
+            "fallback_count": self.fallback_count,
+            "scaler": self._scaler.state_dict(),
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if not isinstance(state, dict) or set(state) != {
+            "enabled", "fallback_count", "scaler"
+        }:
+            raise ValueError("invalid mixed-precision checkpoint state")
+        enabled = state["enabled"]
+        fallback_count = state["fallback_count"]
+        if not isinstance(enabled, bool):
+            raise TypeError("mixed-precision enabled state must be bool")
+        if (
+            isinstance(fallback_count, bool)
+            or not isinstance(fallback_count, int)
+            or fallback_count < 0
+        ):
+            raise ValueError("mixed-precision fallback_count must be non-negative int")
+        if enabled and not self.enabled and self.device.type == "cpu" and self.dtype != torch.bfloat16:
+            raise ValueError("checkpoint AMP state is unsupported on this runtime")
+        self._scaler.load_state_dict(state["scaler"])
+        self.enabled = enabled
+        self.fallback_count = fallback_count
+
     def step(
         self,
         loss_closure: Callable[[], torch.Tensor],

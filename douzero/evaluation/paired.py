@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import random
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -20,11 +21,19 @@ from .protocol import (
     MIN_PROMOTION_BOOTSTRAP_SAMPLES,
     MIN_PROMOTION_PAIRED_DEALS,
     OFFICIAL_CONFIDENCE_LEVEL,
+    OFFICIAL_CI_METHOD,
+    OFFICIAL_STATISTICAL_UNIT,
     OFFICIAL_PERMUTATION_HASHES,
     PROMOTION_ESTIMATOR,
     PROMOTION_MODE,
 )
-from .scenario import ROLES, EvaluationScenario, default_seat_permutations
+from .scenario import (
+    ROLES,
+    EvaluationScenario,
+    canonical_deal_hash,
+    canonical_deal_id,
+    default_seat_permutations,
+)
 from .statistics import (
     ConfidenceInterval,
     deal_cluster_means,
@@ -107,7 +116,10 @@ def evaluation_runtime_identity(
 
 
 def validate_evaluation_runtime_identity(
-    result: Mapping[str, Any], *, expected_mode: str | None = None
+    result: Mapping[str, Any],
+    *,
+    expected_mode: str | None = None,
+    expected_source_git_shas: str | Iterable[str] | None = None,
 ) -> None:
     """Reject missing or self-inconsistent evaluation provenance."""
 
@@ -138,6 +150,21 @@ def validate_evaluation_runtime_identity(
         or any(char not in "0123456789abcdef" for char in source_sha)
     ):
         raise ValueError("evaluation source_git_sha must be a full Git SHA")
+    if expected_source_git_shas is not None:
+        approved_shas = (
+            (expected_source_git_shas,)
+            if isinstance(expected_source_git_shas, str)
+            else tuple(expected_source_git_shas)
+        )
+        if not approved_shas or any(
+            not isinstance(sha, str)
+            or len(sha) not in (40, 64)
+            or any(char not in "0123456789abcdef" for char in sha)
+            for sha in approved_shas
+        ):
+            raise ValueError("expected evaluator Git SHA allowlist is invalid")
+        if source_sha not in approved_shas:
+            raise ValueError("evaluation source_git_sha is not approved")
     schema_identities = runtime.get("model_feature_schemas")
     if not isinstance(schema_identities, Mapping):
         raise ValueError("evaluation model feature-schema identities are missing")
@@ -172,9 +199,8 @@ def _seed(base: int, *parts: object) -> int:
     return int.from_bytes(hashlib.sha256(token.encode()).digest()[:8], "big")
 
 
-def _deal_id(index: int, deal: dict[str, Any]) -> str:
-    payload = json.dumps(deal, sort_keys=True, separators=(",", ":"))
-    return f"{index:06d}-{hashlib.sha256(payload.encode()).hexdigest()[:12]}"
+def _deal_id(index: int, deal: Mapping[str, Any]) -> str:
+    return canonical_deal_id(index, canonical_deal_hash(deal))
 
 
 @dataclass(frozen=True)
@@ -215,6 +241,11 @@ class GameRecord:
     # excluded from every formal deal-level estimate.
     formal_evaluation_eligible: bool = True
     exclusion_reason: str = ""
+    # Full experiment/terminal evidence appended for positional compatibility.
+    deal_hash: str = ""
+    seat_to_role: dict[str, str] | None = None
+    bidding_order: tuple[str, ...] = ()
+    bidding_history: tuple[tuple[str, int], ...] = ()
 
     @property
     def candidate_log_score(self) -> float:
@@ -255,6 +286,10 @@ class GameRecord:
             "bidding_inference_calls": self.bidding_inference_calls,
             "formal_evaluation_eligible": self.formal_evaluation_eligible,
             "exclusion_reason": self.exclusion_reason or None,
+            "deal_hash": self.deal_hash,
+            "seat_to_role": copy.deepcopy(self.seat_to_role),
+            "bidding_order": list(self.bidding_order),
+            "bidding_history": [list(bid) for bid in self.bidding_history],
         }
 
 
@@ -295,6 +330,12 @@ class PairedEvaluationResult:
             raise ValueError(
                 f"promotion requires confidence_level={OFFICIAL_CONFIDENCE_LEVEL}"
             )
+        if (
+            self.scenario.get("statistical_unit") != OFFICIAL_STATISTICAL_UNIT
+            or self.scenario.get("ci_method") != OFFICIAL_CI_METHOD
+            or self.scenario.get("release_protocol_id") != EVALUATION_PROTOCOL
+        ):
+            raise ValueError("promotion requires the closed official statistics protocol")
         if (
             self.scenario["bootstrap_samples"]
             < MIN_PROMOTION_BOOTSTRAP_SAMPLES
@@ -370,6 +411,7 @@ def _run_cardplay_leg(
     factory: BundleFactory,
     deal: dict[str, Any],
     deal_id: str,
+    deal_hash: str,
     assignment: tuple[str, str, str],
     leg_index: int,
 ) -> GameRecord:
@@ -430,6 +472,7 @@ def _run_cardplay_leg(
         search_calls=search_calls,
         search_timeouts=search_timeouts,
         search_fallbacks=search_fallbacks,
+        deal_hash=deal_hash,
     )
 
 
@@ -438,6 +481,7 @@ def _run_full_game_leg(
     factory: BundleFactory,
     deal: dict[str, Any],
     deal_id: str,
+    deal_hash: str,
     assignment: tuple[str, str, str],
     leg_index: int,
 ) -> GameRecord:
@@ -580,6 +624,12 @@ def _run_full_game_leg(
         exclusion_reason=(
             "redeal_cap_exhausted_forced_smoke_fallback"
             if max_redeals_exceeded else ""
+        ),
+        deal_hash=deal_hash,
+        seat_to_role=dict(env._seat_to_role),
+        bidding_order=tuple(env.bidding_order),
+        bidding_history=tuple(
+            (str(seat), int(bid)) for seat, bid in env.bidding_history
         ),
     )
 
@@ -851,15 +901,28 @@ def evaluate_scenario(
     factory = BundleFactory(scenario.ruleset)
     games: list[GameRecord] = []
     for deal_index, deal in enumerate(scenario.deals):
+        deal_hash = canonical_deal_hash(deal)
         deal_id = _deal_id(deal_index, deal)
         for leg_index, assignment in enumerate(scenario.seat_permutations):
             if scenario.mode == "cardplay_only":
                 game = _run_cardplay_leg(
-                    scenario, factory, deal, deal_id, assignment, leg_index
+                    scenario,
+                    factory,
+                    deal,
+                    deal_id,
+                    deal_hash,
+                    assignment,
+                    leg_index,
                 )
             else:
                 game = _run_full_game_leg(
-                    scenario, factory, deal, deal_id, assignment, leg_index
+                    scenario,
+                    factory,
+                    deal,
+                    deal_id,
+                    deal_hash,
+                    assignment,
+                    leg_index,
                 )
             games.append(game)
     return PairedEvaluationResult(

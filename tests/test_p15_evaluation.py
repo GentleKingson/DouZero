@@ -268,7 +268,7 @@ def test_report_writes_json_csv_and_markdown_without_nonstandard_nan(tmp_path):
     assert payload["metrics"]["bid_rate"] is None
     csv_text = (tmp_path / "report.csv").read_text(encoding="utf-8")
     markdown_text = (tmp_path / "report.md").read_text(encoding="utf-8")
-    assert csv_text.startswith("deal_id,")
+    assert csv_text.startswith("deal_id,deal_hash,")
     assert payload["runtime_identity"]["source_git_sha"] in csv_text
     assert "Mode: `cardplay_only`" in markdown_text
     assert payload["runtime_identity"]["source_git_sha"] in markdown_text
@@ -287,6 +287,17 @@ def test_evaluation_runtime_identity_binds_protocol_mode_rules_and_schemas():
         "builtin-no-model-input"
     )
     validate_evaluation_runtime_identity(payload, expected_mode="cardplay_only")
+    validate_evaluation_runtime_identity(
+        payload,
+        expected_mode="cardplay_only",
+        expected_source_git_shas=runtime["source_git_sha"],
+    )
+    replacement = "f" if runtime["source_git_sha"][0] != "f" else "e"
+    with pytest.raises(ValueError, match="source_git_sha is not approved"):
+        validate_evaluation_runtime_identity(
+            payload,
+            expected_source_git_shas=[replacement * len(runtime["source_git_sha"])],
+        )
 
     wrong_protocol = json.loads(json.dumps(payload))
     wrong_protocol["protocol"] = "pretend-protocol"
@@ -332,6 +343,13 @@ def test_private_holdout_name_is_redacted_from_report_identity():
     )
     assert private.to_dict()["deal_set_name"] == "private_holdout"
     assert "secret-customer-path" not in json.dumps(private.to_dict())
+    payload = evaluate_scenario(private).to_dict()
+    assert all(len(row["deal_hash"]) == 64 for row in payload["games"])
+    assert all(
+        field not in row
+        for row in payload["games"]
+        for field in ("deal_payload", "deal_digest", "team_scores")
+    )
 
 
 def test_ablation_runner_requires_explicit_checkpoint_backed_variants():

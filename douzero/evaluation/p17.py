@@ -4,22 +4,37 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+from douzero.env.rules import RuleSet
+from douzero.env.scoring import compute_team_score_magnitude
 
 from .ablation import ABLATION_NAMES
 from .protocol import (
     EVALUATION_PROTOCOL,
     OFFICIAL_PERMUTATION_HASHES,
+    OFFICIAL_CI_METHOD,
+    OFFICIAL_CONFIDENCE_LEVEL,
+    OFFICIAL_STATISTICAL_UNIT,
     P17_MIN_BOOTSTRAP_SAMPLES,
     P17_MIN_PAIRED_DEALS,
     P17_READINESS_PROTOCOL,
     PROMOTION_ESTIMATOR,
     PROMOTION_MODE,
 )
-from .scenario import BundleSpec, bundle_from_dict, default_seat_permutations
+from .scenario import (
+    ROLES,
+    BundleSpec,
+    bundle_from_dict,
+    canonical_deal_id,
+    canonical_deal_set_id,
+    default_seat_permutations,
+)
 from .statistics import deal_cluster_means, paired_bootstrap_ci
 
 
@@ -367,6 +382,219 @@ def _numbers_match(actual: object, expected: float | int) -> bool:
     )
 
 
+_DEAL_ID_PATTERN = re.compile(r"^(?P<index>[0-9]{6,12})-[0-9a-f]{12}$")
+
+
+def _is_full_sha256(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _is_official_confidence_level(value: object) -> bool:
+    return bool(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and math.isclose(
+            float(value),
+            OFFICIAL_CONFIDENCE_LEVEL,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    )
+
+
+def _append_issue(issues: list[str], issue: str) -> None:
+    if issue not in issues:
+        issues.append(issue)
+
+
+def _mapping_numbers_match(
+    actual: object, expected: Mapping[str, float]
+) -> bool:
+    return bool(
+        isinstance(actual, Mapping)
+        and set(actual) == set(expected)
+        and all(_numbers_match(actual[key], value) for key, value in expected.items())
+    )
+
+
+def _recompute_full_game_seat_to_role(
+    row: Mapping[str, Any], ruleset: RuleSet
+) -> dict[str, str] | None:
+    """Derive final roles from the legal final-attempt bidding transcript."""
+
+    order = row.get("bidding_order")
+    history = row.get("bidding_history")
+    bid_value = row.get("bid_value")
+    if (
+        not isinstance(order, list)
+        or len(order) != 3
+        or any(type(seat) is not str for seat in order)
+        or set(order) != {"0", "1", "2"}
+        or not isinstance(history, list)
+        or not 1 <= len(history) <= 3
+        or type(bid_value) is not int
+    ):
+        return None
+
+    current_max = 0
+    landlord_seat = ""
+    maximum_bid = max(ruleset.bid_values)
+    for index, entry in enumerate(history):
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or type(entry[0]) is not str
+            or type(entry[1]) is not int
+            or entry[0] != order[index]
+            or entry[1] not in ruleset.bid_values
+            or current_max == maximum_bid
+            or (entry[1] != 0 and entry[1] <= current_max)
+        ):
+            return None
+        if entry[1] > current_max:
+            current_max = entry[1]
+            landlord_seat = entry[0]
+    if (
+        current_max == 0
+        or bid_value != current_max
+        or (len(history) < len(order) and current_max != maximum_bid)
+    ):
+        return None
+
+    landlord_index = order.index(landlord_seat)
+    expected_mapping = {
+        landlord_seat: "landlord",
+        order[(landlord_index + 1) % 3]: "landlord_down",
+        order[(landlord_index + 2) % 3]: "landlord_up",
+    }
+    reported_mapping = row.get("seat_to_role")
+    if not isinstance(reported_mapping, Mapping):
+        return None
+    try:
+        return expected_mapping if dict(reported_mapping) == expected_mapping else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _recompute_terminal_outcome(
+    row: Mapping[str, Any],
+    *,
+    mode: str,
+    assignment: tuple[str, ...],
+    ruleset: RuleSet,
+) -> tuple[tuple[str, ...], float, float] | None:
+    """Derive candidate outcome only from terminal rule facts."""
+
+    winner_position = row.get("winner_position")
+    winner_team = row.get("winner_team")
+    if winner_position not in ROLES:
+        return None
+    expected_winner_team = (
+        "landlord" if winner_position == "landlord" else "farmer"
+    )
+    if winner_team != expected_winner_team:
+        return None
+
+    if mode == "cardplay_only":
+        expected_roles = tuple(
+            role
+            for role, label in zip(ROLES, assignment)
+            if label == "candidate"
+        )
+    else:
+        seat_to_role = _recompute_full_game_seat_to_role(row, ruleset)
+        if seat_to_role is None:
+            return None
+        expected_roles = tuple(
+            str(seat_to_role[str(index)])
+            for index, label in enumerate(assignment)
+            if label == "candidate"
+        )
+
+    candidate_roles = row.get("candidate_roles")
+    if (
+        not isinstance(candidate_roles, list)
+        or tuple(candidate_roles) != expected_roles
+    ):
+        return None
+    candidate_team = "landlord" if expected_roles == ("landlord",) else "farmer"
+
+    bid_value = row.get("bid_value")
+    bomb_count = row.get("bomb_count")
+    rocket_count = row.get("rocket_count")
+    spring = row.get("spring")
+    anti_spring = row.get("anti_spring")
+    if (
+        type(bid_value) is not int
+        or type(bomb_count) is not int
+        or not 0 <= bomb_count <= 13
+        or type(rocket_count) is not int
+        or rocket_count not in (0, 1)
+        or type(spring) is not bool
+        or type(anti_spring) is not bool
+        or (spring and anti_spring)
+    ):
+        return None
+    if mode == "cardplay_only":
+        if bid_value != 0 or spring or anti_spring:
+            return None
+    elif (
+        bid_value not in ruleset.bid_values
+        or bid_value == 0
+        or (spring and winner_team != "landlord")
+        or (anti_spring and winner_team != "farmer")
+    ):
+        return None
+
+    score_arguments = {
+        "bomb_count": bomb_count,
+        "rocket_count": rocket_count,
+        "bid_value": bid_value,
+        "ruleset": ruleset,
+        "spring": spring,
+        "anti_spring": anti_spring,
+    }
+    landlord_magnitude = compute_team_score_magnitude(
+        team="landlord", **score_arguments
+    )
+    farmer_magnitude = compute_team_score_magnitude(
+        team="farmer", **score_arguments
+    )
+    team_scores = {
+        "landlord": float(
+            landlord_magnitude if winner_team == "landlord" else -landlord_magnitude
+        ),
+        "farmer": float(
+            farmer_magnitude if winner_team == "farmer" else -farmer_magnitude
+        ),
+    }
+    candidate_win = float(winner_team == candidate_team)
+    candidate_score = team_scores[candidate_team]
+    candidate_log_score = (
+        0.0
+        if candidate_score == 0.0
+        else math.copysign(math.log1p(abs(candidate_score)), candidate_score)
+    )
+    expected_role_wins = {role: candidate_win for role in expected_roles}
+    expected_role_scores = {role: candidate_score for role in expected_roles}
+    if (
+        not _numbers_match(row.get("candidate_win"), candidate_win)
+        or not _numbers_match(row.get("candidate_score"), candidate_score)
+        or not _numbers_match(row.get("candidate_log_score"), candidate_log_score)
+        or type(row.get("candidate_landlord")) is not int
+        or row.get("candidate_landlord") != int(candidate_team == "landlord")
+        or not _mapping_numbers_match(row.get("role_wins"), expected_role_wins)
+        or not _mapping_numbers_match(row.get("role_scores"), expected_role_scores)
+    ):
+        return None
+    return expected_roles, candidate_win, candidate_score
+
+
 def _recompute_result_evidence(
     result: Mapping[str, Any], *, mode: str
 ) -> tuple[dict[str, Any], list[str]]:
@@ -392,23 +620,42 @@ def _recompute_result_evidence(
     if scenario.get("seat_permutation_hash") != OFFICIAL_PERMUTATION_HASHES[mode]:
         issues.append("scenario seat-permutation hash is invalid")
 
-    grouped: dict[str, list[Mapping[str, Any]]] = {}
+    ruleset = RuleSet.legacy() if mode == "cardplay_only" else RuleSet.standard()
+    ruleset_identity_valid = scenario.get("ruleset") == ruleset.identity()
+    if not ruleset_identity_valid:
+        issues.append("scenario does not use the official ruleset identity")
+
+    grouped: dict[int, list[Mapping[str, Any]]] = {}
+    deal_hashes_by_index: dict[int, str] = {}
     malformed_rows = 0
     for row in games:
         if not isinstance(row, Mapping):
             malformed_rows += 1
             continue
         deal_id = row.get("deal_id")
+        deal_hash = row.get("deal_hash")
         assignment = row.get("assignment")
         if (
             not isinstance(deal_id, str)
-            or not deal_id
+            or not _is_full_sha256(deal_hash)
             or row.get("mode") != mode
             or not isinstance(assignment, list)
         ):
             malformed_rows += 1
             continue
-        grouped.setdefault(deal_id, []).append(row)
+        match = _DEAL_ID_PATTERN.fullmatch(deal_id)
+        if match is None:
+            malformed_rows += 1
+            continue
+        deal_index = int(match.group("index"))
+        if deal_id != canonical_deal_id(deal_index, str(deal_hash)):
+            malformed_rows += 1
+            continue
+        prior_hash = deal_hashes_by_index.setdefault(deal_index, str(deal_hash))
+        if prior_hash != deal_hash:
+            malformed_rows += 1
+            continue
+        grouped.setdefault(deal_index, []).append(row)
     if malformed_rows:
         issues.append(f"{malformed_rows} game rows are malformed")
 
@@ -416,15 +663,39 @@ def _recompute_result_evidence(
     if (
         isinstance(claimed_deals, bool)
         or not isinstance(claimed_deals, int)
+        or claimed_deals < 1
         or claimed_deals != len(grouped)
     ):
         issues.append("scenario num_deals does not match unique game-row deal IDs")
+
+    deal_indices_valid = set(grouped) == set(range(len(grouped)))
+    if not deal_indices_valid:
+        issues.append("game-row deal indices are not contiguous from zero")
+
+    if ruleset_identity_valid and deal_hashes_by_index and deal_indices_valid:
+        try:
+            recomputed_deal_set_id = canonical_deal_set_id(
+                mode,
+                ruleset,
+                [deal_hashes_by_index[index] for index in range(len(grouped))],
+                seat_permutation_hash=OFFICIAL_PERMUTATION_HASHES[mode],
+            )
+        except (TypeError, ValueError):
+            recomputed_deal_set_id = ""
+            issues.append("game-row deal hashes are invalid or duplicated")
+        if scenario.get("deal_set_id") != recomputed_deal_set_id:
+            issues.append("scenario deal_set_id does not match canonical game-row deals")
+    else:
+        recomputed_deal_set_id = ""
+        issues.append("ordered full game-row deal hashes are unavailable")
 
     expected_assignments = Counter(official_permutations)
     eligible_rows: list[Mapping[str, Any]] = []
     excluded_deals = 0
     malformed_deals = 0
-    for rows in grouped.values():
+    recomputed_rows: list[tuple[Mapping[str, Any], float, float]] = []
+    for deal_index in sorted(grouped):
+        rows = grouped[deal_index]
         try:
             assignments = Counter(tuple(row["assignment"]) for row in rows)
         except TypeError:
@@ -441,18 +712,33 @@ def _recompute_result_evidence(
         if forced_smoke:
             excluded_deals += 1
             continue
-        value_name = "candidate_win" if mode == PROMOTION_MODE else "candidate_score"
-        if any(
-            isinstance(row.get(value_name), bool)
-            or not isinstance(row.get(value_name), (int, float))
-            or not math.isfinite(float(row[value_name]))
-            for row in rows
-        ):
+        deal_rows: list[tuple[Mapping[str, Any], float, float]] = []
+        row_invalid = False
+        for row in rows:
+            assignment = tuple(row["assignment"])
+            outcome = _recompute_terminal_outcome(
+                row,
+                mode=mode,
+                assignment=assignment,
+                ruleset=ruleset,
+            )
+            if outcome is None:
+                _append_issue(
+                    issues,
+                    "reported candidate/role outcome does not match terminal rule evidence",
+                )
+                row_invalid = True
+                break
+            _expected_roles, candidate_win, candidate_score = outcome
+            deal_rows.append((row, candidate_win, candidate_score))
+        if row_invalid:
             malformed_deals += 1
             continue
         eligible_rows.extend(rows)
+        recomputed_rows.extend(deal_rows)
     if malformed_deals:
-        issues.append(
+        _append_issue(
+            issues,
             f"{malformed_deals} deals have incomplete, duplicate, or invalid game rows"
         )
     if excluded_deals:
@@ -463,33 +749,46 @@ def _recompute_result_evidence(
     bootstrap_samples = scenario.get("bootstrap_samples")
     confidence_level = scenario.get("confidence_level")
     deterministic_seed = scenario.get("deterministic_seed")
-    statistics_config_valid = (
+    bootstrap_config_valid = (
         isinstance(bootstrap_samples, int)
         and not isinstance(bootstrap_samples, bool)
         and 1 <= bootstrap_samples <= 100_000
-        and isinstance(confidence_level, (int, float))
-        and not isinstance(confidence_level, bool)
-        and 0.0 < float(confidence_level) < 1.0
         and isinstance(deterministic_seed, int)
         and not isinstance(deterministic_seed, bool)
     )
-    if not statistics_config_valid:
+    confidence_level_in_range = (
+        isinstance(confidence_level, (int, float))
+        and not isinstance(confidence_level, bool)
+        and math.isfinite(float(confidence_level))
+        and 0.0 < float(confidence_level) < 1.0
+    )
+    if not bootstrap_config_valid or not confidence_level_in_range:
         issues.append("scenario bootstrap configuration is invalid")
+    if not _is_official_confidence_level(confidence_level):
+        _append_issue(
+            issues, f"requires confidence_level={OFFICIAL_CONFIDENCE_LEVEL}"
+        )
+    if scenario.get("statistical_unit") != OFFICIAL_STATISTICAL_UNIT:
+        issues.append(f"requires statistical_unit={OFFICIAL_STATISTICAL_UNIT!r}")
+    if scenario.get("ci_method") != OFFICIAL_CI_METHOD:
+        issues.append(f"requires ci_method={OFFICIAL_CI_METHOD!r}")
+    if scenario.get("release_protocol_id") != EVALUATION_PROTOCOL:
+        issues.append(f"requires release_protocol_id={EVALUATION_PROTOCOL!r}")
 
     observations = (
         (
             str(row["deal_id"]),
-            float(row["candidate_win"]) - 0.5
-            if mode == PROMOTION_MODE else float(row["candidate_score"]),
+            candidate_win - 0.5
+            if mode == PROMOTION_MODE else candidate_score,
         )
-        for row in eligible_rows
+        for row, candidate_win, candidate_score in recomputed_rows
     )
     deal_values = deal_cluster_means(observations)
     recomputed_ci = None
-    if deal_values and statistics_config_valid:
+    if deal_values and bootstrap_config_valid:
         recomputed_ci = paired_bootstrap_ci(
             deal_values,
-            confidence_level=float(confidence_level),
+            confidence_level=OFFICIAL_CONFIDENCE_LEVEL,
             samples=bootstrap_samples,
             seed=deterministic_seed + (0 if mode == PROMOTION_MODE else 1),
         )
@@ -508,7 +807,7 @@ def _recompute_result_evidence(
             "estimate": None,
             "low": None,
             "high": None,
-            "confidence_level": confidence_level,
+            "confidence_level": OFFICIAL_CONFIDENCE_LEVEL,
             "paired_deals": 0,
             "bootstrap_samples": bootstrap_samples,
         }
@@ -520,6 +819,113 @@ def _recompute_result_evidence(
         ):
             issues.append("reported paired_estimate_ci does not match game rows")
 
+    # Recompute every release-facing diagnostic for which raw row evidence is
+    # present. Missing raw evidence is never replaced with a caller summary.
+    latencies: list[float] = []
+    calibration: list[tuple[str, float, float]] = []
+    search_calls = search_timeouts = search_fallbacks = 0
+    raw_diagnostics_valid = True
+    for row, _win, _score in recomputed_rows:
+        raw_latencies = row.get("candidate_latencies_ms")
+        raw_calibration = row.get("calibration")
+        if not isinstance(raw_latencies, list) or not isinstance(raw_calibration, list):
+            raw_diagnostics_valid = False
+            continue
+        try:
+            parsed_latencies = [float(value) for value in raw_latencies]
+            parsed_calibration = [
+                (str(role), float(prediction), float(label))
+                for role, prediction, label in raw_calibration
+            ]
+            counts = [int(row[name]) for name in (
+                "search_calls", "search_timeouts", "search_fallbacks"
+            )]
+        except (TypeError, ValueError):
+            raw_diagnostics_valid = False
+            continue
+        if (
+            not all(math.isfinite(value) and value >= 0 for value in parsed_latencies)
+            or not all(
+                role in ROLES and math.isfinite(prediction)
+                and 0 <= prediction <= 1 and label in (0.0, 1.0)
+                for role, prediction, label in parsed_calibration
+            )
+            or any(value < 0 for value in counts)
+            or counts[1] > counts[0]
+            or counts[2] > counts[0]
+        ):
+            raw_diagnostics_valid = False
+            continue
+        latencies.extend(parsed_latencies)
+        calibration.extend(parsed_calibration)
+        search_calls += counts[0]
+        search_timeouts += counts[1]
+        search_fallbacks += counts[2]
+    if not raw_diagnostics_valid:
+        issues.append("raw latency, calibration, or search evidence is unavailable")
+
+    from .paired import _calibration_metrics
+    from .statistics import percentile
+
+    recomputed_diagnostics = {
+        "calibration": _json_safe(_calibration_metrics(calibration)),
+        "inference_latency_ms": _json_safe({
+            "count": len(latencies),
+            "p50": percentile(latencies, 0.50),
+            "p95": percentile(latencies, 0.95),
+            "p99": percentile(latencies, 0.99),
+        }),
+        "search": _json_safe({
+            "calls": search_calls,
+            "timeout_rate": (
+                search_timeouts / search_calls if search_calls else float("nan")
+            ),
+            "fallback_rate": (
+                search_fallbacks / search_calls if search_calls else float("nan")
+            ),
+        }),
+    }
+    for name, recomputed in recomputed_diagnostics.items():
+        if _json_safe(metrics.get(name)) != recomputed:
+            issues.append(f"reported {name} does not match raw game-row evidence")
+    candidate_wins = [win for _row, win, _score in recomputed_rows]
+    candidate_scores = [score for _row, _win, score in recomputed_rows]
+    recomputed_overall = (
+        sum(candidate_wins) / len(candidate_wins) if candidate_wins else None
+    )
+    recomputed_mean_score = (
+        sum(candidate_scores) / len(candidate_scores) if candidate_scores else None
+    )
+    if not _numbers_match(metrics.get("overall_win_percentage"), recomputed_overall or 0.0):
+        issues.append("reported overall_win_percentage does not match raw outcomes")
+    if not _numbers_match(metrics.get("mean_score"), recomputed_mean_score or 0.0):
+        issues.append("reported mean_score does not match raw outcomes")
+    reported_by_role = metrics.get("by_role")
+    for role in ROLES:
+        role_rows = [
+            (win, score)
+            for row, win, score in recomputed_rows
+            if role in row["candidate_roles"]
+        ]
+        reported_role = (
+            reported_by_role.get(role, {})
+            if isinstance(reported_by_role, Mapping) else {}
+        )
+        if not role_rows:
+            if reported_role.get("games") != 0:
+                issues.append(f"reported by_role.{role} games do not match raw outcomes")
+            continue
+        expected_role = {
+            "games": len(role_rows),
+            "win_percentage": sum(win for win, _ in role_rows) / len(role_rows),
+            "mean_score": sum(score for _, score in role_rows) / len(role_rows),
+        }
+        if any(
+            not _numbers_match(reported_role.get(name), expected)
+            for name, expected in expected_role.items()
+        ):
+            issues.append(f"reported by_role.{role} does not match raw outcomes")
+
     return {
         "paired_deals": len(deal_values),
         "game_rows": len(games),
@@ -528,6 +934,8 @@ def _recompute_result_evidence(
         "malformed_rows": malformed_rows,
         "malformed_deals": malformed_deals,
         "recomputed_paired_estimate_ci": recomputed_payload,
+        "recomputed_deal_set_id": recomputed_deal_set_id,
+        "recomputed_diagnostics": recomputed_diagnostics,
     }, issues
 
 
@@ -543,6 +951,10 @@ def result_readiness(result: Mapping[str, Any], *, mode: str) -> dict[str, Any]:
         or bootstrap_samples < P17_MIN_BOOTSTRAP_SAMPLES
     ):
         issues.append(f"requires >= {P17_MIN_BOOTSTRAP_SAMPLES} bootstrap samples")
+    if not _is_official_confidence_level(scenario.get("confidence_level")):
+        _append_issue(
+            issues, f"requires confidence_level={OFFICIAL_CONFIDENCE_LEVEL}"
+        )
     if evidence["paired_deals"] < P17_MIN_PAIRED_DEALS:
         issues.append(f"requires >= {P17_MIN_PAIRED_DEALS} paired deals")
     if mode == "full_game" and isinstance(scenario, Mapping):
@@ -555,6 +967,7 @@ def result_readiness(result: Mapping[str, Any], *, mode: str) -> dict[str, Any]:
         "requirements": {
             "bootstrap_samples": P17_MIN_BOOTSTRAP_SAMPLES,
             "paired_deals": P17_MIN_PAIRED_DEALS,
+            "confidence_level": OFFICIAL_CONFIDENCE_LEVEL,
         },
         "status": "eligible" if not issues else "insufficient",
         "issues": issues,
@@ -569,6 +982,9 @@ def write_p17_artifacts(
     cardplay_result: Mapping[str, Any] | None = None,
     full_game_result: Mapping[str, Any] | None = None,
     ablation_results: Mapping[str, Mapping[str, Any]] | None = None,
+    expected_evaluator_git_shas: str | Iterable[str] | None = None,
+    expected_cardplay_deal_set_id: str | None = None,
+    expected_full_game_deal_set_id: str | None = None,
 ) -> dict[str, str]:
     """Write the fixed P17 artifact set, retaining explicit NOT RUN rows."""
 
@@ -579,6 +995,40 @@ def write_p17_artifacts(
     unknown = set(ablation_results) - set(ABLATION_NAMES)
     if unknown:
         raise P17MatrixError(f"unknown ablation results: {sorted(unknown)}")
+    approved_evaluator_shas = (
+        (expected_evaluator_git_shas,)
+        if isinstance(expected_evaluator_git_shas, str)
+        else tuple(expected_evaluator_git_shas or ())
+    )
+    has_results = any(
+        result is not None
+        for result in (cardplay_result, full_game_result, *ablation_results.values())
+    )
+    if has_results and not approved_evaluator_shas:
+        raise P17MatrixError(
+            "completed results require an expected evaluator Git SHA allowlist"
+        )
+    expected_deal_set_ids = {
+        "cardplay_only": expected_cardplay_deal_set_id,
+        "full_game": expected_full_game_deal_set_id,
+    }
+    required_deal_set_modes = {
+        mode
+        for result, mode in (
+            (cardplay_result, "cardplay_only"),
+            (full_game_result, "full_game"),
+        )
+        if result is not None
+    }
+    required_deal_set_modes.update(
+        normalized["ablations"][name]["protocol"]
+        for name in ablation_results
+    )
+    for mode in required_deal_set_modes:
+        if not _is_full_sha256(expected_deal_set_ids[mode]):
+            raise P17MatrixError(
+                f"completed {mode} results require an approved deal_set_id"
+            )
 
     def validate_result_inventory(result: Mapping[str, Any] | None, mode: str) -> None:
         if result is None:
@@ -586,6 +1036,10 @@ def write_p17_artifacts(
         scenario = result.get("scenario")
         if not isinstance(scenario, Mapping):
             raise P17MatrixError(f"{mode} result has no valid scenario identity")
+        if scenario.get("deal_set_id") != expected_deal_set_ids[mode]:
+            raise P17MatrixError(
+                f"{mode} result deal_set_id does not match the approved evaluation set"
+            )
         for side in ("candidate", "baseline"):
             actual_bundle = scenario.get(side)
             if not isinstance(actual_bundle, Mapping):
@@ -609,7 +1063,11 @@ def write_p17_artifacts(
         from .paired import validate_evaluation_runtime_identity
 
         try:
-            validate_evaluation_runtime_identity(result, expected_mode=mode)
+            validate_evaluation_runtime_identity(
+                result,
+                expected_mode=mode,
+                expected_source_git_shas=approved_evaluator_shas,
+            )
         except (TypeError, ValueError) as exc:
             raise P17MatrixError(
                 f"{mode} result runtime identity is invalid: {exc}"
@@ -647,6 +1105,7 @@ def write_p17_artifacts(
         return {
             "schema_version": P17_REPORT_SCHEMA_VERSION,
             "status": "completed",
+            "approved_deal_set_id": expected_deal_set_ids[mode],
             "readiness": result_readiness(result, mode=mode),
             "mode": mode,
             "result": result,
@@ -660,6 +1119,13 @@ def write_p17_artifacts(
             name: (
                 {
                     "status": "completed",
+                    "approved_deal_set_id": expected_deal_set_ids[
+                        normalized["ablations"][name]["protocol"]
+                    ],
+                    "readiness": result_readiness(
+                        ablation_results[name],
+                        mode=normalized["ablations"][name]["protocol"],
+                    ),
                     "result": ablation_results[name],
                 }
                 if name in ablation_results

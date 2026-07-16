@@ -45,6 +45,9 @@ from __future__ import annotations
 import math
 import os
 import random
+import copy
+import hashlib
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -117,6 +120,7 @@ class TrainerConfig:
     belief_supervised_weight: float = 0.0
     belief_alternating_interval: int = 1
     belief_supervised_batch_size: int = 16
+    first_bidder_mode: str = "rotate"
 
     def __post_init__(self) -> None:
         """Validate ranges so a malformed config fails fast (P06 r2).
@@ -182,6 +186,8 @@ class TrainerConfig:
             raise ValueError("belief_alternating_interval must be >= 1")
         if self.belief_supervised_batch_size < 1:
             raise ValueError("belief_supervised_batch_size must be >= 1")
+        if self.first_bidder_mode not in {"rotate", "seeded_random"}:
+            raise ValueError("first_bidder_mode must be 'rotate' or 'seeded_random'")
 
 
 @dataclass
@@ -565,6 +571,7 @@ class V2Trainer:
         self._curriculum_game_index = 0
         self._opening_prediction_sum = 0.0
         self._opening_prediction_count = 0
+        self._first_bidder_game_index = 0
         # P06 r3: put the model in eval mode for self-play collection.
         # ``inference_mode`` in _choose_action_index only disables autograd;
         # it does NOT switch Dropout / BatchNorm behaviour, so without
@@ -630,6 +637,14 @@ class V2Trainer:
             self.stats.max_redeals_exceeded += int(
                 episode.max_redeals_exceeded
             )
+            if episode.max_redeals_exceeded:
+                episode.excluded_from_training = True
+                episode.exclusion_reason = "redeal_cap_guard"
+                # The forced landlord is a liveness fallback, not a sample from
+                # the declared rules. Exclude the whole game from every target.
+                episode.transitions.clear()
+                episode.bidding_transitions.clear()
+                continue
             if episode.transitions:
                 self.buffer.add_episode(episode)
             if episode.bidding_transitions:
@@ -687,6 +702,11 @@ class V2Trainer:
                 policy_step_at_start=policy_step_at_start,
             )
             self._league_game_index += 1
+            if episode.max_redeals_exceeded:
+                episode.excluded_from_training = True
+                episode.exclusion_reason = "redeal_cap_guard"
+                episode.transitions.clear()
+                episode.bidding_transitions.clear()
             if self.strategy_aux_weight > 0:
                 episode.label_strategy_auxiliary(
                     node_budget=self.model.config.strategy_node_budget,
@@ -695,7 +715,16 @@ class V2Trainer:
             self._record_coach_label(opening, episode)
             return episode
         env = Env(objective="adp", ruleset=self.ruleset)
-        env.reset(opening=opening)
+        bidding_order = None
+        if self.standard_mode and opening is None:
+            seats = ["0", "1", "2"]
+            if self.config.first_bidder_mode == "rotate":
+                offset = self._first_bidder_game_index % len(seats)
+            else:
+                offset = self.rng.randrange(len(seats))
+            bidding_order = seats[offset:] + seats[:offset]
+            self._first_bidder_game_index += 1
+        env.reset(opening=opening, bidding_order=bidding_order)
         episode = Episode(
             policy_version_at_start=policy_version_at_start,
             policy_step_at_start=policy_step_at_start,
@@ -723,6 +752,7 @@ class V2Trainer:
                     bid_action=bid,
                     policy_version=policy_version_at_start,
                     source_policy=source_policy,
+                    policy_target_valid=source_policy != "epsilon_random",
                 ))
                 _obs_out, _reward, done, info = env.step(None, bid_value=bid)
                 if done and info.get("redeal"):
@@ -779,7 +809,12 @@ class V2Trainer:
             if done:
                 episode.terminal_result = info or {}
                 break
-        if self.strategy_aux_weight > 0:
+        if episode.max_redeals_exceeded:
+            episode.excluded_from_training = True
+            episode.exclusion_reason = "redeal_cap_guard"
+            episode.transitions.clear()
+            episode.bidding_transitions.clear()
+        if self.strategy_aux_weight > 0 and not episode.excluded_from_training:
             episode.label_strategy_auxiliary(
                 node_budget=self.model.config.strategy_node_budget,
                 time_budget_ms=self.model.config.strategy_time_budget_ms,
@@ -1022,12 +1057,14 @@ class V2Trainer:
         if self.bidding_policy_config is None:
             raise RuntimeError("bidding decision requested outside standard mode")
 
+        if (
+            self.bidding_policy_config.policy == "learned"
+            and self.config.exp_epsilon > 0.0
+            and self.rng.random() < self.config.exp_epsilon
+        ):
+            return int(self.rng.choice(obs.legal_bids)), "epsilon_random"
+
         def learned_selector(bidding_obs) -> int:
-            if (
-                self.config.exp_epsilon > 0.0
-                and self.rng.random() < self.config.exp_epsilon
-            ):
-                return int(self.rng.choice(bidding_obs.legal_bids))
             with torch.inference_mode(), self.mixed_precision.autocast():
                 out = self.inference_model.forward_bidding(bidding_obs)
             return out.argmax_bid()
@@ -1084,6 +1121,25 @@ class V2Trainer:
             float(state["cached_gaussian"]),
         )
 
+    @staticmethod
+    def _state_dict_hash(state_dict: dict[str, torch.Tensor]) -> str:
+        """Hash tensor names, shapes, dtypes, and exact CPU bytes."""
+        digest = hashlib.sha256()
+        for name, tensor in sorted(state_dict.items()):
+            if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
+                raise TypeError("state_dict must map strings to tensors")
+            value = tensor.detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(value.dtype).encode("ascii"))
+            digest.update(json.dumps(list(value.shape)).encode("ascii"))
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
+    def _trainer_config_identity(self) -> tuple[dict, str]:
+        payload = asdict(self.config)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
     def save_training_checkpoint(self, path: str) -> dict:
         """Atomically save resumable optimizer/counter/RNG and identity state."""
         from douzero.observation.bidding import (
@@ -1096,8 +1152,12 @@ class V2Trainer:
         if self.model.config.bidding_enabled:
             bidding_schema_hash = self.model.bidding_schema.stable_hash()
         belief_config_hash = ""
+        belief_state_dict = None
+        belief_state_hash = ""
         if self.belief_model is not None:
             belief_config_hash = self.belief_model.config.stable_hash()
+            belief_state_dict = self.belief_model.state_dict()
+            belief_state_hash = self._state_dict_hash(belief_state_dict)
         coupled_belief = self.belief_training_mode != "frozen"
         source_sha = git_sha()
         if (
@@ -1109,6 +1169,7 @@ class V2Trainer:
                 "resumable trainer checkpoints require a full source Git SHA; "
                 "build from a Git checkout or set DOUZERO_GIT_SHA"
             )
+        trainer_config, trainer_config_hash = self._trainer_config_identity()
         bundle = {
             # Version 1 is intentionally retained byte-for-field compatible
             # for frozen mode. Version 2 is an atomic belief+value bundle.
@@ -1134,6 +1195,10 @@ class V2Trainer:
             ),
             "bidding_feature_schema_hash": bidding_schema_hash,
             "belief_config_hash": belief_config_hash,
+            "belief_state_dict": belief_state_dict,
+            "belief_state_dict_hash": belief_state_hash,
+            "trainer_config": trainer_config,
+            "trainer_config_hash": trainer_config_hash,
             "loss_config": self.loss_fn.config.to_dict(),
             "bidding_policy_config": (
                 asdict(self.bidding_policy_config)
@@ -1144,7 +1209,10 @@ class V2Trainer:
                 "league_game_index": self._league_game_index,
                 "opening_prediction_sum": self._opening_prediction_sum,
                 "opening_prediction_count": self._opening_prediction_count,
+                "first_bidder_game_index": self._first_bidder_game_index,
             },
+            "mixed_precision": self.mixed_precision.state_dict(),
+            "replay_resume_policy": "flushed_checkpoint_boundary_v1",
             "rng": {
                 "trainer": self.rng.getstate(),
                 "python": random.getstate(),
@@ -1159,7 +1227,6 @@ class V2Trainer:
         if coupled_belief:
             bundle.update({
                 "belief_training_mode": self.belief_training_mode,
-                "belief_state_dict": self.belief_model.state_dict(),
                 "belief_public_input_contract": "belief_input_public_v1",
                 "belief_supervised_weight": self.belief_supervised_weight,
                 "belief_alternating_interval": self.config.belief_alternating_interval,
@@ -1170,12 +1237,20 @@ class V2Trainer:
         temporary = destination.with_name(destination.name + ".tmp")
         torch.save(bundle, temporary)
         os.replace(temporary, destination)
+        # Replay observations contain rich Python objects that are deliberately
+        # excluded from the weights-only checkpoint. A successful save defines
+        # an explicit empty-replay boundary for both the continuing trainer and
+        # a fresh resumed process, preserving deterministic N+M semantics.
+        self.buffer.clear()
+        self.bidding_buffer.clear()
         identity_keys = [
             "checkpoint_version", "source_git_sha", "policy_version",
             "feature_schema_hash", "model_config_hash",
             "ruleset_id", "ruleset_version", "ruleset_hash",
             "bidding_head_version", "bidding_action_schema",
             "bidding_feature_schema_hash", "belief_config_hash",
+            "belief_state_dict_hash", "trainer_config", "trainer_config_hash",
+            "replay_resume_policy",
             "loss_config", "bidding_policy_config",
         ]
         if coupled_belief:
@@ -1243,7 +1318,11 @@ class V2Trainer:
                 asdict(self.bidding_policy_config)
                 if self.bidding_policy_config is not None else None
             ),
+            "replay_resume_policy": "flushed_checkpoint_boundary_v1",
         }
+        trainer_config, trainer_config_hash = self._trainer_config_identity()
+        expected["trainer_config"] = trainer_config
+        expected["trainer_config_hash"] = trainer_config_hash
         if self.belief_training_mode != "frozen":
             expected.update({
                 "belief_training_mode": self.belief_training_mode,
@@ -1262,6 +1341,7 @@ class V2Trainer:
         required_counters = {
             "curriculum_game_index", "league_game_index",
             "opening_prediction_sum", "opening_prediction_count",
+            "first_bidder_game_index",
         }
         if not isinstance(counters, dict) or set(counters) != required_counters:
             raise CheckpointCompatibilityError(
@@ -1270,6 +1350,7 @@ class V2Trainer:
         for name in (
             "curriculum_game_index", "league_game_index",
             "opening_prediction_count",
+            "first_bidder_game_index",
         ):
             value = counters[name]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1285,23 +1366,100 @@ class V2Trainer:
             raise CheckpointCompatibilityError(
                 "V2 trainer checkpoint opening_prediction_sum must be finite"
             )
-        self.model.load_state_dict(bundle["model_state_dict"], strict=True)
-        if self.belief_training_mode != "frozen":
-            belief_state = bundle.get("belief_state_dict")
-            if not isinstance(belief_state, dict):
+        belief_state = bundle.get("belief_state_dict")
+        belief_state_hash = bundle.get("belief_state_dict_hash", "")
+        if self.belief_model is not None:
+            if not isinstance(belief_state, dict) or (
+                self._state_dict_hash(belief_state) != belief_state_hash
+            ):
                 raise CheckpointCompatibilityError(
-                    "coupled trainer checkpoint is missing belief_state_dict"
+                    "trainer checkpoint belief weights or provenance are invalid"
                 )
-            self.belief_model.load_state_dict(belief_state, strict=True)
-        self.optimizer.load_state_dict(bundle["optimizer_state_dict"])
-        self.stats = TrainerStats(**bundle["stats"])
+            if (
+                self.belief_training_mode == "frozen"
+                and self._state_dict_hash(self.belief_model.state_dict())
+                != belief_state_hash
+            ):
+                raise CheckpointCompatibilityError(
+                    "frozen belief weights do not match the checkpoint"
+                )
+        elif belief_state is not None or belief_state_hash:
+            raise CheckpointCompatibilityError(
+                "belief-disabled trainer checkpoint carries belief state"
+            )
+        try:
+            restored_stats = TrainerStats(**bundle["stats"])
+            rng = bundle["rng"]
+            if not isinstance(rng, dict) or set(rng) != {
+                "trainer", "python", "numpy", "torch", "cuda"
+            }:
+                raise ValueError("checkpoint RNG state has an invalid field set")
+            probe_rng = random.Random()
+            probe_rng.setstate(rng["trainer"])
+            probe_python_rng = random.Random()
+            probe_python_rng.setstate(rng["python"])
+            probe_numpy = self._decode_numpy_rng_state(rng["numpy"])
+            np.random.RandomState().set_state(probe_numpy)
+            probe_torch_rng = torch.Generator(device="cpu")
+            probe_torch_rng.set_state(rng["torch"].cpu())
+            if self.device.type == "cuda":
+                if not isinstance(rng["cuda"], torch.Tensor):
+                    raise ValueError("CUDA trainer resume requires CUDA RNG state")
+                probe_cuda_rng = torch.Generator(device=self.device)
+                probe_cuda_rng.set_state(rng["cuda"])
+            elif rng["cuda"] is not None:
+                raise ValueError("CPU trainer checkpoint must not carry CUDA RNG state")
+            policy_step = bundle["policy_step"]
+            if (
+                isinstance(policy_step, bool)
+                or not isinstance(policy_step, int)
+                or policy_step < 0
+            ):
+                raise ValueError("checkpoint policy_step must be a non-negative int")
+            temp_model, temp_belief, temp_optimizer, temp_mixed = copy.deepcopy((
+                self.model, self.belief_model, self.optimizer, self.mixed_precision
+            ))
+            temp_model.load_state_dict(bundle["model_state_dict"], strict=True)
+            if temp_belief is not None and self.belief_training_mode != "frozen":
+                temp_belief.load_state_dict(belief_state, strict=True)
+            temp_optimizer.load_state_dict(bundle["optimizer_state_dict"])
+            temp_mixed.load_state_dict(bundle["mixed_precision"])
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise CheckpointCompatibilityError(
+                f"V2 trainer checkpoint state cannot be restored atomically: {exc}"
+            ) from exc
+
+        # All compatibility and load operations above target temporary objects.
+        # The live trainer is mutated only after that complete dry run succeeds.
+        original = copy.deepcopy((
+            self.model.state_dict(),
+            self.belief_model.state_dict() if self.belief_model is not None else None,
+            self.optimizer.state_dict(),
+            self.mixed_precision.state_dict(),
+        ))
+        try:
+            self.model.load_state_dict(bundle["model_state_dict"], strict=True)
+            if self.belief_model is not None and self.belief_training_mode != "frozen":
+                self.belief_model.load_state_dict(belief_state, strict=True)
+            self.optimizer.load_state_dict(bundle["optimizer_state_dict"])
+            self.mixed_precision.load_state_dict(bundle["mixed_precision"])
+        except Exception:
+            self.model.load_state_dict(original[0], strict=True)
+            if self.belief_model is not None and original[1] is not None:
+                self.belief_model.load_state_dict(original[1], strict=True)
+            self.optimizer.load_state_dict(original[2])
+            self.mixed_precision.load_state_dict(original[3])
+            raise
+        self.stats = restored_stats
+        self.buffer.clear()
+        self.bidding_buffer.clear()
         self.policy_version = str(bundle["policy_version"])
-        self.policy_step = int(bundle["policy_step"])
+        self.policy_step = policy_step
         self._curriculum_game_index = int(counters["curriculum_game_index"])
         self._league_game_index = int(counters["league_game_index"])
         self._opening_prediction_sum = float(counters["opening_prediction_sum"])
         self._opening_prediction_count = int(counters["opening_prediction_count"])
-        rng = bundle["rng"]
+        self._first_bidder_game_index = int(counters["first_bidder_game_index"])
         self.rng.setstate(rng["trainer"])
         random.setstate(rng["python"])
         np.random.set_state(self._decode_numpy_rng_state(rng["numpy"]))

@@ -130,6 +130,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Synthetic labelled episodes for the supervised joint/alternating term.",
     )
     parser.add_argument(
+        "--first_bidder_mode",
+        choices=["rotate", "seeded_random"],
+        default=argparse.SUPPRESS,
+        help="Reproducible opening-bidder schedule for standard training.",
+    )
+    parser.add_argument(
         "--bidding_policy",
         choices=["random", "rule", "max", "pass", "learned"],
         default=argparse.SUPPRESS,
@@ -750,6 +756,11 @@ def main() -> None:
             "belief_supervised_batch_size",
             yaml_cfg.belief_supervised_batch_size if yaml_cfg else None,
             defaults.belief_supervised_batch_size,
+        ),
+        first_bidder_mode=resolve(
+            "first_bidder_mode",
+            yaml_cfg.first_bidder_mode if yaml_cfg else None,
+            defaults.first_bidder_mode,
         ),
     )
     if distributed.enabled and trainer_cfg.belief_training_mode != "frozen":

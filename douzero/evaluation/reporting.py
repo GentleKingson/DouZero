@@ -149,7 +149,8 @@ def write_report(
 
     rows = [game.to_dict() for game in result.games]
     scalar_fields = [
-        "deal_id", "leg_id", "mode", "candidate_win", "candidate_score",
+        "deal_id", "deal_hash", "leg_id", "mode", "candidate_win",
+        "candidate_score",
         "candidate_log_score", "winner_team", "winner_position", "bid_value",
         "candidate_bid_attempts", "candidate_positive_bids", "candidate_landlord",
         "bomb_count", "rocket_count", "spring", "anti_spring", "game_length",
@@ -164,17 +165,24 @@ def write_report(
         "ruleset_hash",
         "model_feature_schemas",
     ]
+    structured_fields = [
+        "assignment",
+        "candidate_roles",
+        "role_wins",
+        "role_scores",
+        "seat_to_role",
+        "bidding_order",
+        "bidding_history",
+    ]
     with open(paths["csv"], "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=scalar_fields + [
-                "assignment", "candidate_roles", "role_wins", "role_scores"
-            ] + provenance_fields,
+            fieldnames=scalar_fields + structured_fields + provenance_fields,
         )
         writer.writeheader()
         for row in rows:
             output = {field: row[field] for field in scalar_fields}
-            for field in ("assignment", "candidate_roles", "role_wins", "role_scores"):
+            for field in structured_fields:
                 output[field] = json.dumps(row[field], sort_keys=True)
             output.update({
                 "result_schema_version": runtime_identity["schema_version"],

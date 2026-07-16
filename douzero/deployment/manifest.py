@@ -64,6 +64,15 @@ class ModelManifest:
     public_or_privileged: str
     dtype: str
     required_package_versions: dict[str, str]
+    source_checkpoint_sha256: str
+    source_checkpoint_manifest_sha256: str
+    source_git_sha: str
+    source_training_config_hash: str
+    source_ruleset_hash: str
+    source_feature_schema_hash: str
+    source_model_config_hash: str
+    source_checkpoint_kind: str
+    release_eligible: bool
     weights_sha256: str = ""
 
     def __post_init__(self) -> None:
@@ -84,6 +93,14 @@ class ModelManifest:
             "git_sha",
             "training_config_hash",
             "belief_config_hash",
+            "source_checkpoint_sha256",
+            "source_checkpoint_manifest_sha256",
+            "source_git_sha",
+            "source_training_config_hash",
+            "source_ruleset_hash",
+            "source_feature_schema_hash",
+            "source_model_config_hash",
+            "source_checkpoint_kind",
         ):
             value = getattr(self, name)
             if not isinstance(value, str) or not value:
@@ -95,6 +112,12 @@ class ModelManifest:
             "ruleset_hash",
             "training_config_hash",
             "belief_config_hash",
+            "source_checkpoint_sha256",
+            "source_checkpoint_manifest_sha256",
+            "source_training_config_hash",
+            "source_ruleset_hash",
+            "source_feature_schema_hash",
+            "source_model_config_hash",
         ):
             value = getattr(self, name)
             if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
@@ -103,6 +126,16 @@ class ModelManifest:
             c not in "0123456789abcdef" for c in self.git_sha
         ):
             raise ModelManifestError("git_sha must be a full lowercase Git object ID")
+        if len(self.source_git_sha) not in (40, 64) or any(
+            c not in "0123456789abcdef" for c in self.source_git_sha
+        ):
+            raise ModelManifestError("source_git_sha must be a full lowercase Git object ID")
+        if not isinstance(self.release_eligible, bool):
+            raise ModelManifestError("release_eligible must be bool")
+        if self.release_eligible and self.source_checkpoint_kind != "public_policy":
+            raise ModelManifestError(
+                "release-eligible packages require a public_policy source checkpoint"
+            )
         if not self.role_support or len(set(self.role_support)) != len(self.role_support):
             raise ModelManifestError("role_support must contain unique supported roles")
         unknown_roles = set(self.role_support) - set(SUPPORTED_ROLES)
@@ -199,6 +232,7 @@ def build_model_manifest(
     search_compatible: bool = False,
     public_or_privileged: str = PUBLIC_MODEL,
     dtype: str | None = None,
+    source_provenance: Mapping[str, Any] | None = None,
 ) -> ModelManifest:
     """Build deployment metadata from the actual model and ruleset identity."""
 
@@ -261,6 +295,34 @@ def build_model_manifest(
         bidding_head_version = ""
         bidding_action_schema = ""
         bidding_feature_schema_hash = ""
+    if source_provenance is None:
+        # Direct in-memory export remains useful for smoke tests and migration,
+        # but it cannot manufacture training provenance.
+        source_provenance = {
+            "source_checkpoint_sha256": canonical_hash(None),
+            "source_checkpoint_manifest_sha256": canonical_hash(None),
+            "source_git_sha": source_sha,
+            "source_training_config_hash": canonical_hash(None),
+            "source_ruleset_hash": ruleset.stable_hash(),
+            "source_feature_schema_hash": model.schema.stable_hash(),
+            "source_model_config_hash": model.config.stable_hash(),
+            "source_checkpoint_kind": "migration_artifact",
+            "release_eligible": False,
+        }
+    required_source = {
+        "source_checkpoint_sha256", "source_checkpoint_manifest_sha256",
+        "source_git_sha", "source_training_config_hash", "source_ruleset_hash",
+        "source_feature_schema_hash", "source_model_config_hash",
+        "source_checkpoint_kind", "release_eligible",
+    }
+    if set(source_provenance) != required_source:
+        raise ModelManifestError("source checkpoint provenance has an invalid field set")
+    if (
+        source_provenance["source_ruleset_hash"] != ruleset.stable_hash()
+        or source_provenance["source_feature_schema_hash"] != model.schema.stable_hash()
+        or source_provenance["source_model_config_hash"] != model.config.stable_hash()
+    ):
+        raise ModelManifestError("source checkpoint identity does not match the model")
     return ModelManifest(
         format_version=CURRENT_MODEL_FORMAT_VERSION,
         model_abi_version=MODEL_ABI_VERSION,
@@ -272,7 +334,7 @@ def build_model_manifest(
         ruleset_id=ruleset.ruleset_id,
         ruleset_hash=ruleset.stable_hash(),
         git_sha=source_sha,
-        training_config_hash=canonical_hash(training_config),
+        training_config_hash=str(source_provenance["source_training_config_hash"]),
         belief_config_hash=belief_config_hash,
         role_support=tuple(role_support),
         belief_enabled=belief_enabled,
@@ -289,4 +351,5 @@ def build_model_manifest(
             "torch": ">=2.0",
             "douzero": f"=={__version__}",
         },
+        **dict(source_provenance),
     )

@@ -22,6 +22,20 @@
 The working tree was clean at the start. `origin/main` was fetched and matched
 the local base SHA before this branch was created.
 
+### Independent Deep Review (2026-07-16)
+
+An independent adversarial review invalidated the earlier code-merge judgment
+at `6f66650`: green CI did not cover the release trust boundaries around deal
+identity, statistical protocol, raw evidence, package loadability/provenance,
+frozen-belief resume, redeal fallback data, exploration labels, or atomic
+checkpoint restoration. PR #20 therefore remains Draft and must not be merged
+as "infrastructure first".
+
+The current working tree contains directed remediations and regressions for
+those findings. This changes the code-correctness evidence, not the empirical
+release result. The release candidate remains `NONE`; GPU, authorized-data,
+formal strength, ablation, latency, and 1,000-deal gates remain open.
+
 ## 2. Baseline Findings
 
 Inspection of `main` at `fa9f76d` confirmed the following rather than relying
@@ -79,13 +93,13 @@ or private-data validation.
 | Single GPU | BLOCKED | No CUDA/NVIDIA device |
 | Multi-GPU NCCL DDP | BLOCKED | No CUDA/NCCL runtime; standard learned bidding, joint/alternating belief, and distributed trainer resume also fail closed as implementation blockers |
 | CUDA FP16/BF16 AMP | BLOCKED | No CUDA device; CPU BF16 is not a substitute |
-| Checkpoint resume | PASS (CPU) | Standard trainer save/load followed by optimizer step |
-| Paired evaluation | PARTIAL | 4-deal synthetic BC and 2-deal identical-model smokes only; no formal candidate. P17 collation re-hashes matrix checkpoints and recomputes deal-level evidence from game rows. |
+| Checkpoint resume | PASS (focused CPU) | Full TrainerConfig/hash, value/optimizer/belief, GradScaler/AMP fallback, counters, first-bidder schedule, and Python/NumPy/Torch CPU/CUDA RNG are validated through temporary objects before commit. Frozen belief weights are hash-bound; replay uses an explicit flushed checkpoint boundary. Injected optimizer restore failure leaves the active model/optimizer unchanged. |
+| Paired evaluation | PARTIAL | 4-deal synthetic BC and 2-deal identical-model smokes only; no formal candidate. P17 collation rebuilds canonical deal/deal-set identities and outcome, CI, calibration, latency, search, overall, and role evidence from raw game rows under the fixed 95% deal-level paired-bootstrap protocol. |
 | Full-game learned evaluation | PARTIAL | Strict learned-bidding two-deal equality smoke passes; 1,000-deal formal gate not run |
 | Eight-ablation matrix | BLOCKED | Semantically trained ablation checkpoints unavailable |
 | Calibration | BLOCKED | No release-candidate predictions/results |
 | Target latency/throughput | BLOCKED | No target GPU or release candidate |
-| Model package | PASS (tooling) | Standard bidding and self-contained belief packages clean-load; tamper/identity/incomplete-state rejection tests pass |
+| Model package | PASS (tooling) | Verification now strict-constructs the runtime model and strict-loads finite tensors, so verification implies CPU loadability. Format-2 provenance is inherited and cross-checked from the source public checkpoint; in-memory/legacy migration exports are explicitly `release_eligible=false`. |
 | Model card | PASS (documentation) | Honest no-RC draft; missing metrics marked unavailable |
 | Artifact provenance | PARTIAL / BLOCKED | P17 trainer/belief checkpoints, canonical human datasets, paired results, and format-2 packages carry strict identities; several historical coach/distillation/eval-data side artifacts do not yet meet the universal requirement |
 | License review | PASS | `docs/third_party_review.md`, `THIRD_PARTY_NOTICES`; no copied external code |
@@ -110,11 +124,10 @@ or private-data validation.
 - The full eight-row ablation matrix cannot be claimed without independently
   trained, identity-compatible checkpoints.
 - Repository-wide provenance is not universally closed. Historical coach
-  label/checkpoint, distillation/intermediate dataset, bare evaluation-deal,
-  and quarantine artifacts do not all have full producer manifests; package
-  training metadata is caller-supplied rather than cryptographically derived
-  from a source trainer checkpoint. The strict P17 paths do not erase this
-  cross-cutting release blocker.
+  label/checkpoint, distillation/intermediate dataset, and quarantine artifacts
+  do not all have full producer manifests. Format-2 release packages now inherit
+  checkpoint provenance rather than accepting caller re-declaration, but that
+  does not retroactively establish lineage for older side artifacts.
 
 ### High
 
@@ -179,8 +192,8 @@ under ignored `artifacts/`.
 | RL+BC `train_v2.py --config /tmp/douzero-p17-rlbc.yaml ...` | PASS; 19 transitions, one finite optimizer step, parameters changed |
 | Fresh synthetic BC before/after `evaluate_paired.py ... --num-deals 4 --bootstrap-samples 2000` | PASS as code smoke; estimate -0.1250, CI [-0.5000, 0.2500]; `p15-paired-result-v2` identities verified; not strength evidence |
 | Fresh learned full-game equality on current `v2-bidding-2`, 2 deals/2,000 bootstrap | PASS as code smoke; 6 seat-rotated games, 5 learned-bid calls, estimate 0, CI [0, 0], no cap fallback |
-| `prepare_p17_evaluation.py --matrix ... --full-game-result ...` | PASS; fixed seven files; result/checkpoint/runtime identities validated; recomputed readiness `insufficient` at 2/1,000 deals |
-| P17 result-integrity and all-pass-cap tests | PASS; forged runtime/checkpoint/count/CI evidence is rejected; forced cap fallbacks are cleared, audited, excluded, and release-ineligible |
+| `prepare_p17_evaluation.py --matrix ... --full-game-result ... --expected-evaluator-git-sha <approved-full-sha> --expected-full-game-deal-set-id <approved-set-sha256>` | PASS; fixed seven files; result/checkpoint/runtime/deal-set identities validated; recomputed readiness `insufficient` at 2/1,000 deals |
+| P17 result-integrity and all-pass-cap tests | PASS; forged evaluator SHA, ordered deal hash/set, terminal outcome/score, confidence/count/CI evidence is rejected; forced cap fallbacks are cleared, audited, excluded, and release-ineligible |
 | `tools/package_model.py ...` with the fresh standard learned-bidding sidecar | PASS; format-2 public package binds `b7db29a`, `v2-bidding-2`, rule/model/training identities and summaries |
 | First manual package-load command | FAILED: omitted required runtime schema/rules/config and used a nonexistent rollback test selector; no inference was claimed |
 | Second manual package-load command | MODEL LOAD FAILED: treated wrapped `model_config.json` as bare config; two independently selected package tests still passed because the shell lacked `set -e` |
@@ -191,6 +204,10 @@ under ignored `artifacts/`.
 | `scripts/validate_gpu_training.sh --probe-only`; full script | Probe PASS; full script expected exit 3 with CUDA unavailable and DDP implementation blockers, no GPU metrics claimed |
 | `git diff --check`; clean-tree and SHA readback after code validation | PASS; clean `b7db29a3856324d65170b49ef32d17be7d3a6996` |
 | Draft PR build/test matrix on `43b50a3e223e08844724762ea2b49f458564794f` | PASS: build and test on Python 3.11/3.12/3.13; slowest test job 3m59s |
+| Independent-review directed regressions (`tests/test_p17_deep_review_fixes.py`) | PASS: canonical deal identity/raw evidence, fixed statistics, strict package loadability, source-checkpoint provenance, epsilon-label masking, frozen-belief identity, atomic restore failure, and whole-game redeal-cap exclusion |
+| Post-review focused evaluation/deployment/bidding/belief suites | PASS |
+| Post-review host full suite | PASS, 1,582 tests and the existing expected `lambda_bc==0` warning |
+| Post-review Docker release gate (`douzero-p16-test:latest`, bind-mounted current tree) | PASS, Python 3.11.15/Linux arm64; compile, CLI, 1,582 tests, baseline capture, and `git diff --check` |
 
 ## 7. Conclusion
 
@@ -200,7 +217,7 @@ Release status: NOT READY
 ```
 
 ```text
-Implementation complete, external empirical validation pending
+Code trust-boundary remediation complete; external empirical validation pending
 ```
 
 That required sentence is scoped to the implemented P17 single-process CPU

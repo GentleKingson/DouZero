@@ -11,6 +11,7 @@ from douzero.evaluation.p17 import (
     ABLATION_NAMES,
     empty_matrix,
     load_result,
+    normalize_matrix,
     write_p17_artifacts,
 )
 
@@ -33,6 +34,23 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--ablation-result", action="append", type=_assignment, default=[]
     )
+    parser.add_argument(
+        "--expected-evaluator-git-sha",
+        action="append",
+        default=[],
+        help=(
+            "approved full evaluator Git SHA; repeat for an explicit cross-version "
+            "allowlist"
+        ),
+    )
+    parser.add_argument(
+        "--expected-cardplay-deal-set-id",
+        help="pre-approved cardplay_only deal-set SHA-256",
+    )
+    parser.add_argument(
+        "--expected-full-game-deal-set-id",
+        help="pre-approved full_game deal-set SHA-256",
+    )
     parser.add_argument("--output", default="artifacts/evaluation/p17")
     args = parser.parse_args(argv)
 
@@ -47,6 +65,35 @@ def main(argv=None) -> int:
     if not args.matrix:
         parser.error("--matrix is required unless --write-matrix-template is used")
     matrix = json.loads(Path(args.matrix).read_text(encoding="utf-8"))
+    normalized_matrix = normalize_matrix(matrix)
+    ablation_protocols = {
+        name: normalized_matrix["ablations"][name]["protocol"]
+        for name, _path in args.ablation_result
+    }
+    if (
+        args.cardplay_result
+        or args.full_game_result
+        or args.ablation_result
+    ) and not args.expected_evaluator_git_sha:
+        parser.error(
+            "--expected-evaluator-git-sha is required when collating results"
+        )
+    needs_cardplay_set = bool(args.cardplay_result) or any(
+        ablation_protocols[name] == "cardplay_only"
+        for name, _path in args.ablation_result
+    )
+    needs_full_game_set = bool(args.full_game_result) or any(
+        ablation_protocols[name] == "full_game"
+        for name, _path in args.ablation_result
+    )
+    if needs_cardplay_set and not args.expected_cardplay_deal_set_id:
+        parser.error(
+            "--expected-cardplay-deal-set-id is required for cardplay results"
+        )
+    if needs_full_game_set and not args.expected_full_game_deal_set_id:
+        parser.error(
+            "--expected-full-game-deal-set-id is required for full-game results"
+        )
     cardplay = (
         load_result(args.cardplay_result, "cardplay_only")
         if args.cardplay_result else None
@@ -56,7 +103,7 @@ def main(argv=None) -> int:
         if args.full_game_result else None
     )
     ablations = {
-        name: load_result(path, "cardplay_only" if name == "no_bidding" else "full_game")
+        name: load_result(path, ablation_protocols[name])
         for name, path in args.ablation_result
     }
     paths = write_p17_artifacts(
@@ -65,6 +112,9 @@ def main(argv=None) -> int:
         cardplay_result=cardplay,
         full_game_result=full_game,
         ablation_results=ablations,
+        expected_evaluator_git_shas=args.expected_evaluator_git_sha,
+        expected_cardplay_deal_set_id=args.expected_cardplay_deal_set_id,
+        expected_full_game_deal_set_id=args.expected_full_game_deal_set_id,
     )
     print(json.dumps(paths, indent=2, sort_keys=True))
     return 0

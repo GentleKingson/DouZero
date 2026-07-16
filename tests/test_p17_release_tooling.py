@@ -29,7 +29,7 @@ from douzero.env.game import GameEnv
 from douzero.env.env import Env
 from douzero.checkpoint import save_v2_position_weights
 from douzero.env.rules import RuleSet
-from douzero.evaluation.paired import evaluate_scenario
+from douzero.evaluation.paired import evaluation_runtime_identity, evaluate_scenario
 from douzero.evaluation.p17 import (
     P17MatrixError,
     empty_matrix,
@@ -37,8 +37,17 @@ from douzero.evaluation.p17 import (
     result_readiness,
     write_p17_artifacts,
 )
-from douzero.evaluation.protocol import EVALUATION_PROTOCOL, P17_READINESS_PROTOCOL
-from douzero.evaluation.scenario import BundleSpec, EvaluationScenario
+from douzero.evaluation.protocol import (
+    EVALUATION_PROTOCOL,
+    OFFICIAL_PERMUTATION_HASHES,
+    P17_READINESS_PROTOCOL,
+)
+from douzero.evaluation.scenario import (
+    BundleSpec,
+    EvaluationScenario,
+    canonical_deal_id,
+    canonical_deal_set_id,
+)
 from douzero.evaluation.agents import RuleAgent
 from douzero.evaluation.deep_agent import DeepAgentV2
 from douzero.evaluation.legacy_data_adapter import deal_standard_deck
@@ -626,6 +635,67 @@ def test_p17_empty_matrix_writes_explicit_not_run_artifact_set(tmp_path):
     )
 
 
+def test_prepare_p17_cli_requires_an_external_evaluator_sha(tmp_path):
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps(empty_matrix()), encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools" / "prepare_p17_evaluation.py"),
+            "--matrix",
+            str(matrix),
+            "--cardplay-result",
+            str(tmp_path / "result.json"),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "--expected-evaluator-git-sha is required" in completed.stderr
+
+    missing_set = subprocess.run(
+        [
+            *completed.args,
+            "--expected-evaluator-git-sha",
+            "a" * 40,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing_set.returncode == 2
+    assert "--expected-cardplay-deal-set-id is required" in missing_set.stderr
+
+
+def test_prepare_p17_cli_uses_the_matrix_ablation_protocol(tmp_path):
+    matrix_payload = empty_matrix()
+    matrix_payload["ablations"]["no_belief"]["protocol"] = "cardplay_only"
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps(matrix_payload), encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools" / "prepare_p17_evaluation.py"),
+            "--matrix",
+            str(matrix),
+            "--ablation-result",
+            f"no_belief={tmp_path / 'result.json'}",
+            "--expected-evaluator-git-sha",
+            "a" * 40,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "--expected-cardplay-deal-set-id is required" in completed.stderr
+    assert "--expected-full-game-deal-set-id is required" not in completed.stderr
+
+
 def test_p17_readiness_policy_is_versioned_separately_from_p15_promotion(
     monkeypatch,
 ):
@@ -633,7 +703,7 @@ def test_p17_readiness_policy_is_versioned_separately_from_p15_promotion(
     assert P17_READINESS_PROTOCOL == "p17_empirical_readiness_v1"
     assert P17_READINESS_PROTOCOL != EVALUATION_PROTOCOL
     result = {
-        "scenario": {"bootstrap_samples": 1999},
+        "scenario": {"bootstrap_samples": 1999, "confidence_level": 0.95},
     }
     monkeypatch.setattr(
         p17_evaluation,
@@ -643,7 +713,11 @@ def test_p17_readiness_policy_is_versioned_separately_from_p15_promotion(
     insufficient = result_readiness(result, mode="cardplay_only")
     assert insufficient == {
         "protocol": P17_READINESS_PROTOCOL,
-        "requirements": {"bootstrap_samples": 2000, "paired_deals": 1000},
+        "requirements": {
+            "bootstrap_samples": 2000,
+            "paired_deals": 1000,
+            "confidence_level": 0.95,
+        },
         "status": "insufficient",
         "issues": [
             "requires >= 2000 bootstrap samples",
@@ -763,13 +837,31 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
     assert result.metrics["redeals"]["total"] == 0
     artifacts = tmp_path / "p17"
     result_payload = result.to_dict()
+    approved_sha = result_payload["runtime_identity"]["source_git_sha"]
+    approved_deal_set_id = result_payload["scenario"]["deal_set_id"]
+    with pytest.raises(P17MatrixError, match="expected evaluator Git SHA"):
+        write_p17_artifacts(
+            tmp_path / "missing-evaluator-sha",
+            matrix=matrix,
+            full_game_result=result_payload,
+        )
+    with pytest.raises(P17MatrixError, match="approved deal_set_id"):
+        write_p17_artifacts(
+            tmp_path / "missing-deal-set-id",
+            matrix=matrix,
+            full_game_result=result_payload,
+            expected_evaluator_git_shas=[approved_sha],
+        )
     write_p17_artifacts(
         artifacts,
         matrix=matrix,
         full_game_result=result_payload,
+        expected_evaluator_git_shas=[approved_sha],
+        expected_full_game_deal_set_id=approved_deal_set_id,
     )
     full_report = json.loads((artifacts / "full_game_results.json").read_text())
     assert full_report["status"] == "completed"
+    assert full_report["approved_deal_set_id"] == approved_deal_set_id
     assert full_report["readiness"]["status"] == "insufficient"
     assert any("1000 paired deals" in issue for issue in full_report["readiness"]["issues"])
 
@@ -782,6 +874,8 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
             tmp_path / "wrong-identity",
             matrix=matrix,
             full_game_result=wrong_identity,
+            expected_evaluator_git_shas=[approved_sha],
+            expected_full_game_deal_set_id=approved_deal_set_id,
         )
 
     wrong_runtime_schema = copy.deepcopy(result_payload)
@@ -793,6 +887,70 @@ def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
             tmp_path / "wrong-runtime-schema",
             matrix=matrix,
             full_game_result=wrong_runtime_schema,
+            expected_evaluator_git_shas=[approved_sha],
+            expected_full_game_deal_set_id=approved_deal_set_id,
+        )
+
+    replacement = "f" if approved_sha[0] != "f" else "e"
+    unapproved_sha = replacement * len(approved_sha)
+    with pytest.raises(P17MatrixError, match="source_git_sha is not approved"):
+        write_p17_artifacts(
+            tmp_path / "wrong-evaluator-sha",
+            matrix=matrix,
+            full_game_result=result_payload,
+            expected_evaluator_git_shas=[unapproved_sha],
+            expected_full_game_deal_set_id=approved_deal_set_id,
+        )
+    write_p17_artifacts(
+        tmp_path / "explicit-evaluator-allowlist",
+        matrix=matrix,
+        full_game_result=result_payload,
+        expected_evaluator_git_shas=[unapproved_sha, approved_sha],
+        expected_full_game_deal_set_id=approved_deal_set_id,
+    )
+
+    wrong_deal_set_id = "f" * 64
+    if wrong_deal_set_id == approved_deal_set_id:
+        wrong_deal_set_id = "e" * 64
+    with pytest.raises(P17MatrixError, match="approved evaluation set"):
+        write_p17_artifacts(
+            tmp_path / "wrong-deal-set-id",
+            matrix=matrix,
+            full_game_result=result_payload,
+            expected_evaluator_git_shas=[approved_sha],
+            expected_full_game_deal_set_id=wrong_deal_set_id,
+        )
+
+    self_consistent_forgery = copy.deepcopy(result_payload)
+    forged_hash = "d" * 64
+    if forged_hash == self_consistent_forgery["games"][0]["deal_hash"]:
+        forged_hash = "c" * 64
+    for row in self_consistent_forgery["games"]:
+        row["deal_hash"] = forged_hash
+        row["deal_id"] = canonical_deal_id(0, forged_hash)
+    self_consistent_forgery["scenario"]["deal_set_id"] = canonical_deal_set_id(
+        "full_game",
+        ruleset,
+        [forged_hash],
+        seat_permutation_hash=OFFICIAL_PERMUTATION_HASHES["full_game"],
+    )
+    self_consistent_forgery["runtime_identity"] = evaluation_runtime_identity(
+        self_consistent_forgery["scenario"], ablation="base"
+    )
+    forged_readiness = result_readiness(
+        self_consistent_forgery, mode="full_game"
+    )
+    assert not any(
+        "deal_set_id" in issue or "deal hashes" in issue
+        for issue in forged_readiness["issues"]
+    )
+    with pytest.raises(P17MatrixError, match="approved evaluation set"):
+        write_p17_artifacts(
+            tmp_path / "self-consistent-forged-deal-set",
+            matrix=matrix,
+            full_game_result=self_consistent_forgery,
+            expected_evaluator_git_shas=[approved_sha],
+            expected_full_game_deal_set_id=approved_deal_set_id,
         )
 
     inflated = copy.deepcopy(result_payload)

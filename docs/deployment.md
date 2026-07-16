@@ -40,8 +40,12 @@ belief checkpoint or architecture identity.
 The output directory must be absent or empty. Packaging derives schema and
 model-config hashes from the constructed model, saves through the strict V2
 sidecar writer, and checksums every payload. Raw training configuration is not
-copied because it commonly contains private filesystem or dataset paths; only
-its canonical hash is published. A privileged model cannot be labelled as
+copied because it commonly contains private filesystem or dataset paths. Its
+canonical hash is inherited from the source checkpoint manifest;
+`--training-config` is only a cross-check and cannot replace Git, ruleset,
+schema, model, or training identity. Direct in-memory exports without a trusted
+source checkpoint are marked `source_checkpoint_kind=migration_artifact` and
+`release_eligible=false`. A privileged model cannot be labelled as
 public. Package verification rejects unexpected files, so canonical or raw
 human data cannot be smuggled into a release directory outside `SHA256SUMS`.
 
@@ -65,7 +69,9 @@ eval-mode public `BeliefModel` attached as `model.belief_model`.
 callers no longer need an untracked external belief checkpoint. The return type
 and construction path for belief-disabled packages are unchanged.
 
-The loader rejects checksum changes, unknown manifest fields, wrong feature or
+The verifier strict-constructs `ModelV2` and strict-loads every finite tensor,
+so successful verification establishes CPU loadability under the same runtime
+identity. The loader rejects checksum changes, unknown manifest fields, wrong feature or
 ruleset identity, wrong model or belief config, a training-config identity
 mismatch, missing or empty release documents, unexpected files, missing
 package versions, unsafe access class, bare legacy weights, and incomplete state

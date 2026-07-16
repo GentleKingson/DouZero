@@ -96,15 +96,29 @@ counts. The deprecated JSON `actor_fps` key is retained as the exact same
 inference-only rate for P15 consumer compatibility; it is not actor wall-clock
 FPS.
 
-The versioned `p17_empirical_readiness_v1` release policy requires at least
-2,000 bootstrap samples and 1,000 paired deals without changing the closed P15
-promotion contract. The P17 collation tool refuses missing matrix rows,
-missing checkpoint files, smoke-only random/rule model backends, unavailable
-ablation rows, and any full-game row without learned bidding.
+The versioned `p17_empirical_readiness_v1` release policy requires exactly the
+closed 95% `paired_percentile_bootstrap_v1` protocol with `deal` as the
+statistical unit, at least 2,000 bootstrap samples, and 1,000 paired deals
+without changing the closed P15 promotion contract. The P17 collation tool
+refuses missing matrix rows, missing checkpoint files, smoke-only random/rule
+model backends, unavailable ablation rows, and any full-game row without
+learned bidding.
 It also binds each supplied result to path-free SHA-256 identities for every
-matrix-validated role/bidding/belief checkpoint, recomputes paired evidence
-and confidence intervals from complete game rows, and makes any deal that
-exhausted the redeal cap smoke-only and release-ineligible.
+matrix-validated role/bidding/belief checkpoint. Each game row carries the
+complete `deal_hash` while private holdout cards remain undisclosed; collation
+uses the indexed hashes to reconstruct the order-sensitive deal-set identity,
+required seat rotations, candidate outcomes/scores, confidence intervals,
+calibration, latency, search, overall, and role metrics from those raw rows.
+Caller summaries cannot substitute for missing evidence. Any deal that
+exhausted the redeal cap is smoke-only and release-ineligible.
+
+Completed results also require at least one externally approved evaluator
+commit via `--expected-evaluator-git-sha`; repeat the option to declare an
+explicit cross-version allowlist. The matching pre-registered deal-set root is
+required through `--expected-cardplay-deal-set-id` or
+`--expected-full-game-deal-set-id`. SHAs claimed only by the result are not an
+approval source. Formal P17 readiness uses the canonical legacy/standard
+rulesets; custom-rule P15 runs remain descriptive and release-ineligible.
 
 ```bash
 .venv/bin/python tools/prepare_p17_evaluation.py \

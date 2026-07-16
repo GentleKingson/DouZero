@@ -77,3 +77,7 @@ bidding:
   # Raise toward 1.0 as the bidding head becomes calibrated. Warm-start bids
   # retain source_policy=rule and are never mislabelled as learned samples.
   learned_probability: 0.10
+
+# Rotate the neutral opening bidder across games. seeded_random is also
+# reproducible and uses the trainer-owned RNG.
+first_bidder_mode: rotate

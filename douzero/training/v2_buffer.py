@@ -188,6 +188,8 @@ class Episode:
     bidding_transitions: list[object] = field(default_factory=list)
     redeal_count: int = 0
     max_redeals_exceeded: bool = False
+    excluded_from_training: bool = False
+    exclusion_reason: str = ""
     abandoned_bidding_transitions: int = 0
     terminal_result: dict = field(default_factory=dict)
     # Complete public action trace, including forced single-action decisions.
@@ -391,6 +393,11 @@ class V2ReplayBuffer:
 
     def __len__(self) -> int:
         return self._size
+
+    def clear(self) -> None:
+        """Drop replay at an explicit checkpoint-safe boundary."""
+        self._episodes.clear()
+        self._size = 0
 
     @property
     def capacity(self) -> int:

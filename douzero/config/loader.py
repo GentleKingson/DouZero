@@ -277,6 +277,7 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "belief_training_mode": str, "belief_supervised_weight": float,
     "belief_alternating_interval": int, "belief_supervised_batch_size": int,
     "belief_supervised_episodes": int,
+    "first_bidder_mode": str,
     "seed": int, "deterministic": bool, "config": str,
     "feature_version": str, "ruleset": str, "model_version": str,
     "learning_rate": float, "alpha": float, "momentum": float, "epsilon": float,
@@ -430,6 +431,8 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         raise ValueError("belief_supervised_batch_size must be >= 1")
     if cfg.belief_supervised_episodes < 0:
         raise ValueError("belief_supervised_episodes must be non-negative")
+    if cfg.first_bidder_mode not in {"rotate", "seeded_random"}:
+        raise ValueError("first_bidder_mode must be 'rotate' or 'seeded_random'")
 
 
 # P01 only supports the "legacy" feature/rule/model versions. Later phases

@@ -539,6 +539,7 @@ class TrainingConfig:
     belief_alternating_interval: int = 1
     belief_supervised_batch_size: int = 16
     belief_supervised_episodes: int = 0
+    first_bidder_mode: str = "rotate"
 
     # New P01 knobs (carried, not yet enforced; defaults preserve legacy)
     seed: int = 0

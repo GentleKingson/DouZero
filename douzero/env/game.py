@@ -475,6 +475,11 @@ class GameEnv(object):
         """
         if bidding_order is None:
             bidding_order = list(self.NEUTRAL_SEATS)
+        if (
+            len(bidding_order) != len(self.NEUTRAL_SEATS)
+            or set(bidding_order) != set(self.NEUTRAL_SEATS)
+        ):
+            raise ValueError("bidding_order must be a permutation of neutral seats")
         self.bidding_order = list(bidding_order)
         self._bidding_index = 0
 

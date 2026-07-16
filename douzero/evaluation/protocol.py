@@ -12,6 +12,8 @@ EVALUATION_PROTOCOL = "p15_paired_v1"
 PROMOTION_MODE = "cardplay_only"
 PROMOTION_ESTIMATOR = "cardplay_win_rate_delta"
 OFFICIAL_CONFIDENCE_LEVEL = 0.95
+OFFICIAL_STATISTICAL_UNIT = "deal"
+OFFICIAL_CI_METHOD = "paired_percentile_bootstrap_v1"
 # Preserve the closed P15 v1 promotion contract. P17 raises release-evidence
 # requirements through a separate policy below; changing these values under
 # the same protocol identifier would invalidate previously eligible reports.

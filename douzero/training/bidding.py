@@ -14,7 +14,9 @@ import torch.nn.functional as F
 from douzero.models_v2.output import BiddingModelOutput
 from douzero.observation.bidding import BIDDING_ACTIONS, BiddingObservationV2
 
-_POLICIES = frozenset({"random", "rule", "max", "pass", "learned"})
+_POLICIES = frozenset({
+    "random", "rule", "max", "pass", "learned", "epsilon_random"
+})
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ class BiddingTransition:
     bid_action: int
     policy_version: str
     source_policy: str
+    policy_target_valid: bool = True
     target_landlord_win: float = float("nan")
     target_landlord_score: float = float("nan")
     target_regret: float = float("nan")
@@ -113,6 +116,10 @@ class BiddingTransition:
             raise ValueError("bidding transition must record policy_version")
         if self.source_policy not in _POLICIES:
             raise ValueError("bidding transition source_policy is invalid")
+        if not isinstance(self.policy_target_valid, bool):
+            raise ValueError("policy_target_valid must be bool")
+        if self.source_policy == "epsilon_random" and self.policy_target_valid:
+            raise ValueError("epsilon-random bids cannot be imitation policy targets")
         if self.target_landlord_win not in (0.0, 1.0):
             raise ValueError("target_landlord_win must be binary")
         if not math.isfinite(self.target_landlord_score):
@@ -139,6 +146,9 @@ class BiddingReplayBuffer:
 
     def __len__(self) -> int:
         return len(self._transitions)
+
+    def clear(self) -> None:
+        self._transitions.clear()
 
     def add_terminal_deal(
         self, transitions: Iterable[BiddingTransition], terminal: dict
@@ -202,7 +212,16 @@ def bidding_loss(
     if not bool(masks[torch.arange(len(outputs), device=logits.device), actions].all()):
         raise ValueError("bidding policy label points to an illegal action")
     masked_logits = logits.masked_fill(~masks, torch.finfo(logits.dtype).min)
-    policy = F.cross_entropy(masked_logits, actions)
+    policy_mask = torch.tensor(
+        [transition.policy_target_valid for transition in batch.transitions],
+        device=logits.device,
+        dtype=torch.bool,
+    )
+    policy = (
+        F.cross_entropy(masked_logits[policy_mask], actions[policy_mask])
+        if bool(policy_mask.any())
+        else masked_logits.sum() * 0.0
+    )
     win_logits = torch.stack([out.landlord_win_logit.float() for out in outputs])
     target_win = torch.tensor(
         [transition.target_landlord_win for transition in batch.transitions],

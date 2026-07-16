@@ -78,7 +78,7 @@ class Env:
         obs["redeal_count"] = self._redeal_count
         return obs
 
-    def reset(self, opening=None):
+    def reset(self, opening=None, bidding_order=None):
         """
         Every time reset is called, the environment
         will be re-initialized with a new deck of cards.
@@ -98,7 +98,7 @@ class Env:
             _deck = deck.copy()
             np.random.shuffle(_deck)
             card_play_data = None
-            bidding_order = None
+            # Callers may supply a reproducible training schedule.
         else:
             from douzero.coach.records import OpeningRecord
 
@@ -117,7 +117,10 @@ class Env:
                 raise ValueError("opening RuleSet hash does not match the environment")
             _deck = list(opening.deck)
             card_play_data = opening.to_card_play_data()
-            bidding_order = list(opening.bidding_order)
+            opening_order = list(opening.bidding_order)
+            if bidding_order is not None and list(bidding_order) != opening_order:
+                raise ValueError("bidding_order conflicts with the supplied opening")
+            bidding_order = opening_order
 
         if self.ruleset is not None:
             # Standard mode: deal 17+17+17 + 3 bottom cards, enter bidding.
@@ -160,6 +163,7 @@ class Env:
         redeal guard accumulates across redeals within the same game. Use
         ``reset()`` to start a completely new game.
         """
+        bidding_order = list(self._env.bidding_order)
         self._env.reset()
         self.need_redeal = False
         _deck = deck.copy()
@@ -171,7 +175,9 @@ class Env:
                           }
         for key in card_play_data:
             card_play_data[key].sort()
-        self._env.card_play_init_standard(card_play_data)
+        self._env.card_play_init_standard(
+            card_play_data, bidding_order=bidding_order
+        )
         self.bidding_obs = self._current_bidding_observation()
         self.infoset = None
         return self.bidding_obs

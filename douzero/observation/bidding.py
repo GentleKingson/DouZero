@@ -253,6 +253,14 @@ def get_bidding_obs_v2(
         )
     if any(value not in ruleset.bid_values for _, value in history):
         raise ValueError("bidding_history contains a bid outside the ruleset")
+    positive_bids = [value for _, value in history if value > 0]
+    if any(
+        later <= earlier
+        for earlier, later in zip(positive_bids, positive_bids[1:])
+    ):
+        raise ValueError("non-pass bidding_history values must strictly increase")
+    if 3 in positive_bids:
+        raise ValueError("a bid of 3 is terminal and cannot appear in an active observation")
     if len(history) >= len(order) or current_seat != order[len(history)]:
         raise ValueError(
             "current_seat must be the next neutral seat in bidding_order"

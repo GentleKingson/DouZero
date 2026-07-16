@@ -67,6 +67,7 @@ belief_supervised_weight: 0.0
 belief_alternating_interval: 1
 belief_supervised_batch_size: 16
 belief_supervised_episodes: 0
+first_bidder_mode: rotate
 
 # Reproducibility (consumed: seed=0 means no-op per the project convention)
 seed: 0

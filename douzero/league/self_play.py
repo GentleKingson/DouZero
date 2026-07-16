@@ -118,7 +118,12 @@ class PopulationEpisodeRunner:
         expected_bundle_hash = bundle.bundle_hash
         rng = random.Random(self.pool.config.seed + game_index * 97_409)
         env = Env(objective=self.pool.current.objective, ruleset=self.ruleset)
-        env.reset(opening=opening)
+        bidding_order = None
+        if self.ruleset is not None and opening is None:
+            seats = ["0", "1", "2"]
+            offset = game_index % len(seats)
+            bidding_order = seats[offset:] + seats[:offset]
+        env.reset(opening=opening, bidding_order=bidding_order)
         episode = Episode(
             policy_ids_by_seat=dict(bundle.policy_ids_by_seat),
             learner_controlled_seats=bundle.learner_controlled_seats,
@@ -176,6 +181,7 @@ class PopulationEpisodeRunner:
                         bid_action=bid,
                         policy_version=policy_version_at_start,
                         source_policy=source_policy,
+                        policy_target_valid=source_policy != "epsilon_random",
                     ))
                 _obs, _reward, done, info = env.step(None, bid_value=bid)
                 if done and info.get("redeal"):
@@ -283,6 +289,11 @@ class PopulationEpisodeRunner:
         else:
             raise RuntimeError(f"population episode exceeded max_steps={self.max_steps}")
 
+        if episode.max_redeals_exceeded:
+            episode.excluded_from_training = True
+            episode.exclusion_reason = "redeal_cap_guard"
+            episode.transitions.clear()
+            episode.bidding_transitions.clear()
         record = self._record(bundle, episode)
         if self.logger is not None:
             self.logger.append(record)
