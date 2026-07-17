@@ -79,6 +79,8 @@ class AttestationPolicy:
     source_digest: str
     source_ref: str
     artifact_sha256: str
+    trusted_root_path: str | os.PathLike[str] | None = None
+    trusted_root_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not _REPOSITORY.fullmatch(self.repository):
@@ -99,6 +101,21 @@ class AttestationPolicy:
             raise ProvenanceError("source_ref must be an exact fully qualified Git ref")
         if not _HEX_SHA256.fullmatch(self.artifact_sha256):
             raise ProvenanceError("artifact_sha256 must be a lowercase SHA-256 digest")
+        if (self.trusted_root_path is None) != (self.trusted_root_sha256 is None):
+            raise ProvenanceError(
+                "trusted_root_path and trusted_root_sha256 must be supplied together"
+            )
+        if self.trusted_root_path is not None:
+            try:
+                trusted_root = os.fspath(self.trusted_root_path)
+            except TypeError as exc:
+                raise ProvenanceError("trusted_root_path must be path-like") from exc
+            if not trusted_root or not _HEX_SHA256.fullmatch(
+                self.trusted_root_sha256 or ""
+            ):
+                raise ProvenanceError(
+                    "trusted root requires a path and lowercase SHA-256 digest"
+                )
 
 
 @dataclass(frozen=True)
@@ -670,6 +687,24 @@ def verify_github_attested_result(
         raise ProvenanceError("evaluation result artifact cannot be read") from exc
     if not bundle.is_file():
         raise ProvenanceError("detached attestation bundle does not exist")
+    trusted_root_bytes = None
+    if policy.trusted_root_path is not None:
+        trusted_root = Path(policy.trusted_root_path)
+        try:
+            if trusted_root.is_symlink() or not trusted_root.is_file():
+                raise ProvenanceError(
+                    "attestation trusted root must be a regular non-symlink file"
+                )
+            trusted_root_bytes = trusted_root.read_bytes()
+        except ProvenanceError:
+            raise
+        except OSError as exc:
+            raise ProvenanceError("attestation trusted root cannot be read") from exc
+        actual_root_sha = hashlib.sha256(trusted_root_bytes).hexdigest()
+        if not hmac.compare_digest(
+            actual_root_sha, policy.trusted_root_sha256 or ""
+        ):
+            raise ProvenanceError("attestation trusted root SHA-256 mismatch")
     artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
     if not hmac.compare_digest(artifact_sha256, policy.artifact_sha256):
         raise ProvenanceError("evaluation artifact SHA-256 does not match policy")
@@ -692,6 +727,10 @@ def verify_github_attested_result(
     with tempfile.TemporaryDirectory(prefix="douzero-attestation-") as directory:
         snapshot = Path(directory, "evaluation-result.json")
         snapshot.write_bytes(artifact_bytes)
+        trusted_root_snapshot = None
+        if trusted_root_bytes is not None:
+            trusted_root_snapshot = Path(directory, "trusted-root.jsonl")
+            trusted_root_snapshot.write_bytes(trusted_root_bytes)
         command = [
             gh_executable,
             "attestation",
@@ -699,6 +738,13 @@ def verify_github_attested_result(
             os.fspath(snapshot),
             "--bundle",
             os.fspath(bundle),
+        ]
+        if trusted_root_snapshot is not None:
+            command.extend([
+                "--custom-trusted-root",
+                os.fspath(trusted_root_snapshot),
+            ])
+        command.extend([
             "--repo",
             policy.repository,
             "--signer-workflow",
@@ -711,7 +757,7 @@ def verify_github_attested_result(
             policy.source_ref,
             "--format",
             "json",
-        ]
+        ])
         try:
             completed = subprocess.run(
                 command,

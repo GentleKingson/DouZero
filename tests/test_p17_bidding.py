@@ -676,6 +676,9 @@ def test_standard_training_step_and_strict_resume(tmp_path):
 
     checkpoint = tmp_path / "standard-resume.pt"
     identity = trainer.save_training_checkpoint(str(checkpoint))
+    assert identity["checkpoint_version"] == 3
+    assert identity["training_topology"] == "single_process"
+    assert identity["training_world_size"] == 1
     assert identity["bidding_head_version"]
     assert len(identity["source_git_sha"]) in (40, 64)
     restored = V2Trainer(
@@ -704,6 +707,15 @@ def test_standard_training_step_and_strict_resume(tmp_path):
     torch.save(tampered_bundle, tampered_checkpoint)
     with pytest.raises(CheckpointCompatibilityError, match="source_git_sha mismatch"):
         restored.load_training_checkpoint(str(tampered_checkpoint))
+
+    topology_tamper = torch.load(checkpoint, weights_only=True)
+    topology_tamper["training_world_size"] = 2
+    topology_checkpoint = tmp_path / "wrong-training-topology.pt"
+    torch.save(topology_tamper, topology_checkpoint)
+    with pytest.raises(
+        CheckpointCompatibilityError, match="training_world_size mismatch"
+    ):
+        restored.load_training_checkpoint(str(topology_checkpoint))
 
 
 def test_v2_checkpoint_carries_and_validates_explicit_bidding_identity(tmp_path):

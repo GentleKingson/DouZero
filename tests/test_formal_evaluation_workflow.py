@@ -624,6 +624,8 @@ def test_checkout_code_cannot_write_trusted_audit_or_other_stage_outputs() -> No
         "type=bind,src=$FORMAL_EVAL_DATA,dst=$FORMAL_EVAL_DATA,readonly",
         "type=bind,src=$FORMAL_RESULT_JSON,dst=$FORMAL_RESULT_JSON,readonly",
         "type=bind,src=$attestation_snapshot,dst=$attestation_snapshot,readonly",
+        "type=bind,src=$FORMAL_ATTESTATION_TRUSTED_ROOT,"
+        "dst=$FORMAL_ATTESTATION_TRUSTED_ROOT,readonly",
         "type=bind,src=$FORMAL_RUN_ROOT/p17-snapshot,"
         "dst=$FORMAL_RUN_ROOT/p17-snapshot,readonly",
         "type=bind,src=$FORMAL_P17_OUTPUT,dst=$FORMAL_P17_OUTPUT",
@@ -1001,6 +1003,7 @@ def test_exact_result_is_sigstore_attested_verified_and_uploaded() -> None:
     assert 'gh attestation verify "$FORMAL_RESULT_JSON"' in verification
     for flag in (
         "--bundle",
+        "--custom-trusted-root",
         "--repo",
         "--signer-workflow",
         "--signer-digest",
@@ -1014,6 +1017,7 @@ def test_exact_result_is_sigstore_attested_verified_and_uploaded() -> None:
         "Upload public result, detached bundle, and audit material"
     ]
     assert public_upload["if"] == (
+        "success() && steps.upload-gate.outputs.authorized == 'true' && "
         "steps.request.outputs.dataset_scope == 'public'"
     )
     assert "${{ steps.request.outputs.mode }}" in public_upload["with"]["name"]
@@ -1031,6 +1035,7 @@ def test_exact_result_is_sigstore_attested_verified_and_uploaded() -> None:
         "Upload private attestation audit without game traces"
     ]
     assert private_upload["if"] == (
+        "success() && steps.upload-gate.outputs.authorized == 'true' && "
         "steps.request.outputs.dataset_scope == 'private_holdout'"
     )
     assert "${{ env.FORMAL_RESULT_JSON }}" not in private_upload["with"]["path"]
@@ -1048,6 +1053,12 @@ def test_exact_result_is_sigstore_attested_verified_and_uploaded() -> None:
     assert "--network none" in collation
     assert '"$FORMAL_EVALUATOR_IMAGE"' in collation
     assert "GH_TOKEN" not in collation
+    assert "--attestation-trusted-root" in collation
+    assert "--attestation-trusted-root-sha256" in collation
+    assert (
+        "src=$FORMAL_ATTESTATION_TRUSTED_ROOT,"
+        "dst=$FORMAL_ATTESTATION_TRUSTED_ROOT,readonly" in collation
+    )
     assert 'install -m 0400 "$ATTESTATION_BUNDLE"' in collation
     assert "tools/prepare_p17_evaluation.py" in collation
     assert "--approved-cardplay-eval-data" in collation
@@ -1064,7 +1075,18 @@ def test_exact_result_is_sigstore_attested_verified_and_uploaded() -> None:
         "Verify P17 artifact manifest attestation"
     ]["run"]
     assert 'gh attestation verify "$manifest"' in p17_verification
+    assert (
+        '--custom-trusted-root "$FORMAL_ATTESTATION_TRUSTED_ROOT"'
+        in p17_verification
+    )
+    assert "FORMAL_ATTESTATION_TRUSTED_ROOT_SHA256" in p17_verification
     assert "--signer-workflow" in p17_verification
+
+    trusted_root_snapshot = (
+        "${{ env.FORMAL_AUDIT_ROOT }}/attestation-trusted-root.jsonl"
+    )
+    assert trusted_root_snapshot in public_upload["with"]["path"]
+    assert trusted_root_snapshot in private_upload["with"]["path"]
 
 
 def test_signed_manifest_closure_is_rechecked_immediately_before_upload() -> None:
@@ -1100,6 +1122,31 @@ def test_signed_manifest_closure_is_rechecked_immediately_before_upload() -> Non
         "report.md",
     ):
         assert f'"{artifact}"' in recheck
+
+
+def test_stale_runner_state_and_incomplete_results_fail_before_upload() -> None:
+    steps = _steps_by_name()
+    snapshot = steps["Snapshot protected evaluation request"]["run"]
+    assert 'stale_roots=("$RUNNER_TEMP"/douzero-formal-*)' in snapshot
+    assert "${#stale_roots[@]} != 0" in snapshot
+    assert "Refusing protected evaluation with a stale formal run root" in snapshot
+    assert "rm -rf" not in snapshot
+
+    recheck = steps["Recheck signed P17 manifest closure before upload"]["run"]
+    assert "release_status" in recheck
+    assert 'release_status[os.environ["EVALUATION_MODE"]] != "eligible"' in recheck
+    assert "signed manifest is not release eligible" in recheck
+
+    names = [step["name"] for step in _job()["steps"]]
+    gate_index = names.index("Authorize completed formal artifact upload")
+    assert gate_index < names.index(
+        "Upload public result, detached bundle, and audit material"
+    )
+    assert gate_index < names.index(
+        "Upload private attestation audit without game traces"
+    )
+    cleanup = steps["Remove protected input snapshots"]["run"]
+    assert '[[ ! -e "$run_root" && ! -L "$run_root" ]]' in cleanup
 
 
 def test_every_third_party_action_is_pinned_to_a_full_commit() -> None:

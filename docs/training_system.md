@@ -118,7 +118,10 @@ belief, loss, policy snapshot, and full source Git SHA. Resume rejects an
 unknown or different source SHA before restoring model/optimizer state; a
 wheel or source archive without Git metadata must set `DOUZERO_GIT_SHA` to the
 exact build commit. Standard and joint trainer checkpoint save/resume remains
-single-process only and fails closed when DDP is enabled.
+single-process only and fails closed when DDP is enabled. Trainer-checkpoint
+format 3 records `training_topology=single_process` and
+`training_world_size=1`; formats 1/2 and any topology mismatch are rejected
+rather than inferred to be compatible.
 
 ## Compile and transfer controls
 

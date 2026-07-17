@@ -1,10 +1,9 @@
-# P17 Release Readiness
+# P17 Readiness Infrastructure
 
 ## 1. Baseline Information
 
 - Repository: `https://github.com/GentleKingson/DouZero`
 - Base branch/SHA: `main` / `fa9f76de5ca31b4de33d4237e14b36e102c67655`
-- Review branch: `codex/p17-release-readiness-closure`
 - Mutable PR identity is deliberately not duplicated in this tracked file.
   The authoritative head SHA, merge-result SHA, workflow run IDs, job results,
   and review state live in [PR #20](https://github.com/GentleKingson/DouZero/pull/20)
@@ -15,50 +14,37 @@
   `{repository, head_sha, merge_sha, workflow_run_ids, image_digest,
   artifact_digest, attestation_identity}`. This document records the required
   gates and commands, not a moving copy of that tuple.
+- `.github/workflows/pr-evidence.yml` enforces the stable PR claim contract on
+  every open, synchronize, reopen, edit, and ready-for-review event. It rejects
+  a closure/release-ready title, literal object IDs, final-head language, fixed
+  test counts, and unbound audit claims. Its uploaded JSON binds the PR head,
+  tested merge commit, workflow commit, run identity, title hash, and body hash.
+  A later push necessarily creates a different head-bound check and artifact.
+- PR evidence is engineering evidence only. It is not a protected evaluator
+  result, an OIDC/Sigstore release attestation, or model-strength evidence.
 - The formal workflow implements request-v2 protected checkpoint roots,
   step-scoped protected paths, image-owned checkpoint snapshots, disjoint
   control/audit/result/P17 outputs, and exact stage-minimal mounts. Whether a
   particular PR head passed those checks must be established from the external
   evidence tuple above.
-- Historical implementation/test/Docker evidence was collected at
-  `b7db29a3856324d65170b49ef32d17be7d3a6996`; it does not validate the current
-  evaluation trust-boundary changes.
-- Review window: 2026-07-15 through 2026-07-17 (Asia/Hong_Kong)
-- Host: macOS 26.5.2, arm64, Apple A18 Pro; no NVIDIA device or
-  `nvidia-smi`
-- Isolated CPU runtime: Python 3.11.15, PyTorch 2.13.0+cpu, Linux arm64;
-  CUDA build `None`, CUDA devices 0, NCCL unavailable
-- Docker: Docker Desktop 29.6.1; only `runc` runtimes are installed (no
-  NVIDIA container runtime)
-- Authorized human-data variables: `DOUZERO_HUMAN_DATA_PATH` and
-  `DOUZERO_HUMAN_DATA_HMAC_KEY_FILE` were both unset
 - Scope: P00-P16 regression audit and P17 full-game training, joint belief,
-  empirical-validation tooling, evaluation, packaging, and release gates
+  empirical-validation tooling, evaluation, packaging, and fail-closed release
+  infrastructure. This is not a release-readiness closure or a release-ready
+  model delivery.
 
-The working tree was clean at the start. `origin/main` was fetched and matched
-the local base SHA before this branch was created.
+### Trust-Boundary Status
 
-### Independent Deep Review (2026-07-16)
-
-An independent adversarial review invalidated the earlier code-merge judgment
-at `6f66650`. A second review of published head `852b630` then showed that
-hash-bound rows and internally recomputed summaries still did not prove the
-declared game was played, that evaluator SHAs were still self-assertable,
-calibration labels were caller-controlled, and standalone diagnostics copied
-untrusted summaries. Green CI at that head therefore does not close the
-formal-evaluation trust boundary. At that review point, PR #20 had to remain
-Draft and could not be merged.
-
-The result-v3 implementation targets those findings with full action traces,
-deterministic replay against separately approved deal payloads,
+The result-v3 implementation targets earlier trust-boundary findings with full
+action traces, deterministic replay against separately approved deal payloads,
 replay-derived calibration labels, nanosecond timing evidence, a canonical
 whole-result digest, real clean/stable Git identity, and detached GitHub
-OIDC/Sigstore artifact attestation. Host, Docker, workflow-contract,
-packaging, tamper, and independent local-audit methods are present. Their
-commit-bound outcomes are recorded externally rather than frozen here.
-The current Draft/ready/review disposition is read from PR #20 rather than
-asserted here. No protected formal evaluation has produced an attested result
-under this boundary. The release candidate remains `NONE`; GPU,
+OIDC/Sigstore artifact attestation. Unit, Docker, workflow-contract, packaging,
+and tamper-test methods are present. Their commit-bound outcomes are recorded
+externally rather than frozen here. The current Draft/ready/review disposition
+is read from PR #20 rather than asserted here. A protected Environment,
+self-hosted evaluator, approved assets, and an actual protected workflow run
+must exist externally before this can produce formal evidence. Until such a run
+is recorded, the release candidate remains `NONE`; GPU,
 authorized-data, formal strength, ablation, latency, and 1,000-deal gates stay
 open.
 
@@ -79,9 +65,9 @@ on phase documentation:
 
 ## 3. Phase Status
 
-`Complete` means the repository implementation and its CPU evidence were
-reviewed in this closure. It does not imply model-strength, GPU, production,
-or private-data validation.
+`Complete` identifies an implemented repository contract. Its validation must
+still be rerun for each candidate head and does not imply model-strength, GPU,
+production, or private-data validation.
 
 | Phase | Status | Evidence |
 |---|---|---|
@@ -102,7 +88,7 @@ or private-data validation.
 | P14 AMP/DDP runtime | Partial | CPU BF16/Gloo legacy tests pass; CUDA AMP/NCCL are untested and standard learned-bidding DDP is not implemented |
 | P15 paired evaluation | Partial | `p15-paired-result-v3` defines full traces, strict result integrity, real-checkout identity, nanosecond timing, and isolated protected-input snapshots. Commit-bound CI is read from the external PR evidence tuple; a protected formal run remains pending. |
 | P16 deployment package | Complete (current format) | format-2 strict package/checksum/access/identity, loaded bidding/card-play inference, self-contained belief/search, rollback, and explicit format-1 rejection diagnostics pass; no RC exists |
-| P17 closure | Partial | Replay, attestation, and snapshot-isolation implementations have host/Docker/contract test methods. Commit-bound results live with the PR; a protected formal run, standard/joint DDP, and external empirical gates remain open. |
+| P17 readiness infrastructure | Partial | Replay, attestation, snapshot isolation, synthetic engineering smoke, and commit-bound PR evidence contracts are implemented. A protected formal run, standard/joint DDP, and external empirical gates remain open. |
 
 ## 4. Release Gates
 
@@ -131,7 +117,32 @@ or private-data validation.
 | License review | PASS | `docs/third_party_review.md`, `THIRD_PARTY_NOTICES`; no copied external code |
 | Rollback test | PASS (tooling) | Tampered candidate is rejected, then the immutable known-good package reloads and reproduces fixed-state inference |
 
-## 5. Blockers
+## 5. Delivery Boundary
+
+This change set delivers readiness infrastructure and fail-closed unsupported
+paths. It does not deliver a release candidate or close the model-release
+program. Merging the infrastructure must not change any `NONE`, `NOT READY`,
+`BLOCKED`, `PARTIAL`, or `unavailable` result into a positive claim.
+
+The public synthetic workflow exercises checkpoint snapshotting, offline
+evaluation, deterministic replay, production attestation-aware P17 collation,
+detached synthetic attestation, isolation flags, failure-to-upload gating, and
+cleanup on a GitHub-hosted runner. It runs automatically for same-repository PR
+merge results while recording the PR head as a separate identity; this keeps
+the evaluated source digest identical to the GitHub attestation source digest.
+Fork-origin code is skipped before an attestation-writing job receives a token.
+It uses only generated public inputs, has a distinct signer-workflow identity,
+and always emits `release_eligible=false` with an `insufficient` P17 result. It
+cannot satisfy the protected producer policy.
+
+The following remain external model-release gates rather than acceptance
+claims for this infrastructure delivery: protected formal evaluation, approved
+private-holdout replay, authorized human-data canary, target CUDA/NCCL
+validation, independently trained ablations, and the 1,000-deal candidate
+evaluation. Their absence keeps the model release blocked, even if repository
+CI and the synthetic engineering smoke pass.
+
+## 6. Blockers
 
 ### Blocker
 
@@ -198,13 +209,12 @@ or private-data validation.
 
 ### Low
 
-- A fresh `douzero-p17-test` Docker image build reached final layer extraction
-  but the local Docker VM lacked space. No Docker data was deleted. An existing
-  isolated Python 3.11 CPU image can support a bind-mounted engineering gate,
-  but that does not replace a fresh image digest or an externally recorded
-  commit-bound run. `.venv` remains excluded from the Docker context.
+- The fresh-image Docker CPU gate remains required for every candidate head.
+  Its image digest, exact source identity, complete log, and outcome belong in
+  the external commit-bound evidence rather than as mutable host state in this
+  tracked report. `.venv` remains excluded from the Docker context.
 
-## 6. Validation Commands
+## 7. Validation Commands
 
 Run these gates from a clean checkout of the exact candidate head. Store their
 outputs and identities with the PR or protected evaluation artifact; do not
@@ -214,7 +224,7 @@ copy a moving head SHA back into this file.
 test -z "$(git status --porcelain)"
 git rev-parse HEAD
 git diff --check
-actionlint .github/workflows/formal-evaluation.yml
+actionlint .github/workflows/*.yml
 .venv/bin/python -m compileall -q douzero tools tests
 .venv/bin/python -m pytest -q
 ```
@@ -239,62 +249,7 @@ docker run --rm --tmpfs /tmp:rw,exec,nosuid,size=4g \
 | Review disposition | Draft is removed only after blocking code review is cleared; the exact review state is read from GitHub |
 | Protected evaluator, approved-deal replay, detached attestation, and formal collation | Required for model release; result and attestation digests are external immutable evidence |
 
-Historical test counts and bind-mounted runs below are engineering history only.
-They must never be promoted to evidence for a later candidate head.
-
-### Archived Pre-v3 Evidence
-
-These entries are retained only as historical engineering evidence tied to
-their stated older SHA. The words "current tree" and "post-review" in an
-archived command referred to that earlier review point, not the present
-working tree.
-
-| Archived command | Historical result |
-|---|---|
-| `git status`; `git branch --show-current`; `git rev-parse HEAD`; `git log --oneline --decorate -20`; `git fetch origin main` | PASS; clean start, new P17 branch from local/remote `fa9f76d` |
-| Host Python/Torch/CUDA, `nvidia-smi`, OS, Docker/runtime probes | PASS as probes; no CUDA device, driver interface, NCCL, or NVIDIA Docker runtime |
-| `docker build -f .docker/Dockerfile.test -t douzero-p17-test .` | FAILED: Docker VM ran out of space during `apt` installation; user Docker data was not deleted |
-| `.venv/bin/python -m compileall -q douzero tests *.py`; required shell syntax checks | PASS |
-| All 12 requested CLI `--help` commands; Docker gate's 17 Python/shell entry points | PASS, all exit 0 |
-| `.venv/bin/python -m pytest -q tests/test_p17_bidding.py tests/test_p17_joint_belief.py tests/test_p17_release_tooling.py` | PASS, 49 tests |
-| `.venv/bin/python -m pytest --collect-only -qq`; `.venv/bin/python -m pytest -q` on clean `b7db29a` | 1,575 collected; PASS, 1,575 tests and one expected `lambda_bc==0` warning |
-| First post-review Docker `run_tests.sh` attempt | FAILED: the source-SHA tamper test replaced the image's fixed all-zero test SHA with the same value; the test now always chooses a different valid SHA |
-| Historical bind-mounted checkout `docker run ... bash .docker/run_tests.sh -q` | PASS, 1,575 tests and one expected warning |
-| `/usr/bin/time -p docker run ... bash .docker/run_release_gate.sh` on clean `b7db29a` | PASS; 1,575 tests in 93.60 s plus compile/CLI/diff/baseline, 110.31 s total |
-| Fresh `train_v2.py --config configs/standard_v2.yaml ... --bidding_policy max` on `b7db29a` | PASS; 2 full games, 114 play and 2 bid transitions, one finite optimizer step, parameters changed, no redeals/caps |
-| Fresh strict standard `--resume_checkpoint ...`, one additional game | PASS; cumulative 3 games, 137 play and 3 bid transitions, 2 optimizer steps, parameters changed; full code/rule/model/`v2-bidding-2` identities matched |
-| Standard `--bidding_policy learned --bidding_warm_start_policy max --bidding_learned_probability 0.5` | FAILED CLOSED: the untrained head produced only abandoned auctions, so no labelled bid minibatch existed; no optimizer step was claimed |
-| Fresh standard learned warm-start probability `0.1`, 4 episodes | PASS; 151 play and 5 bid transitions, one finite optimizer step, parameters changed, no redeals/caps |
-| `train_belief.py --ruleset standard ...` then `evaluate_belief.py --ruleset standard ...` | PASS; 32 training labels; 28 evaluation samples; constrained conservation 28/28; result binds full SHA/rule/schema/checkpoint/config identities |
-| Joint `train_v2.py ... --belief_training_mode joint` and strict resume | PASS; coupled checkpoint version 2; 1 then 2 optimizer steps, finite losses, parameters changed |
-| Final-SHA standard/joint checkpoint focused tests | Initial joint selector name was wrong and collected no such test; corrected command PASS, 2 tests |
-| First two Draft-PR test matrices | FAILED on Linux CPU BF16: the random value-only fixture produced a zero belief update across the runner's PyTorch versions, including after the sensitive belief path was moved to float32 |
-| Float32 joint-belief path plus deterministic supervised AMP fixture; focused host and Docker tests | PASS; the belief encoder/DP/features opt out of outer autocast, and the AMP test now uses an explicit weighted belief target rather than relying on a random nonzero value gradient |
-| Synthetic canonical serialization then manifest-default `validate_human_games.py` | PASS; 4 total/valid, 0 quarantined/parse errors; both full-SHA sidecars verified count/rule/checksum/lineage |
-| Strict external-ingest HMAC/attestation tests (`tests/test_p08_ingest_cli.py`) | PASS, 10 tests; missing key, unsalted IDs, leakage, and wrong attestations fail closed; real adapter run not performed |
-| Dataset manifest missing/tamper/count/ruleset/unverified-lineage tests | PASS; training/rebuild consumers fail closed; migration output cannot train or release |
-| `pretrain_bc.py ... --epochs 1 --batch_size 4 ...` | PASS; 115 samples, val loss 1.2304, val top-1 0.486; checkpoint config binds dataset SHA; synthetic only |
-| RL+BC `train_v2.py --config /tmp/douzero-p17-rlbc.yaml ...` | PASS; 19 transitions, one finite optimizer step, parameters changed |
-| Fresh synthetic BC before/after `evaluate_paired.py ... --num-deals 4 --bootstrap-samples 2000` | PASS as a pre-v3 code smoke; estimate -0.1250, CI [-0.5000, 0.2500]; its old result identity is not accepted by current formal collation |
-| Historical learned full-game equality on `v2-bidding-2`, 2 deals/2,000 bootstrap | PASS as code smoke; 6 seat-rotated games, 5 learned-bid calls, estimate 0, CI [0, 0], no cap fallback |
-| Historical `prepare_p17_evaluation.py` hash/set-only command | OBSOLETE for formal use: it did not supply approved deal payloads or a detached attestation and cannot establish current eligibility |
-| P17 result-integrity and all-pass-cap tests | PASS; forged evaluator SHA, ordered deal hash/set, terminal outcome/score, confidence/count/CI evidence is rejected; forced cap fallbacks are cleared, audited, excluded, and release-ineligible |
-| `tools/package_model.py ...` with the fresh standard learned-bidding sidecar | PASS; format-2 public package binds `b7db29a`, `v2-bidding-2`, rule/model/training identities and summaries |
-| First manual package-load command | FAILED: omitted required runtime schema/rules/config and used a nonexistent rollback test selector; no inference was claimed |
-| Second manual package-load command | MODEL LOAD FAILED: treated wrapped `model_config.json` as bare config; two independently selected package tests still passed because the shell lacked `set -e` |
-| Corrected `set -e` package load plus rollback/self-contained-belief tests | PASS; checksum verification, learned bid legal, loaded card-play action legal, rollback and actual search-enabled belief inference tests passed |
-| `.venv/bin/python -m build --wheel ...` | FAILED: repository `build/` package shadowed the absent build frontend; no wheel was claimed from this command |
-| `.venv/bin/python -m pip wheel . --no-deps --no-build-isolation ...` | PASS; `douzero-1.1.0-py3-none-any.whl` built |
-| Docker temporary venv install/import from `/tmp` | First assertion used nonexistent `douzero.__version__` and failed after successful install; corrected `importlib.metadata.version` check PASS, importing from venv site-packages with Torch 2.13.0+cpu |
-| `scripts/validate_gpu_training.sh --probe-only`; full script | Probe PASS; full script expected exit 3 with CUDA unavailable and DDP implementation blockers, no GPU metrics claimed |
-| `git diff --check`; clean-tree and SHA readback after code validation | PASS; clean `b7db29a3856324d65170b49ef32d17be7d3a6996` |
-| Draft PR build/test matrix on `43b50a3e223e08844724762ea2b49f458564794f` | PASS: build and test on Python 3.11/3.12/3.13; slowest test job 3m59s |
-| Independent-review directed regressions (`tests/test_p17_deep_review_fixes.py`) | PASS: canonical deal identity/raw evidence, fixed statistics, strict package loadability, source-checkpoint provenance, epsilon-label masking, frozen-belief identity, atomic restore failure, and whole-game redeal-cap exclusion |
-| Post-review focused evaluation/deployment/bidding/belief suites | PASS |
-| Post-review host full suite | PASS, 1,582 tests and the existing expected `lambda_bc==0` warning |
-| Post-review Docker release gate (`douzero-p16-test:latest`, historical bind-mounted tree) | PASS, Python 3.11.15/Linux arm64; compile, CLI, 1,582 tests, baseline capture, and `git diff --check` |
-
-## 7. Conclusion
+## 8. Conclusion
 
 ```text
 Release candidate: NONE
@@ -308,9 +263,10 @@ Formal model-release evidence: pending
 
 The tracked report defines stable gates and validation methods. It does not
 self-assert a moving PR head or CI result; those commit-bound facts must be read
-from the external evidence tuple. No protected attested replay run has
-occurred, so passing code CI is not a model-release claim.
-It does not override unresolved repository-wide provenance work.
+from the external evidence tuple and the PR evidence artifact. Passing code CI
+or the public synthetic workflow is not a model-release claim and does not
+substitute for a protected attested replay. This infrastructure status does not
+override unresolved repository-wide provenance work.
 Standard learned-bidding DDP, joint/alternating belief DDP, distributed trainer
 checkpoint resume, and standard/joint compile support remain explicit
 implementation blockers, not external-validation euphemisms. The open

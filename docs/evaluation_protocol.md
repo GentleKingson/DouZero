@@ -348,6 +348,8 @@ python tools/prepare_p17_evaluation.py \
   --attestation-signer-workflow "$ATTESTATION_SIGNER_WORKFLOW" \
   --attestation-signer-digest "$ATTESTATION_SIGNER_DIGEST" \
   --attestation-source-ref "$ATTESTATION_SOURCE_REF" \
+  --attestation-trusted-root "$ATTESTATION_TRUSTED_ROOT" \
+  --attestation-trusted-root-sha256 "$ATTESTATION_TRUSTED_ROOT_SHA256" \
   --output artifacts/evaluation/p17
 ```
 
@@ -355,7 +357,10 @@ Use the equivalent `full-game` options for that mode. Each ablation requires a
 matched `--ablation-result NAME=PATH` and
 `--ablation-attestation NAME=PATH`. The verifier pins the exact repository,
 source commit/ref, protected workflow path and workflow Git digest, result-file
-SHA-256, and canonical result digest. It also records the immutable GitHub
+SHA-256, digest-bound trusted-root snapshot, and canonical result digest. The
+trusted root is fetched before entering the offline verifier and passed with
+`--custom-trusted-root`; bundle presence alone is not an offline-verification
+claim. The verifier also records the immutable GitHub
 workflow-run URL and the attested hosted/self-hosted runner class. A
 missing/failed attestation, missing approved deal payload, replay failure, or
 raw unverified result can never be `eligible`; descriptive library output

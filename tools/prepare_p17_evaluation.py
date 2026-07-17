@@ -85,6 +85,14 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--attestation-source-ref", help="fully qualified evaluated source ref"
     )
+    parser.add_argument(
+        "--attestation-trusted-root",
+        help="trusted_root.jsonl snapshot required for offline verification",
+    )
+    parser.add_argument(
+        "--attestation-trusted-root-sha256",
+        help="precomputed SHA-256 of the trusted-root snapshot",
+    )
     parser.add_argument("--output", default="artifacts/evaluation/p17")
     args = parser.parse_args(argv)
 
@@ -133,9 +141,12 @@ def main(argv=None) -> int:
         args.attestation_signer_workflow,
         args.attestation_signer_digest,
         args.attestation_source_ref,
+        args.attestation_trusted_root,
+        args.attestation_trusted_root_sha256,
     )):
         parser.error(
-            "formal results require repository, signer workflow/digest, and source ref"
+            "formal results require repository, signer workflow/digest, source ref, "
+            "and a digest-bound trusted-root snapshot"
         )
     needs_cardplay_set = bool(args.cardplay_result) or any(
         ablation_protocols[name] == "cardplay_only"
@@ -208,6 +219,8 @@ def main(argv=None) -> int:
                     source_digest=source_sha,
                     source_ref=args.attestation_source_ref,
                     artifact_sha256=artifact_sha,
+                    trusted_root_path=args.attestation_trusted_root,
+                    trusted_root_sha256=args.attestation_trusted_root_sha256,
                 ),
             )
         except ProvenanceError as exc:

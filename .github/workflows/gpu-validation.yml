@@ -45,16 +45,18 @@ jobs:
       - name: Publish summary
         if: always()
         run: |
-          if [[ -f artifacts/gpu-validation/summary.md ]]; then
-            cat artifacts/gpu-validation/summary.md >>"$GITHUB_STEP_SUMMARY"
-          fi
-          for report in artifacts/gpu-validation/*.json; do
-            if [[ -f "$report" ]]; then
-              printf '\n### `%s`\n\n```json\n' "$(basename "$report")" >>"$GITHUB_STEP_SUMMARY"
-              cat "$report" >>"$GITHUB_STEP_SUMMARY"
-              printf '```\n' >>"$GITHUB_STEP_SUMMARY"
+          {
+            if [[ -f artifacts/gpu-validation/summary.md ]]; then
+              cat artifacts/gpu-validation/summary.md
             fi
-          done
+            for report in artifacts/gpu-validation/*.json; do
+              if [[ -f "$report" ]]; then
+                printf "\n### \`%s\`\n\n\`\`\`json\n" "$(basename "$report")"
+                cat "$report"
+                printf "\`\`\`\n"
+              fi
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
 
       # actions/upload-artifact@v4.6.2
       - name: Upload validation artifacts

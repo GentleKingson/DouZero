@@ -77,6 +77,13 @@ from douzero.training.bidding import (
 )
 
 
+# Format 3 makes the resume topology explicit. Formats 1/2 predated this
+# contract and are intentionally rejected rather than guessed to be safe for a
+# different process topology.
+_TRAINER_CHECKPOINT_VERSION = 3
+_SINGLE_PROCESS_TOPOLOGY = "single_process"
+
+
 @dataclass
 class TrainerConfig:
     """Knobs for :class:`V2Trainer`.
@@ -1145,8 +1152,17 @@ class V2Trainer:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
+    def _require_single_process_checkpoint_io(self, operation: str) -> None:
+        """Reject distributed trainer save/resume before touching the path."""
+        if self.distributed.enabled or self.distributed.world_size != 1:
+            raise NotImplementedError(
+                f"trainer checkpoint {operation} is single-process only; "
+                "distributed resume/checkpoint publication is not implemented"
+            )
+
     def save_training_checkpoint(self, path: str) -> dict:
         """Atomically save resumable optimizer/counter/RNG and identity state."""
+        self._require_single_process_checkpoint_io("save")
         from douzero.observation.bidding import (
             BIDDING_ACTION_SCHEMA_VERSION,
             BIDDING_HEAD_VERSION,
@@ -1176,9 +1192,9 @@ class V2Trainer:
             )
         trainer_config, trainer_config_hash = self._trainer_config_identity()
         bundle = {
-            # Version 1 is intentionally retained byte-for-field compatible
-            # for frozen mode. Version 2 is an atomic belief+value bundle.
-            "checkpoint_version": 2 if coupled_belief else 1,
+            "checkpoint_version": _TRAINER_CHECKPOINT_VERSION,
+            "training_topology": _SINGLE_PROCESS_TOPOLOGY,
+            "training_world_size": 1,
             "source_git_sha": source_sha,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -1249,7 +1265,8 @@ class V2Trainer:
         self.buffer.clear()
         self.bidding_buffer.clear()
         identity_keys = [
-            "checkpoint_version", "source_git_sha", "policy_version",
+            "checkpoint_version", "training_topology", "training_world_size",
+            "source_git_sha", "policy_version",
             "feature_schema_hash", "model_config_hash",
             "ruleset_id", "ruleset_version", "ruleset_hash",
             "bidding_head_version", "bidding_action_schema",
@@ -1271,6 +1288,7 @@ class V2Trainer:
 
     def load_training_checkpoint(self, path: str) -> dict:
         """Strictly restore a checkpoint saved by :meth:`save_training_checkpoint`."""
+        self._require_single_process_checkpoint_io("resume")
         from douzero.checkpoint.io import CheckpointCompatibilityError
         from douzero.observation.bidding import (
             BIDDING_ACTION_SCHEMA_VERSION,
@@ -1278,10 +1296,9 @@ class V2Trainer:
         )
 
         bundle = torch.load(path, map_location=self.device, weights_only=True)
-        expected_version = 1 if self.belief_training_mode == "frozen" else 2
         if (
             not isinstance(bundle, dict)
-            or bundle.get("checkpoint_version") != expected_version
+            or bundle.get("checkpoint_version") != _TRAINER_CHECKPOINT_VERSION
         ):
             raise CheckpointCompatibilityError("unsupported V2 trainer checkpoint")
         active_ruleset = self.ruleset or RuleSet.legacy()
@@ -1295,6 +1312,8 @@ class V2Trainer:
                 "resumable trainer checkpoints require a full runtime Git SHA"
             )
         expected = {
+            "training_topology": _SINGLE_PROCESS_TOPOLOGY,
+            "training_world_size": 1,
             "source_git_sha": source_sha,
             "policy_version": self.policy_version,
             "feature_schema_hash": self.model.schema.stable_hash(),

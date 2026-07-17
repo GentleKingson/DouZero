@@ -37,7 +37,9 @@ python validate_human_games.py --help >/dev/null
 python pretrain_bc.py --help >/dev/null
 python tools/package_model.py --help >/dev/null
 python tools/prepare_p17_evaluation.py --help >/dev/null
+python tools/formal_evaluation_dry_run.py --help >/dev/null
 python tools/rebuild_human_dataset.py --help >/dev/null
+python tools/validate_pr_evidence.py --help >/dev/null
 python tools/gpu_validation_probe.py --help >/dev/null
 python tools/validate_amp_fallback.py --help >/dev/null
 bash scripts/validate_gpu_training.sh --help >/dev/null

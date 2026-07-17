@@ -49,6 +49,32 @@ DEFAULT_NUM_DEALS = 64
 DEFAULT_OUTPUT = "artifacts/baseline/baseline.json"
 
 
+def _ci_identity():
+    """Return explicit PR head/merge identity when CI supplied both values."""
+
+    head = os.environ.get("DOUZERO_CI_HEAD_SHA")
+    merge = os.environ.get("DOUZERO_CI_MERGE_SHA")
+    if not head and not merge:
+        return None
+    full_sha = lambda value: bool(
+        isinstance(value, str)
+        and len(value) in (40, 64)
+        and all(char in "0123456789abcdef" for char in value)
+    )
+    if not full_sha(head) or not full_sha(merge):
+        raise ValueError(
+            "DOUZERO_CI_HEAD_SHA and DOUZERO_CI_MERGE_SHA must both be full "
+            "lowercase Git object IDs"
+        )
+    return {
+        "head_sha": head,
+        "merge_sha": merge,
+        "workflow": os.environ.get("GITHUB_WORKFLOW"),
+        "run_id": os.environ.get("GITHUB_RUN_ID"),
+        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+    }
+
+
 def _setup_imports():
     import numpy as np  # noqa: F401
     import torch  # noqa: F401
@@ -181,6 +207,7 @@ def capture(num_deals: int, seed: int, output: str):
             "weights -- this freezes DETERMINISM, not playing strength."
         ),
         "environment": environment_info(),
+        "ci_identity": _ci_identity(),
         "config": {
             "num_deals": num_deals,
             "base_seed": seed,

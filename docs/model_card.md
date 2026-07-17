@@ -39,7 +39,7 @@ empirical-evaluation, target-hardware, and packaging gates.
 - Personal-identifier handling: the canonical pipeline requires HMAC game IDs,
   allowlisted provenance, replay validation, and package exclusion. Supported
   training readers reject missing, tampered, or unverified dataset sidecars;
-  no real dataset was processed during P17 closure.
+  this infrastructure change contains no authorized-data release evidence.
 
 ## Evaluation
 

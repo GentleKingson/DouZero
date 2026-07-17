@@ -145,6 +145,14 @@ def test_p17_package_has_identity_summaries_rollback_and_hash_only_training(tmp_
     )
     assert training_identity["payload_policy"] == "hash_only"
     assert training_identity["training_config_hash"] == manifest.training_config_hash
+    assert training_identity["runtime_training_support"] == {
+        "base_v2_cardplay_ddp": True,
+        "standard_learned_bidding_ddp": False,
+        "joint_belief_ddp": False,
+        "alternating_belief_ddp": False,
+        "single_process_trainer_resume": True,
+        "distributed_trainer_resume": False,
+    }
     assert secret_path not in json.dumps(training_identity)
     weights_payload = torch.load(package / "weights.pt", map_location="cpu", weights_only=True)
     assert secret_path not in json.dumps(weights_payload["manifest"], sort_keys=True)
@@ -152,6 +160,54 @@ def test_p17_package_has_identity_summaries_rollback_and_hash_only_training(tmp_
     default_card = (package / "model_card.md").read_text()
     assert "Release candidate: **NONE**" in default_card
     assert "Release status: **NOT READY**" in default_card
+    assert "Standard learned-bidding DDP: `NOT SUPPORTED`" in default_card
+    assert "Distributed trainer resume: `NOT SUPPORTED`" in default_card
+    assert "Distributed trainer resume is not implemented" in (
+        package / "gpu_validation_summary.md"
+    ).read_text()
+    assert verify_model_package(package) == manifest
+
+
+def test_package_rejects_distributed_capability_claim_for_unsupported_paths(tmp_path):
+    model, ruleset = _model(bidding_enabled=True)
+    package = tmp_path / "unsupported-ddp-claim"
+    create_model_package(package, model, ruleset)
+    identity_path = package / "training_config.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity["runtime_training_support"]["standard_learned_bidding_ddp"] = True
+    identity["runtime_training_support"]["distributed_trainer_resume"] = True
+    identity_path.write_text(
+        json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    _refresh_checksums(package)
+
+    with pytest.raises(ModelPackageError, match="training_config.json identity"):
+        verify_model_package(package)
+
+
+def test_format2_schema1_training_identity_remains_compatible_without_claims(
+    tmp_path,
+):
+    model, ruleset = _model(bidding_enabled=True)
+    package = tmp_path / "schema1-format2-package"
+    manifest = create_model_package(package, model, ruleset)
+    identity_path = package / "training_config.json"
+    identity_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "training_config_hash": manifest.training_config_hash,
+                "payload_policy": "hash_only",
+                "payload_included": False,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _refresh_checksums(package)
+
     assert verify_model_package(package) == manifest
 
 
@@ -1253,6 +1309,10 @@ def test_prepare_p17_cli_uses_the_matrix_ablation_protocol(tmp_path):
             "b" * 40,
             "--attestation-source-ref",
             "refs/heads/main",
+            "--attestation-trusted-root",
+            str(tmp_path / "trusted-root.jsonl"),
+            "--attestation-trusted-root-sha256",
+            "c" * 64,
         ],
         cwd=ROOT,
         capture_output=True,

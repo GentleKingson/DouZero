@@ -10,6 +10,14 @@ also require a manifest-bearing `belief_weights.pt` plus an identity-bound
 require `bidding_schema.json` bound to the head version, action schema, feature
 schema hash, and exact `0/1/2/3` action list.
 
+The hash-only `training_config.json` also carries a machine-checked runtime
+support matrix. It marks standard learned-bidding DDP, joint/alternating belief
+DDP, and distributed trainer resume as unsupported; packaging cannot turn an
+unvalidated training topology into a capability claim. Earlier format-2
+packages with schema-1 hash-only training identity remain readable, but the
+missing support matrix is interpreted as declaring no optional distributed
+capability, never as evidence that one was validated.
+
 Format-1 P16 directories are intentionally rejected by the format-2 verifier.
 Continue using one only with its matching P16 runtime, or rebuild it from the
 original manifest-bearing public checkpoint and reviewed metadata. Do not add

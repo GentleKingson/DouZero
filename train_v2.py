@@ -444,9 +444,29 @@ def _build_curriculum(cfg):
     return sampler, label_store, cc.policy_version, cc.policy_step
 
 
-def _validate_ddp_features(cfg, model_cfg, loss_cfg, distributed) -> None:
-    """Reject training modes whose file side effects are not DDP-safe."""
-    if not distributed.enabled:
+def _validate_ddp_features(
+    cfg,
+    model_cfg,
+    loss_cfg,
+    distributed,
+    *,
+    belief_training_mode: str = "frozen",
+    resume_checkpoint: str = "",
+    checkpoint_path: str = "",
+) -> None:
+    """Reject unsupported DDP requests before process-group initialization.
+
+    ``distributed`` accepts either the requested boolean or an initialized
+    :class:`DistributedContext`.  The CLI deliberately calls this helper with
+    the boolean request so unsupported graphs and checkpoint I/O fail before
+    ``torch.distributed.init_process_group`` can create any runtime state.
+    """
+    enabled = (
+        bool(distributed)
+        if isinstance(distributed, bool)
+        else bool(distributed.enabled)
+    )
+    if not enabled:
         return
     if bool(getattr(model_cfg, "bidding_enabled", False)) or (
         cfg is not None and getattr(cfg, "ruleset", "legacy") == "standard"
@@ -455,6 +475,17 @@ def _validate_ddp_features(cfg, model_cfg, loss_cfg, distributed) -> None:
             "DDP does not yet support standard learned-bidding training: the "
             "bid and card-play paths use different parameter sets under the "
             "current static graph. Run this configuration single-process."
+        )
+    if belief_training_mode != "frozen":
+        raise NotImplementedError(
+            "DDP does not yet synchronize joint/alternating BeliefModel "
+            "gradients. Use belief_training_mode=frozen or run "
+            "single-process."
+        )
+    if resume_checkpoint or checkpoint_path:
+        raise NotImplementedError(
+            "trainer checkpoint save/resume is currently single-process only; "
+            "remove --resume_checkpoint/--checkpoint_path for DDP"
         )
     if cfg is not None and cfg.curriculum.enabled:
         raise NotImplementedError(
@@ -616,16 +647,39 @@ def main() -> None:
         yaml_cfg.deterministic if yaml_cfg else None,
         False,
     )
-    import torch
-
-    from douzero.runtime.distributed import initialize_distributed
-
     ddp_enabled = resolve(
         "ddp_enabled", yaml_cfg.ddp_enabled if yaml_cfg else None, False
     )
     ddp_backend = resolve(
         "ddp_backend", yaml_cfg.ddp_backend if yaml_cfg else None, "auto"
     )
+    loss_cfg = _build_loss_config(yaml_cfg)
+    model_cfg = _build_model_cfg(yaml_cfg)
+    belief_training_mode = resolve(
+        "belief_training_mode",
+        yaml_cfg.belief_training_mode if yaml_cfg else None,
+        defaults.belief_training_mode,
+    )
+    resume_checkpoint = getattr(args, "resume_checkpoint", "")
+    output_checkpoint = getattr(args, "checkpoint_path", "")
+
+    # This must remain before initialize_distributed. Unsupported feature
+    # combinations and checkpoint I/O are configuration errors, not reasons to
+    # create a process group and only then abort each rank.
+    _validate_ddp_features(
+        yaml_cfg,
+        model_cfg,
+        loss_cfg,
+        bool(ddp_enabled),
+        belief_training_mode=belief_training_mode,
+        resume_checkpoint=resume_checkpoint,
+        checkpoint_path=output_checkpoint,
+    )
+
+    import torch
+
+    from douzero.runtime.distributed import initialize_distributed
+
     distributed = initialize_distributed(
         enabled=ddp_enabled, backend=ddp_backend
     )
@@ -647,9 +701,6 @@ def main() -> None:
     rank_seed = seed + distributed.rank if seed != 0 else 0
     set_global_seed(rank_seed)
     maybe_set_global_deterministic(deterministic)
-    loss_cfg = _build_loss_config(yaml_cfg)
-    model_cfg = _build_model_cfg(yaml_cfg)
-    _validate_ddp_features(yaml_cfg, model_cfg, loss_cfg, distributed)
 
     # Build the V2 model from the schema + config (honouring score_clamp so
     # the head clamp matches the loss target clamp exactly).
@@ -665,11 +716,6 @@ def main() -> None:
         torch.manual_seed(rank_seed)
     schema = build_v2_schema()
     model = ModelV2(schema, model_cfg).to(learner_device)
-    belief_training_mode = resolve(
-        "belief_training_mode",
-        yaml_cfg.belief_training_mode if yaml_cfg else None,
-        defaults.belief_training_mode,
-    )
     compile_enabled = resolve(
         "compile_model", yaml_cfg.compile_model if yaml_cfg else None, False
     )
@@ -992,12 +1038,6 @@ def main() -> None:
         distributed_context=distributed,
     )
 
-    resume_checkpoint = getattr(args, "resume_checkpoint", "")
-    output_checkpoint = getattr(args, "checkpoint_path", "")
-    if distributed.enabled and (resume_checkpoint or output_checkpoint):
-        raise NotImplementedError(
-            "trainer checkpoint save/resume is currently single-process only"
-        )
     if resume_checkpoint:
         identity = trainer.load_training_checkpoint(resume_checkpoint)
         if distributed.is_rank_zero:

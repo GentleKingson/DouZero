@@ -47,6 +47,15 @@ _CORE_REQUIRED_FILES = frozenset({
     "SHA256SUMS",
 })
 
+_TRAINING_SUPPORT = {
+    "base_v2_cardplay_ddp": True,
+    "standard_learned_bidding_ddp": False,
+    "joint_belief_ddp": False,
+    "alternating_belief_ddp": False,
+    "single_process_trainer_resume": True,
+    "distributed_trainer_resume": False,
+}
+
 
 def _required_files(
     *, belief_enabled: bool, bidding_enabled: bool
@@ -103,6 +112,9 @@ def _default_model_card(manifest: ModelManifest) -> str:
 - Numeric dtype: `{manifest.dtype}`
 - Training configuration hash: `{manifest.training_config_hash}`
 - Belief configuration hash: `{manifest.belief_config_hash}`
+- Standard learned-bidding DDP: `NOT SUPPORTED`
+- Joint/alternating belief DDP: `NOT SUPPORTED`
+- Distributed trainer resume: `NOT SUPPORTED`
 
 ## Training Data
 
@@ -131,8 +143,10 @@ this package.
 
 This package was created without reviewed empirical summaries and is not a
 release candidate. It may fail outside the declared ruleset and feature
-schema. Roll back for checksum/identity failure, non-finite inference, illegal
-actions, privileged-information leakage, or an unexplained paired regression.
+schema. Standard learned-bidding and joint/alternating belief training are
+single-process-only, and trainer resume is not implemented for DDP. Roll back
+for checksum/identity failure, non-finite inference, illegal actions,
+privileged-information leakage, or an unexplained paired regression.
 
 ## Intended And Prohibited Uses
 
@@ -162,6 +176,10 @@ Status: **NOT MEASURED**
 
 No target-hardware FP32, AMP, NCCL DDP, checkpoint-resume, memory, or throughput
 report was supplied to the packaging command.
+
+Standard learned-bidding DDP and joint/alternating belief DDP are not
+implemented. Distributed trainer resume is not implemented, and neither
+capability can be marked validated by this summary.
 """
 
 
@@ -392,10 +410,11 @@ def create_model_package(
     # Training configs commonly contain private paths.  A public package keeps
     # their canonical identity but never copies the raw payload by default.
     _write_json(root / "training_config.json", {
-        "schema_version": 1,
+        "schema_version": 2,
         "training_config_hash": manifest.training_config_hash,
         "payload_policy": "hash_only",
         "payload_included": False,
+        "runtime_training_support": dict(_TRAINING_SUPPORT),
     })
     if manifest.belief_enabled:
         assert belief_model is not None
@@ -668,13 +687,26 @@ def verify_model_package(
     ):
         raise ModelPackageError("model_config.json identity does not match manifest.json")
 
-    expected_training_payload = {
+    legacy_training_payload = {
         "schema_version": 1,
         "training_config_hash": manifest.training_config_hash,
         "payload_policy": "hash_only",
         "payload_included": False,
     }
-    if training_config_payload != expected_training_payload:
+    expected_training_payload = {
+        "schema_version": 2,
+        "training_config_hash": manifest.training_config_hash,
+        "payload_policy": "hash_only",
+        "payload_included": False,
+        "runtime_training_support": dict(_TRAINING_SUPPORT),
+    }
+    # P17 format-2 packages created before the machine-readable support matrix
+    # used schema 1. Absence means no optional distributed capability was
+    # declared; it never means the unsupported paths are available.
+    if training_config_payload not in (
+        legacy_training_payload,
+        expected_training_payload,
+    ):
         raise ModelPackageError(
             "training_config.json identity or hash-only payload policy does not "
             "match manifest.json"

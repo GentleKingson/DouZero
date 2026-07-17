@@ -198,6 +198,8 @@ raw trace result is never included in the uploaded private artifact.
   --attestation-signer-workflow "$ATTESTATION_SIGNER_WORKFLOW" \
   --attestation-signer-digest "$ATTESTATION_SIGNER_DIGEST" \
   --attestation-source-ref "$ATTESTATION_SOURCE_REF" \
+  --attestation-trusted-root "$ATTESTATION_TRUSTED_ROOT" \
+  --attestation-trusted-root-sha256 "$ATTESTATION_TRUSTED_ROOT_SHA256" \
   --output artifacts/evaluation/p17
 ```
 

@@ -334,6 +334,44 @@ def test_detached_github_attestation_verifies_exact_artifact_and_source(
     ]
 
 
+def test_detached_attestation_snapshots_digest_bound_offline_trusted_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact, bundle, base_policy = _write_attested_result(tmp_path)
+    trusted_root = tmp_path / "trusted-root.jsonl"
+    trusted_root.write_text('{"mediaType":"trusted-root"}\n', encoding="utf-8")
+    root_digest = hashlib.sha256(trusted_root.read_bytes()).hexdigest()
+    policy = AttestationPolicy(
+        repository=base_policy.repository,
+        signer_workflow=base_policy.signer_workflow,
+        signer_digest=base_policy.signer_digest,
+        source_digest=base_policy.source_digest,
+        source_ref=base_policy.source_ref,
+        artifact_sha256=base_policy.artifact_sha256,
+        trusted_root_path=trusted_root,
+        trusted_root_sha256=root_digest,
+    )
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        root_index = command.index("--custom-trusted-root") + 1
+        snapshot = Path(command[root_index])
+        assert snapshot != trusted_root
+        assert hashlib.sha256(snapshot.read_bytes()).hexdigest() == root_digest
+        return subprocess.CompletedProcess(
+            command, 0, _gh_output(policy.artifact_sha256), ""
+        )
+
+    monkeypatch.setattr(provenance.subprocess, "run", fake_run)
+    verify_github_attested_result(artifact, bundle, policy)
+    assert "--custom-trusted-root" in captured["command"]
+
+    trusted_root.write_text("substituted\n", encoding="utf-8")
+    with pytest.raises(ProvenanceError, match="trusted root SHA-256"):
+        verify_github_attested_result(artifact, bundle, policy)
+
+
 def protected_digest(artifact: Path) -> str:
     return verify_result_integrity(json.loads(artifact.read_text(encoding="utf-8")))
 

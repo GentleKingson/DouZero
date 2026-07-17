@@ -76,6 +76,8 @@ jobs:
           git diff --cached --quiet HEAD --
           command -v gh >/dev/null
           command -v docker >/dev/null
+          gh attestation trusted-root --help \
+            | grep -q -- "gh attestation trusted-root"
 
       - name: Pull and verify protected immutable evaluator image
         shell: bash
@@ -128,6 +130,12 @@ jobs:
           request_sha="$(sha256sum "$FORMAL_EVALUATION_REQUEST_PATH" | cut -d' ' -f1)"
           [[ "$request_sha" == "$FORMAL_EVALUATION_REQUEST_SHA256" ]]
 
+          shopt -s nullglob
+          stale_roots=("$RUNNER_TEMP"/douzero-formal-*)
+          if (( ${#stale_roots[@]} != 0 )); then
+            echo "Refusing protected evaluation with a stale formal run root" >&2
+            exit 1
+          fi
           run_root="$RUNNER_TEMP/douzero-formal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           [[ ! -e "$run_root" ]]
           mkdir -m 0700 \
@@ -180,6 +188,8 @@ jobs:
           "${container[@]}" sh -ec '
             mkdir -p "$HOME"
             command -v gh >/dev/null
+            gh attestation verify --help \
+              | grep -q -- --custom-trusted-root
             python -I -B -m pip freeze --all \
               | LC_ALL=C sort \
               >"$FORMAL_AUDIT_ROOT/python-packages.txt"
@@ -751,11 +761,26 @@ jobs:
           set -euo pipefail
           [[ "$(sha256sum "$FORMAL_RESULT_JSON" | cut -d' ' -f1)" == "$EXPECTED_RESULT_SHA256" ]]
           [[ -f "$ATTESTATION_BUNDLE" ]]
+          trusted_root="$FORMAL_AUDIT_ROOT/attestation-trusted-root.jsonl"
+          [[ ! -e "$trusted_root" && ! -L "$trusted_root" ]]
+          set -o noclobber
+          gh attestation trusted-root >"$trusted_root"
+          set +o noclobber
+          [[ -s "$trusted_root" && ! -L "$trusted_root" ]]
+          [[ "$(stat -c '%F' "$trusted_root")" == "regular file" ]]
+          trusted_root_sha="$(sha256sum "$trusted_root" | cut -d' ' -f1)"
+          [[ "$trusted_root_sha" =~ ^[0-9a-f]{64}$ ]]
+          chmod 0444 "$trusted_root"
+          {
+            echo "FORMAL_ATTESTATION_TRUSTED_ROOT=$trusted_root"
+            echo "FORMAL_ATTESTATION_TRUSTED_ROOT_SHA256=$trusted_root_sha"
+          } >>"$GITHUB_ENV"
           verification="$FORMAL_AUDIT_ROOT/attestation-verification.json"
           [[ ! -e "$verification" && ! -L "$verification" ]]
           set -o noclobber
           gh attestation verify "$FORMAL_RESULT_JSON" \
             --bundle "$ATTESTATION_BUNDLE" \
+            --custom-trusted-root "$trusted_root" \
             --repo "$EXPECTED_REPOSITORY" \
             --signer-workflow "GentleKingson/DouZero/.github/workflows/formal-evaluation.yml" \
             --signer-digest "$GITHUB_WORKFLOW_SHA" \
@@ -786,6 +811,9 @@ jobs:
               "GentleKingson/DouZero/.github/workflows/formal-evaluation.yml"
             --attestation-signer-digest "$GITHUB_WORKFLOW_SHA"
             --attestation-source-ref "$GITHUB_REF"
+            --attestation-trusted-root "$FORMAL_ATTESTATION_TRUSTED_ROOT"
+            --attestation-trusted-root-sha256 \
+              "$FORMAL_ATTESTATION_TRUSTED_ROOT_SHA256"
             --output "$FORMAL_P17_OUTPUT"
           )
           container=(
@@ -803,6 +831,7 @@ jobs:
             --mount "type=bind,src=$FORMAL_EVAL_DATA,dst=$FORMAL_EVAL_DATA,readonly"
             --mount "type=bind,src=$FORMAL_RESULT_JSON,dst=$FORMAL_RESULT_JSON,readonly"
             --mount "type=bind,src=$attestation_snapshot,dst=$attestation_snapshot,readonly"
+            --mount "type=bind,src=$FORMAL_ATTESTATION_TRUSTED_ROOT,dst=$FORMAL_ATTESTATION_TRUSTED_ROOT,readonly"
             --mount "type=bind,src=$FORMAL_RUN_ROOT/p17-snapshot,dst=$FORMAL_RUN_ROOT/p17-snapshot,readonly"
             --mount "type=bind,src=$FORMAL_P17_OUTPUT,dst=$FORMAL_P17_OUTPUT"
             --env DOUZERO_GIT_SHA=
@@ -950,11 +979,15 @@ jobs:
           manifest="$FORMAL_P17_OUTPUT/manifest.json"
           [[ "$(sha256sum "$manifest" | cut -d' ' -f1)" == "$EXPECTED_MANIFEST_SHA256" ]]
           [[ -f "$P17_ATTESTATION_BUNDLE" ]]
+          [[ -f "$FORMAL_ATTESTATION_TRUSTED_ROOT" && ! -L "$FORMAL_ATTESTATION_TRUSTED_ROOT" ]]
+          [[ "$(sha256sum "$FORMAL_ATTESTATION_TRUSTED_ROOT" | cut -d' ' -f1)" == \
+            "$FORMAL_ATTESTATION_TRUSTED_ROOT_SHA256" ]]
           verification="$FORMAL_AUDIT_ROOT/p17-manifest-attestation-verification.json"
           [[ ! -e "$verification" && ! -L "$verification" ]]
           set -o noclobber
           gh attestation verify "$manifest" \
             --bundle "$P17_ATTESTATION_BUNDLE" \
+            --custom-trusted-root "$FORMAL_ATTESTATION_TRUSTED_ROOT" \
             --repo "$EXPECTED_REPOSITORY" \
             --signer-workflow "GentleKingson/DouZero/.github/workflows/formal-evaluation.yml" \
             --signer-digest "$GITHUB_WORKFLOW_SHA" \
@@ -984,6 +1017,7 @@ jobs:
             --workdir /tmp \
             --mount "type=bind,src=$FORMAL_P17_OUTPUT,dst=$FORMAL_P17_OUTPUT,readonly" \
             --env EXPECTED_MANIFEST_SHA256 \
+            --env EVALUATION_MODE \
             --env HOME=/tmp/formal-home \
             "$FORMAL_EVALUATOR_IMAGE" \
             python -I -S - "$FORMAL_P17_OUTPUT/manifest.json" <<'PY'
@@ -1079,6 +1113,18 @@ jobs:
               raise SystemExit("signed manifest top-level shape is invalid")
           if manifest["schema_version"] != "p17-artifact-manifest-v1":
               raise SystemExit("signed manifest schema is unsupported")
+          release_status = manifest["release_status"]
+          if (
+              not isinstance(release_status, dict)
+              or set(release_status) != {
+                  "cardplay_only", "full_game", "ablations"
+              }
+              or os.environ["EVALUATION_MODE"] not in {
+                  "cardplay_only", "full_game"
+              }
+              or release_status[os.environ["EVALUATION_MODE"]] != "eligible"
+          ):
+              raise SystemExit("signed manifest is not release eligible")
           declared = manifest["files"]
           if not isinstance(declared, dict) or set(declared) != EXPECTED_FILES:
               raise SystemExit("signed manifest has missing or extra file entries")
@@ -1133,11 +1179,13 @@ jobs:
           }
 
           package_manifest="$FORMAL_AUDIT_ROOT/python-packages.txt"
+          trusted_root="$FORMAL_ATTESTATION_TRUSTED_ROOT"
           result_verification="$FORMAL_AUDIT_ROOT/attestation-verification.json"
           manifest_verification="$FORMAL_AUDIT_ROOT/p17-manifest-attestation-verification.json"
           manifest="$FORMAL_P17_OUTPUT/manifest.json"
           for path in \
             "$package_manifest" \
+            "$trusted_root" \
             "$result_verification" \
             "$manifest_verification" \
             "$FORMAL_RESULT_JSON" \
@@ -1146,21 +1194,34 @@ jobs:
           done
           [[ "$(sha256sum "$package_manifest" | cut -d' ' -f1)" == \
             "$PYTHON_PACKAGES_SHA256" ]]
+          [[ "$(sha256sum "$trusted_root" | cut -d' ' -f1)" == \
+            "$FORMAL_ATTESTATION_TRUSTED_ROOT_SHA256" ]]
           [[ "$(sha256sum "$FORMAL_RESULT_JSON" | cut -d' ' -f1)" == \
             "$EXPECTED_RESULT_SHA256" ]]
           [[ "$(sha256sum "$manifest" | cut -d' ' -f1)" == \
             "$EXPECTED_MANIFEST_SHA256" ]]
 
+      - name: Authorize completed formal artifact upload
+        id: upload-gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "authorized=true" >>"$GITHUB_OUTPUT"
+
       # Public deals may publish the exact attested trace result for audit.
       # actions/upload-artifact@v4.6.2
       - name: Upload public result, detached bundle, and audit material
-        if: steps.request.outputs.dataset_scope == 'public'
+        if: >-
+          success() &&
+          steps.upload-gate.outputs.authorized == 'true' &&
+          steps.request.outputs.dataset_scope == 'public'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: formal-p17-${{ steps.request.outputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.FORMAL_RESULT_JSON }}
             ${{ env.FORMAL_AUDIT_ROOT }}/python-packages.txt
+            ${{ env.FORMAL_AUDIT_ROOT }}/attestation-trusted-root.jsonl
             ${{ env.FORMAL_AUDIT_ROOT }}/attestation-verification.json
             ${{ env.FORMAL_AUDIT_ROOT }}/p17-manifest-attestation-verification.json
             ${{ env.FORMAL_P17_OUTPUT }}/
@@ -1174,12 +1235,16 @@ jobs:
       # protected collation replays it against the approved deals and emits
       # only the redacted P17 projection plus detached provenance.
       - name: Upload private attestation audit without game traces
-        if: steps.request.outputs.dataset_scope == 'private_holdout'
+        if: >-
+          success() &&
+          steps.upload-gate.outputs.authorized == 'true' &&
+          steps.request.outputs.dataset_scope == 'private_holdout'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: formal-p17-private-audit-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.FORMAL_AUDIT_ROOT }}/python-packages.txt
+            ${{ env.FORMAL_AUDIT_ROOT }}/attestation-trusted-root.jsonl
             ${{ env.FORMAL_AUDIT_ROOT }}/attestation-verification.json
             ${{ env.FORMAL_AUDIT_ROOT }}/p17-manifest-attestation-verification.json
             ${{ env.FORMAL_P17_OUTPUT }}/
@@ -1221,6 +1286,7 @@ jobs:
           [[ "$run_root" == "$RUNNER_TEMP"/douzero-formal-* ]]
           chmod -R u+rwX -- "$run_root" 2>/dev/null || true
           rm -rf -- "$run_root"
+          [[ ! -e "$run_root" && ! -L "$run_root" ]]
           for bundle in "${ATTESTATION_BUNDLE:-}" "${P17_ATTESTATION_BUNDLE:-}"; do
             if [[ -n "$bundle" && -f "$bundle" ]]; then
               [[ "$bundle" == "$RUNNER_TEMP"/* ]]

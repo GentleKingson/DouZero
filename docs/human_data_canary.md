@@ -1,13 +1,13 @@
-# P17 Authorized Human-Data Canary
+# P17 Authorized Human-Data Canary Procedure
 
 ## Result
 
-**Real authorized-data canary: NOT RUN**  
-**Reason: no DOUZERO_HUMAN_DATA_PATH supplied**
+**Repository release evidence: NOT AVAILABLE**
 
-`DOUZERO_HUMAN_DATA_HMAC_KEY_FILE` was also unset on the audit host. No private
-dataset or secret was opened, copied, logged, committed, placed in a
-checkpoint, or included in a model package.
+Whether an authorized run occurred is an external, commit-bound fact. The run
+ledger must name the source head, workflow run, input attestation, output
+digests, and reviewer; this tracked procedure must not copy a moving run result
+or private input identity.
 
 No real-data game counts, rule/seat/outcome/bid distributions, duplicate
 counts, quarantine rates, BC metrics, paired estimates, or confidence
@@ -16,29 +16,25 @@ is supplied and the entire canary completes.
 
 ## Synthetic Code Smoke
 
-A deterministic fixture exercised canonical serialization, provenance
+A deterministic fixture can exercise canonical serialization, provenance
 verification, replay validation, BC pretraining, RL+BC, and paired-evaluation
-code paths on clean commit
-`b7db29a3856324d65170b49ef32d17be7d3a6996`. The synthetic CLI does **not**
+code paths. The synthetic CLI does **not**
 exercise an external adapter, HMAC pseudonymization, or external deduplication;
 those have unit evidence only. This is software evidence, not evidence about
 human behavior or model strength:
 
 ```bash
+run_root="$(mktemp -d /tmp/douzero-p17-human.XXXXXX)"
 .venv/bin/python ingest_human_games.py --synthetic \
   --num_synthetic 4 --synthetic_seed 17 \
-  --output /tmp/douzero-p17-human-b7db29a/canonical.jsonl
+  --output "$run_root/canonical.jsonl"
 .venv/bin/python validate_human_games.py \
-  --input /tmp/douzero-p17-human-b7db29a/canonical.jsonl \
-  --output /tmp/douzero-p17-human-b7db29a/validated
+  --input "$run_root/canonical.jsonl" \
+  --output "$run_root/validated"
 ```
 
-Observed synthetic result: 4 total, 4 valid, 0 quarantined, 0 parse errors.
-All four records use the legacy ruleset and contain no bidding phase. Both the
-canonical and validated JSONL sidecars verified `lineage_verified=true`, four
-records, the full source SHA above, the strict legacy ruleset hash, and content
-SHA-256
-`042dfd75801da7f3220484800f5f76b9aa45a27de0d9b4086cc5ba445f5fd72b`.
+The command must fail closed on any invalid record or sidecar. Counts and
+digests belong in the commit-bound run artifact, not in this procedure.
 
 Every supported canonical, validated, and rebuilt JSONL has a sibling
 `<path>.manifest.json`. It carries the dataset/record schema versions, full
@@ -52,25 +48,22 @@ release readers reject. Rebuild manifests bind the source dataset SHA.
 
 ```bash
 .venv/bin/python pretrain_bc.py \
-  --data /tmp/douzero-p17-human-b7db29a/validated.jsonl \
-  --save_dir /tmp/douzero-p17-human-b7db29a/bc \
+  --data "$run_root/validated.jsonl" \
+  --save_dir "$run_root/bc" \
   --save_name synthetic-bc.pt \
   --epochs 1 --batch_size 4 --val_ratio 0.25 \
   --hidden_size 16 --history_layers 1 --history_heads 1 \
   --history_encoder lstm --seed 17
 
 .venv/bin/python train_v2.py \
-  --config /tmp/douzero-p17-human-b7db29a/rlbc.yaml --episodes 1 \
+  --config "$run_root/rlbc.yaml" --episodes 1 \
   --optimizer_steps 1 --batch_size 1 --buffer_capacity 64 \
-  --checkpoint_path /tmp/douzero-p17-human-b7db29a/rlbc.pt --seed 17
+  --checkpoint_path "$run_root/rlbc.pt" --seed 17
 ```
 
-The one-epoch BC smoke produced 115 samples (44 landlord, 35 landlord-down,
-36 landlord-up), validation loss 1.2304 and validation top-1 0.486. Its
-checkpoint configuration binds the input dataset SHA. These tiny synthetic
-values are pipeline diagnostics only, not a BC-quality claim. RL+BC collected
-19 card-play transitions, completed one optimizer step, changed parameters,
-and recorded finite total loss 1.4469 plus BC cross-entropy 2.6577.
+The smoke must record finite diagnostics and bind its checkpoint configuration
+to the input dataset SHA. Synthetic values are pipeline diagnostics only, not
+a BC-quality claim.
 
 After converting the training checkpoints to strict public-policy sidecars,
 the P15 path compared the synthetic BC prior with its untrained initialization
@@ -84,12 +77,9 @@ on four generated deals and 2,000 deal-level bootstrap samples:
   --output /tmp/douzero-p17-bc-before-after
 ```
 
-Observed historical smoke estimate: -0.1250 with CI [-0.5000, 0.2500].
-That pre-v3 result bound the source/configuration, ruleset, checkpoint, and V2
-feature identities, but it predates complete trace replay and detached
-attestation and is not accepted by current formal P17 collation. Four synthetic
-deals are far below the 1,000-deal promotion gate; the number is recorded only
-to prove the paired path executed and must not be interpreted as improvement.
+This local comparison is not accepted by formal P17 collation. Four synthetic
+deals are far below the 1,000-deal promotion gate and must not be interpreted
+as improvement.
 
 ## Authorized Invocation
 
