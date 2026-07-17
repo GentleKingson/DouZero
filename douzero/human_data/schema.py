@@ -28,16 +28,31 @@ AGENTS.md "Human-game data" rules this module enforces:
 
 from __future__ import annotations
 
+import errno
+import hashlib
+import io
 import json
 import math
+import os
 import re
+import stat
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Iterable, Iterator, Mapping, Sequence
 
+from douzero._version import git_sha
+
+try:  # POSIX provides the descriptor locks required by safe publication.
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised on Windows only
+    _fcntl = None
+
+from .identifiers import is_canonical_game_id
 from .privacy import assert_no_forbidden as _assert_no_forbidden_privacy
 from .privacy import assert_valid_source_metadata
-from .identifiers import is_canonical_game_id
 
 # --------------------------------------------------------------------------- #
 # Canonical version stamps
@@ -50,6 +65,16 @@ CANONICAL_FORMAT_VERSION: int = 1
 #: The per-record schema version. Bumped whenever a field is added, removed, or
 #: its semantic changes. The loader rejects a mismatch rather than guessing.
 HUMAN_RECORD_SCHEMA_VERSION: int = 2
+HUMAN_DATASET_MANIFEST_VERSION: str = "human-dataset-manifest-v1"
+HUMAN_DATASET_POINTER_VERSION: str = "human-dataset-pointer-v1"
+
+_DATASET_POINTER_MAGIC = b"DOUZERO_HUMAN_DATASET_POINTER_V1\n"
+_DATASET_POINTER_NAMESPACE = b"DOUZERO_HUMAN_DATASET_POINTER_"
+_MAX_DATASET_POINTER_BYTES = 4096
+_DATASET_VERSION_PATTERN: re.Pattern[str] = re.compile(r"^v-[0-9a-f]{32}$")
+_VERSION_PAYLOAD_NAME = "dataset.jsonl"
+_DATASET_LOCK_SUFFIX = ".lock"
+_VERIFIED_SPOOL_MAX_BYTES = 8 * 1024 * 1024
 
 #: Kind stamp identifying a human-game record as privileged training data. A
 #: deployment guard can reject any object/dict carrying this kind without
@@ -783,19 +808,895 @@ def record_from_jsonl_line(line: str) -> HumanGameRecord:
 # --------------------------------------------------------------------------- #
 # JSONL file I/O (streaming, ordered)
 # --------------------------------------------------------------------------- #
-def write_jsonl(records: Iterable[HumanGameRecord], path: str) -> int:
+def _legacy_dataset_manifest_path(path: str | Path) -> Path:
+    return Path(f"{path}.manifest.json")
+
+
+def dataset_lock_path(path: str | Path) -> Path:
+    source = _canonical_dataset_path(path)
+    return source.parent / f".{source.name}{_DATASET_LOCK_SUFFIX}"
+
+
+def dataset_version_root(path: str | Path) -> Path:
+    """Return the private immutable-version directory for a published path."""
+
+    source = _canonical_dataset_path(path)
+    return source.parent / f".{source.name}.versions"
+
+
+def _canonical_dataset_path(path: str | Path) -> Path:
+    """Bind a dataset name to its current real parent directory."""
+
+    source = Path(path)
+    try:
+        parent = source.parent.resolve(strict=True)
+    except OSError as exc:
+        raise RecordValidationError(
+            "canonical dataset parent directory is missing or unreadable"
+        ) from exc
+    return parent / source.name
+
+
+def _dataset_version_payload_path(path: str | Path, version: str) -> Path:
+    if not _DATASET_VERSION_PATTERN.fullmatch(version):
+        raise RecordValidationError("canonical dataset pointer version is invalid")
+    return dataset_version_root(path) / version / _VERSION_PAYLOAD_NAME
+
+
+def _encode_dataset_pointer(version: str) -> bytes:
+    if not _DATASET_VERSION_PATTERN.fullmatch(version):
+        raise RecordValidationError("canonical dataset pointer version is invalid")
+    body = json.dumps(
+        {
+            "schema_version": HUMAN_DATASET_POINTER_VERSION,
+            "version": version,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return _DATASET_POINTER_MAGIC + body.encode("utf-8") + b"\n"
+
+
+def _directory_open_flags(*, nofollow: bool = False) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    if nofollow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    return flags
+
+
+def _regular_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _open_parent_directory(path: Path) -> int:
+    try:
+        descriptor = os.open(path.parent or Path("."), _directory_open_flags())
+    except OSError as exc:
+        raise RecordValidationError(
+            "canonical dataset parent directory is missing or unreadable"
+        ) from exc
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise RecordValidationError("canonical dataset parent is not a directory")
+    return descriptor
+
+
+def _open_regular_at(parent_fd: int, name: str, *, label: str) -> int:
+    if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+        raise RecordValidationError(f"canonical dataset {label} name is invalid")
+    try:
+        descriptor = os.open(name, _regular_open_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise RecordValidationError(
+            f"canonical dataset {label} is missing, unreadable, or a symlink"
+        ) from exc
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise RecordValidationError(
+            f"canonical dataset {label} must be a regular, non-symlink file"
+        )
+    return descriptor
+
+
+def _open_private_directory_at(parent_fd: int, name: str, *, label: str) -> int:
+    if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+        raise RecordValidationError(f"canonical dataset {label} name is invalid")
+    try:
+        descriptor = os.open(
+            name,
+            _directory_open_flags(nofollow=True),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise RecordValidationError(
+            f"canonical dataset {label} is missing, unreadable, or a symlink"
+        ) from exc
+    mode = os.fstat(descriptor).st_mode
+    if not stat.S_ISDIR(mode):
+        os.close(descriptor)
+        raise RecordValidationError(
+            f"canonical dataset {label} must be a non-symlink directory"
+        )
+    if stat.S_IMODE(mode) & 0o077:
+        os.close(descriptor)
+        raise RecordValidationError(
+            f"canonical dataset {label} must not grant group or other permissions"
+        )
+    return descriptor
+
+
+@contextmanager
+def dataset_publication_lock(
+    path: str | Path,
+    *,
+    exclusive: bool,
+    create: bool,
+    optional: bool = False,
+    require_posix: bool = False,
+) -> Iterator[None]:
+    """Coordinate pointer resolution, publication, and version retirement.
+
+    The lock is advisory: every supported publisher participates, including
+    :func:`write_jsonl` and the versioned rebuild path. The dataset parent is
+    therefore a trusted owner-controlled directory; a same-UID process able to
+    rename that directory can also replace the protected data directly and is
+    outside this API's enforceable threat boundary.
+    """
+
+    if _fcntl is None:
+        if require_posix:
+            raise RecordValidationError(
+                "secure canonical dataset publication requires POSIX advisory "
+                "locks"
+            )
+        yield
+        return
+
+    lock_path = dataset_lock_path(_canonical_dataset_path(path))
+    parent_fd = _open_parent_directory(lock_path)
+    descriptor: int | None = None
+    try:
+        base_flags = (
+            (os.O_RDWR if exclusive else os.O_RDONLY)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        if create:
+            # Open-existing/create-exclusive avoids two writers racing through
+            # O_CREAT on filesystems whose name cache can transiently return
+            # ENOENT. O_NOFOLLOW applies to both operations.
+            last_missing: FileNotFoundError | None = None
+            for _attempt in range(16):
+                try:
+                    descriptor = os.open(
+                        lock_path.name,
+                        base_flags,
+                        dir_fd=parent_fd,
+                    )
+                except FileNotFoundError as exc:
+                    last_missing = exc
+                    try:
+                        descriptor = os.open(
+                            lock_path.name,
+                            base_flags | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=parent_fd,
+                        )
+                    except FileExistsError:
+                        continue
+                    except FileNotFoundError as create_exc:
+                        last_missing = create_exc
+                        continue
+                    except OSError as create_exc:
+                        if optional and create_exc.errno in {
+                            errno.EACCES,
+                            errno.EPERM,
+                            errno.EROFS,
+                        }:
+                            # The directory may be read-only while another
+                            # publisher already created the shared lock. Retry
+                            # that existing inode before falling back to an
+                            # unlocked, descriptor-pinned legacy read.
+                            try:
+                                descriptor = os.open(
+                                    lock_path.name,
+                                    base_flags,
+                                    dir_fd=parent_fd,
+                                )
+                            except FileNotFoundError:
+                                descriptor = None
+                            except OSError as fallback_exc:
+                                raise RecordValidationError(
+                                    "canonical dataset publication lock is "
+                                    "unavailable"
+                                ) from fallback_exc
+                            break
+                        raise RecordValidationError(
+                            "canonical dataset publication lock is unavailable"
+                        ) from create_exc
+                    else:
+                        break
+                except OSError as exc:
+                    raise RecordValidationError(
+                        "canonical dataset publication lock is unavailable"
+                    ) from exc
+                else:
+                    break
+            else:
+                if optional:
+                    descriptor = None
+                else:
+                    raise RecordValidationError(
+                        "canonical dataset publication lock is missing"
+                    ) from last_missing
+        else:
+            try:
+                descriptor = os.open(
+                    lock_path.name,
+                    base_flags,
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError as exc:
+                if optional:
+                    descriptor = None
+                else:
+                    raise RecordValidationError(
+                        "canonical dataset publication lock is missing"
+                    ) from exc
+            except OSError as exc:
+                raise RecordValidationError(
+                    "canonical dataset publication lock is unavailable"
+                ) from exc
+
+        if descriptor is None:
+            os.close(parent_fd)
+            parent_fd = -1
+        else:
+            mode = os.fstat(descriptor).st_mode
+            if not stat.S_ISREG(mode) or stat.S_IMODE(mode) & 0o077:
+                raise RecordValidationError(
+                    "canonical dataset publication lock must be a private "
+                    "regular file"
+                )
+            try:
+                _fcntl.flock(
+                    descriptor,
+                    _fcntl.LOCK_EX if exclusive else _fcntl.LOCK_SH,
+                )
+            except OSError as exc:
+                raise RecordValidationError(
+                    "canonical dataset publication lock is unavailable"
+                ) from exc
+            os.close(parent_fd)
+            parent_fd = -1
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+            descriptor = None
+        if parent_fd >= 0:
+            os.close(parent_fd)
+            parent_fd = -1
+        raise
+
+    try:
+        yield
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                # Closing releases flock. Cleanup failure must never replace
+                # the body result after a publication may have committed.
+                pass
+
+
+def _read_dataset_pointer(source: Path, handle: BinaryIO) -> str | None:
+    try:
+        prefix = handle.read(len(_DATASET_POINTER_MAGIC))
+        if not prefix.startswith(_DATASET_POINTER_NAMESPACE):
+            return None
+        if prefix != _DATASET_POINTER_MAGIC:
+            raise RecordValidationError(
+                "canonical dataset pointer framing is invalid"
+            )
+        remainder = handle.read(_MAX_DATASET_POINTER_BYTES + 1)
+    except OSError as exc:
+        raise RecordValidationError(
+            "canonical dataset is missing or unreadable"
+        ) from exc
+
+    if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+        raise RecordValidationError(
+            "canonical dataset pointer must be a regular, non-symlink file"
+        )
+    if len(prefix) + len(remainder) > _MAX_DATASET_POINTER_BYTES:
+        raise RecordValidationError("canonical dataset pointer is too large")
+    try:
+        text = remainder.decode("utf-8")
+        if not text.endswith("\n") or "\n" in text[:-1]:
+            raise ValueError("pointer body must be one newline-terminated line")
+        pairs = json.loads(text, object_pairs_hook=lambda value: value)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise RecordValidationError("canonical dataset pointer is invalid") from exc
+    if (
+        not isinstance(pairs, list)
+        or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in pairs)
+        or len({key for key, _value in pairs}) != len(pairs)
+    ):
+        raise RecordValidationError("canonical dataset pointer is invalid")
+    pointer = dict(pairs)
+    if set(pointer) != {"schema_version", "version"}:
+        raise RecordValidationError("canonical dataset pointer fields are invalid")
+    if pointer["schema_version"] != HUMAN_DATASET_POINTER_VERSION:
+        raise RecordValidationError("canonical dataset pointer schema mismatch")
+    version = pointer["version"]
+    if not isinstance(version, str) or not _DATASET_VERSION_PATTERN.fullmatch(version):
+        raise RecordValidationError("canonical dataset pointer version is invalid")
+    return version
+
+
+def _load_dataset_pointer(source: Path) -> str | None:
+    """Return a referenced immutable version, or ``None`` for plain JSONL."""
+
+    source = _canonical_dataset_path(source)
+    parent_fd = _open_parent_directory(source)
+    try:
+        descriptor = _open_regular_at(parent_fd, source.name, label="file")
+        with os.fdopen(descriptor, "rb") as handle:
+            return _read_dataset_pointer(source, handle)
+    except RecordValidationError:
+        raise
+    finally:
+        os.close(parent_fd)
+
+
+def _open_version_artifacts(
+    source: Path, parent_fd: int, version: str
+) -> tuple[Path, int, Path, int]:
+    if not _DATASET_VERSION_PATTERN.fullmatch(version):
+        raise RecordValidationError("canonical dataset pointer version is invalid")
+    root_name = dataset_version_root(source).name
+    root_fd: int | None = None
+    version_fd: int | None = None
+    try:
+        root_fd = _open_private_directory_at(
+            parent_fd, root_name, label="version root"
+        )
+        version_fd = _open_private_directory_at(
+            root_fd, version, label="version directory"
+        )
+        payload_fd = _open_regular_at(
+            version_fd, _VERSION_PAYLOAD_NAME, label="payload"
+        )
+        payload = dataset_version_root(source) / version / _VERSION_PAYLOAD_NAME
+        manifest = _legacy_dataset_manifest_path(payload)
+        try:
+            manifest_fd = _open_regular_at(
+                version_fd, manifest.name, label="manifest"
+            )
+        except BaseException:
+            os.close(payload_fd)
+            raise
+        return payload, payload_fd, manifest, manifest_fd
+    finally:
+        if version_fd is not None:
+            os.close(version_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _resolve_pointer_paths(source: Path, version: str) -> tuple[Path, Path]:
+    parent_fd = _open_parent_directory(source)
+    payload_fd: int | None = None
+    manifest_fd: int | None = None
+    try:
+        payload, payload_fd, manifest, manifest_fd = _open_version_artifacts(
+            source, parent_fd, version
+        )
+        return payload, manifest
+    finally:
+        if manifest_fd is not None:
+            os.close(manifest_fd)
+        if payload_fd is not None:
+            os.close(payload_fd)
+        os.close(parent_fd)
+
+
+def _resolve_jsonl_paths(path: str | Path) -> tuple[Path, Path]:
+    source = _canonical_dataset_path(path)
+    version = _load_dataset_pointer(source)
+    if version is None:
+        return source, _legacy_dataset_manifest_path(source)
+    return _resolve_pointer_paths(source, version)
+
+
+@contextmanager
+def _open_jsonl_snapshot(
+    path: str | Path,
+    *,
+    require_manifest: bool,
+    acquire_lock: bool = True,
+) -> Iterator[tuple[Path, BinaryIO, Path | None, BinaryIO | None]]:
+    """Pin data and, when requested, manifest descriptors from one version."""
+
+    if _fcntl is None:  # Windows-compatible legacy plain-JSONL path.
+        source = Path(path)
+        data_handle = open(source, "rb")
+        manifest_handle: BinaryIO | None = None
+        try:
+            if _read_dataset_pointer(source, data_handle) is not None:
+                raise RecordValidationError(
+                    "version-managed canonical datasets require POSIX "
+                    "advisory locks"
+                )
+            data_handle.seek(0)
+            manifest_path = (
+                _legacy_dataset_manifest_path(source)
+                if require_manifest else None
+            )
+            if manifest_path is not None:
+                manifest_handle = open(manifest_path, "rb")
+            yield source, data_handle, manifest_path, manifest_handle
+        finally:
+            if manifest_handle is not None:
+                manifest_handle.close()
+            data_handle.close()
+        return
+
+    source = _canonical_dataset_path(path)
+    data_path: Path | None = None
+    data_handle: BinaryIO | None = None
+    manifest_path: Path | None = None
+    manifest_handle: BinaryIO | None = None
+    immutable_version = False
+    lock = dataset_publication_lock(
+        source,
+        exclusive=False,
+        create=True,
+        optional=True,
+    )
+    lock_entered = False
+    try:
+        if acquire_lock:
+            lock.__enter__()
+            lock_entered = True
+        parent_fd = _open_parent_directory(source)
+        try:
+            source_fd = _open_regular_at(parent_fd, source.name, label="file")
+            source_handle = os.fdopen(source_fd, "rb")
+            try:
+                version = _read_dataset_pointer(source, source_handle)
+                if version is None:
+                    source_handle.seek(0)
+                    data_path = source
+                    data_handle = source_handle
+                    source_handle = None
+                    if require_manifest:
+                        manifest_path = _legacy_dataset_manifest_path(source)
+                        manifest_fd = _open_regular_at(
+                            parent_fd, manifest_path.name, label="manifest"
+                        )
+                        manifest_handle = os.fdopen(manifest_fd, "rb")
+                else:
+                    immutable_version = True
+                    source_handle.close()
+                    source_handle = None
+                    (
+                        data_path,
+                        payload_fd,
+                        manifest_path,
+                        manifest_fd,
+                    ) = _open_version_artifacts(source, parent_fd, version)
+                    data_handle = os.fdopen(payload_fd, "rb")
+                    manifest_handle = os.fdopen(manifest_fd, "rb")
+            finally:
+                if source_handle is not None:
+                    source_handle.close()
+        finally:
+            os.close(parent_fd)
+        if lock_entered and immutable_version:
+            lock.__exit__(None, None, None)
+            lock_entered = False
+        assert data_path is not None and data_handle is not None
+        yield data_path, data_handle, manifest_path, manifest_handle
+    finally:
+        if lock_entered:
+            lock.__exit__(None, None, None)
+        if manifest_handle is not None:
+            manifest_handle.close()
+        if data_handle is not None:
+            data_handle.close()
+
+
+def dataset_manifest_path(path: str | Path) -> Path:
+    """Return a legacy sidecar path; reject unstable version-specific paths.
+
+    Versioned consumers must use :func:`open_verified_jsonl_snapshot`, which
+    keeps manifest identity and records bound even while old versions retire.
+    """
+
+    original = Path(path)
+    if not original.exists() and not original.is_symlink():
+        # Preserve the legacy path-construction API for writers that ask for a
+        # sidecar location before creating the JSONL file.
+        return _legacy_dataset_manifest_path(original)
+    with _open_jsonl_snapshot(
+        original, require_manifest=False
+    ) as (_data_path, _data, manifest_path, _manifest):
+        if manifest_path is None:
+            return _legacy_dataset_manifest_path(original)
+        raise RecordValidationError(
+            "version-managed datasets have no stable manifest path; use "
+            "open_verified_jsonl_snapshot()"
+        )
+
+
+def _canonical_config_hash(config: Mapping[str, Any] | None) -> str:
+    try:
+        payload = json.dumps(
+            dict(config or {"operation": "write_jsonl"}),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RecordValidationError(
+            "dataset config identity must be strict JSON"
+        ) from exc
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _write_jsonl_unlocked(
+    records: Iterable[HumanGameRecord],
+    path: str,
+    *,
+    config_identity: Mapping[str, Any] | None = None,
+    lineage_verified: bool = True,
+) -> int:
     """Write records to ``path`` as JSONL. Returns the number of records written.
 
     Records are written in iteration order; deterministic ordering is the
     caller's responsibility (ingest sorts by ``game_id`` for reproducibility).
     """
+    source_sha = git_sha()
+    if not isinstance(lineage_verified, bool):
+        raise RecordValidationError("lineage_verified must be a bool")
+    if (
+        len(source_sha) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in source_sha)
+    ):
+        raise RecordValidationError(
+            "canonical dataset writes require a full source Git SHA; set "
+            "DOUZERO_GIT_SHA in source-less runtimes"
+        )
     n = 0
+    digest = hashlib.sha256()
+    rulesets: set[tuple[str, str, str]] = set()
     with open(path, "w", encoding="utf-8") as fh:
         for rec in records:
-            fh.write(rec.to_jsonl_line())
-            fh.write("\n")
+            line = rec.to_jsonl_line() + "\n"
+            fh.write(line)
+            digest.update(line.encode("utf-8"))
+            rulesets.add(
+                (rec.ruleset_id, rec.ruleset_version, rec.ruleset_hash)
+            )
             n += 1
+    manifest = {
+        "schema_version": HUMAN_DATASET_MANIFEST_VERSION,
+        "canonical_format_version": CANONICAL_FORMAT_VERSION,
+        "record_schema_version": HUMAN_RECORD_SCHEMA_VERSION,
+        "source_git_sha": source_sha,
+        "config_identity_hash": _canonical_config_hash(config_identity),
+        "rulesets": [
+            {
+                "ruleset_id": identity[0],
+                "ruleset_version": identity[1],
+                "ruleset_hash": identity[2],
+            }
+            for identity in sorted(rulesets)
+        ],
+        "record_count": n,
+        "dataset_sha256": digest.hexdigest(),
+        "access_class": "privileged_training_data",
+        "lineage_verified": lineage_verified,
+    }
+    _legacy_dataset_manifest_path(path).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
     return n
+
+
+def write_jsonl(
+    records: Iterable[HumanGameRecord],
+    path: str,
+    *,
+    config_identity: Mapping[str, Any] | None = None,
+    lineage_verified: bool = True,
+) -> int:
+    """Write one plain JSONL/manifest pair under its publication lock.
+
+    Version-managed destinations must be changed through the rebuild API;
+    directly truncating their pointer would bypass cumulative deletion state.
+    Legacy readers retain a shared lock for their whole read, while immutable
+    version readers can release it once both descriptors are pinned.
+    """
+
+    if _fcntl is None:  # Preserve legacy plain-JSONL I/O on Windows.
+        source = Path(path)
+        if source.exists() or source.is_symlink():
+            with open(source, "rb") as handle:
+                if _read_dataset_pointer(source, handle) is not None:
+                    raise RecordValidationError(
+                        "version-managed canonical datasets require POSIX "
+                        "advisory locks"
+                    )
+        return _write_jsonl_unlocked(
+            records,
+            str(source),
+            config_identity=config_identity,
+            lineage_verified=lineage_verified,
+        )
+
+    source = _canonical_dataset_path(path)
+    with dataset_publication_lock(
+        source,
+        exclusive=True,
+        create=True,
+    ):
+        if source.exists() or source.is_symlink():
+            if _load_dataset_pointer(source) is not None:
+                raise RecordValidationError(
+                    "version-managed canonical datasets must be updated with "
+                    "rebuild_without_game_ids()"
+                )
+        return _write_jsonl_unlocked(
+            records,
+            str(source),
+            config_identity=config_identity,
+            lineage_verified=lineage_verified,
+        )
+
+
+def _records_from_snapshot_handle(
+    source: Path, handle: BinaryIO
+) -> Iterator[HumanGameRecord]:
+    handle.seek(0)
+    text_handle = io.TextIOWrapper(handle, encoding="utf-8")
+    try:
+        for lineno, line in enumerate(text_handle, start=1):
+            try:
+                yield record_from_jsonl_line(line)
+            except RecordValidationError as exc:
+                raise RecordValidationError(
+                    f"{source}:{lineno}: {exc}"
+                ) from exc
+    except UnicodeDecodeError as exc:
+        raise RecordValidationError("canonical dataset is not valid UTF-8") from exc
+    finally:
+        text_handle.detach()
+
+
+def _verify_jsonl_snapshot(
+    source: Path,
+    data_handle: BinaryIO,
+    manifest_handle: BinaryIO,
+    spool_handle: BinaryIO,
+    *,
+    allow_unverified_lineage: bool = False,
+) -> dict[str, Any]:
+    try:
+        manifest_handle.seek(0)
+        manifest = json.loads(manifest_handle.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RecordValidationError(
+            "canonical dataset manifest is missing or invalid"
+        ) from exc
+    expected_keys = {
+        "schema_version", "canonical_format_version", "record_schema_version",
+        "source_git_sha", "config_identity_hash", "rulesets", "record_count",
+        "dataset_sha256", "access_class",
+        "lineage_verified",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+        raise RecordValidationError("canonical dataset manifest fields are invalid")
+    if manifest["schema_version"] != HUMAN_DATASET_MANIFEST_VERSION:
+        raise RecordValidationError("canonical dataset manifest schema mismatch")
+    if manifest["canonical_format_version"] != CANONICAL_FORMAT_VERSION:
+        raise RecordValidationError("canonical dataset format identity mismatch")
+    if manifest["record_schema_version"] != HUMAN_RECORD_SCHEMA_VERSION:
+        raise RecordValidationError("canonical dataset record schema mismatch")
+    for name in ("source_git_sha", "config_identity_hash", "dataset_sha256"):
+        value = manifest[name]
+        lengths = (40, 64) if name == "source_git_sha" else (64,)
+        if (
+            not isinstance(value, str)
+            or len(value) not in lengths
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise RecordValidationError(f"canonical dataset {name} is invalid")
+    data_handle.seek(0)
+    spool_handle.seek(0)
+    spool_handle.truncate(0)
+    digest_builder = hashlib.sha256()
+    actual_count = 0
+    actual_rulesets: set[tuple[str, str, str]] = set()
+    first_parse_error: RecordValidationError | None = None
+    for lineno, raw_line in enumerate(data_handle, start=1):
+        digest_builder.update(raw_line)
+        spool_handle.write(raw_line)
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if first_parse_error is None:
+                first_parse_error = RecordValidationError(
+                    f"{source}:{lineno}: canonical dataset is not valid UTF-8"
+                )
+            continue
+        try:
+            record = record_from_jsonl_line(line)
+        except RecordValidationError as exc:
+            if first_parse_error is None:
+                first_parse_error = RecordValidationError(
+                    f"{source}:{lineno}: {exc}"
+                )
+            continue
+        actual_count += 1
+        actual_rulesets.add(
+            (record.ruleset_id, record.ruleset_version, record.ruleset_hash)
+        )
+    digest = digest_builder.hexdigest()
+    if digest != manifest["dataset_sha256"]:
+        raise RecordValidationError("canonical dataset checksum mismatch")
+    if first_parse_error is not None:
+        raise first_parse_error
+    if manifest["access_class"] != "privileged_training_data":
+        raise RecordValidationError("canonical dataset access class mismatch")
+    if not isinstance(manifest["lineage_verified"], bool):
+        raise RecordValidationError("canonical dataset lineage identity is invalid")
+    if not manifest["lineage_verified"] and not allow_unverified_lineage:
+        raise RecordValidationError(
+            "canonical dataset has unverified migration lineage and cannot be "
+            "used for training or release"
+        )
+    if (
+        isinstance(manifest["record_count"], bool)
+        or not isinstance(manifest["record_count"], int)
+        or manifest["record_count"] < 0
+    ):
+        raise RecordValidationError("canonical dataset record_count is invalid")
+    if manifest["record_count"] != actual_count:
+        raise RecordValidationError(
+            "canonical dataset manifest record_count does not match content"
+        )
+    raw_rulesets = manifest["rulesets"]
+    if not isinstance(raw_rulesets, list):
+        raise RecordValidationError("canonical dataset rulesets are invalid")
+    manifest_rulesets: set[tuple[str, str, str]] = set()
+    for identity in raw_rulesets:
+        if (
+            not isinstance(identity, dict)
+            or set(identity)
+            != {"ruleset_id", "ruleset_version", "ruleset_hash"}
+            or not all(isinstance(value, str) for value in identity.values())
+            or not identity["ruleset_id"]
+            or not identity["ruleset_version"]
+            or len(identity["ruleset_hash"]) != 64
+            or any(
+                char not in "0123456789abcdef"
+                for char in identity["ruleset_hash"]
+            )
+        ):
+            raise RecordValidationError("canonical dataset rulesets are invalid")
+        manifest_rulesets.add(
+            (
+                identity["ruleset_id"],
+                identity["ruleset_version"],
+                identity["ruleset_hash"],
+            )
+        )
+    if len(manifest_rulesets) != len(raw_rulesets):
+        raise RecordValidationError("canonical dataset rulesets contain duplicates")
+    if manifest_rulesets != actual_rulesets:
+        raise RecordValidationError(
+            "canonical dataset manifest rulesets do not match content"
+        )
+    spool_handle.seek(0)
+    return manifest
+
+
+@dataclass(frozen=True)
+class VerifiedJsonlSnapshot:
+    """A verified, immutable spool of one pinned dataset version."""
+
+    manifest: Mapping[str, Any]
+    source_path: Path
+    _spool_handle: BinaryIO
+
+    def iter_records(self) -> Iterator[HumanGameRecord]:
+        yield from _records_from_snapshot_handle(
+            self.source_path, self._spool_handle
+        )
+
+
+@contextmanager
+def open_verified_jsonl_snapshot(
+    path: str | Path,
+    *,
+    allow_unverified_lineage: bool = False,
+    acquire_lock: bool = True,
+) -> Iterator[VerifiedJsonlSnapshot]:
+    """Verify and spool one exact data/manifest version with bounded memory."""
+
+    spool = tempfile.SpooledTemporaryFile(
+        max_size=_VERIFIED_SPOOL_MAX_BYTES,
+        mode="w+b",
+    )
+    try:
+        with _open_jsonl_snapshot(
+            path,
+            require_manifest=True,
+            acquire_lock=acquire_lock,
+        ) as (source, data, _manifest_path, manifest):
+            assert manifest is not None
+            manifest_dict = _verify_jsonl_snapshot(
+                source,
+                data,
+                manifest,
+                spool,
+                allow_unverified_lineage=allow_unverified_lineage,
+            )
+        yield VerifiedJsonlSnapshot(
+            manifest=MappingProxyType(dict(manifest_dict)),
+            source_path=source,
+            _spool_handle=spool,
+        )
+    finally:
+        spool.close()
+
+
+def _load_verified_jsonl_snapshot(
+    path: str | Path,
+    *,
+    allow_unverified_lineage: bool = False,
+    acquire_lock: bool = True,
+) -> tuple[dict[str, Any], list[HumanGameRecord]]:
+    """Load records and their manifest from the same pinned dataset version."""
+
+    with open_verified_jsonl_snapshot(
+        path,
+        allow_unverified_lineage=allow_unverified_lineage,
+        acquire_lock=acquire_lock,
+    ) as snapshot:
+        return (
+            dict(snapshot.manifest),
+            list(snapshot.iter_records()),
+        )
+
+
+def verify_jsonl_manifest(
+    path: str | Path, *, allow_unverified_lineage: bool = False
+) -> dict[str, Any]:
+    """Verify canonical dataset provenance and one pinned content snapshot."""
+
+    with open_verified_jsonl_snapshot(
+        path, allow_unverified_lineage=allow_unverified_lineage
+    ) as snapshot:
+        return dict(snapshot.manifest)
+
+
+def read_verified_jsonl(path: str) -> Iterator[HumanGameRecord]:
+    """Verify the provenance sidecar, then stream canonical records."""
+
+    with open_verified_jsonl_snapshot(path) as snapshot:
+        yield from snapshot.iter_records()
 
 
 def read_jsonl(path: str) -> Iterator[HumanGameRecord]:
@@ -806,14 +1707,10 @@ def read_jsonl(path: str) -> Iterator[HumanGameRecord]:
     file path and line number. Use this when the input is expected to be clean
     and any corruption should stop the pipeline immediately.
     """
-    with open(path, "r", encoding="utf-8") as fh:
-        for lineno, line in enumerate(fh, start=1):
-            try:
-                yield record_from_jsonl_line(line)
-            except RecordValidationError as exc:
-                raise RecordValidationError(
-                    f"{path}:{lineno}: {exc}"
-                ) from exc
+    with _open_jsonl_snapshot(
+        path, require_manifest=False
+    ) as (source, handle, _manifest_path, _manifest):
+        yield from _records_from_snapshot_handle(source, handle)
 
 
 @dataclass(frozen=True)
@@ -842,15 +1739,21 @@ def iter_jsonl_resilient(path: str) -> Iterator[JsonlLineResult]:
     Empty lines are reported as errors (the caller decides whether to skip or
     quarantine). The yield order matches the file order.
     """
-    with open(path, "r", encoding="utf-8") as fh:
-        for lineno, line in enumerate(fh, start=1):
-            stripped = line.strip()
-            if not stripped:
-                yield JsonlLineResult(lineno=lineno, error="empty line")
-                continue
-            try:
-                record = record_from_jsonl_line(line)
-            except RecordValidationError as exc:
-                yield JsonlLineResult(lineno=lineno, error=str(exc))
-                continue
-            yield JsonlLineResult(lineno=lineno, record=record)
+    with _open_jsonl_snapshot(
+        path, require_manifest=False
+    ) as (_source, handle, _manifest_path, _manifest):
+        fh = io.TextIOWrapper(handle, encoding="utf-8")
+        try:
+            for lineno, line in enumerate(fh, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    yield JsonlLineResult(lineno=lineno, error="empty line")
+                    continue
+                try:
+                    record = record_from_jsonl_line(line)
+                except RecordValidationError as exc:
+                    yield JsonlLineResult(lineno=lineno, error=str(exc))
+                    continue
+                yield JsonlLineResult(lineno=lineno, record=record)
+        finally:
+            fh.detach()

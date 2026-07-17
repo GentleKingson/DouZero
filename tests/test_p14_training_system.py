@@ -6,7 +6,9 @@ import os
 import socket
 import queue
 import random
+import sys
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +23,7 @@ from douzero.dmc.utils import get_batch
 
 
 POSITIONS = ("landlord", "landlord_up", "landlord_down")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class _TinyPolicy:
@@ -534,6 +537,99 @@ def test_ddp_unsupported_file_side_effects_fail_fast(
             SimpleNamespace(lambda_bc=lambda_bc),
             DistributedContext(enabled=True),
         )
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (
+            ["--config", str(ROOT / "configs/standard_v2.yaml")],
+            "standard learned-bidding",
+        ),
+        (
+            [
+                "--config", str(ROOT / "configs/enhanced.yaml"),
+                "--belief_training_mode", "joint",
+            ],
+            "joint/alternating",
+        ),
+        (
+            ["--resume_checkpoint", "must-not-be-read.pt"],
+            "checkpoint save/resume",
+        ),
+        (
+            ["--checkpoint_path", "must-not-be-written.pt"],
+            "checkpoint save/resume",
+        ),
+    ],
+)
+def test_unsupported_ddp_cli_fails_before_process_group_initialization(
+    monkeypatch, extra_args, message
+):
+    import train_v2
+    import douzero.runtime.distributed as distributed_runtime
+
+    initialized = False
+
+    def forbidden_initialize(**_kwargs):
+        nonlocal initialized
+        initialized = True
+        raise AssertionError("process group initialization must not be attempted")
+
+    monkeypatch.setattr(
+        distributed_runtime, "initialize_distributed", forbidden_initialize
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["train_v2.py", "--ddp_enabled", *extra_args]
+    )
+    with pytest.raises(NotImplementedError, match=message):
+        train_v2.main()
+    assert initialized is False
+
+
+def test_ddp_trainer_checkpoint_io_rejects_before_path_access(tmp_path):
+    from douzero.models_v2 import ModelV2, ModelV2Config
+    from douzero.observation import build_v2_schema
+    from douzero.training import TrainerConfig, V2Trainer
+
+    class FakeDDP(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+            self.config = module.config
+            self.schema = module.schema
+            self.strategy_feature_config = module.strategy_feature_config
+
+        def forward(self, *args, **kwargs):
+            return self.module(*args, **kwargs)
+
+    core = ModelV2(
+        build_v2_schema(),
+        ModelV2Config(hidden_size=16, history_layers=1, history_heads=1),
+    )
+    single_process_checkpoint = tmp_path / "single-process.pt"
+    V2Trainer(
+        core,
+        config=TrainerConfig(max_episodes=0, optimizer_steps=0),
+    ).save_training_checkpoint(str(single_process_checkpoint))
+    trainer = V2Trainer(
+        FakeDDP(core),
+        config=TrainerConfig(max_episodes=0, optimizer_steps=0),
+        distributed_context=DistributedContext(
+            enabled=True,
+            rank=0,
+            world_size=2,
+            local_rank=0,
+            backend="gloo",
+            device=torch.device("cpu"),
+        ),
+    )
+    save_path = tmp_path / "new-parent" / "checkpoint.pt"
+    with pytest.raises(NotImplementedError, match="single-process only"):
+        trainer.save_training_checkpoint(str(save_path))
+    assert not save_path.parent.exists()
+    with pytest.raises(NotImplementedError, match="single-process only"):
+        trainer.load_training_checkpoint(str(single_process_checkpoint))
 
 
 @pytest.mark.parametrize(

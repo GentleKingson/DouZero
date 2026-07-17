@@ -33,6 +33,33 @@ from douzero.models_v2 import (
 from douzero.observation import build_v2_schema, get_obs_v2
 
 
+_FROZEN_P16_FORMAT1_MANIFEST = {
+    "format_version": 1,
+    "model_abi_version": "model-v2-deployment-1",
+    "implementation_hash": "1" * 64,
+    "model_version": "v2",
+    "feature_version": "v2",
+    "feature_schema_hash": "2" * 64,
+    "model_config_hash": "3" * 64,
+    "ruleset_id": "legacy",
+    "ruleset_hash": "4" * 64,
+    "git_sha": "5" * 40,
+    "training_config_hash": "6" * 64,
+    "role_support": ["landlord", "landlord_up", "landlord_down"],
+    "belief_enabled": False,
+    "search_compatible": False,
+    "public_or_privileged": "public",
+    "dtype": "float32",
+    "required_package_versions": {
+        "python": ">=3.11",
+        "numpy": ">=1.24",
+        "torch": ">=2.0",
+        "douzero": "==0.1.0",
+    },
+    "weights_sha256": "7" * 64,
+}
+
+
 def _refresh_package_checksums(package):
     names = sorted(
         path.name for path in package.iterdir() if path.name != "SHA256SUMS"
@@ -62,6 +89,25 @@ def p16_runtime():
     env.reset()
     obs = get_obs_v2(env.infoset, ruleset=ruleset, schema=schema)
     return model, schema, config, ruleset, obs
+
+
+def test_format1_package_rejection_names_matching_runtime_and_rebuild(tmp_path):
+    """A frozen P16 manifest gets migration guidance before P17 file checks."""
+
+    package = tmp_path / "p16-format1"
+    package.mkdir()
+    (package / "manifest.json").write_text(
+        json.dumps(_FROZEN_P16_FORMAT1_MANIFEST), encoding="utf-8"
+    )
+
+    with pytest.raises(
+        ModelPackageError,
+        match=(
+            "format-1 P16 package requires its matching P16 runtime.*"
+            "rebuild a new package from the original manifest-bearing public checkpoint"
+        ),
+    ):
+        verify_model_package(package)
 
 
 def test_model_manifest_roundtrip_and_complete_fields(p16_runtime):

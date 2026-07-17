@@ -475,6 +475,11 @@ class GameEnv(object):
         """
         if bidding_order is None:
             bidding_order = list(self.NEUTRAL_SEATS)
+        if (
+            len(bidding_order) != len(self.NEUTRAL_SEATS)
+            or set(bidding_order) != set(self.NEUTRAL_SEATS)
+        ):
+            raise ValueError("bidding_order must be a permutation of neutral seats")
         self.bidding_order = list(bidding_order)
         self._bidding_index = 0
 
@@ -728,13 +733,22 @@ class GameEnv(object):
                 f"expected {PHASE_BIDDING!r}"
             )
         pos = self.acting_player_position
+        current_highest = max(
+            (bid for _, bid in self.bidding_history), default=0
+        )
         return {
             'phase': 'bidding',
             'position': pos,
             'my_handcards': sorted(self._seat_infosets[pos].player_hand_cards),
+            'current_highest_bid': current_highest,
             'bidding_history': list(self.bidding_history),
             'bidding_order': list(self.bidding_order),
+            'first_bidder': self.bidding_order[0],
             'bid_values': list(self.ruleset.bid_values),
+            'legal_bids': self.get_legal_bids(),
+            'ruleset_id': self.ruleset.ruleset_id,
+            'ruleset_version': self.ruleset.ruleset_version,
+            'ruleset_hash': self.ruleset.stable_hash(),
             'num_cards_left': {
                 s: len(self._seat_infosets[s].player_hand_cards)
                 for s in self.NEUTRAL_SEATS

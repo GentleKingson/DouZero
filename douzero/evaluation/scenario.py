@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from types import MappingProxyType
+from typing import Any, Mapping, Sequence
 
 from douzero.env.rules import RuleSet
 
+from .checkpoint_inputs import checkpoint_sha256, validate_sha256
 from .protocol import (
     EVALUATION_PROTOCOL,
+    OFFICIAL_CI_METHOD,
+    OFFICIAL_STATISTICAL_UNIT,
     OFFICIAL_PERMUTATIONS,
     OFFICIAL_PERMUTATION_HASHES,
 )
@@ -20,9 +23,86 @@ from .protocol import (
 SCENARIO_MODES = ("cardplay_only", "full_game")
 DATASET_SCOPES = ("public", "private_holdout")
 BACKENDS = ("random", "rule", "legacy", "legacy_factorized", "v2", "bc")
-BIDDING_POLICIES = ("rule", "random", "pass", "max")
+BIDDING_POLICIES = ("rule", "random", "pass", "max", "learned")
 SEATS = ("0", "1", "2")
 ROLES = ("landlord", "landlord_up", "landlord_down")
+DEAL_SET_IDENTITY_SCHEMA = "canonical-evaluation-deal-set-v1"
+
+
+def _canonical_mapping_hash(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def canonical_deal_hash(deal: Mapping[str, Any]) -> str:
+    """Hash only canonical fields that affect the evaluated game."""
+
+    if deal.get("format_version") == 2:
+        payload = {
+            "format_version": 2,
+            "schema_version": deal["schema_version"],
+            "ruleset_id": deal["ruleset_id"],
+            "ruleset_version": deal["ruleset_version"],
+            "ruleset_hash": deal["ruleset_hash"],
+            "deck": list(deal["deck"]),
+            "first_bidder": deal["first_bidder"],
+            "bidding_order": list(deal["bidding_order"]),
+            "bidding_script": None,
+        }
+    else:
+        payload = {
+            "landlord": sorted(deal["landlord"]),
+            "landlord_up": sorted(deal["landlord_up"]),
+            "landlord_down": sorted(deal["landlord_down"]),
+            "three_landlord_cards": sorted(deal["three_landlord_cards"]),
+        }
+    return _canonical_mapping_hash(payload)
+
+
+def canonical_deal_id(index: int, deal_hash: str) -> str:
+    """Return the stable human-readable ID for one ordered deal."""
+
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("deal index must be a non-negative integer")
+    if (
+        not isinstance(deal_hash, str)
+        or len(deal_hash) != 64
+        or any(char not in "0123456789abcdef" for char in deal_hash)
+    ):
+        raise ValueError("deal_hash must be a full lowercase SHA-256")
+    return f"{index:06d}-{deal_hash[:12]}"
+
+
+def canonical_deal_set_id(
+    mode: str,
+    ruleset: RuleSet | Mapping[str, Any],
+    deal_hashes: Sequence[str],
+    *,
+    seat_permutation_hash: str,
+) -> str:
+    """Hash the ordered real deals and required experiment arrangement."""
+
+    if any(
+        not isinstance(deal_hash, str)
+        or len(deal_hash) != 64
+        or any(char not in "0123456789abcdef" for char in deal_hash)
+        for deal_hash in deal_hashes
+    ):
+        raise ValueError("deal hashes must be full lowercase SHA-256 values")
+    if len(set(deal_hashes)) != len(deal_hashes):
+        raise ValueError("formal evaluation deal sets must not contain duplicates")
+    ruleset_identity = (
+        ruleset.identity() if isinstance(ruleset, RuleSet) else dict(ruleset)
+    )
+    payload = {
+        "schema_version": DEAL_SET_IDENTITY_SCHEMA,
+        "mode": mode,
+        "ruleset": ruleset_identity,
+        "deal_hashes": list(deal_hashes),
+        "seat_permutation_hash": seat_permutation_hash,
+        "permutations_per_deal": len(default_seat_permutations(mode)),
+    }
+    return _canonical_mapping_hash(payload)
 
 
 @dataclass(frozen=True)
@@ -43,6 +123,17 @@ class BundleSpec:
     belief_checkpoint: str = ""
     search_config: Mapping[str, Any] = field(default_factory=dict)
     tags: tuple[str, ...] = ()
+    # P17 field appended after every pre-P17 positional field.
+    bidding_checkpoint: str = ""
+    # File identities are separate from paths so a formal matrix can declare
+    # the approved bytes before anything is loaded. They remain appended for
+    # compatibility with the historical positional constructor contract.
+    checkpoint_sha256: Mapping[str, str] = field(default_factory=dict)
+    belief_checkpoint_sha256: str = ""
+    bidding_checkpoint_sha256: str = ""
+    checkpoint_digests_explicit: bool = field(
+        init=False, repr=False, compare=False, default=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not isinstance(self.backend, str):
@@ -56,15 +147,137 @@ class BundleSpec:
                 f"bidding_policy must be one of {BIDDING_POLICIES}, "
                 f"got {self.bidding_policy!r}"
             )
-        for field_name in ("checkpoints", "model_config", "search_config"):
+        for field_name in (
+            "checkpoints",
+            "checkpoint_sha256",
+            "model_config",
+            "search_config",
+        ):
             if not isinstance(getattr(self, field_name), Mapping):
                 raise TypeError(f"bundle {field_name} must be a mapping")
+        if any(
+            not isinstance(role, str) or not isinstance(path, str)
+            for role, path in self.checkpoints.items()
+        ):
+            raise TypeError("bundle checkpoints must map role strings to path strings")
+        if not isinstance(self.belief_checkpoint, str) or not isinstance(
+            self.bidding_checkpoint, str
+        ):
+            raise TypeError("belief_checkpoint and bidding_checkpoint must be strings")
         if self.backend in ("legacy", "legacy_factorized", "v2", "bc"):
             missing = [role for role in ROLES if not self.checkpoints.get(role)]
             if missing:
                 raise ValueError(
                     f"bundle {self.name!r} is missing checkpoints for {missing}"
                 )
+        if self.bidding_policy == "learned":
+            if self.backend not in ("v2", "bc"):
+                raise ValueError("learned bidding requires a V2 bundle backend")
+            if not self.bidding_checkpoint:
+                raise ValueError("learned bidding requires bidding_checkpoint")
+        elif self.bidding_checkpoint:
+            raise ValueError(
+                "bidding_checkpoint is only valid with bidding_policy='learned'"
+            )
+        if not isinstance(self.belief_checkpoint_sha256, str) or not isinstance(
+            self.bidding_checkpoint_sha256, str
+        ):
+            raise TypeError(
+                "belief and bidding checkpoint SHA-256 values must be strings"
+            )
+
+        paths = {role: path for role, path in self.checkpoints.items() if path}
+        declared_roles = dict(self.checkpoint_sha256)
+        supplied_values = [
+            *declared_roles.values(),
+            self.belief_checkpoint_sha256,
+            self.bidding_checkpoint_sha256,
+        ]
+        any_declared = any(bool(value) for value in supplied_values)
+        all_declared = (
+            set(declared_roles) == set(paths)
+            and all(bool(declared_roles[role]) for role in paths)
+            and bool(self.belief_checkpoint)
+            == bool(self.belief_checkpoint_sha256)
+            and bool(self.bidding_checkpoint)
+            == bool(self.bidding_checkpoint_sha256)
+        )
+        if any_declared and not all_declared:
+            raise ValueError(
+                "checkpoint SHA-256 declarations must cover every role, belief, "
+                "and bidding checkpoint exactly"
+            )
+        if any_declared:
+            normalized_roles = {
+                role: validate_sha256(
+                    declared_roles[role],
+                    label=f"bundle {self.name!r} {role} checkpoint_sha256",
+                )
+                for role in sorted(paths)
+            }
+            belief_digest = (
+                validate_sha256(
+                    self.belief_checkpoint_sha256,
+                    label=f"bundle {self.name!r} belief_checkpoint_sha256",
+                )
+                if self.belief_checkpoint
+                else ""
+            )
+            bidding_digest = (
+                validate_sha256(
+                    self.bidding_checkpoint_sha256,
+                    label=f"bundle {self.name!r} bidding_checkpoint_sha256",
+                )
+                if self.bidding_checkpoint
+                else ""
+            )
+            explicit = True
+        else:
+            # Backward-compatible local construction snapshots identities once.
+            # Missing files stay unbound and will be rejected if loading is tried.
+            def local_digest(path: str) -> str:
+                try:
+                    return checkpoint_sha256(path)
+                except ValueError:
+                    return ""
+
+            normalized_roles = {
+                role: local_digest(path) for role, path in sorted(paths.items())
+            }
+            belief_digest = (
+                local_digest(self.belief_checkpoint) if self.belief_checkpoint else ""
+            )
+            bidding_digest = (
+                local_digest(self.bidding_checkpoint) if self.bidding_checkpoint else ""
+            )
+            explicit = (
+                not paths
+                and not self.belief_checkpoint
+                and not self.bidding_checkpoint
+            )
+        object.__setattr__(
+            self, "checkpoints", MappingProxyType(dict(self.checkpoints))
+        )
+        object.__setattr__(
+            self, "checkpoint_sha256", MappingProxyType(normalized_roles)
+        )
+        object.__setattr__(self, "belief_checkpoint_sha256", belief_digest)
+        object.__setattr__(self, "bidding_checkpoint_sha256", bidding_digest)
+        object.__setattr__(self, "checkpoint_digests_explicit", explicit)
+
+    def checkpoint_identities(self) -> dict[str, Any]:
+        """Return path-free identities for every checkpoint in this bundle."""
+
+        return {
+            "scheme": "predeclared-sha256-file-including-manifest-v1",
+            "explicitly_predeclared": self.checkpoint_digests_explicit,
+            "roles": {
+                role: self.checkpoint_sha256.get(role) or None
+                for role in sorted(self.checkpoints)
+            },
+            "belief": self.belief_checkpoint_sha256 or None,
+            "bidding": self.bidding_checkpoint_sha256 or None,
+        }
 
     def to_dict(self, *, include_paths: bool = False) -> dict[str, Any]:
         checkpoints = (
@@ -72,17 +285,33 @@ class BundleSpec:
             if include_paths
             else {role: bool(path) for role, path in self.checkpoints.items()}
         )
-        return {
+        payload = {
             "name": self.name,
             "backend": self.backend,
             "checkpoints": checkpoints,
             "bidding_policy": self.bidding_policy,
             "decision_mode": self.decision_mode,
             "model_config": dict(self.model_config),
-            "belief_checkpoint": bool(self.belief_checkpoint),
+            "belief_checkpoint": (
+                self.belief_checkpoint
+                if include_paths else bool(self.belief_checkpoint)
+            ),
+            "bidding_checkpoint": (
+                self.bidding_checkpoint
+                if include_paths else bool(self.bidding_checkpoint)
+            ),
             "search_config": dict(self.search_config),
             "tags": list(self.tags),
         }
+        if include_paths:
+            payload.update({
+                "checkpoint_sha256": dict(self.checkpoint_sha256),
+                "belief_checkpoint_sha256": self.belief_checkpoint_sha256,
+                "bidding_checkpoint_sha256": self.bidding_checkpoint_sha256,
+            })
+        if not include_paths:
+            payload["checkpoint_identities"] = self.checkpoint_identities()
+        return payload
 
 
 def default_seat_permutations(mode: str) -> tuple[tuple[str, str, str], ...]:
@@ -184,41 +413,29 @@ class EvaluationScenario:
 
             for index, deal in enumerate(self.deals):
                 _validate_standard_record(deal, index, self.ruleset)
+                if deal.get("bidding_script") is not None:
+                    raise ValueError(
+                        "formal paired evaluation does not support bidding_script"
+                    )
         else:
-            expected_counts = Counter(list(range(3, 15)) * 4 + [17] * 4 + [20, 30])
+            from .legacy_data_adapter import _validate_legacy_record
+
             for index, deal in enumerate(self.deals):
-                required = {
-                    "landlord", "landlord_up", "landlord_down",
-                    "three_landlord_cards",
-                }
-                if set(deal) != required:
-                    raise ValueError(
-                        f"legacy deal {index} must contain exactly {sorted(required)}"
-                    )
-                cards = (
-                    list(deal["landlord"])
-                    + list(deal["landlord_up"])
-                    + list(deal["landlord_down"])
-                )
-                if Counter(cards) != expected_counts:
-                    raise ValueError(f"legacy deal {index} is not a valid 54-card deal")
-                if not (
-                    len(deal["landlord"]) == 20
-                    and len(deal["landlord_up"]) == 17
-                    and len(deal["landlord_down"]) == 17
-                    and len(deal["three_landlord_cards"]) == 3
-                ):
-                    raise ValueError(f"legacy deal {index} has invalid hand sizes")
-                if Counter(deal["three_landlord_cards"]) - Counter(deal["landlord"]):
-                    raise ValueError(
-                        f"legacy deal {index} bottom cards are not in landlord hand"
-                    )
+                _validate_legacy_record(deal, index)
+        deal_hashes = [canonical_deal_hash(deal) for deal in self.deals]
+        if len(set(deal_hashes)) != len(deal_hashes):
+            raise ValueError("formal evaluation deals must be unique")
 
     @property
     def deal_set_id(self) -> str:
-        """Content identity; never includes the private holdout path/name."""
-        payload = json.dumps(self.deals, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        """Order-sensitive identity of the real deals and row arrangement."""
+        deal_hashes = [canonical_deal_hash(deal) for deal in self.deals]
+        return canonical_deal_set_id(
+            self.mode,
+            self.ruleset,
+            deal_hashes,
+            seat_permutation_hash=OFFICIAL_PERMUTATION_HASHES[self.mode],
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -241,16 +458,31 @@ class EvaluationScenario:
             "seat_permutation_hash": OFFICIAL_PERMUTATION_HASHES[self.mode],
             "bootstrap_samples": self.bootstrap_samples,
             "confidence_level": self.confidence_level,
+            "statistical_unit": OFFICIAL_STATISTICAL_UNIT,
+            "ci_method": OFFICIAL_CI_METHOD,
+            "release_protocol_id": EVALUATION_PROTOCOL,
         }
 
 
-def bundle_from_dict(data: Mapping[str, Any]) -> BundleSpec:
+def bundle_from_dict(
+    data: Mapping[str, Any], *, require_checkpoint_digests: bool = False
+) -> BundleSpec:
     """Parse a model-matrix bundle entry with strict unknown-key checking."""
-    allowed = {field.name for field in BundleSpec.__dataclass_fields__.values()}
+    allowed = {
+        field.name
+        for field in BundleSpec.__dataclass_fields__.values()
+        if field.init
+    }
     unknown = set(data) - allowed
     if unknown:
         raise ValueError(f"unknown bundle fields: {sorted(unknown)}")
     converted = dict(data)
     if "tags" in converted:
         converted["tags"] = tuple(converted["tags"])
-    return BundleSpec(**converted)
+    bundle = BundleSpec(**converted)
+    if require_checkpoint_digests and not bundle.checkpoint_digests_explicit:
+        raise ValueError(
+            f"bundle {bundle.name!r} requires explicit predeclared checkpoint "
+            "SHA-256 values"
+        )
+    return bundle

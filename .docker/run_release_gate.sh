@@ -2,8 +2,14 @@
 set -euo pipefail
 
 bash .docker/run_tests.sh
-python -m compileall -q tools/package_model.py
+python -m compileall -q tools/package_model.py tools/prepare_p17_evaluation.py tools/formal_evaluation_dry_run.py tools/rebuild_human_dataset.py tools/gpu_validation_probe.py tools/validate_amp_fallback.py tools/validate_pr_evidence.py
 python tools/package_model.py --help >/dev/null
+python tools/prepare_p17_evaluation.py --help >/dev/null
+python tools/formal_evaluation_dry_run.py --help >/dev/null
+python tools/rebuild_human_dataset.py --help >/dev/null
+python tools/validate_pr_evidence.py --help >/dev/null
+python tools/validate_amp_fallback.py --help >/dev/null
+bash scripts/validate_gpu_training.sh --help >/dev/null
 python tools/capture_baseline.py --num_deals 2 --output artifacts/baseline/p16_release_gate.json
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git diff --check

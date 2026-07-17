@@ -162,19 +162,20 @@ class TestBeliefFusionForward:
         # But the belief_proj layer DID receive gradient (it is trainable).
         assert model.belief_proj.weight.grad is not None
 
-    def test_joint_training_is_not_implemented(self):
-        """belief_stop_gradient=False must raise NotImplementedError.
-
-        Joint value+belief training is not supported in P07: the constrained
-        DP and feature projection are non-differentiable (NumPy), so the API
-        must not promise a gradient path it cannot deliver (review blocker #1).
-        """
+    def test_stop_gradient_false_preserves_feature_graph(self):
+        """The opt-in joint path propagates value loss to belief features."""
         model, _ = self._belief_enabled_model()
         (scv, scf, ccv, cf, ht, hmask, af, am, role, _obs) = _model_inputs()
-        with pytest.raises(NotImplementedError):
-            model(scv, scf, ccv, cf, ht, hmask, af, am, role,
-                  belief_features=torch.zeros(BELIEF_FEATURE_DIM),
-                  belief_stop_gradient=False)
+        features = torch.randn(BELIEF_FEATURE_DIM, requires_grad=True)
+        output = model(
+            scv, scf, ccv, cf, ht, hmask, af, am, role,
+            belief_features=features,
+            belief_stop_gradient=False,
+        )
+        output.win_logit.sum().backward()
+        assert features.grad is not None
+        assert bool(torch.isfinite(features.grad).all())
+        assert float(features.grad.abs().sum()) > 0
 
     def test_rejects_wrong_belief_feature_shape(self):
         """Exact shape (BELIEF_FEATURE_DIM,) is required, not just trailing dim."""

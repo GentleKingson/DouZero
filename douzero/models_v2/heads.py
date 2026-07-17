@@ -110,6 +110,60 @@ class ValueHeads(nn.Module):
         }
 
 
+class BiddingHeads(nn.Module):
+    """Neutral-seat bid policy plus landlord-perspective outcome values."""
+
+    def __init__(
+        self,
+        input_width: int,
+        hidden_size: int,
+        *,
+        num_bid_actions: int = 4,
+        score_clamp: float = 32.0,
+        uncertainty_enabled: bool = False,
+    ) -> None:
+        super().__init__()
+        if input_width <= 0 or hidden_size <= 0 or num_bid_actions <= 0:
+            raise ValueError("bidding head widths must be positive")
+        self.input_width = int(input_width)
+        self.num_bid_actions = int(num_bid_actions)
+        self.score_clamp = float(score_clamp)
+        self.trunk = nn.Sequential(
+            nn.Linear(input_width, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+        )
+        self.policy = nn.Linear(hidden_size, num_bid_actions)
+        self.landlord_win = nn.Linear(hidden_size, 1)
+        self.landlord_score = nn.Linear(hidden_size, 1)
+        self.uncertainty = (
+            nn.Linear(hidden_size, 1) if uncertainty_enabled else None
+        )
+
+    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | None]:
+        if features.ndim != 1 or features.shape[0] != self.input_width:
+            raise ValueError(
+                f"bidding features must have shape ({self.input_width},), "
+                f"got {tuple(features.shape)}"
+            )
+        hidden = self.trunk(features)
+        uncertainty = None
+        if self.uncertainty is not None:
+            uncertainty = torch.nn.functional.softplus(self.uncertainty(hidden))
+        return {
+            "bid_logits": self.policy(hidden),
+            "landlord_win_logit": self.landlord_win(hidden).reshape(()),
+            "expected_landlord_score": torch.clamp(
+                self.landlord_score(hidden).reshape(()),
+                -self.score_clamp,
+                self.score_clamp,
+            ),
+            "uncertainty": uncertainty.reshape(()) if uncertainty is not None else None,
+        }
+
+
 class PriorHead(nn.Module):
     """Listwise policy-prior head over N fused action representations (P08).
 

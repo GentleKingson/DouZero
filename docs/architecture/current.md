@@ -209,8 +209,8 @@ The legacy baseline deliberately omits several things AGENTS.md requires:
 - ~~**No bidding / scoring state machine.**~~ **Resolved in P02:** a
   configurable `RuleSet` and a `DEAL→BIDDING→REVEAL_BOTTOM→PLAYING→TERMINAL`
   state machine are added to `GameEnv` (opt-in via `--ruleset standard`).
-  Legacy mode is unchanged. See `docs/rules_and_scoring.md`. Training does
-  not yet support standard mode (P05/P06).
+  Legacy mode is unchanged. P17 wires standard mode and learned bidding into
+  `train_v2.py`; see `docs/rules_and_scoring.md`.
 - ~~**No spring / anti-spring** affecting reward.~~ **Resolved in P02:**
   spring/anti-spring detection and multipliers are in `douzero/env/scoring.py`
   (standard mode only; legacy has `spring_multiplier=0`).
@@ -275,9 +275,9 @@ The legacy baseline deliberately omits several things AGENTS.md requires:
 | Boundary | Where | Later phase |
 |---|---|---|
 | Rule legality | `move_generator` / `move_detector` / `move_selector` | P02 `RuleSet` added (rules.py); move_generator/detector/selector NOT modified (TYPE_15 anomaly deferred) |
-| Bidding/scoring | `GameEnv` (ruleset=None=legacy) / `Env` / `scoring.py` | P02 resolved (standard mode); training integration → P05/P06 |
+| Bidding/scoring | `GameEnv` (ruleset=None=legacy) / `Env` / `scoring.py` | P02 resolved the state machine; P17 adds opt-in standard V2 training and learned bidding |
 | Observation schema | `get_obs` (role encoders) | P03 resolved: `douzero/observation/` adds versioned `PublicObservation`/`PrivilegedObservation` + schema + legacy adapter; `get_obs` unchanged (default `feature_version=legacy`) |
-| Model input/widths | `Landlord/FarmerLstmModel.forward(z,x)` | P04 resolved (deployment): `douzero/dmc/models_factorized.py` adds `LegacyFactorizedLandlord/FarmerModel` — same state_dict keys/shapes, encodes shared history/state once per decision, numerically equivalent to legacy; `DeepAgent` gains `backend='legacy_factorized'`. P05 resolved (deployment): `douzero/models_v2/` adds `ModelV2` — shared state/action trunk + role embedding + Transformer/LSTM history encoder + multi-head outputs (win prob + conditional scores); consumes `ObservationV2` (public only); state/history encoded once per decision. `DeepAgentV2` gains a canonical `PrivilegedObservation` type guard. Training integration → P06. See `docs/model_v2.md`. |
+| Model input/widths | `Landlord/FarmerLstmModel.forward(z,x)` | P04 resolved legacy factorization. P05 adds public-only `ModelV2`; P06 wires V2 training; P17 adds the independent learned-bidding path. See `docs/model_v2.md`. |
 | Deployment selection | `DeepAgent.act(infoset)` | P04 resolved (legacy_factorized backend). P05 resolved: `DeepAgentV2` (public-only, `backend='v2'`) with `act_v2(ObservationV2)` + legacy-compatible `act(infoset)`, plus the strict manifest-bearing V2 loader (`load_v2_model`). Legacy per-position permissive loader → P16. |
 | Reward sign | `Env._get_reward` + actor negation | P06 centralised perspective |
 | Checkpoint manifest | `{pos}_weights_*.ckpt`, `model.tar` | P16 strict `ModelManifest` |

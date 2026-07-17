@@ -1,0 +1,1755 @@
+"""Focused P17 release, empirical-input, GPU, and privacy tooling tests."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import stat
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
+from pathlib import Path
+
+import pytest
+import torch
+
+import ingest_human_games
+import douzero.human_data.rebuild as human_data_rebuild
+import douzero.human_data.schema as human_data_schema
+import douzero.evaluation.p17 as p17_evaluation
+from douzero.belief import BeliefConfig, BeliefModel
+from douzero.belief.checkpoint import save_belief_checkpoint
+from douzero.deployment import (
+    CURRENT_MODEL_FORMAT_VERSION,
+    ModelPackageError,
+    create_model_package,
+    load_model_package,
+    verify_model_package,
+)
+from douzero.env.game import GameEnv
+from douzero.env.env import Env
+from douzero.checkpoint import save_v2_position_weights
+from douzero.env.rules import RuleSet
+from douzero.evaluation.paired import evaluation_runtime_identity, evaluate_scenario
+from douzero.evaluation.provenance import attach_result_integrity
+from douzero.evaluation.p17 import (
+    P17MatrixError,
+    empty_matrix,
+    normalize_matrix,
+    result_readiness,
+    write_p17_artifacts,
+)
+from douzero.evaluation.protocol import (
+    EVALUATION_PROTOCOL,
+    OFFICIAL_PERMUTATION_HASHES,
+    P17_READINESS_PROTOCOL,
+)
+from douzero.evaluation.scenario import (
+    BundleSpec,
+    EvaluationScenario,
+    canonical_deal_id,
+    canonical_deal_set_id,
+)
+from douzero.evaluation.agents import RuleAgent
+from douzero.evaluation.deep_agent import DeepAgentV2
+from douzero.evaluation.legacy_data_adapter import deal_standard_deck
+from douzero.human_data import (
+    RecordValidationError,
+    RebuildCommitUncertainError,
+    RebuildPostCommitError,
+    dataset_manifest_path,
+    dedupe_by_game_id,
+    iter_jsonl_resilient,
+    load_hmac_project_key,
+    open_verified_jsonl_snapshot,
+    read_jsonl,
+    read_verified_jsonl,
+    rebuild_without_game_ids,
+    verify_jsonl_manifest,
+    write_jsonl,
+)
+from douzero.human_data.synthetic import generate_synthetic_records
+from douzero.models_v2 import ModelV2, ModelV2Config
+from douzero.observation import build_v2_schema, get_obs_v2
+from douzero.search import SearchConfig
+import tools.gpu_validation_probe as gpu_validation_probe
+import tools.rebuild_human_dataset as rebuild_human_dataset_tool
+from tools.gpu_validation_probe import probe_environment
+from tools.validate_amp_fallback import validate_amp_fallback
+from train_v2 import _build_training_metrics
+from evaluate_paired import generate_deals
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _active_manifest_path(path: Path) -> Path:
+    """Test-only resolver; production consumers use the pinned snapshot API."""
+
+    return human_data_schema._resolve_jsonl_paths(path)[1]
+
+
+def _model(
+    *, belief_enabled: bool = False, bidding_enabled: bool = False
+) -> tuple[ModelV2, RuleSet]:
+    torch.manual_seed(1700)
+    config = ModelV2Config(
+        hidden_size=32,
+        history_layers=1,
+        history_heads=4,
+        role_embedding_dim=8,
+        mlp_layers=1,
+        belief_enabled=belief_enabled,
+        bidding_enabled=bidding_enabled,
+        nan_guard=False,
+    )
+    ruleset = RuleSet.standard() if bidding_enabled else RuleSet.legacy()
+    return ModelV2(build_v2_schema(max_history_len=8), config).eval(), ruleset
+
+
+def _refresh_checksums(package: Path) -> None:
+    names = sorted(path.name for path in package.iterdir() if path.name != "SHA256SUMS")
+    (package / "SHA256SUMS").write_text(
+        "".join(
+            f"{hashlib.sha256((package / name).read_bytes()).hexdigest()}  {name}\n"
+            for name in names
+        ),
+        encoding="ascii",
+    )
+
+
+def test_p17_package_has_identity_summaries_rollback_and_hash_only_training(tmp_path):
+    model, ruleset = _model()
+    package = tmp_path / "release"
+    secret_path = "/outside/repo/private-human-games.jsonl"
+    manifest = create_model_package(
+        package,
+        model,
+        ruleset,
+        training_config={"seed": 17, "human_data_path": secret_path},
+    )
+    assert CURRENT_MODEL_FORMAT_VERSION == 2
+    assert manifest.format_version == 2
+    assert {path.name for path in package.iterdir()} == {
+        "weights.pt", "manifest.json", "ruleset.json", "feature_schema.json",
+        "model_config.json", "training_config.json", "README.md",
+        "model_card.md",
+        "evaluation_summary.md", "gpu_validation_summary.md", "rollback.md",
+        "THIRD_PARTY_NOTICES", "SHA256SUMS",
+    }
+    training_identity = json.loads(
+        (package / "training_config.json").read_text(encoding="utf-8")
+    )
+    assert training_identity["payload_policy"] == "hash_only"
+    assert training_identity["training_config_hash"] == manifest.training_config_hash
+    assert training_identity["runtime_training_support"] == {
+        "base_v2_cardplay_ddp": True,
+        "standard_learned_bidding_ddp": False,
+        "joint_belief_ddp": False,
+        "alternating_belief_ddp": False,
+        "single_process_trainer_resume": True,
+        "distributed_trainer_resume": False,
+    }
+    assert secret_path not in json.dumps(training_identity)
+    weights_payload = torch.load(package / "weights.pt", map_location="cpu", weights_only=True)
+    assert secret_path not in json.dumps(weights_payload["manifest"], sort_keys=True)
+    assert "NOT MEASURED" in (package / "evaluation_summary.md").read_text()
+    default_card = (package / "model_card.md").read_text()
+    assert "Release candidate: **NONE**" in default_card
+    assert "Release status: **NOT READY**" in default_card
+    assert "Standard learned-bidding DDP: `NOT SUPPORTED`" in default_card
+    assert "Distributed trainer resume: `NOT SUPPORTED`" in default_card
+    assert "Distributed trainer resume is not implemented" in (
+        package / "gpu_validation_summary.md"
+    ).read_text()
+    assert verify_model_package(package) == manifest
+
+
+def test_package_rejects_distributed_capability_claim_for_unsupported_paths(tmp_path):
+    model, ruleset = _model(bidding_enabled=True)
+    package = tmp_path / "unsupported-ddp-claim"
+    create_model_package(package, model, ruleset)
+    identity_path = package / "training_config.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity["runtime_training_support"]["standard_learned_bidding_ddp"] = True
+    identity["runtime_training_support"]["distributed_trainer_resume"] = True
+    identity_path.write_text(
+        json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    _refresh_checksums(package)
+
+    with pytest.raises(ModelPackageError, match="training_config.json identity"):
+        verify_model_package(package)
+
+
+def test_format2_schema1_training_identity_remains_compatible_without_claims(
+    tmp_path,
+):
+    model, ruleset = _model(bidding_enabled=True)
+    package = tmp_path / "schema1-format2-package"
+    manifest = create_model_package(package, model, ruleset)
+    identity_path = package / "training_config.json"
+    identity_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "training_config_hash": manifest.training_config_hash,
+                "payload_policy": "hash_only",
+                "payload_included": False,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _refresh_checksums(package)
+
+    assert verify_model_package(package) == manifest
+
+
+def test_rollback_restores_known_good_package_and_fixed_state_inference(tmp_path):
+    model, ruleset = _model()
+    approved = tmp_path / "approved"
+    candidate = tmp_path / "candidate"
+    create_model_package(approved, model, ruleset)
+    create_model_package(candidate, model, ruleset)
+
+    env = Env("adp")
+    env.reset()
+    observation = get_obs_v2(
+        env.infoset, ruleset=ruleset, schema=model.schema
+    )
+
+    def approved_action() -> list[int]:
+        loaded = load_model_package(
+            approved,
+            schema=model.schema,
+            ruleset=ruleset,
+            config=model.config,
+            device="cpu",
+        )
+        return DeepAgentV2(
+            "landlord", loaded, ruleset, device="cpu"
+        ).act_v2(observation)
+
+    before = approved_action()
+    with (candidate / "README.md").open("a", encoding="utf-8") as handle:
+        handle.write("tampered candidate\n")
+    with pytest.raises(ModelPackageError, match="checksum mismatch"):
+        verify_model_package(candidate)
+
+    # Roll back by reselecting the immutable known-good package, never by
+    # modifying the failed candidate in place.
+    assert approved_action() == before
+
+
+def test_p17_package_rejects_config_drift_and_unexpected_dataset(tmp_path):
+    model, ruleset = _model()
+    package = tmp_path / "release"
+    create_model_package(package, model, ruleset)
+
+    config_path = package / "model_config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["config"]["score_clamp"] = 31.0
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    _refresh_checksums(package)
+    with pytest.raises(ModelPackageError, match="model_config.json identity"):
+        verify_model_package(package)
+
+    package = tmp_path / "release-with-data"
+    create_model_package(package, model, ruleset)
+    (package / "canonical-human-data.jsonl").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ModelPackageError, match="unexpected files"):
+        verify_model_package(package)
+
+
+def test_belief_package_is_self_contained_and_runs_public_inference(tmp_path):
+    model, ruleset = _model(belief_enabled=True)
+    missing = tmp_path / "missing"
+    with pytest.raises(ModelPackageError, match="manifest-bearing belief_checkpoint"):
+        create_model_package(missing, model, ruleset)
+    assert not missing.exists()
+
+    belief = BeliefModel(
+        BeliefConfig(
+            hidden_size=24,
+            num_layers=1,
+            style_enabled=True,
+            style_embedding_dim=8,
+        )
+    ).eval()
+    belief_checkpoint = tmp_path / "belief.pt"
+    save_belief_checkpoint(
+        str(belief_checkpoint),
+        belief,
+        ruleset=ruleset,
+        feature_version=model.schema.feature_version,
+    )
+    package = tmp_path / "belief-release"
+    manifest = create_model_package(
+        package,
+        model,
+        ruleset,
+        belief_checkpoint=belief_checkpoint,
+        search_compatible=True,
+    )
+    assert manifest.belief_config_hash == belief.config.stable_hash()
+    assert manifest.search_compatible is True
+    assert (package / "belief_config.json").is_file()
+    assert (package / "belief_weights.pt").is_file()
+    assert "  belief_weights.pt\n" in (package / "SHA256SUMS").read_text()
+    assert verify_model_package(package) == manifest
+
+    payload = json.loads((package / "belief_config.json").read_text())
+    assert payload["config"] == asdict(belief.config)
+    assert payload["compatibility"] == belief.config.compatibility_dict()
+
+    loaded = load_model_package(
+        package,
+        schema=model.schema,
+        ruleset=ruleset,
+        config=model.config,
+        device="cpu",
+    )
+    assert isinstance(loaded.belief_model, BeliefModel)
+    assert loaded.belief_model.training is False
+    env = Env("adp")
+    env.reset()
+    observation = get_obs_v2(env.infoset, ruleset=ruleset, schema=model.schema)
+    assert len(observation.actions.legal_actions) > 1
+    base_agent = DeepAgentV2("landlord", loaded, ruleset, device="cpu")
+    action, explanation = base_agent.act_v2(
+        observation, return_explanation=True
+    )
+    assert action in observation.actions.legal_actions
+    assert explanation["source"] == "model"
+    assert explanation["search_enabled"] is False
+
+    search_agent = DeepAgentV2(
+        "landlord",
+        loaded,
+        ruleset,
+        search_config=SearchConfig(
+            enabled=True,
+            top_k=1,
+            belief_samples=1,
+            rollout_depth=0,
+            endgame_cards_threshold=0,
+            max_nodes=100,
+            max_rollouts=1,
+            max_milliseconds=5_000,
+            seed=17,
+        ),
+        device="cpu",
+    )
+    search_action, search_explanation = search_agent.act_v2(
+        observation, return_explanation=True
+    )
+    assert search_action == action
+    assert search_explanation["search_enabled"] is True
+    assert search_agent.last_search_log.timed_out is False
+    assert search_agent.last_search_log.samples == 1
+    assert search_agent.last_search_log.rollouts == 1
+
+
+def test_belief_package_rejects_tamper_and_wrong_checkpoint_identity(tmp_path):
+    model, ruleset = _model(belief_enabled=True)
+    belief = BeliefModel(BeliefConfig(hidden_size=24, num_layers=1)).eval()
+    checkpoint = tmp_path / "belief.pt"
+    save_belief_checkpoint(
+        str(checkpoint), belief, ruleset=ruleset,
+        feature_version=model.schema.feature_version,
+    )
+    package = tmp_path / "belief-release"
+    create_model_package(package, model, ruleset, belief_checkpoint=checkpoint)
+
+    wrong_config = BeliefModel(BeliefConfig(hidden_size=32, num_layers=1)).eval()
+    save_belief_checkpoint(
+        str(package / "belief_weights.pt"), wrong_config, ruleset=ruleset,
+        feature_version=model.schema.feature_version,
+    )
+    _refresh_checksums(package)
+    with pytest.raises(ModelPackageError, match="belief_weights.pt checkpoint identity"):
+        verify_model_package(package)
+
+    arbitrary_config_package = tmp_path / "arbitrary-config"
+    create_model_package(
+        arbitrary_config_package,
+        model,
+        ruleset,
+        belief_checkpoint=checkpoint,
+    )
+    config_path = arbitrary_config_package / "belief_config.json"
+    config_payload = json.loads(config_path.read_text(encoding="utf-8"))
+    config_payload["config"]["decoder"] = "arbitrary-dict-is-not-a-config"
+    config_path.write_text(json.dumps(config_payload), encoding="utf-8")
+    _refresh_checksums(arbitrary_config_package)
+    with pytest.raises(ModelPackageError, match="exact BeliefConfig fields"):
+        verify_model_package(arbitrary_config_package)
+
+    wrong_ruleset = tmp_path / "wrong-ruleset.pt"
+    save_belief_checkpoint(
+        str(wrong_ruleset), belief, ruleset=RuleSet.standard(),
+        feature_version=model.schema.feature_version,
+    )
+    with pytest.raises(ModelPackageError, match="belief checkpoint identity"):
+        create_model_package(
+            tmp_path / "wrong-ruleset-package",
+            model,
+            ruleset,
+            belief_checkpoint=wrong_ruleset,
+        )
+
+    wrong_feature = tmp_path / "wrong-feature.pt"
+    save_belief_checkpoint(
+        str(wrong_feature), belief, ruleset=ruleset,
+        feature_version="not-runtime-v2",
+    )
+    with pytest.raises(ModelPackageError, match="belief checkpoint identity"):
+        create_model_package(
+            tmp_path / "wrong-feature-package",
+            model,
+            ruleset,
+            belief_checkpoint=wrong_feature,
+        )
+
+
+def test_belief_package_cli_embeds_manifest_checkpoint(tmp_path):
+    model, ruleset = _model(belief_enabled=True)
+    value_checkpoint = tmp_path / "value.pt"
+    save_v2_position_weights(
+        str(value_checkpoint), model, ruleset=ruleset
+    )
+    belief = BeliefModel(BeliefConfig(hidden_size=20, num_layers=1)).eval()
+    belief_checkpoint = tmp_path / "belief.pt"
+    save_belief_checkpoint(
+        str(belief_checkpoint),
+        belief,
+        ruleset=ruleset,
+        feature_version=model.schema.feature_version,
+    )
+    model_config = tmp_path / "model_config.json"
+    model_config.write_text(json.dumps(asdict(model.config)), encoding="utf-8")
+    package = tmp_path / "cli-package"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "tools/package_model.py",
+            "--checkpoint", str(value_checkpoint),
+            "--belief-checkpoint", str(belief_checkpoint),
+            "--output", str(package),
+            "--ruleset", "legacy",
+            "--model-config", str(model_config),
+            "--max-history-len", "8",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    manifest = verify_model_package(package)
+    assert manifest.belief_config_hash == belief.config.stable_hash()
+    assert (package / "belief_weights.pt").is_file()
+
+
+def test_learned_bidding_package_requires_identity_bound_schema(tmp_path):
+    model, ruleset = _model(bidding_enabled=True)
+    package = tmp_path / "bidding-release"
+    manifest = create_model_package(package, model, ruleset)
+    assert manifest.bidding_enabled is True
+    assert manifest.bidding_head_version == "bid-policy-value-v2"
+    assert manifest.bidding_action_schema
+    assert len(manifest.bidding_feature_schema_hash) == 64
+    payload = json.loads((package / "bidding_schema.json").read_text())
+    assert payload["bidding_actions"] == [0, 1, 2, 3]
+    assert verify_model_package(package) == manifest
+    loaded = load_model_package(
+        package,
+        schema=model.schema,
+        ruleset=ruleset,
+        config=model.config,
+        device="cpu",
+    )
+    deck = list(range(3, 15)) * 4 + [17] * 4 + [20, 30]
+    env = GameEnv(
+        {role: RuleAgent() for role in ("landlord", "landlord_up", "landlord_down")},
+        ruleset=ruleset,
+    )
+    env.card_play_init_standard(deal_standard_deck(deck), bidding_order=["0", "1", "2"])
+    from douzero.observation.bidding import get_bidding_obs_v2
+
+    observation = get_bidding_obs_v2(env.get_bidding_obs(), ruleset=ruleset)
+    assert loaded.forward_bidding(observation).argmax_bid() in env.get_legal_bids()
+
+    env.step_bidding(3)
+    play_observation = get_obs_v2(
+        env.get_infoset(), ruleset=ruleset, schema=loaded.schema
+    )
+    loaded_agent = DeepAgentV2("landlord", loaded, ruleset, device="cpu")
+    original_agent = DeepAgentV2("landlord", model, ruleset, device="cpu")
+    loaded_action = loaded_agent.act_v2(play_observation)
+    assert loaded_action in play_observation.actions.legal_actions
+    assert loaded_action == original_agent.act_v2(play_observation)
+
+    manifest_path = package / "manifest.json"
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    old_semantics_payload = copy.deepcopy(payload)
+    old_semantics_manifest = copy.deepcopy(manifest_payload)
+    old_semantics_payload["bidding_head_version"] = "bid-policy-value-v1"
+    old_semantics_manifest["bidding_head_version"] = "bid-policy-value-v1"
+    (package / "bidding_schema.json").write_text(
+        json.dumps(old_semantics_payload), encoding="utf-8"
+    )
+    manifest_path.write_text(json.dumps(old_semantics_manifest), encoding="utf-8")
+    _refresh_checksums(package)
+    with pytest.raises(ModelPackageError, match="bidding_schema.json identity"):
+        verify_model_package(package)
+
+    (package / "bidding_schema.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
+
+    payload["bidding_actions"] = [0, 1, 2]
+    (package / "bidding_schema.json").write_text(json.dumps(payload), encoding="utf-8")
+    _refresh_checksums(package)
+    with pytest.raises(ModelPackageError, match="bidding_schema.json identity"):
+        verify_model_package(package)
+
+
+def test_gpu_probe_is_sanitized_and_probe_script_handles_hidden_cuda(
+    monkeypatch, tmp_path
+):
+    report = probe_environment()
+    assert report["schema_version"] == "p17-gpu-environment-v1"
+    assert report["privacy"] == "sanitized_no_host_or_device_identifiers"
+    serialized = json.dumps(report).lower()
+    for forbidden in ("hostname", "username", "gpu_uuid", "serial_number"):
+        assert forbidden not in serialized
+
+    monkeypatch.setattr(gpu_validation_probe.shutil, "which", lambda _: "nvidia-smi")
+    monkeypatch.setattr(
+        gpu_validation_probe,
+        "_run",
+        lambda *_args, **_kwargs: (1, "private-host /secret/path GPU-UUID"),
+    )
+    failed_probe = gpu_validation_probe._nvidia_environment()
+    assert failed_probe["probe_error_class"] == "NonZeroExit"
+    assert "private-host" not in json.dumps(failed_probe)
+
+    env = dict(os.environ)
+    env.update({"CUDA_VISIBLE_DEVICES": "", "DOUZERO_PYTHON": sys.executable})
+    output = tmp_path / "gpu"
+    result = subprocess.run(
+        ["bash", "scripts/validate_gpu_training.sh", "--output", str(output)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 3
+    environment = json.loads((output / "environment.json").read_text())
+    assert environment["status"] == "blocked_no_cuda_device"
+    for name in (
+        "single_gpu_fp32", "single_gpu_fp16", "single_gpu_bf16",
+        "amp_nonfinite_fallback", "belief_frozen", "belief_joint",
+        "checkpoint_resume",
+    ):
+        assert json.loads((output / f"{name}.json").read_text())["status"] == "not_run"
+    ddp = json.loads((output / "ddp_2gpu.json").read_text())
+    assert ddp["status"] == "blocked_implementation"
+    assert "fails closed" in ddp["reason"]
+    assert "NOT RUN" in (output / "summary.md").read_text()
+
+
+def test_training_metrics_are_measured_and_amp_fallback_is_exercised():
+    class Stats:
+        episodes_completed = 3
+        transitions_collected = 10
+        bidding_transitions_collected = 2
+        optimizer_steps = 4
+        redeals = 1
+        max_redeals_exceeded = 1
+        belief_supervised_steps = 0
+        amp_fallbacks = 1
+
+    report = _build_training_metrics(
+        Stats(),
+        training_wall_seconds=2.0,
+        device_type="cuda",
+        peak_memory_bytes=2 * 1024 * 1024,
+        peak_reserved_memory_bytes=3 * 1024 * 1024,
+        amp_enabled=True,
+        amp_dtype="float16",
+        amp_fallback_on_nonfinite=True,
+        compile_enabled=False,
+        ddp_enabled=False,
+        world_size=1,
+        parameters_changed=True,
+    )
+    assert report["metrics"] == {
+        "peak_memory_mib": 2.0,
+        "peak_reserved_memory_mib": 3.0,
+        "cardplay_transitions_per_second": 5.0,
+        "bidding_decisions_per_second": 1.0,
+        "samples_per_second": 6.0,
+        "decisions_per_second": 6.0,
+        "learner_steps_per_second": 2.0,
+    }
+    assert report["amp"]["fallback_exercised"] is True
+    assert report["counts"]["max_redeals_exceeded"] == 1
+    fallback = validate_amp_fallback(device="cpu", dtype="bfloat16")
+    assert fallback["status"] == "passed"
+    assert fallback["fallback_count"] == 1
+    assert fallback["parameter_finite"] is True
+
+
+def test_hmac_key_env_and_ingest_data_path_env(monkeypatch, tmp_path):
+    key = tmp_path / "key"
+    key.write_bytes(b"k" * 32)
+    monkeypatch.setenv("DOUZERO_HUMAN_DATA_HMAC_KEY_FILE", str(key))
+    assert load_hmac_project_key() == b"k" * 32
+
+    raw = tmp_path / "authorized.jsonl"
+    raw.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("DOUZERO_HUMAN_DATA_PATH", str(raw))
+    args = ingest_human_games._parse_args(["--output", str(tmp_path / "out.jsonl")])
+    assert args.input == str(raw)
+
+    key.write_bytes(b"short")
+    with pytest.raises(ValueError, match="at least 32 bytes"):
+        load_hmac_project_key()
+
+
+def test_game_id_deletion_rebuild_removes_complete_record_without_logging_ids(tmp_path):
+    records = list(generate_synthetic_records(num_games=3, base_seed=17))
+    source = tmp_path / "canonical.jsonl"
+    output = tmp_path / "rebuilt.jsonl"
+    write_jsonl(records, str(source))
+    source_manifest = verify_jsonl_manifest(source)
+    assert source_manifest["record_count"] == 3
+    assert source_manifest["record_schema_version"] == 2
+    assert source_manifest["lineage_verified"] is True
+    assert len(source_manifest["source_git_sha"]) in (40, 64)
+    assert len(source_manifest["config_identity_hash"]) == 64
+    assert source_manifest["rulesets"][0]["ruleset_hash"] == records[0].ruleset_hash
+    assert all(
+        record.game_id not in json.dumps(source_manifest) for record in records
+    )
+    removed = records[1].game_id
+
+    report = rebuild_without_game_ids(source, output, [removed])
+    assert report.to_dict() == {
+        "input_records": 3,
+        "output_records": 2,
+        "excluded_records": 1,
+        "requested_ids": 1,
+    }
+    rebuilt = list(read_jsonl(str(output)))
+    assert [record.game_id for record in read_verified_jsonl(str(output))] == [
+        record.game_id for record in rebuilt
+    ]
+    resilient = list(iter_jsonl_resilient(str(output)))
+    assert not [result.error for result in resilient if result.error]
+    assert [result.record.game_id for result in resilient if result.record] == [
+        record.game_id for record in rebuilt
+    ]
+    rebuilt_manifest = verify_jsonl_manifest(output)
+    assert rebuilt_manifest["record_count"] == 2
+    assert _active_manifest_path(output).is_file()
+    assert removed not in {record.game_id for record in rebuilt}
+    assert removed not in json.dumps(report.to_dict())
+    assert {record.game_id for record in rebuilt} == {
+        records[0].game_id, records[2].game_id
+    }
+
+    active_payload = _active_manifest_path(output).parent / "dataset.jsonl"
+    assert stat.S_IMODE(active_payload.stat().st_mode) == 0o400
+    assert stat.S_IMODE(active_payload.parent.stat().st_mode) == 0o500
+    assert stat.S_IMODE(active_payload.parent.parent.stat().st_mode) == 0o700
+    active_payload.parent.chmod(0o700)
+    active_payload.chmod(0o600)
+    with active_payload.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    with pytest.raises(Exception, match="checksum mismatch"):
+        verify_jsonl_manifest(output)
+
+
+@pytest.mark.parametrize("old_layout", ["legacy", "versioned"])
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("injected publish failure"), KeyboardInterrupt()],
+    ids=["replace-error", "interruption"],
+)
+def test_game_id_deletion_publish_failure_preserves_old_dataset(
+    tmp_path, monkeypatch, old_layout, failure
+):
+    records = list(generate_synthetic_records(num_games=4, base_seed=71))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    if old_layout == "legacy":
+        write_jsonl(records, str(output), config_identity={"generation": "old"})
+    else:
+        rebuild_without_game_ids(source, output, [records[1].game_id])
+
+    old_records = [record.game_id for record in read_jsonl(str(output))]
+    old_pointer_or_payload = output.read_bytes()
+    old_manifest_path = _active_manifest_path(output)
+    old_manifest = old_manifest_path.read_bytes()
+    version_root = output.parent / f".{output.name}.versions"
+    versions_before = (
+        {entry.name for entry in version_root.iterdir()}
+        if version_root.exists()
+        else set()
+    )
+    fsynced_files = []
+    real_fsync_file = human_data_rebuild._fsync_file
+
+    def track_fsync(path):
+        real_fsync_file(path)
+        fsynced_files.append(path.name)
+
+    def fail_publish(_source, _destination):
+        raise failure
+
+    monkeypatch.setattr(human_data_rebuild, "_fsync_file", track_fsync)
+    monkeypatch.setattr(human_data_rebuild.os, "replace", fail_publish)
+    with pytest.raises(type(failure)):
+        rebuild_without_game_ids(source, output, [records[2].game_id])
+
+    assert fsynced_files == ["dataset.jsonl", "dataset.jsonl.manifest.json"]
+    assert output.read_bytes() == old_pointer_or_payload
+    assert _active_manifest_path(output) == old_manifest_path
+    assert old_manifest_path.read_bytes() == old_manifest
+    assert [record.game_id for record in read_jsonl(str(output))] == old_records
+    assert verify_jsonl_manifest(output)["dataset_sha256"] == json.loads(
+        old_manifest.decode("utf-8")
+    )["dataset_sha256"]
+    assert records[2].game_id in old_records
+    versions_after = {entry.name for entry in version_root.iterdir()}
+    assert versions_after == versions_before
+    assert not list(tmp_path.glob(f".{output.name}.*.pointer.tmp"))
+
+
+def test_game_id_deletion_rejects_non_private_version_root(tmp_path):
+    records = list(generate_synthetic_records(num_games=2, base_seed=72))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    version_root = output.parent / f".{output.name}.versions"
+    version_root.mkdir()
+    version_root.chmod(0o755)
+
+    with pytest.raises(ValueError, match="group or other permissions"):
+        rebuild_without_game_ids(source, output, [records[1].game_id])
+
+    assert not output.exists()
+    assert not list(version_root.iterdir())
+    assert verify_jsonl_manifest(source)["record_count"] == 2
+
+
+def test_versioned_dataset_pointer_target_tampering_fails_closed(tmp_path):
+    records = list(generate_synthetic_records(num_games=2, base_seed=73))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, output, [records[1].game_id])
+
+    magic, body = output.read_bytes().split(b"\n", maxsplit=1)
+    pointer = json.loads(body)
+    pointer["version"] = "v-" + "f" * 32
+    output.write_bytes(
+        magic
+        + b"\n"
+        + json.dumps(pointer, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+    with pytest.raises(RecordValidationError, match="version directory is missing"):
+        verify_jsonl_manifest(output)
+    with pytest.raises(RecordValidationError, match="version directory is missing"):
+        list(read_jsonl(str(output)))
+    with pytest.raises(RecordValidationError, match="version directory is missing"):
+        dataset_manifest_path(output)
+
+
+def test_versioned_dataset_reader_rejects_broadened_permissions(tmp_path):
+    records = list(generate_synthetic_records(num_games=2, base_seed=74))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, output, [records[1].game_id])
+    version_root = _active_manifest_path(output).parent.parent
+    version_root.chmod(0o755)
+
+    with pytest.raises(RecordValidationError, match="group or other permissions"):
+        verify_jsonl_manifest(output)
+    with pytest.raises(RecordValidationError, match="group or other permissions"):
+        list(read_jsonl(str(output)))
+    with pytest.raises(RecordValidationError, match="group or other permissions"):
+        dataset_manifest_path(output)
+
+
+def test_reader_pins_version_during_atomic_switch_and_retirement(tmp_path):
+    records = list(generate_synthetic_records(num_games=4, base_seed=79))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, output, [records[0].game_id])
+    old_versions = {
+        entry.name
+        for entry in (output.parent / f".{output.name}.versions").iterdir()
+    }
+
+    pinned_reader = read_jsonl(str(output))
+    first = next(pinned_reader)
+    rebuild_without_game_ids(source, output, [records[1].game_id])
+    pinned = [first, *list(pinned_reader)]
+
+    assert [record.game_id for record in pinned] == [
+        records[1].game_id,
+        records[2].game_id,
+        records[3].game_id,
+    ]
+    assert [record.game_id for record in read_verified_jsonl(str(output))] == [
+        records[2].game_id,
+        records[3].game_id,
+    ]
+    current_versions = {
+        entry.name
+        for entry in (output.parent / f".{output.name}.versions").iterdir()
+    }
+    assert len(current_versions) == 1
+    assert old_versions.isdisjoint(current_versions)
+
+
+def test_verified_snapshot_keeps_manifest_and_records_bound_during_switch(tmp_path):
+    records = list(generate_synthetic_records(num_games=3, base_seed=83))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+
+    with open_verified_jsonl_snapshot(active) as snapshot:
+        pinned_manifest = dict(snapshot.manifest)
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+        pinned_records = list(snapshot.iter_records())
+
+    pinned_bytes = "".join(
+        record.to_jsonl_line() + "\n" for record in pinned_records
+    ).encode("utf-8")
+    assert hashlib.sha256(pinned_bytes).hexdigest() == pinned_manifest["dataset_sha256"]
+    assert [record.game_id for record in pinned_records] == [
+        records[1].game_id,
+        records[2].game_id,
+    ]
+    assert [record.game_id for record in read_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+
+
+def test_concurrent_deletions_are_serialized_and_cumulative(tmp_path):
+    records = list(generate_synthetic_records(num_games=4, base_seed=89))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reports = list(
+            executor.map(
+                lambda game_id: rebuild_without_game_ids(
+                    source, active, [game_id]
+                ),
+                [records[0].game_id, records[1].game_id],
+            )
+        )
+
+    active_ids = {record.game_id for record in read_verified_jsonl(str(active))}
+    assert records[0].game_id not in active_ids
+    assert records[1].game_id not in active_ids
+    assert active_ids == {records[2].game_id, records[3].game_id}
+    assert sorted(report.input_records for report in reports) == [3, 4]
+    version_root = active.parent / f".{active.name}.versions"
+    assert len(list(version_root.iterdir())) == 1
+
+
+def test_retired_pointer_rollback_fails_closed(tmp_path):
+    records = list(generate_synthetic_records(num_games=3, base_seed=97))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+    retired_pointer = active.read_bytes()
+    retired_version = json.loads(retired_pointer.split(b"\n", maxsplit=1)[1])[
+        "version"
+    ]
+
+    rebuild_without_game_ids(source, active, [records[1].game_id])
+    current_pointer = active.read_bytes()
+    version_root = active.parent / f".{active.name}.versions"
+    assert not (version_root / retired_version).exists()
+
+    active.write_bytes(retired_pointer)
+    with pytest.raises(RecordValidationError, match="version directory"):
+        verify_jsonl_manifest(active)
+    active.write_bytes(current_pointer)
+    assert verify_jsonl_manifest(active)["record_count"] == 1
+
+
+def test_replace_then_interrupt_reports_committed_state(tmp_path, monkeypatch):
+    records = list(generate_synthetic_records(num_games=3, base_seed=101))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+    real_replace = human_data_rebuild.os.replace
+
+    def replace_then_interrupt(source_path, destination_path):
+        real_replace(source_path, destination_path)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(human_data_rebuild.os, "replace", replace_then_interrupt)
+    with pytest.raises(RebuildPostCommitError) as raised:
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+
+    assert raised.value.committed is True
+    assert raised.value.durable is True
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+    version_root = active.parent / f".{active.name}.versions"
+    assert len(list(version_root.iterdir())) == 1
+
+
+def test_post_replace_fsync_failure_is_explicit_and_keeps_recovery_version(
+    tmp_path, monkeypatch
+):
+    records = list(generate_synthetic_records(num_games=3, base_seed=103))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+    real_fsync_directory = human_data_rebuild._fsync_directory
+    parent_fsync_calls = 0
+
+    def fail_second_parent_fsync(path):
+        nonlocal parent_fsync_calls
+        if Path(path) == active.parent:
+            parent_fsync_calls += 1
+            if parent_fsync_calls == 2:
+                raise OSError("injected post-replace fsync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(
+        human_data_rebuild, "_fsync_directory", fail_second_parent_fsync
+    )
+    with pytest.raises(RebuildPostCommitError) as raised:
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+
+    assert raised.value.committed is True
+    assert raised.value.durable is False
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+    version_root = active.parent / f".{active.name}.versions"
+    assert len(list(version_root.iterdir())) == 2
+
+
+def test_retirement_failure_is_explicit_after_durable_commit(
+    tmp_path, monkeypatch
+):
+    records = list(generate_synthetic_records(num_games=3, base_seed=104))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+
+    def fail_retirement(*_args, **_kwargs):
+        raise OSError("injected retirement failure")
+
+    monkeypatch.setattr(
+        human_data_rebuild,
+        "_retire_version_directories",
+        fail_retirement,
+    )
+    with pytest.raises(RebuildPostCommitError) as raised:
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+
+    assert raised.value.committed is True
+    assert raised.value.durable is True
+    assert raised.value.current is True
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+
+
+def test_ambiguous_pointer_switch_retains_target_version(tmp_path, monkeypatch):
+    records = list(generate_synthetic_records(num_games=3, base_seed=105))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+    real_replace = human_data_rebuild.os.replace
+
+    def replace_then_interrupt(source_path, destination_path):
+        real_replace(source_path, destination_path)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(human_data_rebuild.os, "replace", replace_then_interrupt)
+    monkeypatch.setattr(
+        human_data_rebuild,
+        "_publication_state",
+        lambda *_args, **_kwargs: "unknown",
+    )
+    with pytest.raises(RebuildCommitUncertainError) as raised:
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+
+    assert raised.value.committed is None
+    assert raised.value.durable is None
+    version_root = active.parent / f".{active.name}.versions"
+    assert len(list(version_root.iterdir())) == 2
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_rc", "expected_status"),
+    [
+        (
+            RebuildPostCommitError("injected", durable=False),
+            3,
+            "post_commit_error",
+        ),
+        (
+            RebuildCommitUncertainError("injected"),
+            4,
+            "commit_uncertain",
+        ),
+    ],
+)
+def test_rebuild_cli_reports_commit_state(
+    monkeypatch, capsys, error, expected_rc, expected_status
+):
+    def fail_rebuild(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        rebuild_human_dataset_tool,
+        "rebuild_without_game_ids",
+        fail_rebuild,
+    )
+    rc = rebuild_human_dataset_tool.main(
+        [
+            "--input",
+            "source.jsonl",
+            "--output",
+            "active.jsonl",
+            "--exclude-game-id",
+            "dzg_" + "0" * 64,
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().err)
+    assert rc == expected_rc
+    assert payload["status"] == expected_status
+    assert payload["committed"] is error.committed
+    assert payload["durable"] is error.durable
+
+
+def test_plain_writer_refuses_to_overwrite_version_pointer(tmp_path):
+    records = list(generate_synthetic_records(num_games=3, base_seed=106))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+
+    with pytest.raises(RecordValidationError, match="version-managed"):
+        write_jsonl(records, str(active))
+
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[1].game_id,
+        records[2].game_id,
+    ]
+
+
+def test_legacy_plain_io_survives_without_posix_locking(tmp_path, monkeypatch):
+    records = list(generate_synthetic_records(num_games=2, base_seed=110))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    monkeypatch.setattr(human_data_schema, "_fcntl", None)
+
+    assert write_jsonl(records, str(source)) == 2
+    assert verify_jsonl_manifest(source)["record_count"] == 2
+    assert list(read_verified_jsonl(str(source))) == records
+    with pytest.raises(RecordValidationError, match="POSIX advisory locks"):
+        rebuild_without_game_ids(source, active, [records[0].game_id])
+
+
+def test_rebuild_binds_lock_and_publication_to_resolved_parent(
+    tmp_path, monkeypatch
+):
+    records = list(generate_synthetic_records(num_games=2, base_seed=109))
+    source = tmp_path / "source.jsonl"
+    parent_a = tmp_path / "parent-a"
+    parent_b = tmp_path / "parent-b"
+    parent_a.mkdir()
+    parent_b.mkdir()
+    alias = tmp_path / "publication"
+    alias.symlink_to(parent_a, target_is_directory=True)
+    write_jsonl(records, str(source))
+    real_destination_token = human_data_rebuild._destination_token
+    swapped = False
+
+    def swap_alias_then_token(path):
+        nonlocal swapped
+        if not swapped:
+            alias.unlink()
+            alias.symlink_to(parent_b, target_is_directory=True)
+            swapped = True
+        return real_destination_token(path)
+
+    monkeypatch.setattr(
+        human_data_rebuild,
+        "_destination_token",
+        swap_alias_then_token,
+    )
+    rebuild_without_game_ids(
+        source,
+        alias / "active.jsonl",
+        [records[0].game_id],
+    )
+
+    assert (parent_a / "active.jsonl").is_file()
+    assert not (parent_b / "active.jsonl").exists()
+    assert (parent_a / ".active.jsonl.lock").is_file()
+    assert not (parent_b / ".active.jsonl.lock").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires POSIX")
+@pytest.mark.parametrize("artifact", ["data", "manifest"])
+def test_verified_reader_rejects_fifo_without_blocking(tmp_path, artifact):
+    records = list(generate_synthetic_records(num_games=1, base_seed=108))
+    source = tmp_path / "source.jsonl"
+    write_jsonl(records, str(source))
+    target = source if artifact == "data" else dataset_manifest_path(source)
+    target.unlink()
+    os.mkfifo(target, 0o600)
+
+    with pytest.raises(RecordValidationError, match="regular|missing"):
+        verify_jsonl_manifest(source)
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ["dataset.jsonl", "dataset.jsonl.manifest.json"],
+)
+def test_versioned_reader_rejects_artifact_symlink_swap(
+    tmp_path, artifact_name
+):
+    records = list(generate_synthetic_records(num_games=2, base_seed=107))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    outside = tmp_path / "outside"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[1].game_id])
+    version_directory = _active_manifest_path(active).parent
+    artifact = version_directory / artifact_name
+    outside.write_bytes(artifact.read_bytes())
+    version_directory.chmod(0o700)
+    artifact.unlink()
+    artifact.symlink_to(outside)
+    version_directory.chmod(0o500)
+
+    try:
+        with pytest.raises(RecordValidationError, match="symlink"):
+            verify_jsonl_manifest(active)
+    finally:
+        version_directory.chmod(0o700)
+        artifact.unlink(missing_ok=True)
+        for sibling in version_directory.iterdir():
+            sibling.chmod(0o600)
+
+
+def test_human_dataset_manifest_rejects_fabricated_counts_and_rulesets(tmp_path):
+    records = list(generate_synthetic_records(num_games=2, base_seed=23))
+    source = tmp_path / "canonical.jsonl"
+    write_jsonl(records, str(source))
+    sidecar = dataset_manifest_path(source)
+    original = json.loads(sidecar.read_text(encoding="utf-8"))
+
+    forged = dict(original)
+    forged["record_count"] = 99
+    sidecar.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(Exception, match="record_count does not match"):
+        verify_jsonl_manifest(source)
+
+    forged = dict(original)
+    forged["rulesets"] = []
+    sidecar.write_text(json.dumps(forged), encoding="utf-8")
+    with pytest.raises(Exception, match="rulesets do not match"):
+        verify_jsonl_manifest(source)
+
+
+def test_human_dataset_training_reader_rejects_missing_or_unverified_lineage(tmp_path):
+    from douzero.human_data import read_verified_jsonl
+
+    records = list(generate_synthetic_records(num_games=1, base_seed=29))
+    source = tmp_path / "canonical.jsonl"
+    write_jsonl(records, str(source), lineage_verified=False)
+    with pytest.raises(Exception, match="unverified migration lineage"):
+        list(read_verified_jsonl(str(source)))
+
+    missing_manifest = dataset_manifest_path(source)
+    missing_manifest.unlink()
+    assert dataset_manifest_path(source) == missing_manifest
+    with pytest.raises(Exception, match="manifest is missing"):
+        list(read_verified_jsonl(str(source)))
+
+
+def test_duplicate_ingest_warning_redacts_canonical_identifier(caplog):
+    record = next(iter(generate_synthetic_records(num_games=1, base_seed=18)))
+    assert list(dedupe_by_game_id([record, record])) == [record]
+    assert "identifier redacted" in caplog.text
+    assert record.game_id not in caplog.text
+
+
+def test_p17_empty_matrix_writes_explicit_not_run_artifact_set(tmp_path):
+    matrix = empty_matrix()
+    normalized = normalize_matrix(matrix)
+    assert all(
+        normalized["models"][name]["full_game"]["status"] == "unavailable"
+        for name in normalized["models"]
+    )
+    paths = write_p17_artifacts(tmp_path, matrix=matrix)
+    assert set(paths) == {
+        "model_matrix.json", "cardplay_results.json", "full_game_results.json",
+        "ablations.json", "calibration.json", "latency.json", "report.md",
+        "manifest.json",
+    }
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert set(manifest["files"]) == set(paths) - {"manifest.json"}
+    assert all(
+        manifest["files"][name]["sha256"]
+        == hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in manifest["files"]
+    )
+    assert json.loads((tmp_path / "full_game_results.json").read_text())["status"] == "not_run"
+    assert all(
+        row["status"] == "not_run"
+        for row in json.loads((tmp_path / "ablations.json").read_text())["results"].values()
+    )
+
+
+def test_prepare_p17_cli_requires_an_external_evaluator_sha(tmp_path):
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps(empty_matrix()), encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools" / "prepare_p17_evaluation.py"),
+            "--matrix",
+            str(matrix),
+            "--cardplay-result",
+            str(tmp_path / "result.json"),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "--expected-evaluator-git-sha is required" in completed.stderr
+
+    missing_set = subprocess.run(
+        [
+            *completed.args,
+            "--expected-evaluator-git-sha",
+            "a" * 40,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing_set.returncode == 2
+    assert "--cardplay-attestation is required" in missing_set.stderr
+
+
+def test_prepare_p17_cli_uses_the_matrix_ablation_protocol(tmp_path):
+    matrix_payload = empty_matrix()
+    matrix_payload["ablations"]["no_belief"]["protocol"] = "cardplay_only"
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps(matrix_payload), encoding="utf-8")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "tools" / "prepare_p17_evaluation.py"),
+            "--matrix",
+            str(matrix),
+            "--ablation-result",
+            f"no_belief={tmp_path / 'result.json'}",
+            "--expected-evaluator-git-sha",
+            "a" * 40,
+            "--ablation-attestation",
+            f"no_belief={tmp_path / 'attestation.jsonl'}",
+            "--attestation-repository",
+            "GentleKingson/DouZero",
+            "--attestation-signer-workflow",
+            "GentleKingson/DouZero/.github/workflows/formal-evaluation.yml",
+            "--attestation-signer-digest",
+            "b" * 40,
+            "--attestation-source-ref",
+            "refs/heads/main",
+            "--attestation-trusted-root",
+            str(tmp_path / "trusted-root.jsonl"),
+            "--attestation-trusted-root-sha256",
+            "c" * 64,
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 2
+    assert "--expected-cardplay-deal-set-id is required" in completed.stderr
+    assert "--expected-full-game-deal-set-id is required" not in completed.stderr
+
+
+def test_p17_readiness_policy_is_versioned_separately_from_p15_promotion(
+    monkeypatch,
+):
+    assert EVALUATION_PROTOCOL == "p15_paired_v1"
+    assert P17_READINESS_PROTOCOL == "p17_empirical_readiness_v1"
+    assert P17_READINESS_PROTOCOL != EVALUATION_PROTOCOL
+    result = attach_result_integrity({
+        "protocol": EVALUATION_PROTOCOL,
+        "ablation": "base",
+        "scenario": {"bootstrap_samples": 1999, "confidence_level": 0.95},
+        "metrics": {},
+        "games": [],
+        "runtime_identity": {"source_git_sha": "a" * 40},
+    })
+    monkeypatch.setattr(
+        p17_evaluation,
+        "_recompute_result_evidence",
+        lambda _result, **_kwargs: ({"paired_deals": 999}, []),
+    )
+    insufficient = result_readiness(result, mode="cardplay_only")
+    assert insufficient == {
+        "protocol": P17_READINESS_PROTOCOL,
+        "requirements": {
+            "bootstrap_samples": 2000,
+            "paired_deals": 1000,
+            "confidence_level": 0.95,
+        },
+        "status": "insufficient",
+        "issues": [
+            "requires a verified detached GitHub OIDC/Sigstore attestation",
+            "requires >= 2000 bootstrap samples",
+            "requires >= 1000 paired deals",
+        ],
+        "evidence": {"paired_deals": 999, "provenance_verified": False},
+    }
+
+    result["scenario"]["bootstrap_samples"] = 2000
+    monkeypatch.setattr(
+        p17_evaluation,
+        "_recompute_result_evidence",
+        lambda _result, **_kwargs: ({"paired_deals": 1000}, []),
+    )
+    readiness = result_readiness(result, mode="cardplay_only")
+    assert readiness["status"] == "insufficient"
+    assert readiness["issues"] == [
+        "requires a verified detached GitHub OIDC/Sigstore attestation"
+    ]
+
+
+def test_p17_matrix_rejects_missing_checkpoints_and_pretend_full_game(tmp_path):
+    matrix = empty_matrix()
+    row = matrix["models"]["v2_full_stack"]["cardplay_only"]
+    row.update({
+        "status": "available",
+        "reason": "",
+        "bundle": {
+            "backend": "v2",
+            "checkpoints": {
+                "landlord": str(tmp_path / "landlord.pt"),
+                "landlord_up": str(tmp_path / "up.pt"),
+                "landlord_down": str(tmp_path / "down.pt"),
+            },
+        },
+    })
+    with pytest.raises(P17MatrixError, match="checkpoint files are missing"):
+        normalize_matrix(matrix)
+
+    for name in ("landlord.pt", "up.pt", "down.pt"):
+        (tmp_path / name).write_bytes(b"checkpoint-placeholder")
+    with pytest.raises(P17MatrixError, match="identity validation failed"):
+        normalize_matrix(matrix)
+
+    matrix["models"]["v2_full_stack"]["full_game"] = dict(row)
+    matrix["models"]["v2_full_stack"]["cardplay_only"] = {
+        "status": "unavailable", "reason": "not supplied", "bundle": None
+    }
+    with pytest.raises(P17MatrixError, match="manifest-validated learned bidding"):
+        normalize_matrix(matrix)
+
+
+def test_full_game_evaluation_uses_manifest_validated_learned_bidding(tmp_path):
+    torch.manual_seed(1717)
+    ruleset = RuleSet.standard()
+    schema = build_v2_schema()
+    config = ModelV2Config(
+        hidden_size=32,
+        history_layers=1,
+        history_heads=4,
+        role_embedding_dim=8,
+        mlp_layers=1,
+        bidding_enabled=True,
+        bidding_hidden_size=16,
+        nan_guard=False,
+    )
+    model = ModelV2(schema, config).eval()
+    with torch.no_grad():
+        model.bidding_heads.policy.weight.zero_()
+        model.bidding_heads.policy.bias.copy_(torch.tensor([0.0, 1.0, 2.0, 3.0]))
+    checkpoint = tmp_path / "learned-bidding.pt"
+    save_v2_position_weights(str(checkpoint), model, ruleset=ruleset)
+    checkpoints = {role: str(checkpoint) for role in (
+        "landlord", "landlord_up", "landlord_down"
+    )}
+    candidate = BundleSpec(
+        name="v2_full_stack",
+        backend="v2",
+        checkpoints=checkpoints,
+        bidding_policy="learned",
+        bidding_checkpoint=str(checkpoint),
+        model_config=asdict(config),
+    )
+    baseline = BundleSpec(
+        name="v2_base",
+        backend="v2",
+        checkpoints=checkpoints,
+        bidding_policy="learned",
+        bidding_checkpoint=str(checkpoint),
+        model_config=asdict(config),
+    )
+    matrix = empty_matrix()
+    for name in ("v2_full_stack", "v2_base"):
+        matrix["models"][name]["full_game"] = {
+            "status": "available",
+            "reason": "",
+            "bundle": {
+                "backend": "v2",
+                "checkpoints": checkpoints,
+                "bidding_policy": "learned",
+                "bidding_checkpoint": str(checkpoint),
+                "model_config": asdict(config),
+            },
+        }
+    normalized = normalize_matrix(matrix)
+    assert normalized["models"]["v2_full_stack"]["full_game"]["status"] == "available"
+    scenario = EvaluationScenario(
+        mode="full_game",
+        ruleset=ruleset,
+        candidate=candidate,
+        baseline=baseline,
+        deals=generate_deals("full_game", 1, 1717, ruleset),
+        deterministic_seed=1717,
+        bootstrap_samples=20,
+    )
+    result = evaluate_scenario(scenario)
+    assert result.scenario["candidate"]["bidding_policy"] == "learned"
+    assert result.scenario["candidate"]["bidding_checkpoint"] is True
+    assert result.metrics["sample_counts"]["bidding_inference_calls"] >= 1
+    assert all(game.bid_value == 3 for game in result.games)
+    assert result.metrics["redeals"]["total"] == 0
+    artifacts = tmp_path / "p17"
+    result_payload = result.to_dict()
+    approved_sha = result_payload["runtime_identity"]["source_git_sha"]
+    approved_deal_set_id = result_payload["scenario"]["deal_set_id"]
+    with pytest.raises(P17MatrixError, match="verified detached attestation"):
+        write_p17_artifacts(
+            tmp_path / "missing-attestation",
+            matrix=matrix,
+            full_game_result=result_payload,
+        )
+    with pytest.raises(P17MatrixError, match="expected evaluator Git SHA"):
+        write_p17_artifacts(
+            tmp_path / "missing-evaluator-sha",
+            matrix=matrix,
+            full_game_result=result_payload,
+            allow_unverified_results=True,
+        )
+    with pytest.raises(P17MatrixError, match="approved deal_set_id"):
+        write_p17_artifacts(
+            tmp_path / "missing-deal-set-id",
+            matrix=matrix,
+            full_game_result=result_payload,
+            expected_evaluator_git_shas=[approved_sha],
+            allow_unverified_results=True,
+        )
+    with pytest.raises(P17MatrixError, match="deal payloads for replay"):
+        write_p17_artifacts(
+            tmp_path / "missing-approved-deals",
+            matrix=matrix,
+            full_game_result=result_payload,
+            expected_evaluator_git_shas=[approved_sha],
+            expected_full_game_deal_set_id=approved_deal_set_id,
+            allow_unverified_results=True,
+        )
+    local_common = {
+        "expected_evaluator_git_shas": [approved_sha],
+        "expected_full_game_deal_set_id": approved_deal_set_id,
+        "approved_full_game_deals": scenario.deals,
+        "allow_unverified_results": True,
+    }
+    write_p17_artifacts(
+        artifacts,
+        matrix=matrix,
+        full_game_result=result_payload,
+        **local_common,
+    )
+    full_report = json.loads((artifacts / "full_game_results.json").read_text())
+    assert full_report["status"] == "insufficient"
+    assert full_report["execution_status"] == "completed"
+    assert full_report["provenance"]["status"] == "unverified_local"
+    assert full_report["approved_deal_set_id"] == approved_deal_set_id
+    assert full_report["readiness"]["status"] == "insufficient"
+    assert any("1000 paired deals" in issue for issue in full_report["readiness"]["issues"])
+    assert "| full_game | completed | insufficient |" in (
+        artifacts / "report.md"
+    ).read_text(encoding="utf-8")
+
+    recomputed = result_readiness(
+        result_payload,
+        mode="full_game",
+        approved_deals=scenario.deals,
+    )["evidence"]["recomputed_diagnostics"]
+    assert recomputed["status"] == "available"
+    forged_summaries = copy.deepcopy(result_payload)
+    forged_summaries["metrics"]["calibration"] = {"forged": "perfect"}
+    forged_summaries["metrics"]["inference_latency_ms"] = {
+        "count": 1,
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+    }
+    forged_summaries["metrics"]["inference_calls_per_second"] = 1e12
+    forged_summaries["metrics"]["actor_fps"] = 1e12
+    forged_summaries["metrics"]["search"] = {
+        "calls": 0,
+        "timeouts": 0,
+        "fallbacks": 0,
+        "timeout_rate": 0.0,
+        "fallback_rate": 0.0,
+    }
+    forged_summaries = attach_result_integrity({
+        key: value
+        for key, value in forged_summaries.items()
+        if key != "result_integrity"
+    })
+    diagnostics_dir = tmp_path / "recomputed-diagnostics"
+    write_p17_artifacts(
+        diagnostics_dir,
+        matrix=matrix,
+        full_game_result=forged_summaries,
+        **local_common,
+    )
+    calibration_artifact = json.loads(
+        (diagnostics_dir / "calibration.json").read_text()
+    )
+    latency_artifact = json.loads(
+        (diagnostics_dir / "latency.json").read_text()
+    )
+    assert calibration_artifact["status"] == "insufficient"
+    assert calibration_artifact["results"][0]["calibration"] == recomputed[
+        "calibration"
+    ]
+    assert latency_artifact["status"] == "insufficient"
+    assert latency_artifact["results"][0]["inference_latency_ms"] == recomputed[
+        "inference_latency_ms"
+    ]
+    assert latency_artifact["results"][0][
+        "instrumented_inference_calls_per_second"
+    ] == recomputed["instrumented_inference_calls_per_second"]
+    assert latency_artifact["results"][0]["search"] == recomputed["search"]
+
+    private_payload = copy.deepcopy(result_payload)
+    private_payload["scenario"]["dataset_scope"] = "private_holdout"
+    private_payload["scenario"]["deal_set_name"] = "private_holdout"
+    private_payload["games"][0]["unexpected_private_payload"] = (
+        "must-not-cross-the-private-boundary"
+    )
+    private_payload["metrics"]["unexpected_private_metric"] = (
+        "must-not-cross-the-private-boundary"
+    )
+    private_payload["runtime_identity"] = evaluation_runtime_identity(
+        private_payload["scenario"], ablation=private_payload["ablation"]
+    )
+    private_payload = attach_result_integrity({
+        key: value
+        for key, value in private_payload.items()
+        if key != "result_integrity"
+    })
+    private_dir = tmp_path / "private-published"
+    write_p17_artifacts(
+        private_dir,
+        matrix=matrix,
+        full_game_result=private_payload,
+        **local_common,
+    )
+    published_private = json.loads(
+        (private_dir / "full_game_results.json").read_text()
+    )["result"]
+    assert set(published_private) == {
+        "schema_version",
+        "scenario",
+        "game_evidence",
+    }
+    assert published_private["schema_version"] == (
+        "p17-private-result-projection-v1"
+    )
+    assert set(published_private["scenario"]) == {
+        "mode",
+        "dataset_scope",
+        "deal_set_id",
+        "num_deals",
+        "candidate",
+        "baseline",
+    }
+    assert published_private["scenario"]["candidate"] == {
+        "name": private_payload["scenario"]["candidate"]["name"]
+    }
+    assert published_private["scenario"]["baseline"] == {
+        "name": private_payload["scenario"]["baseline"]["name"]
+    }
+    assert published_private["game_evidence"] == {
+        "status": "redacted",
+        "published_game_rows": 0,
+        "source_game_rows": len(private_payload["games"]),
+    }
+    serialized_private = json.dumps(published_private, sort_keys=True)
+    for forbidden in (
+        "result_integrity",
+        "games",
+        "candidate_decisions",
+        "candidate_latencies_ns",
+        "candidate_latencies_ms",
+        "calibration",
+        "bidding_trace",
+        "cardplay_trace",
+        "must-not-cross-the-private-boundary",
+    ):
+        assert forbidden not in serialized_private
+
+    wrong_identity = copy.deepcopy(result_payload)
+    wrong_identity["scenario"]["candidate"]["checkpoint_identities"][
+        "bidding"
+    ] = "0" * 64
+    with pytest.raises(P17MatrixError, match="checkpoint/manifest identity"):
+        write_p17_artifacts(
+            tmp_path / "wrong-identity",
+            matrix=matrix,
+            full_game_result=wrong_identity,
+            **local_common,
+        )
+
+    wrong_runtime_schema = copy.deepcopy(result_payload)
+    wrong_runtime_schema["runtime_identity"]["model_feature_schemas"][
+        "candidate"
+    ]["feature_schema_hash"] = "0" * 64
+    with pytest.raises(P17MatrixError, match="runtime identity is invalid"):
+        write_p17_artifacts(
+            tmp_path / "wrong-runtime-schema",
+            matrix=matrix,
+            full_game_result=wrong_runtime_schema,
+            **local_common,
+        )
+
+    replacement = "f" if approved_sha[0] != "f" else "e"
+    unapproved_sha = replacement * len(approved_sha)
+    with pytest.raises(P17MatrixError, match="source_git_sha is not approved"):
+        write_p17_artifacts(
+            tmp_path / "wrong-evaluator-sha",
+            matrix=matrix,
+            full_game_result=result_payload,
+            expected_evaluator_git_shas=[unapproved_sha],
+            expected_full_game_deal_set_id=approved_deal_set_id,
+            approved_full_game_deals=scenario.deals,
+            allow_unverified_results=True,
+        )
+    write_p17_artifacts(
+        tmp_path / "explicit-evaluator-allowlist",
+        matrix=matrix,
+        full_game_result=result_payload,
+        expected_evaluator_git_shas=[unapproved_sha, approved_sha],
+        expected_full_game_deal_set_id=approved_deal_set_id,
+        approved_full_game_deals=scenario.deals,
+        allow_unverified_results=True,
+    )
+
+    wrong_deal_set_id = "f" * 64
+    if wrong_deal_set_id == approved_deal_set_id:
+        wrong_deal_set_id = "e" * 64
+    with pytest.raises(P17MatrixError, match="do not match approved deal_set_id"):
+        write_p17_artifacts(
+            tmp_path / "wrong-deal-set-id",
+            matrix=matrix,
+            full_game_result=result_payload,
+            expected_evaluator_git_shas=[approved_sha],
+            expected_full_game_deal_set_id=wrong_deal_set_id,
+            approved_full_game_deals=scenario.deals,
+            allow_unverified_results=True,
+        )
+
+    self_consistent_forgery = copy.deepcopy(result_payload)
+    forged_hash = "d" * 64
+    if forged_hash == self_consistent_forgery["games"][0]["deal_hash"]:
+        forged_hash = "c" * 64
+    for row in self_consistent_forgery["games"]:
+        row["deal_hash"] = forged_hash
+        row["deal_id"] = canonical_deal_id(0, forged_hash)
+    self_consistent_forgery["scenario"]["deal_set_id"] = canonical_deal_set_id(
+        "full_game",
+        ruleset,
+        [forged_hash],
+        seat_permutation_hash=OFFICIAL_PERMUTATION_HASHES["full_game"],
+    )
+    self_consistent_forgery["runtime_identity"] = evaluation_runtime_identity(
+        self_consistent_forgery["scenario"], ablation="base"
+    )
+    forged_readiness = result_readiness(
+        self_consistent_forgery,
+        mode="full_game",
+        approved_deals=scenario.deals,
+    )
+    assert any("approved deal" in issue for issue in forged_readiness["issues"])
+    with pytest.raises(P17MatrixError, match="approved evaluation set"):
+        write_p17_artifacts(
+            tmp_path / "self-consistent-forged-deal-set",
+            matrix=matrix,
+            full_game_result=self_consistent_forgery,
+            expected_evaluator_git_shas=[approved_sha],
+            expected_full_game_deal_set_id=approved_deal_set_id,
+            approved_full_game_deals=scenario.deals,
+            allow_unverified_results=True,
+        )
+
+    inflated = copy.deepcopy(result_payload)
+    inflated["metrics"]["paired_estimate_ci"]["paired_deals"] = 1000
+    readiness = result_readiness(
+        inflated, mode="full_game", approved_deals=scenario.deals
+    )
+    assert readiness["status"] == "insufficient"
+    assert readiness["evidence"]["paired_deals"] == 1
+    assert any("does not match game rows" in issue for issue in readiness["issues"])

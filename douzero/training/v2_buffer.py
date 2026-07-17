@@ -183,6 +183,14 @@ class Episode:
     """All transitions of one game, plus the terminal result dict."""
 
     transitions: list[Transition] = field(default_factory=list)
+    # P17 bidding observations use neutral seats; terminal labelling adds the
+    # resolved actor role for policy credit and landlord-side value targets.
+    bidding_transitions: list[object] = field(default_factory=list)
+    redeal_count: int = 0
+    max_redeals_exceeded: bool = False
+    excluded_from_training: bool = False
+    exclusion_reason: str = ""
+    abandoned_bidding_transitions: int = 0
     terminal_result: dict = field(default_factory=dict)
     # Complete public action trace, including forced single-action decisions.
     # P09 trajectory labels use it so spring/finisher targets are not biased by
@@ -385,6 +393,11 @@ class V2ReplayBuffer:
 
     def __len__(self) -> int:
         return self._size
+
+    def clear(self) -> None:
+        """Drop replay at an explicit checkpoint-safe boundary."""
+        self._episodes.clear()
+        self._size = 0
 
     @property
     def capacity(self) -> int:

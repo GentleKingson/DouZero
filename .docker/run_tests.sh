@@ -20,7 +20,7 @@ print('numpy', numpy.__version__)"
 
 echo
 echo "=== compileall ==="
-python -m compileall -q douzero train.py train_v2.py train_coach.py evaluate.py generate_eval_data.py train_belief.py evaluate_belief.py
+python -m compileall -q douzero tools benchmarks *.py
 
 echo
 echo "=== CLI --help ==="
@@ -28,9 +28,21 @@ python train.py --help >/dev/null
 python train_v2.py --help >/dev/null
 python train_coach.py --help >/dev/null
 python evaluate.py --help >/dev/null
+python evaluate_paired.py --help >/dev/null
 python generate_eval_data.py --help >/dev/null
 python train_belief.py --help >/dev/null
 python evaluate_belief.py --help >/dev/null
+python ingest_human_games.py --help >/dev/null
+python validate_human_games.py --help >/dev/null
+python pretrain_bc.py --help >/dev/null
+python tools/package_model.py --help >/dev/null
+python tools/prepare_p17_evaluation.py --help >/dev/null
+python tools/formal_evaluation_dry_run.py --help >/dev/null
+python tools/rebuild_human_dataset.py --help >/dev/null
+python tools/validate_pr_evidence.py --help >/dev/null
+python tools/gpu_validation_probe.py --help >/dev/null
+python tools/validate_amp_fallback.py --help >/dev/null
+bash scripts/validate_gpu_training.sh --help >/dev/null
 
 echo
 echo "=== pytest ==="

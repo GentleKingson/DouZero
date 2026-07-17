@@ -101,6 +101,33 @@ class TestCheckpointSecurity:
         with pytest.raises(ValueError, match="feature_version"):
             load_belief_checkpoint(path, expected_ruleset=RuleSet.legacy())
 
+    def test_short_source_git_sha_requires_explicit_release_strictness(self, tmp_path):
+        path, _ = self._save(tmp_path)
+        bundle = torch.load(path, map_location="cpu", weights_only=False)
+        bundle["manifest"]["git_sha"] = "abc1234"
+        torch.save(bundle, path)
+        # Historical P07 checkpoints used ``rev-parse --short`` and remain
+        # loadable through the compatibility path.
+        load_belief_checkpoint(path, expected_ruleset=RuleSet.legacy())
+        with pytest.raises(ValueError, match="full source Git SHA"):
+            load_belief_checkpoint(
+                path,
+                expected_ruleset=RuleSet.legacy(),
+                require_full_git_sha=True,
+            )
+
+    def test_save_requires_full_source_git_sha(self, tmp_path, monkeypatch):
+        model = BeliefModel(BeliefConfig(hidden_size=16, num_layers=1))
+        monkeypatch.setattr(
+            "douzero.belief.checkpoint.git_sha", lambda: "unknown"
+        )
+        with pytest.raises(ValueError, match="full source Git SHA"):
+            save_belief_checkpoint(
+                str(tmp_path / "belief.pt"),
+                model,
+                ruleset=RuleSet.legacy(),
+            )
+
     def test_rejects_corrupted_config_hash(self, tmp_path):
         path, _ = self._save(tmp_path)
         bundle = torch.load(path, map_location="cpu", weights_only=False)

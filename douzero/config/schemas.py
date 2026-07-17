@@ -74,6 +74,10 @@ class LossConfig:
     lambda_score: float = 0.0
     lambda_uncertainty: float = 0.0
     lambda_bc: float = 0.0  # P08: listwise BC auxiliary weight (default off)
+    lambda_bid_policy: float = 0.0
+    lambda_bid_win: float = 0.0
+    lambda_bid_score: float = 0.0
+    lambda_bid_regret: float = 0.0
     lambda_min_turns: float = 0.0
     lambda_regain_initiative: float = 0.0
     lambda_teammate_finish: float = 0.0
@@ -174,14 +178,39 @@ class BCConfig:
                 f"BCConfig.schedule_steps must be a non-negative int, "
                 f"got {self.schedule_steps}"
             )
-        if (
-            not math.isfinite(self.schedule_floor)
-            or self.schedule_floor < 0.0
-        ):
+        if not math.isfinite(self.schedule_floor) or self.schedule_floor < 0.0:
             raise ValueError(
                 f"BCConfig.schedule_floor must be non-negative finite, "
                 f"got {self.schedule_floor}"
             )
+
+
+@dataclass(frozen=True)
+class BiddingConfig:
+    """P17 standard full-game bidding driver; disabled by default."""
+
+    enabled: bool = False
+    policy: str = "rule"
+    warm_start_policy: str = "rule"
+    learned_probability: float = 0.0
+
+    def __post_init__(self) -> None:
+        import math
+
+        valid = {"random", "rule", "max", "pass", "learned"}
+        if not isinstance(self.enabled, bool):
+            raise TypeError("BiddingConfig.enabled must be bool")
+        if self.policy not in valid:
+            raise ValueError("BiddingConfig.policy is unsupported")
+        if self.warm_start_policy not in valid - {"learned"}:
+            raise ValueError("warm_start_policy cannot be learned")
+        if (
+            isinstance(self.learned_probability, bool)
+            or not isinstance(self.learned_probability, (int, float))
+            or not math.isfinite(self.learned_probability)
+            or not 0 <= self.learned_probability <= 1
+        ):
+            raise ValueError("learned_probability must be finite and in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -445,6 +474,9 @@ class ModelConfig:
     # (P09 attaches more; P05 keeps the structural skeleton).
     belief_enabled: bool = False
     human_prior_enabled: bool = False
+    bidding_enabled: bool = False
+    bidding_hidden_size: int = 128
+    bidding_uncertainty_enabled: bool = False
     style_enabled: bool = False
     style_embedding_dim: int = 64
     strategy_features_enabled: bool = False
@@ -500,6 +532,15 @@ class TrainingConfig:
     ddp_backend: str = "auto"
     compile_model: bool = False
 
+    # P17 belief/value optimization. ``frozen`` preserves the P07 checkpoint
+    # and numerical path. Joint and alternating are explicit opt-ins.
+    belief_training_mode: str = "frozen"
+    belief_supervised_weight: float = 0.0
+    belief_alternating_interval: int = 1
+    belief_supervised_batch_size: int = 16
+    belief_supervised_episodes: int = 0
+    first_bidder_mode: str = "rotate"
+
     # New P01 knobs (carried, not yet enforced; defaults preserve legacy)
     seed: int = 0
     deterministic: bool = False
@@ -527,6 +568,7 @@ class TrainingConfig:
     # pre-P08 path (BC disabled). Consumed by pretrain_bc.py and the optional
     # BC auxiliary loss hook in the V2 trainer.
     bc: BCConfig = field(default_factory=BCConfig)
+    bidding: BiddingConfig = field(default_factory=BiddingConfig)
     # P10: opt-in and consumed only by the dedicated distillation tools.
     distillation: DistillationConfig = field(default_factory=DistillationConfig)
     # P11: disabled by default; legacy actor/learner semantics are untouched.

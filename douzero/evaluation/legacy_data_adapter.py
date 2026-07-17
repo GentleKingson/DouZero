@@ -34,6 +34,48 @@ from typing import Any
 _NEUTRAL_SEATS = ("0", "1", "2")
 
 
+def _validate_legacy_record(deal: dict[str, Any], idx: int) -> None:
+    """Validate one complete legacy card-play deal.
+
+    This is shared by :class:`EvaluationScenario` and the safe formal JSON
+    loader.  The historical pickle adapter intentionally retains its original
+    compatibility surface; formal inputs add stricter JSON type checks before
+    calling this validator.
+    """
+
+    required = {
+        "landlord",
+        "landlord_up",
+        "landlord_down",
+        "three_landlord_cards",
+    }
+    if set(deal) != required:
+        raise ValueError(
+            f"legacy deal {idx} must contain exactly {sorted(required)}"
+        )
+    cards = (
+        list(deal["landlord"])
+        + list(deal["landlord_up"])
+        + list(deal["landlord_down"])
+    )
+    expected_counts = Counter(
+        list(range(3, 15)) * 4 + [17] * 4 + [20, 30]
+    )
+    if Counter(cards) != expected_counts:
+        raise ValueError(f"legacy deal {idx} is not a valid 54-card deal")
+    if not (
+        len(deal["landlord"]) == 20
+        and len(deal["landlord_up"]) == 17
+        and len(deal["landlord_down"]) == 17
+        and len(deal["three_landlord_cards"]) == 3
+    ):
+        raise ValueError(f"legacy deal {idx} has invalid hand sizes")
+    if Counter(deal["three_landlord_cards"]) - Counter(deal["landlord"]):
+        raise ValueError(
+            f"legacy deal {idx} bottom cards are not in landlord hand"
+        )
+
+
 def _validate_standard_deck(deck: list[int]) -> None:
     """Validate that a deck is a legal 54-card DouDizhu deck."""
     if not isinstance(deck, list):

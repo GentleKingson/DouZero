@@ -19,8 +19,30 @@ WORKDIR /workspace
 # `git` binary, which the slim image does not include. Install it so that
 # importing douzero.dmc (which imports file_writer -> git) succeeds. This does
 # not change any production behavior.
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/*
+
+# The Debian gh package is too old for digest-bound offline attestation
+# verification. Pin a modern immutable upstream release and verify its archive
+# before installation. TARGETARCH is provided by BuildKit (amd64 or arm64).
+ARG TARGETARCH
+ARG GH_VERSION=2.93.0
+RUN case "$TARGETARCH" in \
+      amd64) GH_SHA256=02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0 ;; \
+      arm64) GH_SHA256=c55feb33684abba57e9909737340d5b39282257c0363e1edde6785ac4a413be7 ;; \
+      *) echo "unsupported GitHub CLI architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl --fail --location --silent --show-error \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${TARGETARCH}.tar.gz" \
+      --output /tmp/gh.tar.gz \
+    && echo "$GH_SHA256  /tmp/gh.tar.gz" | sha256sum --check --strict \
+    && mkdir /tmp/gh-cli \
+    && tar -xzf /tmp/gh.tar.gz -C /tmp/gh-cli \
+    && install -m 0755 \
+      "/tmp/gh-cli/gh_${GH_VERSION}_linux_${TARGETARCH}/bin/gh" \
+      /usr/local/bin/gh \
+    && rm -rf /tmp/gh-cli /tmp/gh.tar.gz \
+    && gh attestation verify --help | grep -q -- --custom-trusted-root
 
 # Install runtime + dev deps first for better layer caching.
 COPY requirements.txt requirements-dev.txt ./

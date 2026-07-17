@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import replace
 
 import pytest
@@ -10,9 +11,20 @@ import pytest
 from douzero.env.rules import RuleSet
 from douzero.evaluation.ablation import ABLATION_NAMES, AblationRunner
 from douzero.evaluation.gates import RegressionGateConfig, evaluate_regression_gates
-from douzero.evaluation.paired import evaluate_scenario
+from douzero.evaluation.paired import (
+    GameRecord,
+    evaluate_scenario,
+    validate_evaluation_runtime_identity,
+)
+from douzero.evaluation.p17 import result_readiness
+from douzero.evaluation.provenance import attach_result_integrity
+from douzero.evaluation.replay import replay_game_record
 from douzero.evaluation.reporting import write_report
-from douzero.evaluation.scenario import BundleSpec, EvaluationScenario
+from douzero.evaluation.scenario import (
+    BundleSpec,
+    EvaluationScenario,
+    bundle_from_dict,
+)
 from douzero.evaluation.statistics import deal_cluster_means, paired_bootstrap_ci
 from evaluate_paired import _load_matrix, generate_deals
 
@@ -28,6 +40,57 @@ def _scenario(mode: str, *, seed: int = 17, deals: int = 2):
         deterministic_seed=seed,
         bootstrap_samples=100,
     )
+
+
+def test_p17_fields_preserve_pre_p17_positional_dataclass_contracts():
+    bundle = BundleSpec(
+        "positional",
+        "rule",
+        {},
+        "max",
+        "pure_win",
+        {},
+        "",
+        {"enabled": False},
+        ("pre-p17",),
+    )
+    assert bundle.search_config == {"enabled": False}
+    assert bundle.tags == ("pre-p17",)
+    assert bundle.bidding_checkpoint == ""
+    matrix_payload = bundle.to_dict(include_paths=True)
+    assert "checkpoint_identities" not in matrix_payload
+    assert bundle_from_dict(matrix_payload) == bundle
+    assert "checkpoint_identities" in bundle.to_dict()
+
+    calibration = (("landlord", 0.75),)
+    record = GameRecord(
+        "deal",
+        "leg",
+        "cardplay_only",
+        ("candidate", "baseline", "baseline"),
+        ("landlord",),
+        1.0,
+        1.0,
+        {"landlord": 1.0},
+        {"landlord": 1.0},
+        "landlord",
+        "landlord",
+        0,
+        0,
+        0,
+        1,
+        0,
+        0,
+        False,
+        False,
+        1,
+        (1.25,),
+        calibration,
+    )
+    assert record.candidate_latencies_ms == (1.25,)
+    assert record.calibration == calibration
+    assert record.redeal_count == 0
+    assert record.formal_evaluation_eligible is True
 
 
 def test_deal_cluster_bootstrap_does_not_treat_legs_as_independent():
@@ -86,6 +149,7 @@ def test_cardplay_evaluation_is_reproducible_and_paired_by_deal():
     assert first.metrics["sample_counts"]["deals"] == 2
     assert first.metrics["sample_counts"]["games"] == 4
     assert first.metrics["paired_win_rate_delta_ci"]["paired_deals"] == 2
+    assert first.metrics["actor_fps"] == first.metrics["inference_calls_per_second"]
     assert {game.mode for game in first.games} == {"cardplay_only"}
     with pytest.raises(ValueError, match="at least 1000 bootstrap"):
         first.to_promotion_evaluation()
@@ -117,6 +181,15 @@ def test_full_game_rotates_candidate_and_reports_rules_metrics():
     scenario = _scenario("full_game", deals=1)
     result = evaluate_scenario(scenario)
     repeated = evaluate_scenario(scenario)
+
+    def without_timing(game):
+        payload = game.to_dict()
+        payload["candidate_latencies_ms"] = []
+        payload["candidate_latencies_ns"] = []
+        for decision in payload["candidate_decisions"]:
+            decision["latency_ns"] = 0
+        return payload
+
     assert len(result.games) == 3
     assert {game.assignment for game in result.games} == {
         ("candidate", "baseline", "baseline"),
@@ -128,8 +201,8 @@ def test_full_game_rotates_candidate_and_reports_rules_metrics():
     assert 0.0 <= result.metrics["landlord_acquisition_rate"] <= 1.0
     assert all(game.bid_value >= 1 for game in result.games)
     assert {game.mode for game in result.games} == {"full_game"}
-    assert [game.to_dict() | {"candidate_latencies_ms": []} for game in result.games] == [
-        game.to_dict() | {"candidate_latencies_ms": []} for game in repeated.games
+    assert [without_timing(game) for game in result.games] == [
+        without_timing(game) for game in repeated.games
     ]
     assert result.metrics["paired_win_rate_delta_ci"] is None
     with pytest.raises(ValueError, match="cannot be used for promotion"):
@@ -183,7 +256,45 @@ def test_full_game_all_pass_is_bounded_and_deterministic():
         game.winner_team for game in second.games
     ]
     assert all(game.bid_value == 1 for game in first.games)
-    assert first.metrics["bid_rate"] == 0.0
+    assert all(not game.formal_evaluation_eligible for game in first.games)
+    assert all(
+        game.exclusion_reason == "redeal_cap_exhausted_forced_smoke_fallback"
+        for game in first.games
+    )
+    assert all(
+        game.redeal_count == ruleset.max_redeals + 1 for game in first.games
+    )
+    assert all(
+        len(game.bidding_trace) == ruleset.max_redeals + 1
+        and all(
+            len(attempt) == 3 and all(bid == 0 for _seat, bid in attempt)
+            for attempt in game.bidding_trace
+        )
+        for game in first.games
+    )
+    for game in first.games:
+        replay = replay_game_record(
+            game.to_dict(),
+            scenario.deals[0],
+            mode="full_game",
+            ruleset=ruleset,
+            deterministic_seed=scenario.deterministic_seed,
+        )
+        assert replay.max_redeals_exceeded is True
+        assert replay.redeal_count == ruleset.max_redeals + 1
+        assert replay.bid_value == 1
+        assert replay.bidding_history == ((replay.bidding_order[0], 1),)
+    assert first.metrics["formal_evaluation"]["excluded_deals"] == 1
+    assert first.metrics["paired_estimate_ci"]["paired_deals"] == 0
+    assert math.isnan(first.metrics["bid_rate"])
+    assert first.metrics["smoke_descriptive"]["bid_rate"] == 0.0
+    readiness = result_readiness(
+        first.to_dict(), mode="full_game", approved_deals=scenario.deals
+    )
+    assert readiness["status"] == "insufficient"
+    assert readiness["evidence"]["excluded_deals"] == 1
+    assert readiness["evidence"]["malformed_deals"] == 0
+    assert any("redeal cap" in issue for issue in readiness["issues"])
 
 
 def test_report_writes_json_csv_and_markdown_without_nonstandard_nan(tmp_path):
@@ -193,9 +304,132 @@ def test_report_writes_json_csv_and_markdown_without_nonstandard_nan(tmp_path):
     assert payload["protocol"] == "p15_paired_v1"
     assert payload["scenario"]["mode"] == "cardplay_only"
     assert payload["metrics"]["bid_rate"] is None
-    assert (tmp_path / "report.csv").read_text(encoding="utf-8").startswith("deal_id,")
-    assert "Mode: `cardplay_only`" in (tmp_path / "report.md").read_text(encoding="utf-8")
+    csv_text = (tmp_path / "report.csv").read_text(encoding="utf-8")
+    markdown_text = (tmp_path / "report.md").read_text(encoding="utf-8")
+    assert csv_text.startswith("deal_id,deal_hash,")
+    assert payload["runtime_identity"]["source_git_sha"] in csv_text
+    assert "Mode: `cardplay_only`" in markdown_text
+    assert payload["runtime_identity"]["source_git_sha"] in markdown_text
+    assert payload["runtime_identity"]["evaluation_config_hash"] in markdown_text
     assert set(paths) == {"json", "csv", "markdown"}
+
+
+def test_evaluation_runtime_identity_binds_protocol_mode_rules_and_schemas():
+    payload = evaluate_scenario(_scenario("cardplay_only", deals=1)).to_dict()
+    runtime = payload["runtime_identity"]
+    assert len(runtime["source_git_sha"]) in (40, 64)
+    assert runtime["model_feature_schemas"]["candidate"]["feature_version"] == (
+        "builtin-no-model-input"
+    )
+    assert runtime["model_feature_schemas"]["baseline"]["feature_version"] == (
+        "builtin-no-model-input"
+    )
+    validate_evaluation_runtime_identity(payload, expected_mode="cardplay_only")
+    validate_evaluation_runtime_identity(
+        payload,
+        expected_mode="cardplay_only",
+        expected_source_git_shas=runtime["source_git_sha"],
+    )
+    replacement = "f" if runtime["source_git_sha"][0] != "f" else "e"
+    with pytest.raises(ValueError, match="source_git_sha is not approved"):
+        validate_evaluation_runtime_identity(
+            payload,
+            expected_source_git_shas=[replacement * len(runtime["source_git_sha"])],
+        )
+
+    wrong_protocol = json.loads(json.dumps(payload))
+    wrong_protocol["protocol"] = "pretend-protocol"
+    with pytest.raises(ValueError, match="result protocol mismatch"):
+        validate_evaluation_runtime_identity(wrong_protocol)
+
+    wrong_mode = json.loads(json.dumps(payload))
+    wrong_mode["scenario"]["mode"] = "full_game"
+    with pytest.raises(ValueError, match="mode mismatch"):
+        validate_evaluation_runtime_identity(
+            wrong_mode, expected_mode="cardplay_only"
+        )
+
+    wrong_rules = json.loads(json.dumps(payload))
+    wrong_rules["runtime_identity"]["ruleset_hash"] = "0" * 64
+    with pytest.raises(ValueError, match="result integrity"):
+        validate_evaluation_runtime_identity(wrong_rules)
+
+    wrong_schema = json.loads(json.dumps(payload))
+    wrong_schema["runtime_identity"]["model_feature_schemas"]["candidate"][
+        "feature_version"
+    ] = "legacy"
+    with pytest.raises(ValueError, match="result integrity"):
+        validate_evaluation_runtime_identity(wrong_schema)
+
+    wrong_config = json.loads(json.dumps(payload))
+    wrong_config["scenario"]["deterministic_seed"] += 1
+    with pytest.raises(ValueError, match="result integrity"):
+        validate_evaluation_runtime_identity(wrong_config)
+
+
+def test_formal_runtime_identity_binds_workflow_container_and_hardware():
+    payload = evaluate_scenario(_scenario("cardplay_only", deals=1)).to_dict()
+    runtime = payload["runtime_identity"]
+    source_sha = runtime["source_git_sha"]
+    runtime.update({
+        "source_worktree_clean": True,
+        "source_identity_stable": True,
+        "source_identity_samples": 2,
+    })
+    runtime["execution_environment"].update({
+        "provider": "github_actions",
+        "repository": "GentleKingson/DouZero",
+        "workflow_ref": (
+            "GentleKingson/DouZero/.github/workflows/"
+            "formal-evaluation.yml@refs/heads/main"
+        ),
+        "workflow_sha": source_sha,
+        "source_ref": "refs/heads/main",
+        "source_sha": source_sha,
+        "run_id": "12345",
+        "run_attempt": "2",
+        "run_url": (
+            "https://github.com/GentleKingson/DouZero/"
+            "actions/runs/12345/attempts/2"
+        ),
+        "runner_environment": "github-hosted",
+        "container_image_digest": "sha256:" + "b" * 64,
+    })
+    payload = attach_result_integrity({
+        key: value for key, value in payload.items() if key != "result_integrity"
+    })
+
+    validate_evaluation_runtime_identity(
+        payload,
+        expected_source_git_shas=[source_sha],
+        require_formal_source=True,
+    )
+
+    malformed = json.loads(json.dumps(payload))
+    malformed["runtime_identity"]["execution_environment"][
+        "container_image_digest"
+    ] = None
+    malformed = attach_result_integrity({
+        key: value
+        for key, value in malformed.items()
+        if key != "result_integrity"
+    })
+    with pytest.raises(ValueError, match="workflow/container identity"):
+        validate_evaluation_runtime_identity(
+            malformed,
+            require_formal_source=True,
+        )
+
+
+def test_runtime_source_identity_ignores_environment_sha(monkeypatch):
+    monkeypatch.setenv("DOUZERO_GIT_SHA", "0" * 40)
+    runtime = evaluate_scenario(
+        _scenario("cardplay_only", deals=1)
+    ).to_dict()["runtime_identity"]
+    assert runtime["source_git_sha"] != "0" * 40
+    assert runtime["source_identity_method"] == (
+        "git-head-tree-and-tracked-bytes-v1"
+    )
 
 
 def test_private_holdout_name_is_redacted_from_report_identity():
@@ -212,6 +446,13 @@ def test_private_holdout_name_is_redacted_from_report_identity():
     )
     assert private.to_dict()["deal_set_name"] == "private_holdout"
     assert "secret-customer-path" not in json.dumps(private.to_dict())
+    payload = evaluate_scenario(private).to_dict()
+    assert all(len(row["deal_hash"]) == 64 for row in payload["games"])
+    assert all(
+        field not in row
+        for row in payload["games"]
+        for field in ("deal_payload", "deal_digest", "team_scores")
+    )
 
 
 def test_ablation_runner_requires_explicit_checkpoint_backed_variants():

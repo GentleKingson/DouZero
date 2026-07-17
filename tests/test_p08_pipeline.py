@@ -3,10 +3,17 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
-from douzero.human_data import HumanGameRecord, make_internal_game_id, write_jsonl
+from douzero.human_data import (
+    AttestedAdapterRecord,
+    HumanGameRecord,
+    make_internal_game_id,
+    pseudonymize_external_game_id,
+    write_jsonl,
+)
 from douzero.human_data.ingest import (
     IngestError,
     dedupe_by_game_id,
@@ -31,6 +38,17 @@ from douzero.human_data.validate import (
     validate_record,
     validate_records,
 )
+
+
+_EXTERNAL_TEST_KEY = b"p08-external-adapter-test-key!!!"
+
+
+def _attested(record, external_id, pseudonymizer):
+    identity = pseudonymizer.pseudonymize(external_id)
+    return AttestedAdapterRecord(
+        record=replace(record, game_id=identity.game_id),
+        identity=identity,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -193,8 +211,8 @@ class TestIngest:
     def test_ingest_record_runs_adapter_and_sanitizes(self):
         rec = generate_synthetic_record("ing-1", seed=1)
 
-        def adapter(raw):
-            return HumanGameRecord(
+        def adapter(raw, *, pseudonymizer):
+            record = HumanGameRecord(
                 game_id=make_internal_game_id(raw["game_id"]),
                 ruleset_id=rec.ruleset_id,
                 ruleset_version=rec.ruleset_version,
@@ -206,17 +224,21 @@ class TestIngest:
                 final_result=rec.final_result,
                 source_metadata={"source": "test", "user_id": "LEAK"},
             )
+            return _attested(record, raw["game_id"], pseudonymizer)
 
         # The adapter here intentionally leaves a forbidden key; ingest must
         # reject it even though the adapter produced a valid record otherwise.
         with pytest.raises(IngestError):
-            ingest_record({"game_id": "ing-1"}, adapter)
+            ingest_record(
+                {"game_id": "ing-1"}, adapter,
+                project_key=_EXTERNAL_TEST_KEY,
+            )
 
     def test_ingest_record_clean_adapter_succeeds(self):
         rec = generate_synthetic_record("ing-2", seed=2)
 
-        def adapter(raw):
-            return HumanGameRecord(
+        def adapter(raw, *, pseudonymizer):
+            record = HumanGameRecord(
                 game_id=make_internal_game_id(raw["game_id"]),
                 ruleset_id=rec.ruleset_id,
                 ruleset_version=rec.ruleset_version,
@@ -227,9 +249,15 @@ class TestIngest:
                 action_history=rec.action_history,
                 final_result=rec.final_result,
             )
+            return _attested(record, raw["game_id"], pseudonymizer)
 
-        out = ingest_record({"game_id": "ing-2"}, adapter)
-        assert out.game_id == make_internal_game_id("ing-2")
+        out = ingest_record(
+            {"game_id": "ing-2"}, adapter,
+            project_key=_EXTERNAL_TEST_KEY,
+        )
+        assert out.game_id == pseudonymize_external_game_id(
+            "ing-2", project_key=_EXTERNAL_TEST_KEY
+        )
 
     def test_dedupe_by_game_id_keeps_first(self):
         a = generate_synthetic_record("dup", seed=1)
@@ -241,8 +269,8 @@ class TestIngest:
     def test_ingest_batch_sorts_and_dedupes(self):
         base = generate_synthetic_record("z", seed=1)
 
-        def adapter(raw):
-            return HumanGameRecord(
+        def adapter(raw, *, pseudonymizer):
+            record = HumanGameRecord(
                 game_id=make_internal_game_id(raw["id"]),
                 ruleset_id=base.ruleset_id,
                 ruleset_version=base.ruleset_version,
@@ -253,11 +281,13 @@ class TestIngest:
                 action_history=base.action_history,
                 final_result=base.final_result,
             )
+            return _attested(record, raw["id"], pseudonymizer)
 
         raws = [{"id": "c"}, {"id": "a"}, {"id": "b"}, {"id": "a"}]
-        out = ingest_batch(raws, adapter)
+        out = ingest_batch(raws, adapter, project_key=_EXTERNAL_TEST_KEY)
         assert [r.game_id for r in out] == sorted(
-            make_internal_game_id(label) for label in ("a", "b", "c")
+            pseudonymize_external_game_id(label, project_key=_EXTERNAL_TEST_KEY)
+            for label in ("a", "b", "c")
         )
 
 
@@ -348,6 +378,7 @@ class TestQuarantineContract:
         out_base = str(tmp_path / "out")
         rc = validate_human_games.main([
             "--input", data_path, "--output", out_base,
+            "--allow-unverified-input",
         ])
         assert rc == 0
         import json as _json
@@ -363,6 +394,10 @@ class TestQuarantineContract:
             assert entry["reason"] == "parse_error"
         v_path = out_base + ".jsonl"
         assert os.path.isfile(v_path)
+        from douzero.human_data import verify_jsonl_manifest
+
+        with pytest.raises(Exception, match="unverified migration lineage"):
+            verify_jsonl_manifest(v_path)
 
     def test_pretrain_quarantines_bad_records(self, tmp_path):
         """pretrain_bc.py writes a quarantine file for records that fail replay

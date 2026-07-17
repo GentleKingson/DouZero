@@ -14,13 +14,29 @@ drop personal identifiers and credentials (see
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, runtime_checkable
 
+from .identifiers import ExternalGameIdentity, ExternalGameIdPseudonymizer
 from .privacy import (
     assert_valid_source_metadata,
     sanitize_mapping as _sanitize_metadata,
 )
 from .schema import HumanGameRecord, RecordValidationError
+
+
+@dataclass(frozen=True)
+class AttestedAdapterRecord:
+    """Canonical adapter output bound to project-key pseudonymization."""
+
+    record: HumanGameRecord
+    identity: ExternalGameIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, HumanGameRecord):
+            raise TypeError("record must be a HumanGameRecord")
+        if not isinstance(self.identity, ExternalGameIdentity):
+            raise TypeError("identity must be an ExternalGameIdentity")
 
 
 @runtime_checkable
@@ -32,7 +48,7 @@ class Adapter(Protocol):
     adapters should be exposed as callable instances or adapter functions that
     close over configuration. The protocol is structural
     (``runtime_checkable``), so an adapter can also be a plain function:
-    ``def my_adapter(raw: Mapping) -> HumanGameRecord: ...``.
+    ``adapter(raw, *, pseudonymizer) -> AttestedAdapterRecord``.
 
     Contract
     --------
@@ -43,9 +59,11 @@ class Adapter(Protocol):
       record boundary (:class:`~douzero.human_data.schema.HumanGameRecord`)
       also runs a fail-closed privacy scan, so a forbidden field will be caught
       there even if the adapter forgets to sanitize.
-    - Raw external game/player identifiers MUST be mapped with
-      :func:`douzero.human_data.pseudonymize_external_game_id` and a project
-      secret before constructing the record.
+    - Raw external game identifiers MUST be mapped by calling
+      ``pseudonymizer.pseudonymize(raw_id)``. The returned canonical ID is used
+      in the record and its opaque attestation is returned alongside the record
+      in :class:`AttestedAdapterRecord`. Ingest cryptographically verifies both;
+      a merely regex-shaped or unkeyed ID is rejected.
     - The adapter is responsible for mapping the external card encoding onto
       the legacy integer code points (3..14, 17, 20, 30) and for producing the
       :class:`~douzero.env.rules.RuleSet` identity triple the game was played
@@ -56,7 +74,12 @@ class Adapter(Protocol):
       the shape into a :class:`HumanGameRecord`.
     """
 
-    def __call__(self, raw: Mapping[str, Any]) -> HumanGameRecord:
+    def __call__(
+        self,
+        raw: Mapping[str, Any],
+        *,
+        pseudonymizer: ExternalGameIdPseudonymizer,
+    ) -> AttestedAdapterRecord:
         ...
 
 

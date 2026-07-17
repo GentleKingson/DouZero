@@ -1,0 +1,58 @@
+name: PR Evidence Contract
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  bind-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      EXPECTED_REPOSITORY: ${{ github.repository }}
+      EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      EXPECTED_MERGE_SHA: ${{ github.sha }}
+      EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+
+    steps:
+      # actions/checkout@v6.0.2
+      - name: Checkout the exact PR head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+
+      - name: Validate scope and bind evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse --verify 'HEAD^{commit}')" == "$EXPECTED_HEAD_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          python tools/validate_pr_evidence.py \
+            --event "$GITHUB_EVENT_PATH" \
+            --repository "$EXPECTED_REPOSITORY" \
+            --head-sha "$EXPECTED_HEAD_SHA" \
+            --merge-sha "$EXPECTED_MERGE_SHA" \
+            --workflow-sha "$EXPECTED_WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output "$RUNNER_TEMP/pr-evidence.json"
+
+      # actions/upload-artifact@v4.6.2
+      - name: Upload commit-bound evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr-evidence-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr-evidence.json
+          if-no-files-found: error
+          retention-days: 90

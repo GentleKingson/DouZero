@@ -334,24 +334,30 @@ def test_deepagent_v2_rejects_disagreeing_mode_and_config():
 # --------------------------------------------------------------------------- #
 # Blocker 7: trainer boundaries (standard ruleset / no fake options)
 # --------------------------------------------------------------------------- #
-def test_trainer_rejects_non_none_ruleset_at_construction():
-    """P06 has no bidding driver; ANY non-None RuleSet triggers Env's
-    standard/bidding mode and must fail fast rather than silently
-    mis-driving the bidding phase. This includes RuleSet.legacy() because
-    Env treats any non-None RuleSet as standard mode."""
+def test_trainer_ruleset_boundary_preserves_legacy_and_supports_standard_bidding():
+    """A non-None legacy ruleset remains invalid, while the explicit standard
+    path requires (and accepts) a bidding-enabled model."""
     from douzero.env.rules import RuleSet
 
     torch.manual_seed(7)
     model = ModelV2(build_v2_schema(), ModelV2Config())
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="bidding_enabled"):
         V2Trainer(model, ruleset=RuleSet.standard())
-    # RuleSet.legacy() is ALSO rejected — Env treats any non-None ruleset
-    # as standard mode (bidding), not just RuleSet.standard().
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="must be standard"):
         V2Trainer(model, ruleset=RuleSet.legacy())
-    # ruleset=None is the only accepted value (legacy card-play-only env).
     trainer = V2Trainer(model, ruleset=None, config=TrainerConfig(max_episodes=0))
     assert trainer.ruleset is None
+
+    bidding_model = ModelV2(
+        build_v2_schema(), ModelV2Config(bidding_enabled=True, hidden_size=32)
+    )
+    standard = V2Trainer(
+        bidding_model,
+        ruleset=RuleSet.standard(),
+        loss_config=LossConfig(lambda_bid_policy=1.0),
+        config=TrainerConfig(max_episodes=0, optimizer_steps=0),
+    )
+    assert standard.standard_mode
 
 
 def test_trainer_config_no_fake_checkpoint_or_gpu_options():

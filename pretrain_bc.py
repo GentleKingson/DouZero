@@ -24,13 +24,17 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Sequence
+from contextlib import contextmanager
+from typing import Iterable, Iterator, Sequence
 
 import torch
 
 from douzero.env.rules import RuleSet
 from douzero.human_data.sample import build_bc_samples
-from douzero.human_data.schema import read_jsonl
+from douzero.human_data.schema import (
+    HumanGameRecord,
+    open_verified_jsonl_snapshot,
+)
 from douzero.human_data.synthetic import generate_synthetic_records
 from douzero.human_data.validate import validate_record
 from douzero.models_v2.config import ModelV2Config
@@ -82,37 +86,30 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _load_records(args: argparse.Namespace):
+@contextmanager
+def _open_records(
+    args: argparse.Namespace,
+) -> Iterator[tuple[dict | None, Iterable[HumanGameRecord]]]:
     if args.synthetic:
-        yield from generate_synthetic_records(
-            num_games=args.num_synthetic, base_seed=args.synthetic_seed
+        yield None, generate_synthetic_records(
+            num_games=args.num_synthetic,
+            base_seed=args.synthetic_seed,
         )
         return
     if not args.data:
         raise SystemExit("either --synthetic or --data is required")
-    yield from read_jsonl(args.data)
+    with open_verified_jsonl_snapshot(args.data) as snapshot:
+        yield dict(snapshot.manifest), snapshot.iter_records()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _parse_args(argv)
-
-    # Seed (seed=0 -> no-op per the project convention).
-    if args.seed != 0:
-        torch.manual_seed(args.seed)
-
-    # 1. Load + validate records, then build BC samples.
-    # Blocker 3: records that fail replay validation are QUARANTINED to a
-    # structured file (never silently dropped). The BC sample builder is
-    # fail-closed per-record: a record that does not replay raises rather than
-    # silently yielding no samples, so we catch and quarantine here.
+def _collect_samples(records, args: argparse.Namespace):
     import json as _json
 
-    print(f"[pretrain_bc] loading records...", file=sys.stderr)
     samples = []
     n_records = 0
     n_valid = 0
     quarantined: list[str] = []
-    for record in _load_records(args):
+    for record in records:
         n_records += 1
         if not args.skip_validation and not args.synthetic:
             result = validate_record(record)
@@ -125,7 +122,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "reason": result.reason,
                             "error": result.error,
                         },
-                        sort_keys=True, ensure_ascii=False,
+                        sort_keys=True,
+                        ensure_ascii=False,
                     )
                 )
                 continue
@@ -141,9 +139,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "reason": type(exc).__name__,
                         "error": str(exc),
                     },
-                    sort_keys=True, ensure_ascii=False,
+                    sort_keys=True,
+                    ensure_ascii=False,
                 )
             )
+    return samples, n_records, n_valid, quarantined
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+
+    # Seed (seed=0 -> no-op per the project convention).
+    if args.seed != 0:
+        torch.manual_seed(args.seed)
+
+    # 1. Load + validate records, then build BC samples.
+    # Blocker 3: records that fail replay validation are QUARANTINED to a
+    # structured file (never silently dropped). The BC sample builder is
+    # fail-closed per-record: a record that does not replay raises rather than
+    # silently yielding no samples, so we catch and quarantine here.
+    print(f"[pretrain_bc] loading records...", file=sys.stderr)
+    with _open_records(args) as (dataset_identity, records):
+        samples, n_records, n_valid, quarantined = _collect_samples(
+            records, args
+        )
     # Write the quarantine file alongside the checkpoint so invalid records
     # are auditable (Blocker 3: no silent drops in the production path).
     if quarantined:
@@ -259,6 +278,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "temperature": args.temperature,
             "seed": args.seed,
             "synthetic": bool(args.synthetic),
+            "dataset_sha256": (
+                dataset_identity["dataset_sha256"]
+                if dataset_identity is not None else None
+            ),
         },
     )
     print(f"[pretrain_bc] saved checkpoint to {out_path}", file=sys.stderr)

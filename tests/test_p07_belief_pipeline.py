@@ -118,6 +118,7 @@ class TestCheckpoint:
         assert m["frames"] == 7
         assert m["ruleset_id"] == "legacy"
         assert m["belief_config_hash"]
+        assert len(m["git_sha"]) in (40, 64)
         assert m["python_version"]
 
 
@@ -146,7 +147,37 @@ class TestCLI:
 
         assert os.path.isfile(os.path.join(save_dir, "belief.pt"))
 
-    def test_evaluate_belief_main_runs(self, tmp_path):
+    def test_train_belief_standard_checkpoint_is_strictly_loadable(self, tmp_path):
+        import os
+        import train_belief
+
+        save_dir = str(tmp_path / "standard-bp")
+        rc = train_belief.main([
+            "--save_dir", save_dir,
+            "--ruleset", "standard",
+            "--num_episodes", "1",
+            "--epochs", "1",
+            "--batch_size", "32",
+            "--hidden_size", "16",
+            "--num_layers", "1",
+            "--seed", "17",
+        ])
+        assert rc == 0
+        loaded = load_belief_checkpoint(
+            os.path.join(save_dir, "belief.pt"),
+            expected_ruleset=RuleSet.standard(),
+        )
+        assert isinstance(loaded, BeliefModel)
+        import evaluate_belief
+
+        assert evaluate_belief.main([
+            "--checkpoint", os.path.join(save_dir, "belief.pt"),
+            "--ruleset", "standard",
+            "--num_episodes", "1",
+            "--seed", "19",
+        ]) == 0
+
+    def test_evaluate_belief_main_runs(self, tmp_path, capsys):
         import evaluate_belief
 
         save_dir = str(tmp_path / "bp")
@@ -165,6 +196,18 @@ class TestCLI:
             "--checkpoint", ckpt, "--num_episodes", "4", "--seed", "3",
         ])
         assert rc2 == 0
+        import json
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["schema_version"] == "belief-evaluation-result-v1"
+        identity = payload["runtime_identity"]
+        assert len(identity["source_git_sha"]) in (40, 64)
+        assert len(identity["evaluation_config_hash"]) == 64
+        assert len(identity["checkpoint_sha256"]) == 64
+        assert identity["ruleset"]["ruleset_id"] == "legacy"
+        assert identity["feature_version"] == "v2"
+        assert identity["belief_input_schema"] == "belief_input_public_v1"
+        assert "checkpoint" not in payload
 
     def test_train_belief_help_parses(self):
         import train_belief

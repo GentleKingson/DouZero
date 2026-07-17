@@ -6,24 +6,420 @@ import copy
 import hashlib
 import json
 import math
+import os
+import platform
 import random
+import time
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 from douzero.env.game import GameEnv
+from douzero._version import git_sha
 from douzero.env.rules import PHASE_BIDDING
 
-from .agents import BundleFactory, RuleAgent, TimedAgent, choose_bid
+from .agents import BundleFactory, RuleAgent, TimedAgent
 from .protocol import (
     EVALUATION_PROTOCOL,
     MIN_PROMOTION_BOOTSTRAP_SAMPLES,
+    MIN_PROMOTION_PAIRED_DEALS,
     OFFICIAL_CONFIDENCE_LEVEL,
+    OFFICIAL_CI_METHOD,
+    OFFICIAL_STATISTICAL_UNIT,
     OFFICIAL_PERMUTATION_HASHES,
     PROMOTION_ESTIMATOR,
     PROMOTION_MODE,
 )
-from .scenario import ROLES, EvaluationScenario, default_seat_permutations
-from .statistics import deal_cluster_means, paired_bootstrap_ci, percentile
+from .provenance import (
+    GitCheckoutIdentity,
+    ProvenanceError,
+    attach_result_integrity,
+    inspect_git_checkout,
+    verify_result_integrity,
+)
+from .replay import evaluation_trace_digest
+from .scenario import (
+    ROLES,
+    EvaluationScenario,
+    canonical_deal_hash,
+    canonical_deal_id,
+    default_seat_permutations,
+)
+from .statistics import (
+    ConfidenceInterval,
+    deal_cluster_means,
+    paired_bootstrap_ci,
+    percentile,
+)
+
+
+EVALUATION_RESULT_SCHEMA_VERSION = "p15-paired-result-v3"
+
+
+def _execution_environment_identity() -> dict[str, Any]:
+    """Capture the signed workflow, container, and hardware run context."""
+
+    import torch
+
+    cuda_available = bool(torch.cuda.is_available())
+    cuda_device_count = torch.cuda.device_count() if cuda_available else 0
+    cuda_device_names: list[str] = []
+    if cuda_available:
+        for index in range(cuda_device_count):
+            try:
+                cuda_device_names.append(str(torch.cuda.get_device_name(index)))
+            except (AssertionError, RuntimeError):
+                cuda_device_names.append("unavailable")
+
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
+    run_url = None
+    if repository and run_id and run_attempt:
+        run_url = (
+            f"https://github.com/{repository}/actions/runs/{run_id}/"
+            f"attempts/{run_attempt}"
+        )
+    return {
+        "provider": (
+            "github_actions"
+            if os.environ.get("GITHUB_ACTIONS") == "true"
+            else "local"
+        ),
+        "repository": repository,
+        "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF"),
+        "workflow_sha": os.environ.get("GITHUB_WORKFLOW_SHA"),
+        "source_ref": os.environ.get("GITHUB_REF"),
+        "source_sha": os.environ.get("GITHUB_SHA"),
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "run_url": run_url,
+        "runner_environment": os.environ.get("RUNNER_ENVIRONMENT"),
+        "container_image_digest": os.environ.get(
+            "DOUZERO_EVALUATOR_IMAGE_DIGEST"
+        ),
+        "hardware": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python_implementation": platform.python_implementation(),
+            "python_version": platform.python_version(),
+            "torch_version": str(torch.__version__),
+            "cuda_runtime_version": torch.version.cuda,
+            "cuda_available": cuda_available,
+            "cuda_device_count": cuda_device_count,
+            "cuda_device_names": cuda_device_names,
+        },
+    }
+
+
+def _canonical_sha256(value: Mapping[str, Any]) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _json_result_value(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Mapping):
+        return {str(key): _json_result_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_result_value(item) for item in value]
+    return value
+
+
+def _bundle_feature_schema(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    backend = str(bundle.get("backend", ""))
+    if backend in {"v2", "bc"}:
+        from douzero.observation.bidding import build_bidding_schema
+        from douzero.observation.schema import build_v2_schema
+
+        learned_bidding = bundle.get("bidding_policy") == "learned"
+        return {
+            "feature_version": "v2",
+            "feature_schema_hash": build_v2_schema().stable_hash(),
+            "bidding_feature_schema_hash": (
+                build_bidding_schema().stable_hash() if learned_bidding else None
+            ),
+        }
+    if backend in {"legacy", "legacy_factorized"}:
+        return {
+            "feature_version": "legacy",
+            "feature_schema_hash": None,
+            "bidding_feature_schema_hash": None,
+        }
+    if backend in {"random", "rule"}:
+        return {
+            "feature_version": "builtin-no-model-input",
+            "feature_schema_hash": None,
+            "bidding_feature_schema_hash": None,
+        }
+    raise ValueError(f"unsupported evaluation backend for schema identity: {backend!r}")
+
+
+def evaluation_runtime_identity(
+    scenario: Mapping[str, Any],
+    *,
+    ablation: str,
+    source_identity: GitCheckoutIdentity | None = None,
+    source_identity_stable: bool = False,
+    source_identity_samples: int = 1,
+) -> dict[str, Any]:
+    """Bind evaluator code and effective scenario/schema configuration."""
+
+    local_unverified_source = False
+    if source_identity is None:
+        try:
+            source_identity = inspect_git_checkout(require_clean=False)
+        except ProvenanceError:
+            local_unverified_source = True
+    source_sha = git_sha() if source_identity is None else source_identity.head_sha
+    schema_identities = {
+        side: _bundle_feature_schema(scenario.get(side, {}))
+        for side in ("candidate", "baseline")
+    }
+    config_payload = {
+        "protocol": EVALUATION_PROTOCOL,
+        "ablation": ablation,
+        "scenario": dict(scenario),
+        "model_feature_schemas": schema_identities,
+    }
+    ruleset = scenario.get("ruleset", {})
+    source_fields = (
+        {
+            "source_git_sha": source_sha,
+            "source_git_tree_oid": None,
+            "source_tracked_tree_sha256": None,
+            "source_git_ref": None,
+            "source_worktree_clean": False,
+            "source_tracked_file_count": 0,
+        }
+        if source_identity is None
+        else source_identity.to_runtime_fields()
+    )
+    return {
+        "schema_version": EVALUATION_RESULT_SCHEMA_VERSION,
+        **source_fields,
+        "source_identity_method": (
+            "local-unverified-env-or-package-metadata-v1"
+            if local_unverified_source
+            else "git-head-tree-and-tracked-bytes-v1"
+        ),
+        "source_identity_stable": bool(source_identity_stable),
+        "source_identity_samples": source_identity_samples,
+        "execution_environment": _execution_environment_identity(),
+        "evaluation_config_hash": _canonical_sha256(config_payload),
+        "ruleset_hash": (
+            ruleset.get("ruleset_hash") if isinstance(ruleset, Mapping) else None
+        ),
+        "model_feature_schemas": schema_identities,
+    }
+
+
+def validate_evaluation_runtime_identity(
+    result: Mapping[str, Any],
+    *,
+    expected_mode: str | None = None,
+    expected_source_git_shas: str | Iterable[str] | None = None,
+    require_formal_source: bool = False,
+) -> None:
+    """Reject missing or self-inconsistent evaluation provenance."""
+
+    runtime = result.get("runtime_identity")
+    scenario = result.get("scenario")
+    ablation = result.get("ablation")
+    if not isinstance(runtime, Mapping) or not isinstance(scenario, Mapping):
+        raise ValueError("evaluation result is missing runtime identity or scenario")
+    if result.get("protocol") != EVALUATION_PROTOCOL:
+        raise ValueError("evaluation result protocol mismatch")
+    if scenario.get("protocol") != EVALUATION_PROTOCOL:
+        raise ValueError("evaluation scenario protocol mismatch")
+    mode = scenario.get("mode")
+    if mode not in {"cardplay_only", "full_game"}:
+        raise ValueError("evaluation scenario mode is invalid")
+    if expected_mode is not None and mode != expected_mode:
+        raise ValueError(
+            f"evaluation scenario mode mismatch: expected {expected_mode!r}, got {mode!r}"
+        )
+    if not isinstance(ablation, str) or not ablation:
+        raise ValueError("evaluation ablation identity must be a non-empty string")
+    if runtime.get("schema_version") != EVALUATION_RESULT_SCHEMA_VERSION:
+        raise ValueError("evaluation runtime schema version mismatch")
+    try:
+        verify_result_integrity(result)
+    except ProvenanceError as exc:
+        raise ValueError(f"evaluation result integrity is invalid: {exc}") from exc
+    source_sha = runtime.get("source_git_sha")
+    if (
+        not isinstance(source_sha, str)
+        or len(source_sha) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in source_sha)
+    ):
+        raise ValueError("evaluation source_git_sha must be a full Git SHA")
+    if expected_source_git_shas is not None:
+        approved_shas = (
+            (expected_source_git_shas,)
+            if isinstance(expected_source_git_shas, str)
+            else tuple(expected_source_git_shas)
+        )
+        if not approved_shas or any(
+            not isinstance(sha, str)
+            or len(sha) not in (40, 64)
+            or any(char not in "0123456789abcdef" for char in sha)
+            for sha in approved_shas
+        ):
+            raise ValueError("expected evaluator Git SHA allowlist is invalid")
+        if source_sha not in approved_shas:
+            raise ValueError("evaluation source_git_sha is not approved")
+    source_tree = runtime.get("source_git_tree_oid")
+    tracked_tree = runtime.get("source_tracked_tree_sha256")
+    tracked_count = runtime.get("source_tracked_file_count")
+    formal_identity_shape_invalid = (
+        not isinstance(source_tree, str)
+        or len(source_tree) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in source_tree)
+        or not isinstance(tracked_tree, str)
+        or len(tracked_tree) != 64
+        or any(char not in "0123456789abcdef" for char in tracked_tree)
+        or type(tracked_count) is not int
+        or tracked_count < 1
+        or runtime.get("source_identity_method")
+        != "git-head-tree-and-tracked-bytes-v1"
+    )
+    if require_formal_source and formal_identity_shape_invalid:
+        raise ValueError("evaluation source tree identity is malformed")
+    if require_formal_source and (
+        runtime.get("source_worktree_clean") is not True
+        or runtime.get("source_identity_stable") is not True
+        or runtime.get("source_identity_samples") != 2
+    ):
+        raise ValueError(
+            "formal evaluation requires a stable clean two-sample Git source identity"
+        )
+    execution = runtime.get("execution_environment")
+    if require_formal_source:
+        if not isinstance(execution, Mapping):
+            raise ValueError("formal evaluation execution identity is missing")
+        repository = execution.get("repository")
+        workflow_ref = execution.get("workflow_ref")
+        workflow_sha = execution.get("workflow_sha")
+        source_ref = execution.get("source_ref")
+        run_id = execution.get("run_id")
+        run_attempt = execution.get("run_attempt")
+        expected_run_url = (
+            f"https://github.com/{repository}/actions/runs/{run_id}/"
+            f"attempts/{run_attempt}"
+        )
+        image_digest = execution.get("container_image_digest")
+        hardware = execution.get("hardware")
+        def full_oid(value: object) -> bool:
+            return bool(
+                isinstance(value, str)
+                and len(value) in (40, 64)
+                and all(char in "0123456789abcdef" for char in value)
+            )
+        if (
+            execution.get("provider") != "github_actions"
+            or not isinstance(repository, str)
+            or repository.count("/") != 1
+            or not isinstance(workflow_ref, str)
+            or not workflow_ref.startswith(
+                f"{repository}/.github/workflows/"
+            )
+            or "@refs/" not in workflow_ref
+            or not full_oid(workflow_sha)
+            or not isinstance(source_ref, str)
+            or not source_ref.startswith("refs/")
+            or execution.get("source_sha") != source_sha
+            or not isinstance(run_id, str)
+            or not run_id.isdigit()
+            or int(run_id) < 1
+            or not isinstance(run_attempt, str)
+            or not run_attempt.isdigit()
+            or int(run_attempt) < 1
+            or execution.get("run_url") != expected_run_url
+            or execution.get("runner_environment")
+            not in {"github-hosted", "self-hosted"}
+            or not isinstance(image_digest, str)
+            or len(image_digest) != 71
+            or not image_digest.startswith("sha256:")
+            or any(
+                char not in "0123456789abcdef" for char in image_digest[7:]
+            )
+        ):
+            raise ValueError(
+                "formal evaluation GitHub workflow/container identity is malformed"
+            )
+        expected_hardware_fields = {
+            "system",
+            "release",
+            "machine",
+            "python_implementation",
+            "python_version",
+            "torch_version",
+            "cuda_runtime_version",
+            "cuda_available",
+            "cuda_device_count",
+            "cuda_device_names",
+        }
+        if (
+            not isinstance(hardware, Mapping)
+            or set(hardware) != expected_hardware_fields
+            or any(
+                not isinstance(hardware.get(name), str)
+                or not hardware.get(name)
+                for name in (
+                    "system",
+                    "release",
+                    "machine",
+                    "python_implementation",
+                    "python_version",
+                    "torch_version",
+                )
+            )
+            or (
+                hardware.get("cuda_runtime_version") is not None
+                and not isinstance(hardware.get("cuda_runtime_version"), str)
+            )
+            or type(hardware.get("cuda_available")) is not bool
+            or type(hardware.get("cuda_device_count")) is not int
+            or hardware.get("cuda_device_count", -1) < 0
+            or not isinstance(hardware.get("cuda_device_names"), list)
+            or any(
+                not isinstance(name, str)
+                for name in hardware.get("cuda_device_names", [])
+            )
+            or len(hardware.get("cuda_device_names", []))
+            != hardware.get("cuda_device_count")
+        ):
+            raise ValueError("formal evaluation hardware identity is malformed")
+    schema_identities = runtime.get("model_feature_schemas")
+    if not isinstance(schema_identities, Mapping):
+        raise ValueError("evaluation model feature-schema identities are missing")
+    expected_schema_identities: dict[str, dict[str, Any]] = {}
+    for side in ("candidate", "baseline"):
+        bundle = scenario.get(side)
+        if not isinstance(bundle, Mapping):
+            raise ValueError(f"evaluation scenario {side} bundle is invalid")
+        expected_schema_identities[side] = _bundle_feature_schema(bundle)
+    if dict(schema_identities) != expected_schema_identities:
+        raise ValueError(
+            "evaluation model feature-schema identities do not match the scenario"
+        )
+    config_payload = {
+        "protocol": EVALUATION_PROTOCOL,
+        "ablation": ablation,
+        "scenario": dict(scenario),
+        "model_feature_schemas": expected_schema_identities,
+    }
+    if runtime.get("evaluation_config_hash") != _canonical_sha256(config_payload):
+        raise ValueError("evaluation_config_hash does not match the result scenario")
+    ruleset = scenario.get("ruleset")
+    if (
+        not isinstance(ruleset, Mapping)
+        or runtime.get("ruleset_hash") != ruleset.get("ruleset_hash")
+    ):
+        raise ValueError("evaluation runtime ruleset hash mismatch")
 
 
 def _seed(base: int, *parts: object) -> int:
@@ -31,9 +427,74 @@ def _seed(base: int, *parts: object) -> int:
     return int.from_bytes(hashlib.sha256(token.encode()).digest()[:8], "big")
 
 
-def _deal_id(index: int, deal: dict[str, Any]) -> str:
-    payload = json.dumps(deal, sort_keys=True, separators=(",", ":"))
-    return f"{index:06d}-{hashlib.sha256(payload.encode()).hexdigest()[:12]}"
+def _deal_id(index: int, deal: Mapping[str, Any]) -> str:
+    return canonical_deal_id(index, canonical_deal_hash(deal))
+
+
+def _candidate_decision_id(
+    mode: str,
+    deal_id: str,
+    assignment: tuple[str, str, str],
+    phase: str,
+    primary_index: int,
+    secondary_index: int | None = None,
+) -> str:
+    """Return a trace-derived, stable identifier for one candidate decision."""
+
+    assignment_token = "".join(
+        "c" if label == "candidate" else "b" for label in assignment
+    )
+    suffix = f"{primary_index:06d}"
+    if secondary_index is not None:
+        suffix = f"{suffix}/{secondary_index:06d}"
+    return f"{mode}/{deal_id}/{assignment_token}/{phase}/{suffix}"
+
+
+def _candidate_decision_evidence(
+    *,
+    decision_id: str,
+    phase: str,
+    actor_role: str | None,
+    actor_seat: str | None,
+    latency_ns: int,
+    prediction: float | None,
+    forced_action: bool,
+    search_called: bool,
+    search_timed_out: bool,
+    search_fallback: bool,
+) -> dict[str, Any]:
+    return {
+        "decision_id": decision_id,
+        "phase": phase,
+        "actor_role": actor_role,
+        "actor_seat": actor_seat,
+        "latency_ns": latency_ns,
+        "prediction_status": (
+            "available" if prediction is not None else "unavailable"
+        ),
+        "prediction": prediction,
+        "forced_action": forced_action,
+        "search_called": search_called,
+        "search_timed_out": search_timed_out,
+        "search_fallback": search_fallback,
+    }
+
+
+def _decision_compatibility_fields(
+    evidence: list[dict[str, Any]],
+) -> tuple[tuple[float, ...], tuple[int, ...], tuple[tuple[str, float], ...]]:
+    latencies_ns = tuple(int(item["latency_ns"]) for item in evidence)
+    calibration = tuple(
+        (str(item["actor_role"]), float(item["prediction"]))
+        for item in evidence
+        if item["phase"] == "cardplay"
+        and item["prediction_status"] == "available"
+    )
+    return (
+        tuple(value / 1_000_000.0 for value in latencies_ns),
+        latencies_ns,
+        calibration,
+    )
 
 
 @dataclass(frozen=True)
@@ -61,7 +522,31 @@ class GameRecord:
     anti_spring: bool
     game_length: int
     candidate_latencies_ms: tuple[float, ...] = ()
-    calibration: tuple[tuple[str, float, float], ...] = ()
+    # Calibration rows carry only a role and model prediction. The terminal
+    # label is derived by the collator from a successfully replayed game.
+    calibration: tuple[tuple[str, float], ...] = ()
+    # Every P17 field is appended after the two original defaulted fields so
+    # pre-P17 positional construction retains its exact argument meaning.
+    redeal_count: int = 0
+    max_redeals_exceeded: bool = False
+    search_calls: int = 0
+    search_timeouts: int = 0
+    search_fallbacks: int = 0
+    bidding_inference_calls: int = 0
+    # Forced post-cap gameplay is retained only as an audited smoke row and is
+    # excluded from every formal deal-level estimate.
+    formal_evaluation_eligible: bool = True
+    exclusion_reason: str = ""
+    # Full experiment/terminal evidence appended for positional compatibility.
+    deal_hash: str = ""
+    seat_to_role: dict[str, str] | None = None
+    bidding_order: tuple[str, ...] = ()
+    bidding_history: tuple[tuple[str, int], ...] = ()
+    candidate_latencies_ns: tuple[int, ...] = ()
+    bidding_trace: tuple[tuple[tuple[str, int], ...], ...] = ()
+    cardplay_trace: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    trace_digest: str = ""
+    candidate_decisions: tuple[dict[str, Any], ...] = ()
 
     @property
     def candidate_log_score(self) -> float:
@@ -92,8 +577,31 @@ class GameRecord:
             "spring": self.spring,
             "anti_spring": self.anti_spring,
             "game_length": self.game_length,
+            "redeal_count": self.redeal_count,
+            "max_redeals_exceeded": self.max_redeals_exceeded,
             "candidate_latencies_ms": list(self.candidate_latencies_ms),
             "calibration": [list(sample) for sample in self.calibration],
+            "search_calls": self.search_calls,
+            "search_timeouts": self.search_timeouts,
+            "search_fallbacks": self.search_fallbacks,
+            "bidding_inference_calls": self.bidding_inference_calls,
+            "formal_evaluation_eligible": self.formal_evaluation_eligible,
+            "exclusion_reason": self.exclusion_reason or None,
+            "deal_hash": self.deal_hash,
+            "seat_to_role": copy.deepcopy(self.seat_to_role),
+            "bidding_order": list(self.bidding_order),
+            "bidding_history": [list(bid) for bid in self.bidding_history],
+            "candidate_latencies_ns": list(self.candidate_latencies_ns),
+            "bidding_trace": [
+                [list(bid) for bid in attempt] for attempt in self.bidding_trace
+            ],
+            "cardplay_trace": [
+                [role, list(action)] for role, action in self.cardplay_trace
+            ],
+            "trace_digest": self.trace_digest,
+            "candidate_decisions": copy.deepcopy(
+                list(self.candidate_decisions)
+            ),
         }
 
 
@@ -105,15 +613,26 @@ class PairedEvaluationResult:
     metrics: dict[str, Any]
     games: tuple[GameRecord, ...]
     ablation: str = "base"
+    source_identity: GitCheckoutIdentity | None = None
+    source_identity_stable: bool = False
+    source_identity_samples: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "protocol": EVALUATION_PROTOCOL,
             "ablation": self.ablation,
             "scenario": self.scenario,
             "metrics": self.metrics,
             "games": [game.to_dict() for game in self.games],
         }
+        payload["runtime_identity"] = evaluation_runtime_identity(
+            self.scenario,
+            ablation=self.ablation,
+            source_identity=self.source_identity,
+            source_identity_stable=self.source_identity_stable,
+            source_identity_samples=self.source_identity_samples or 1,
+        )
+        return attach_result_integrity(_json_result_value(payload))
 
     def to_promotion_evaluation(self):
         """Bridge directly to the P11 promotion gate's strict P15 contract."""
@@ -131,12 +650,23 @@ class PairedEvaluationResult:
                 f"promotion requires confidence_level={OFFICIAL_CONFIDENCE_LEVEL}"
             )
         if (
+            self.scenario.get("statistical_unit") != OFFICIAL_STATISTICAL_UNIT
+            or self.scenario.get("ci_method") != OFFICIAL_CI_METHOD
+            or self.scenario.get("release_protocol_id") != EVALUATION_PROTOCOL
+        ):
+            raise ValueError("promotion requires the closed official statistics protocol")
+        if (
             self.scenario["bootstrap_samples"]
             < MIN_PROMOTION_BOOTSTRAP_SAMPLES
         ):
             raise ValueError(
                 "promotion requires at least "
                 f"{MIN_PROMOTION_BOOTSTRAP_SAMPLES} bootstrap samples"
+            )
+        if self.metrics["paired_estimate_ci"]["paired_deals"] < MIN_PROMOTION_PAIRED_DEALS:
+            raise ValueError(
+                "promotion requires at least "
+                f"{MIN_PROMOTION_PAIRED_DEALS} paired deals"
             )
         expected_permutations = [
             list(row) for row in default_seat_permutations(PROMOTION_MODE)
@@ -170,19 +700,14 @@ class PairedEvaluationResult:
         )
 
 
-def _candidate_samples(
-    agents: dict[str, TimedAgent], candidate_roles: tuple[str, ...], winner_team: str
-) -> tuple[tuple[float, ...], tuple[tuple[str, float, float], ...]]:
-    latencies: list[float] = []
-    calibration: list[tuple[str, float, float]] = []
-    for role in candidate_roles:
-        agent = agents[role]
-        latencies.extend(agent.latencies_ms)
-        target = float(
-            winner_team == ("landlord" if role == "landlord" else "farmer")
-        )
-        calibration.extend((role, prediction, target) for prediction in agent.predictions)
-    return tuple(latencies), tuple(calibration)
+def _decision_search_counts(
+    evidence: list[dict[str, Any]],
+) -> tuple[int, int, int]:
+    return (
+        sum(int(item["search_called"]) for item in evidence),
+        sum(int(item["search_timed_out"]) for item in evidence),
+        sum(int(item["search_fallback"]) for item in evidence),
+    )
 
 
 def _run_cardplay_leg(
@@ -190,6 +715,7 @@ def _run_cardplay_leg(
     factory: BundleFactory,
     deal: dict[str, Any],
     deal_id: str,
+    deal_hash: str,
     assignment: tuple[str, str, str],
     leg_index: int,
 ) -> GameRecord:
@@ -205,8 +731,38 @@ def _run_cardplay_leg(
         )
     env = GameEnv(agents)
     env.card_play_init(copy.deepcopy(deal))
+    cardplay_trace: list[tuple[str, tuple[int, ...]]] = []
+    decision_evidence: list[dict[str, Any]] = []
     while not env.game_over:
+        position = str(env.acting_player_position)
+        agent = agents[position]
+        sample_count = len(agent.decision_samples)
+        trace_index = len(cardplay_trace)
+        forced_action = len(env.game_infoset.legal_actions) == 1
         env.step()
+        if len(agent.decision_samples) != sample_count + 1:
+            raise RuntimeError("card-play agent did not emit one timing sample")
+        if agent.bundle_label == "candidate":
+            sample = agent.decision_samples[-1]
+            decision_evidence.append(_candidate_decision_evidence(
+                decision_id=_candidate_decision_id(
+                    scenario.mode,
+                    deal_id,
+                    assignment,
+                    "cardplay",
+                    trace_index,
+                ),
+                phase="cardplay",
+                actor_role=position,
+                actor_seat=None,
+                latency_ns=sample.latency_ns,
+                prediction=sample.prediction,
+                forced_action=forced_action,
+                search_called=sample.search_called,
+                search_timed_out=sample.search_timed_out,
+                search_fallback=sample.search_fallback,
+            ))
+        cardplay_trace.append((position, tuple(env.card_play_action_seq[-1])))
 
     candidate_roles = tuple(
         role for role, label in zip(ROLES, assignment) if label == "candidate"
@@ -220,7 +776,12 @@ def _run_cardplay_leg(
     candidate_win = float(winner_team == candidate_team)
     role_wins = {role: candidate_win for role in candidate_roles}
     role_scores = {role: candidate_score for role in candidate_roles}
-    latencies, calibration = _candidate_samples(agents, candidate_roles, winner_team)
+    latencies, latencies_ns, calibration = _decision_compatibility_fields(
+        decision_evidence
+    )
+    search_calls, search_timeouts, search_fallbacks = _decision_search_counts(
+        decision_evidence
+    )
     return GameRecord(
         deal_id=deal_id,
         leg_id=f"cardplay-{leg_index}",
@@ -243,7 +804,20 @@ def _run_cardplay_leg(
         anti_spring=False,
         game_length=len(env.card_play_action_seq),
         candidate_latencies_ms=latencies,
+        candidate_latencies_ns=latencies_ns,
         calibration=calibration,
+        search_calls=search_calls,
+        search_timeouts=search_timeouts,
+        search_fallbacks=search_fallbacks,
+        deal_hash=deal_hash,
+        cardplay_trace=tuple(cardplay_trace),
+        trace_digest=evaluation_trace_digest(
+            mode=scenario.mode,
+            deal_hash=deal_hash,
+            bidding_trace=(),
+            cardplay_trace=cardplay_trace,
+        ),
+        candidate_decisions=tuple(decision_evidence),
     )
 
 
@@ -252,6 +826,7 @@ def _run_full_game_leg(
     factory: BundleFactory,
     deal: dict[str, Any],
     deal_id: str,
+    deal_hash: str,
     assignment: tuple[str, str, str],
     leg_index: int,
 ) -> GameRecord:
@@ -265,6 +840,10 @@ def _run_full_game_leg(
     env = GameEnv({role: RuleAgent() for role in ROLES}, ruleset=scenario.ruleset)
     candidate_bid_attempts = 0
     candidate_positive_bids = 0
+    redeal_count = 0
+    max_redeals_exceeded = False
+    bidding_trace: list[tuple[tuple[str, int], ...]] = []
+    decision_evidence: list[dict[str, Any]] = []
 
     for _attempt in range(scenario.ruleset.max_redeals + 1):
         env.reset()
@@ -272,18 +851,46 @@ def _run_full_game_leg(
             deal_standard_deck(deck), bidding_order=bidding_order
         )
         redeal = False
+        attempt_trace: list[tuple[str, int]] = []
         while env.phase == PHASE_BIDDING:
             seat = env.acting_player_position
             label = assignment[int(seat)]
             bundle = scenario.candidate if label == "candidate" else scenario.baseline
-            bid = choose_bid(
-                bundle, env.get_bidding_obs(), env.get_legal_bids(), bid_rng
+            bid_started = time.perf_counter_ns()
+            bid = factory.choose_bid(
+                bundle,
+                env.get_bidding_obs(),
+                env.get_legal_bids(),
+                bid_rng,
+                redeal_count=redeal_count,
             )
+            elapsed_ns = max(0, time.perf_counter_ns() - bid_started)
             if label == "candidate":
+                decision_evidence.append(_candidate_decision_evidence(
+                    decision_id=_candidate_decision_id(
+                        scenario.mode,
+                        deal_id,
+                        assignment,
+                        "bidding",
+                        _attempt,
+                        len(attempt_trace),
+                    ),
+                    phase="bidding",
+                    actor_role=None,
+                    actor_seat=str(seat),
+                    latency_ns=elapsed_ns,
+                    prediction=None,
+                    forced_action=False,
+                    search_called=False,
+                    search_timed_out=False,
+                    search_fallback=False,
+                ))
                 candidate_bid_attempts += 1
                 candidate_positive_bids += int(bid > 0)
+            attempt_trace.append((str(seat), int(bid)))
             redeal = env.step_bidding(bid)
             if redeal:
+                redeal_count += 1
                 # Redeal decks depend only on the paired deal and retry index,
                 # not on seat permutation or how many random bids were drawn.
                 deck = list(deal["deck"])
@@ -296,6 +903,7 @@ def _run_full_game_leg(
                     )
                 ).shuffle(deck)
                 break
+        bidding_trace.append(tuple(attempt_trace))
         if not redeal:
             break
     else:
@@ -309,6 +917,7 @@ def _run_full_game_leg(
         env.bid_value = 1
         env.bidding_history = [(bidding_order[0], 1)]
         env._reveal_bottom_cards()
+        max_redeals_exceeded = True
 
     role_to_seat = {role: seat for seat, role in env._seat_to_role.items()}
     agents: dict[str, TimedAgent] = {}
@@ -323,8 +932,37 @@ def _run_full_game_leg(
             bundle_label=label,
         )
     env.players = agents
+    cardplay_trace: list[tuple[str, tuple[int, ...]]] = []
     while not env.game_over:
+        position = str(env.acting_player_position)
+        agent = agents[position]
+        sample_count = len(agent.decision_samples)
+        trace_index = len(cardplay_trace)
+        forced_action = len(env.game_infoset.legal_actions) == 1
         env.step()
+        if len(agent.decision_samples) != sample_count + 1:
+            raise RuntimeError("card-play agent did not emit one timing sample")
+        if agent.bundle_label == "candidate":
+            sample = agent.decision_samples[-1]
+            decision_evidence.append(_candidate_decision_evidence(
+                decision_id=_candidate_decision_id(
+                    scenario.mode,
+                    deal_id,
+                    assignment,
+                    "cardplay",
+                    trace_index,
+                ),
+                phase="cardplay",
+                actor_role=position,
+                actor_seat=str(role_to_seat[position]),
+                latency_ns=sample.latency_ns,
+                prediction=sample.prediction,
+                forced_action=forced_action,
+                search_called=sample.search_called,
+                search_timed_out=sample.search_timed_out,
+                search_fallback=sample.search_fallback,
+            ))
+        cardplay_trace.append((position, tuple(env.card_play_action_seq[-1])))
 
     result = env.game_result
     assert result is not None
@@ -339,8 +977,11 @@ def _run_full_game_leg(
     candidate_score = float(
         result.landlord_score if candidate_team == "landlord" else result.farmer_score
     )
-    latencies, calibration = _candidate_samples(
-        agents, candidate_roles, result.winner_team
+    latencies, latencies_ns, calibration = _decision_compatibility_fields(
+        decision_evidence
+    )
+    search_calls, search_timeouts, search_fallbacks = _decision_search_counts(
+        decision_evidence
     )
     return GameRecord(
         deal_id=deal_id,
@@ -363,8 +1004,37 @@ def _run_full_game_leg(
         spring=result.spring,
         anti_spring=result.anti_spring,
         game_length=len(env.card_play_action_seq),
+        redeal_count=redeal_count,
+        max_redeals_exceeded=max_redeals_exceeded,
         candidate_latencies_ms=latencies,
+        candidate_latencies_ns=latencies_ns,
         calibration=calibration,
+        search_calls=search_calls,
+        search_timeouts=search_timeouts,
+        search_fallbacks=search_fallbacks,
+        bidding_inference_calls=sum(
+            item["phase"] == "bidding" for item in decision_evidence
+        ),
+        formal_evaluation_eligible=not max_redeals_exceeded,
+        exclusion_reason=(
+            "redeal_cap_exhausted_forced_smoke_fallback"
+            if max_redeals_exceeded else ""
+        ),
+        deal_hash=deal_hash,
+        seat_to_role=dict(env._seat_to_role),
+        bidding_order=tuple(env.bidding_order),
+        bidding_history=tuple(
+            (str(seat), int(bid)) for seat, bid in env.bidding_history
+        ),
+        bidding_trace=tuple(bidding_trace),
+        cardplay_trace=tuple(cardplay_trace),
+        trace_digest=evaluation_trace_digest(
+            mode=scenario.mode,
+            deal_hash=deal_hash,
+            bidding_trace=bidding_trace,
+            cardplay_trace=cardplay_trace,
+        ),
+        candidate_decisions=tuple(decision_evidence),
     )
 
 
@@ -402,24 +1072,46 @@ def _calibration_metrics(samples: list[tuple[str, float, float]]) -> dict[str, A
 
 
 def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[str, Any]:
+    audit_games = tuple(games)
+    games_by_deal: dict[str, list[GameRecord]] = {}
+    for game in audit_games:
+        games_by_deal.setdefault(game.deal_id, []).append(game)
+    excluded_deal_ids = {
+        deal_id
+        for deal_id, rows in games_by_deal.items()
+        if any(not row.formal_evaluation_eligible for row in rows)
+    }
+    # A deal is the statistical unit. If any seat rotation used a forced smoke
+    # fallback, exclude every rotation of that deal from formal metrics.
+    games = [
+        game for game in audit_games if game.deal_id not in excluded_deal_ids
+    ]
+
     win_by_deal = deal_cluster_means(
         (game.deal_id, game.candidate_win - 0.5) for game in games
     )
     score_by_deal = deal_cluster_means(
         (game.deal_id, game.candidate_score) for game in games
     )
-    win_ci = paired_bootstrap_ci(
-        win_by_deal,
-        confidence_level=scenario.confidence_level,
-        samples=scenario.bootstrap_samples,
-        seed=scenario.deterministic_seed,
-    )
-    score_ci = paired_bootstrap_ci(
-        score_by_deal,
-        confidence_level=scenario.confidence_level,
-        samples=scenario.bootstrap_samples,
-        seed=scenario.deterministic_seed + 1,
-    )
+    def confidence_interval(values: dict[str, float], seed: int) -> ConfidenceInterval:
+        if values:
+            return paired_bootstrap_ci(
+                values,
+                confidence_level=scenario.confidence_level,
+                samples=scenario.bootstrap_samples,
+                seed=seed,
+            )
+        return ConfidenceInterval(
+            estimate=float("nan"),
+            low=float("nan"),
+            high=float("nan"),
+            confidence_level=scenario.confidence_level,
+            paired_deals=0,
+            bootstrap_samples=scenario.bootstrap_samples,
+        )
+
+    win_ci = confidence_interval(win_by_deal, scenario.deterministic_seed)
+    score_ci = confidence_interval(score_by_deal, scenario.deterministic_seed + 1)
     paired_estimator = (
         PROMOTION_ESTIMATOR
         if scenario.mode == PROMOTION_MODE
@@ -447,20 +1139,101 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
             "win_rate_delta_ci": role_ci.to_dict(),
         }
 
-    latencies = [latency for game in games for latency in game.candidate_latencies_ms]
-    inference_seconds = sum(latencies) / 1000.0
-    calibration = [sample for game in games for sample in game.calibration]
+    latencies_ns = [
+        latency for game in games for latency in game.candidate_latencies_ns
+    ]
+    latencies = [latency / 1_000_000.0 for latency in latencies_ns]
+    inference_seconds = sum(latencies_ns) / 1_000_000_000.0
+    calibration = [
+        (
+            role,
+            prediction,
+            float(
+                game.winner_team
+                == ("landlord" if role == "landlord" else "farmer")
+            ),
+        )
+        for game in games
+        for role, prediction in game.calibration
+    ]
     total_bids = sum(game.candidate_bid_attempts for game in games)
+    total_searches = sum(game.search_calls for game in games)
     denominator = len(games)
+
+    def mean(values) -> float:
+        rows = list(values)
+        return sum(rows) / len(rows) if rows else float("nan")
+
+    inference_calls_per_second = (
+        len(latencies) / inference_seconds
+        if inference_seconds > 0 else float("nan")
+    )
+    by_bid_value = {}
+    if scenario.mode == "full_game":
+        for bid_value in (1, 2, 3):
+            bid_games = [game for game in games if game.bid_value == bid_value]
+            by_bid_value[str(bid_value)] = {
+                "games": len(bid_games),
+                "win_percentage": (
+                    sum(game.candidate_win for game in bid_games) / len(bid_games)
+                    if bid_games else float("nan")
+                ),
+                "mean_score": (
+                    sum(game.candidate_score for game in bid_games) / len(bid_games)
+                    if bid_games else float("nan")
+                ),
+            }
+    excluded_games = [
+        game for game in audit_games if game.deal_id in excluded_deal_ids
+    ]
+    exclusion_reasons: dict[str, int] = {}
+    for game in excluded_games:
+        reason = game.exclusion_reason or "formal_evaluation_ineligible"
+        exclusion_reasons[reason] = exclusion_reasons.get(reason, 0) + 1
+    excluded_bid_attempts = sum(
+        game.candidate_bid_attempts for game in excluded_games
+    )
+    smoke_descriptive = {
+        "status": "present" if excluded_games else "not_present",
+        "games": len(excluded_games),
+        "bid_rate": (
+            sum(game.candidate_positive_bids for game in excluded_games)
+            / excluded_bid_attempts
+            if excluded_bid_attempts else float("nan")
+        ),
+        "mean_score": mean(game.candidate_score for game in excluded_games),
+        "winner_team_counts": {
+            team: sum(game.winner_team == team for game in excluded_games)
+            for team in ("landlord", "farmer")
+        },
+    }
     return {
         "sample_counts": {
-            "deals": len(scenario.deals),
+            "deals": len(win_by_deal),
+            "requested_deals": len(scenario.deals),
             "games": len(games),
+            "games_total": len(audit_games),
+            "excluded_games": len(excluded_games),
             "seat_permutations": len(scenario.seat_permutations),
             "calibration_decisions": len(calibration),
             "inference_calls": len(latencies),
+            "bidding_inference_calls": sum(
+                game.bidding_inference_calls for game in games
+            ),
         },
-        "overall_win_percentage": sum(game.candidate_win for game in games) / denominator,
+        "formal_evaluation": {
+            "status": (
+                "contains_excluded_smoke_fallbacks"
+                if excluded_games else "eligible_input"
+            ),
+            "eligible_deals": len(win_by_deal),
+            "eligible_games": len(games),
+            "excluded_deals": len(excluded_deal_ids),
+            "excluded_games": len(excluded_games),
+            "exclusion_reasons": exclusion_reasons,
+        },
+        "smoke_descriptive": smoke_descriptive,
+        "overall_win_percentage": mean(game.candidate_win for game in games),
         "team_win_percentage": {
             team: (
                 sum(game.candidate_win for game in team_games) / len(team_games)
@@ -477,8 +1250,12 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
             win_ci.to_dict() if scenario.mode == PROMOTION_MODE else None
         ),
         "descriptive_win_rate_delta_ci": win_ci.to_dict(),
-        "mean_score": sum(game.candidate_score for game in games) / denominator,
-        "mean_log_score": sum(game.candidate_log_score for game in games) / denominator,
+        "mean_score": mean(game.candidate_score for game in games),
+        "mean_raw_score": mean(game.candidate_score for game in games),
+        "mean_log_score": mean(game.candidate_log_score for game in games),
+        "zero_sum_seat_score": (
+            score_ci.estimate if scenario.mode == "full_game" else float("nan")
+        ),
         "paired_mean_score_ci": score_ci.to_dict(),
         "by_role": by_role,
         "bid_rate": (
@@ -487,13 +1264,20 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
         ),
         "landlord_acquisition_rate": (
             sum(game.candidate_landlord for game in games) / denominator
-            if scenario.mode == "full_game" else float("nan")
+            if scenario.mode == "full_game" and denominator else float("nan")
         ),
-        "bomb_rate": sum(game.bomb_count > 0 for game in games) / denominator,
-        "rocket_rate": sum(game.rocket_count > 0 for game in games) / denominator,
-        "spring_rate": sum(game.spring for game in games) / denominator,
-        "anti_spring_rate": sum(game.anti_spring for game in games) / denominator,
-        "mean_game_length": sum(game.game_length for game in games) / denominator,
+        "by_bid_value": by_bid_value,
+        "redeals": {
+            "total": sum(game.redeal_count for game in audit_games),
+            "max_redeals_exceeded_games": sum(
+                game.max_redeals_exceeded for game in audit_games
+            ),
+        },
+        "bomb_rate": mean(game.bomb_count > 0 for game in games),
+        "rocket_rate": mean(game.rocket_count > 0 for game in games),
+        "spring_rate": mean(game.spring for game in games),
+        "anti_spring_rate": mean(game.anti_spring for game in games),
+        "mean_game_length": mean(game.game_length for game in games),
         "calibration": _calibration_metrics(calibration),
         "inference_latency_ms": {
             "count": len(latencies),
@@ -501,7 +1285,40 @@ def _aggregate(scenario: EvaluationScenario, games: list[GameRecord]) -> dict[st
             "p95": percentile(latencies, 0.95),
             "p99": percentile(latencies, 0.99),
         },
-        "actor_fps": len(latencies) / inference_seconds if inference_seconds > 0 else float("nan"),
+        "inference_calls_per_second": inference_calls_per_second,
+        "evaluation_wall_calls_per_second": None,
+        # P15 exposed this key even though it counts instrumented inference
+        # calls rather than actor-loop frames. Keep it as a deprecated schema
+        # alias so existing result consumers do not break.
+        "actor_fps": inference_calls_per_second,
+        "search": {
+            "calls": total_searches,
+            "timeouts": sum(game.search_timeouts for game in games),
+            "fallbacks": sum(game.search_fallbacks for game in games),
+            "timeout_rate": (
+                sum(game.search_timeouts for game in games) / total_searches
+                if total_searches else float("nan")
+            ),
+            "fallback_rate": (
+                sum(game.search_fallbacks for game in games) / total_searches
+                if total_searches else float("nan")
+            ),
+        },
+        "timing_evidence": {
+            "clock": "time.perf_counter_ns",
+            "scope": "candidate_bidding_and_cardplay_inference_calls_only",
+            "inference_calls": len(latencies_ns),
+            "inference_elapsed_ns": sum(latencies_ns),
+            "evaluation_wall_elapsed_ns": None,
+        },
+        "belief": {
+            "status": "not_instrumented" if any(
+                bundle.belief_checkpoint
+                for bundle in (scenario.candidate, scenario.baseline)
+            ) else "not_enabled",
+            "exact_decode_rate": float("nan"),
+            "conservation_violation_rate": float("nan"),
+        },
     }
 
 
@@ -509,23 +1326,63 @@ def evaluate_scenario(
     scenario: EvaluationScenario, *, ablation: str = "base"
 ) -> PairedEvaluationResult:
     """Run every deal/permutation sequentially with deterministic local RNGs."""
+    evaluation_started_ns = time.perf_counter_ns()
+    try:
+        source_identity_start = inspect_git_checkout(require_clean=False)
+    except ProvenanceError:
+        source_identity_start = None
     factory = BundleFactory(scenario.ruleset)
     games: list[GameRecord] = []
     for deal_index, deal in enumerate(scenario.deals):
+        deal_hash = canonical_deal_hash(deal)
         deal_id = _deal_id(deal_index, deal)
         for leg_index, assignment in enumerate(scenario.seat_permutations):
             if scenario.mode == "cardplay_only":
                 game = _run_cardplay_leg(
-                    scenario, factory, deal, deal_id, assignment, leg_index
+                    scenario,
+                    factory,
+                    deal,
+                    deal_id,
+                    deal_hash,
+                    assignment,
+                    leg_index,
                 )
             else:
                 game = _run_full_game_leg(
-                    scenario, factory, deal, deal_id, assignment, leg_index
+                    scenario,
+                    factory,
+                    deal,
+                    deal_id,
+                    deal_hash,
+                    assignment,
+                    leg_index,
                 )
             games.append(game)
+    metrics = _aggregate(scenario, games)
+    evaluation_wall_elapsed_ns = max(
+        0, time.perf_counter_ns() - evaluation_started_ns
+    )
+    metrics["timing_evidence"][
+        "evaluation_wall_elapsed_ns"
+    ] = evaluation_wall_elapsed_ns
+    metrics["evaluation_wall_calls_per_second"] = (
+        metrics["timing_evidence"]["inference_calls"]
+        / (evaluation_wall_elapsed_ns / 1_000_000_000.0)
+        if evaluation_wall_elapsed_ns > 0 else float("nan")
+    )
+    try:
+        source_identity_end = inspect_git_checkout(require_clean=False)
+    except ProvenanceError:
+        source_identity_end = None
     return PairedEvaluationResult(
         scenario=scenario.to_dict(),
-        metrics=_aggregate(scenario, games),
+        metrics=metrics,
         games=tuple(games),
         ablation=ablation,
+        source_identity=source_identity_start,
+        source_identity_stable=(
+            source_identity_start is not None
+            and source_identity_start == source_identity_end
+        ),
+        source_identity_samples=2,
     )

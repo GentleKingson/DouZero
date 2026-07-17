@@ -14,15 +14,40 @@ Example::
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import sys
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import torch
 
+from douzero._version import git_sha
 from douzero.belief.checkpoint import load_belief_checkpoint
 from douzero.belief.data import collect_random_dataset
 from douzero.env.rules import RuleSet
+
+
+BELIEF_EVALUATION_SCHEMA_VERSION = "belief-evaluation-result-v1"
+
+
+def _canonical_hash(value: dict) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _full_git_sha() -> str:
+    value = git_sha()
+    if (
+        len(value) not in (40, 64)
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise RuntimeError(
+            "belief evaluation requires a full source Git SHA; set "
+            "DOUZERO_GIT_SHA in source-less runtimes"
+        )
+    return value
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -36,6 +61,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--num_episodes", type=int, default=20,
                    help="number of random self-play games for evaluation data")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--ruleset",
+        choices=("legacy", "standard"),
+        default="legacy",
+        help="checkpoint ruleset identity and evaluation collection state machine",
+    )
     return p.parse_args(argv)
 
 
@@ -44,18 +75,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # The belief collector only produces legacy-ruleset data in P07 (Blocker
-    # #2); the checkpoint is stamped legacy, so we validate against legacy.
-    ruleset = RuleSet.legacy()
+    ruleset = (
+        RuleSet.standard() if args.ruleset == "standard" else RuleSet.legacy()
+    )
+    source_sha = _full_git_sha()
     model = load_belief_checkpoint(
-        args.checkpoint, expected_ruleset=ruleset, map_location="cpu"
+        args.checkpoint,
+        expected_ruleset=ruleset,
+        map_location="cpu",
+        require_full_git_sha=True,
     )
     config = model.config
-    print(f"[evaluate_belief] loaded {args.checkpoint}", file=sys.stderr)
+    checkpoint_sha256 = hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest()
+    print(
+        f"[evaluate_belief] loaded checkpoint sha256={checkpoint_sha256[:12]}",
+        file=sys.stderr,
+    )
     print(f"[evaluate_belief] belief_config_hash={config.stable_hash()}",
           file=sys.stderr)
 
-    dataset = collect_random_dataset(args.num_episodes, seed=args.seed)
+    dataset = collect_random_dataset(
+        args.num_episodes,
+        seed=args.seed,
+        ruleset=ruleset if args.ruleset == "standard" else None,
+    )
     n = len(dataset)
     print(f"[evaluate_belief] {n} evaluation samples", file=sys.stderr)
     if n == 0:
@@ -123,13 +166,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         file=sys.stderr,
     )
 
-    # Machine-readable JSON to stdout for logging.
-    import json
-
-    out = {
-        "checkpoint": args.checkpoint,
-        "num_samples": n,
+    ruleset_identity = ruleset.identity()
+    evaluation_config = {
+        "num_episodes": args.num_episodes,
+        "seed": args.seed,
+        "ruleset": ruleset_identity,
+        "feature_version": "v2",
+        "belief_input_schema": "belief_input_public_v1",
         "belief_config_hash": config.stable_hash(),
+        "checkpoint_sha256": checkpoint_sha256,
+    }
+    out = {
+        "schema_version": BELIEF_EVALUATION_SCHEMA_VERSION,
+        "runtime_identity": {
+            "source_git_sha": source_sha,
+            "evaluation_config_hash": _canonical_hash(evaluation_config),
+            "ruleset": ruleset_identity,
+            "feature_version": "v2",
+            "belief_input_schema": "belief_input_public_v1",
+            "belief_config_hash": config.stable_hash(),
+            "checkpoint_sha256": checkpoint_sha256,
+        },
+        "num_samples": n,
         "factor_argmax": factor_metrics,
         "constrained_map": map_metrics,
         "constrained_map_conservation": map_conservation,

@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import sys
+from dataclasses import asdict
 from dataclasses import replace
 from importlib import metadata
 from pathlib import Path
@@ -20,23 +21,53 @@ from douzero.deployment.manifest import (
     ModelManifest,
     ModelManifestError,
     build_model_manifest,
+    canonical_hash,
 )
 
 if TYPE_CHECKING:
+    from douzero.belief.model import BeliefConfig, BeliefModel
     from douzero.env.rules import RuleSet
     from douzero.models_v2.config import ModelV2Config
     from douzero.models_v2.model import ModelV2
     from douzero.observation.schema import FeatureSchemaManifest
 
-_REQUIRED_FILES = frozenset({
+_CORE_REQUIRED_FILES = frozenset({
     "weights.pt",
     "manifest.json",
     "ruleset.json",
     "feature_schema.json",
+    "model_config.json",
+    "training_config.json",
     "README.md",
+    "model_card.md",
+    "evaluation_summary.md",
+    "gpu_validation_summary.md",
+    "rollback.md",
     "THIRD_PARTY_NOTICES",
     "SHA256SUMS",
 })
+
+_TRAINING_SUPPORT = {
+    "base_v2_cardplay_ddp": True,
+    "standard_learned_bidding_ddp": False,
+    "joint_belief_ddp": False,
+    "alternating_belief_ddp": False,
+    "single_process_trainer_resume": True,
+    "distributed_trainer_resume": False,
+}
+
+
+def _required_files(
+    *, belief_enabled: bool, bidding_enabled: bool
+) -> frozenset[str]:
+    extra = (
+        {"belief_config.json", "belief_weights.pt"}
+        if belief_enabled
+        else set()
+    )
+    if bidding_enabled:
+        extra.add("bidding_schema.json")
+    return frozenset(set(_CORE_REQUIRED_FILES) | extra)
 
 
 class ModelPackageError(RuntimeError):
@@ -59,7 +90,12 @@ def _write_json(path: Path, value: Any) -> None:
 
 
 def _default_model_card(manifest: ModelManifest) -> str:
-    return f"""# DouZero Model Card
+    return f"""# DouZero Unreleased Model Card
+
+## Release Status
+
+- Release candidate: **NONE**
+- Release status: **NOT READY**
 
 ## Model Details
 
@@ -71,34 +107,157 @@ def _default_model_card(manifest: ModelManifest) -> str:
 - Ruleset: `{manifest.ruleset_id}`
 - Roles: `{', '.join(manifest.role_support)}`
 - Belief model enabled: `{str(manifest.belief_enabled).lower()}`
+- Learned bidding enabled: `{str(manifest.bidding_enabled).lower()}`
 - Search compatible: `{str(manifest.search_compatible).lower()}`
 - Numeric dtype: `{manifest.dtype}`
+- Training configuration hash: `{manifest.training_config_hash}`
+- Belief configuration hash: `{manifest.belief_config_hash}`
+- Standard learned-bidding DDP: `NOT SUPPORTED`
+- Joint/alternating belief DDP: `NOT SUPPORTED`
+- Distributed trainer resume: `NOT SUPPORTED`
 
 ## Training Data
 
-Record the authorized training data categories and provenance before release.
-Raw personal identifiers must not be included in this package.
+- Data categories: `NOT AVAILABLE`
+- Authorization and provenance: `NOT AVAILABLE`
+- Authorized human-data status: `NOT AVAILABLE`
+- Training hardware: `NOT MEASURED`
+
+Raw personal identifiers and canonical or raw game records are not included in
+this package.
 
 ## Evaluation
 
-Record paired, seat-rotated metrics and confidence intervals for every
-supported role and opponent. Metrics are **not measured** by the packaging
-command.
+- Paired card-play metrics: `NOT MEASURED`
+- Standard full-game metrics: `NOT MEASURED`
+- Role metrics and confidence intervals: `NOT MEASURED`
+- Calibration and ablations: `NOT MEASURED`
 
 ## Latency
 
-Not measured. Benchmark the packaged model on the target hardware before deployment.
+- Target hardware p50/p95/p99: `NOT MEASURED`
+- Peak memory and throughput: `NOT MEASURED`
+- AMP and NCCL DDP: `NOT MEASURED`
 
 ## Known Limitations
 
-This research model may fail outside the declared ruleset and feature schema.
-It is not suitable for platform automation, account operation, scraping,
-anti-detection, or decisions involving undisclosed hidden information.
+This package was created without reviewed empirical summaries and is not a
+release candidate. It may fail outside the declared ruleset and feature
+schema. Standard learned-bidding and joint/alternating belief training are
+single-process-only, and trainer resume is not implemented for DDP. Roll back
+for checksum/identity failure, non-finite inference, illegal actions,
+privileged-information leakage, or an unexplained paired regression.
+
+## Intended And Prohibited Uses
+
+Offline research and explicitly authorized evaluation only. Prohibited uses
+include platform automation, account operation, scraping, anti-detection,
+service-control bypass, or decisions involving undisclosed hidden information.
 
 ## License
 
 Apache-2.0. See `THIRD_PARTY_NOTICES` for dependency and reference-source attribution.
 """
+
+
+_DEFAULT_EVALUATION_SUMMARY = """# Evaluation Summary
+
+Status: **NOT MEASURED**
+
+No paired card-play, standard full-game, calibration, latency, or ablation
+result was supplied to the packaging command. This package must not be treated
+as a release candidate until the declared evaluation gates are completed.
+"""
+
+
+_DEFAULT_GPU_VALIDATION_SUMMARY = """# GPU Validation Summary
+
+Status: **NOT MEASURED**
+
+No target-hardware FP32, AMP, NCCL DDP, checkpoint-resume, memory, or throughput
+report was supplied to the packaging command.
+
+Standard learned-bidding DDP and joint/alternating belief DDP are not
+implemented. Distributed trainer resume is not implemented, and neither
+capability can be marked validated by this summary.
+"""
+
+
+_DEFAULT_ROLLBACK = """# Rollback Instructions
+
+1. Stop routing new games to this model package.
+2. Restore the previously approved, checksummed package without modifying it.
+3. Verify that package with the runtime-owned ruleset, feature schema, and
+   model configuration identities before serving traffic.
+4. Preserve this package and its evaluation logs for incident analysis.
+
+Rollback is required for checksum or identity failures, non-finite inference,
+illegal-action output, material release-gate regression, or undeclared use of
+privileged information.
+"""
+
+
+def _validated_markdown(value: str | None, default: str, label: str) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str) or not value.strip():
+        raise ModelPackageError(f"{label} must be non-empty Markdown")
+    return value if value.endswith("\n") else value + "\n"
+
+
+def _belief_config_payload(config: "BeliefConfig") -> dict[str, Any]:
+    """Serialize only a real BeliefConfig and its compatibility identity."""
+
+    from douzero.belief.model import BeliefConfig
+
+    if not isinstance(config, BeliefConfig):
+        raise TypeError(
+            f"belief config must be BeliefConfig, got {type(config).__name__}"
+        )
+    return {
+        "schema_version": 2,
+        "belief_config_hash": config.stable_hash(),
+        "config": asdict(config),
+        "compatibility": config.compatibility_dict(),
+    }
+
+
+def _parse_belief_config_payload(value: Any) -> "BeliefConfig":
+    """Reconstruct and identity-check a packaged BeliefConfig payload."""
+
+    from dataclasses import fields
+
+    from douzero.belief.model import BeliefConfig
+
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "belief_config_hash",
+        "config",
+        "compatibility",
+    }:
+        raise ModelPackageError("belief_config.json has an invalid schema")
+    if value["schema_version"] != 2:
+        raise ModelPackageError(
+            "belief_config.json has an unsupported schema_version"
+        )
+    config_payload = value["config"]
+    expected_fields = {field.name for field in fields(BeliefConfig)}
+    if not isinstance(config_payload, dict) or set(config_payload) != expected_fields:
+        raise ModelPackageError(
+            "belief_config.json must contain the exact BeliefConfig fields"
+        )
+    try:
+        config = BeliefConfig(**config_payload)
+    except (TypeError, ValueError) as exc:
+        raise ModelPackageError(f"invalid BeliefConfig in belief_config.json: {exc}") from exc
+    if (
+        value["compatibility"] != config.compatibility_dict()
+        or value["belief_config_hash"] != config.stable_hash()
+    ):
+        raise ModelPackageError(
+            "belief_config.json identity does not match the runtime BeliefConfig"
+        )
+    return config
 
 
 def create_model_package(
@@ -109,6 +268,11 @@ def create_model_package(
     training_config: Mapping[str, Any] | None = None,
     search_compatible: bool = False,
     model_card: str | None = None,
+    evaluation_summary: str | None = None,
+    gpu_validation_summary: str | None = None,
+    rollback_instructions: str | None = None,
+    belief_checkpoint: str | Path | None = None,
+    source_checkpoint: str | Path | None = None,
 ) -> ModelManifest:
     """Write a checksummed public Model V2 package.
 
@@ -121,25 +285,186 @@ def create_model_package(
     root = Path(output_dir)
     if root.exists() and any(root.iterdir()):
         raise ModelPackageError(f"output directory is not empty: {root}")
+    belief_enabled = bool(model.config.belief_enabled)
+    belief_model: "BeliefModel | None" = None
+    belief_source: Path | None = None
+    if belief_enabled:
+        if belief_checkpoint is None:
+            raise ModelPackageError(
+                "belief-enabled packages require a manifest-bearing "
+                "belief_checkpoint"
+            )
+        belief_source = Path(belief_checkpoint)
+        if not belief_source.is_file():
+            raise ModelPackageError(
+                f"belief checkpoint is not a file: {belief_source}"
+            )
+        from douzero.belief.checkpoint import load_belief_checkpoint
+
+        try:
+            belief_model = load_belief_checkpoint(
+                str(belief_source),
+                expected_ruleset=ruleset,
+                expected_feature_version=model.schema.feature_version,
+                map_location="cpu",
+                require_full_git_sha=True,
+            )
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise ModelPackageError(
+                f"belief checkpoint identity does not match the package: {exc}"
+            ) from exc
+    elif belief_checkpoint is not None:
+        raise ModelPackageError(
+            "belief_checkpoint was supplied for a belief-disabled model"
+        )
+    source_provenance = None
+    if source_checkpoint is not None:
+        source_path = Path(source_checkpoint)
+        if not source_path.is_file():
+            raise ModelPackageError(f"source checkpoint is not a file: {source_path}")
+        from douzero.checkpoint import load_v2_position_weights
+
+        try:
+            source_state, source_manifest = load_v2_position_weights(
+                str(source_path),
+                expected_schema_hash=model.schema.stable_hash(),
+                expected_model_config_hash=model.config.stable_hash(),
+                expected_ruleset=ruleset,
+                runtime_model_config=model.config,
+                training_device="cpu",
+            )
+            model_state = model.state_dict()
+            if set(source_state) != set(model_state) or any(
+                not torch.equal(source_state[name].cpu(), model_state[name].detach().cpu())
+                for name in model_state
+            ):
+                raise ValueError("source checkpoint weights do not match the supplied model")
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise ModelPackageError(f"invalid source checkpoint provenance: {exc}") from exc
+        source_effective = dict(source_manifest.effective_config)
+        declared_hash = source_effective.get("training_config_hash")
+        if (
+            isinstance(declared_hash, str)
+            and len(declared_hash) == 64
+            and all(char in "0123456789abcdef" for char in declared_hash)
+        ):
+            source_training_hash = declared_hash
+        else:
+            source_training_hash = canonical_hash(source_effective)
+        if training_config is not None and canonical_hash(training_config) != source_training_hash:
+            raise ModelPackageError(
+                "training_config does not match the source checkpoint manifest"
+            )
+        source_manifest_payload = source_manifest.to_dict()
+        source_provenance = {
+            "source_checkpoint_sha256": _sha256(source_path),
+            "source_checkpoint_manifest_sha256": canonical_hash(source_manifest_payload),
+            "source_git_sha": source_manifest.git_sha,
+            "source_training_config_hash": source_training_hash,
+            "source_ruleset_hash": source_manifest.ruleset_hash,
+            "source_feature_schema_hash": model.schema.stable_hash(),
+            "source_model_config_hash": model.config.stable_hash(),
+            "source_checkpoint_kind": source_manifest.checkpoint_kind,
+            "release_eligible": True,
+        }
     root.mkdir(parents=True, exist_ok=True)
 
     manifest = build_model_manifest(
         model,
         ruleset,
         training_config=training_config,
+        belief_config=belief_model.config if belief_model is not None else None,
         search_compatible=search_compatible,
         public_or_privileged=PUBLIC_MODEL,
+        source_provenance=source_provenance,
     )
     weights_path = root / "weights.pt"
     save_v2_position_weights(
-        str(weights_path), model, ruleset=ruleset, flags=training_config or {}
+        str(weights_path),
+        model,
+        ruleset=ruleset,
+        flags={
+            "training_config_hash": manifest.training_config_hash,
+            "training_config_payload_policy": "hash_only",
+            "source_checkpoint_sha256": manifest.source_checkpoint_sha256,
+            "source_checkpoint_manifest_sha256": manifest.source_checkpoint_manifest_sha256,
+            "source_git_sha": manifest.source_git_sha,
+            "source_ruleset_hash": manifest.source_ruleset_hash,
+            "source_feature_schema_hash": manifest.source_feature_schema_hash,
+            "source_model_config_hash": manifest.source_model_config_hash,
+            "source_checkpoint_kind": manifest.source_checkpoint_kind,
+            "release_eligible": manifest.release_eligible,
+        },
     )
     manifest = replace(manifest, weights_sha256=_sha256(weights_path))
+    if belief_source is not None:
+        shutil.copyfile(belief_source, root / "belief_weights.pt")
     _write_json(root / "manifest.json", manifest.to_dict())
     _write_json(root / "ruleset.json", ruleset.to_dict())
     _write_json(root / "feature_schema.json", model.schema.to_dict())
+    _write_json(root / "model_config.json", {
+        "schema_version": 1,
+        "model_config_hash": manifest.model_config_hash,
+        "config": asdict(model.config),
+    })
+    # Training configs commonly contain private paths.  A public package keeps
+    # their canonical identity but never copies the raw payload by default.
+    _write_json(root / "training_config.json", {
+        "schema_version": 2,
+        "training_config_hash": manifest.training_config_hash,
+        "payload_policy": "hash_only",
+        "payload_included": False,
+        "runtime_training_support": dict(_TRAINING_SUPPORT),
+    })
+    if manifest.belief_enabled:
+        assert belief_model is not None
+        belief_payload = _belief_config_payload(belief_model.config)
+        if belief_payload["belief_config_hash"] != manifest.belief_config_hash:
+            raise ModelPackageError(
+                "belief checkpoint config identity does not match manifest.json"
+            )
+        _write_json(root / "belief_config.json", belief_payload)
+    if manifest.bidding_enabled:
+        from douzero.observation.bidding import BIDDING_ACTIONS
+
+        _write_json(root / "bidding_schema.json", {
+            "schema_version": 1,
+            "bidding_head_version": manifest.bidding_head_version,
+            "bidding_action_schema": manifest.bidding_action_schema,
+            "bidding_actions": list(BIDDING_ACTIONS),
+            "bidding_feature_schema_hash": manifest.bidding_feature_schema_hash,
+            "feature_schema": model.bidding_schema.compatibility_dict(),
+        })
+    card = _validated_markdown(
+        model_card, _default_model_card(manifest), "model_card"
+    )
+    (root / "model_card.md").write_text(card, encoding="utf-8")
     (root / "README.md").write_text(
-        model_card or _default_model_card(manifest), encoding="utf-8"
+        "# DouZero Model Package\n\n"
+        "Verify this directory with `verify_model_package` before loading it. "
+        "See `model_card.md`, `evaluation_summary.md`, "
+        "`gpu_validation_summary.md`, and `rollback.md`.\n",
+        encoding="utf-8",
+    )
+    (root / "evaluation_summary.md").write_text(
+        _validated_markdown(
+            evaluation_summary, _DEFAULT_EVALUATION_SUMMARY, "evaluation_summary"
+        ),
+        encoding="utf-8",
+    )
+    (root / "gpu_validation_summary.md").write_text(
+        _validated_markdown(
+            gpu_validation_summary,
+            _DEFAULT_GPU_VALIDATION_SUMMARY,
+            "gpu_validation_summary",
+        ),
+        encoding="utf-8",
+    )
+    (root / "rollback.md").write_text(
+        _validated_markdown(
+            rollback_instructions, _DEFAULT_ROLLBACK, "rollback_instructions"
+        ),
+        encoding="utf-8",
     )
 
     notices = Path(__file__).with_name("THIRD_PARTY_NOTICES")
@@ -147,7 +472,11 @@ def create_model_package(
         raise ModelPackageError(f"release audit file is missing: {notices}")
     shutil.copyfile(notices, root / "THIRD_PARTY_NOTICES")
 
-    checksummed = sorted(_REQUIRED_FILES - {"SHA256SUMS"})
+    required_files = _required_files(
+        belief_enabled=manifest.belief_enabled,
+        bidding_enabled=manifest.bidding_enabled,
+    )
+    checksummed = sorted(required_files - {"SHA256SUMS"})
     sums = "".join(f"{_sha256(root / name)}  {name}\n" for name in checksummed)
     (root / "SHA256SUMS").write_text(sums, encoding="ascii")
     return manifest
@@ -190,6 +519,7 @@ def verify_model_package(
     expected_feature_version: str | None = None,
     expected_model_config_hash: str | None = None,
     expected_belief_enabled: bool | None = None,
+    expected_bidding_enabled: bool | None = None,
     allow_privileged: bool = False,
     check_package_versions: bool = True,
 ) -> ModelManifest:
@@ -198,18 +528,62 @@ def verify_model_package(
     root = Path(package_dir)
     if not root.is_dir():
         raise ModelPackageError(f"model package is not a directory: {root}")
-    missing = sorted(name for name in _REQUIRED_FILES if not (root / name).is_file())
+    # Read the manifest before applying the format-2 file allowlist. A valid
+    # P16 directory otherwise looks merely "incomplete" because it predates
+    # the P17 documents. It still must fail closed, but with actionable
+    # compatibility guidance rather than an invitation to add files by hand.
+    manifest_path = root / "manifest.json"
+    if manifest_path.is_symlink():
+        raise ModelPackageError("model package manifest.json must not be a symlink")
+    if not manifest_path.is_file():
+        raise ModelPackageError("model package is missing files: ['manifest.json']")
+    try:
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ModelPackageError(f"invalid manifest.json: {exc}") from exc
+    manifest_format = (
+        manifest_payload.get("format_version")
+        if isinstance(manifest_payload, Mapping)
+        else None
+    )
+    if (
+        isinstance(manifest_format, int)
+        and not isinstance(manifest_format, bool)
+        and manifest_format == 1
+    ):
+        raise ModelPackageError(
+            "format-1 P16 package requires its matching P16 runtime and cannot "
+            "be loaded by the format-2 P17 verifier; rebuild a new package "
+            "from the original manifest-bearing public checkpoint and reviewed "
+            "metadata rather than editing the old directory"
+        )
+    try:
+        manifest = ModelManifest.from_dict(manifest_payload)
+    except ModelManifestError as exc:
+        raise ModelPackageError(f"invalid manifest.json: {exc}") from exc
+
+    # The manifest determines the conditional belief/bidding payload. Check the
+    # complete format-2 set only after its version and capabilities are known.
+    required_files = _required_files(
+        belief_enabled=manifest.belief_enabled,
+        bidding_enabled=manifest.bidding_enabled,
+    )
+    missing = sorted(name for name in required_files if not (root / name).is_file())
     if missing:
         raise ModelPackageError(f"model package is missing files: {missing}")
-    if any((root / name).is_symlink() for name in _REQUIRED_FILES):
-        raise ModelPackageError("model package required files must not be symlinks")
-
-    try:
-        manifest = ModelManifest.from_dict(
-            json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    actual_entries = {path.name for path in root.iterdir()}
+    unexpected = sorted(actual_entries - required_files)
+    if unexpected:
+        raise ModelPackageError(
+            f"model package contains unexpected files: {unexpected}"
         )
-    except (OSError, json.JSONDecodeError, ModelManifestError) as exc:
-        raise ModelPackageError(f"invalid manifest.json: {exc}") from exc
+    if any((root / name).is_symlink() for name in required_files):
+        raise ModelPackageError("model package required files must not be symlinks")
+    for name in (
+        "README.md", "model_card.md", "evaluation_summary.md", "gpu_validation_summary.md", "rollback.md"
+    ):
+        if not (root / name).read_text(encoding="utf-8").strip():
+            raise ModelPackageError(f"model package document is empty: {name}")
     if manifest.public_or_privileged != PUBLIC_MODEL and not allow_privileged:
         raise ModelPackageError(
             "privileged models are training-only and are rejected by the production loader"
@@ -233,10 +607,10 @@ def verify_model_package(
     expected_lines = {}
     for line in (root / "SHA256SUMS").read_text(encoding="ascii").splitlines():
         parts = line.split("  ", 1)
-        if len(parts) != 2 or parts[1] not in _REQUIRED_FILES - {"SHA256SUMS"}:
+        if len(parts) != 2 or parts[1] not in required_files - {"SHA256SUMS"}:
             raise ModelPackageError(f"malformed SHA256SUMS entry: {line!r}")
         expected_lines[parts[1]] = parts[0]
-    expected_names = _REQUIRED_FILES - {"SHA256SUMS"}
+    expected_names = required_files - {"SHA256SUMS"}
     if set(expected_lines) != expected_names:
         raise ModelPackageError("SHA256SUMS does not cover every required payload")
     for name, expected in expected_lines.items():
@@ -248,6 +622,12 @@ def verify_model_package(
     try:
         ruleset_payload = json.loads((root / "ruleset.json").read_text(encoding="utf-8"))
         schema_payload = json.loads((root / "feature_schema.json").read_text(encoding="utf-8"))
+        model_config_payload = json.loads(
+            (root / "model_config.json").read_text(encoding="utf-8")
+        )
+        training_config_payload = json.loads(
+            (root / "training_config.json").read_text(encoding="utf-8")
+        )
     except (OSError, json.JSONDecodeError) as exc:
         raise ModelPackageError(f"invalid package JSON: {exc}") from exc
     from douzero.env.rules import RuleSet
@@ -289,6 +669,118 @@ def verify_model_package(
     if packaged_schema.stable_hash() != manifest.feature_schema_hash:
         raise ModelPackageError("feature_schema.json identity does not match manifest.json")
 
+    if not isinstance(model_config_payload, dict) or set(model_config_payload) != {
+        "schema_version", "model_config_hash", "config"
+    }:
+        raise ModelPackageError("model_config.json has an invalid schema")
+    if model_config_payload["schema_version"] != 1:
+        raise ModelPackageError("model_config.json has an unsupported schema_version")
+    from douzero.models_v2.config import ModelV2Config
+
+    try:
+        packaged_model_config = ModelV2Config(**model_config_payload["config"])
+    except (TypeError, ValueError) as exc:
+        raise ModelPackageError(f"invalid model_config.json: {exc}") from exc
+    if (
+        model_config_payload["model_config_hash"] != manifest.model_config_hash
+        or packaged_model_config.stable_hash() != manifest.model_config_hash
+    ):
+        raise ModelPackageError("model_config.json identity does not match manifest.json")
+
+    legacy_training_payload = {
+        "schema_version": 1,
+        "training_config_hash": manifest.training_config_hash,
+        "payload_policy": "hash_only",
+        "payload_included": False,
+    }
+    expected_training_payload = {
+        "schema_version": 2,
+        "training_config_hash": manifest.training_config_hash,
+        "payload_policy": "hash_only",
+        "payload_included": False,
+        "runtime_training_support": dict(_TRAINING_SUPPORT),
+    }
+    # P17 format-2 packages created before the machine-readable support matrix
+    # used schema 1. Absence means no optional distributed capability was
+    # declared; it never means the unsupported paths are available.
+    if training_config_payload not in (
+        legacy_training_payload,
+        expected_training_payload,
+    ):
+        raise ModelPackageError(
+            "training_config.json identity or hash-only payload policy does not "
+            "match manifest.json"
+        )
+    packaged_belief_config = None
+    if manifest.belief_enabled:
+        try:
+            belief_payload = json.loads(
+                (root / "belief_config.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ModelPackageError(f"invalid belief_config.json: {exc}") from exc
+        packaged_belief_config = _parse_belief_config_payload(belief_payload)
+        if packaged_belief_config.stable_hash() != manifest.belief_config_hash:
+            raise ModelPackageError(
+                "belief_config.json identity does not match manifest.json"
+            )
+        from douzero.belief.checkpoint import load_belief_checkpoint
+
+        try:
+            checked_belief_model = load_belief_checkpoint(
+                str(root / "belief_weights.pt"),
+                expected_ruleset=packaged_ruleset,
+                expected_feature_version=packaged_schema.feature_version,
+                expected_belief_config=packaged_belief_config,
+                map_location="cpu",
+                require_full_git_sha=True,
+            )
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise ModelPackageError(
+                "belief_weights.pt checkpoint identity does not match the "
+                f"package: {exc}"
+            ) from exc
+        if checked_belief_model.config.stable_hash() != manifest.belief_config_hash:
+            raise ModelPackageError(
+                "belief_weights.pt config identity does not match manifest.json"
+            )
+    elif manifest.belief_config_hash != canonical_hash(None):
+        raise ModelPackageError(
+            "belief-disabled package has a non-empty belief configuration identity"
+        )
+    if manifest.bidding_enabled:
+        try:
+            bidding_payload = json.loads(
+                (root / "bidding_schema.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ModelPackageError(f"invalid bidding_schema.json: {exc}") from exc
+        from douzero.observation.bidding import (
+            BIDDING_ACTIONS,
+            BIDDING_ACTION_SCHEMA_VERSION,
+            BIDDING_HEAD_VERSION,
+            build_bidding_schema,
+        )
+
+        runtime_bidding_schema = build_bidding_schema()
+        expected_bidding_payload = {
+            "schema_version": 1,
+            "bidding_head_version": BIDDING_HEAD_VERSION,
+            "bidding_action_schema": BIDDING_ACTION_SCHEMA_VERSION,
+            "bidding_actions": list(BIDDING_ACTIONS),
+            "bidding_feature_schema_hash": runtime_bidding_schema.stable_hash(),
+            "feature_schema": runtime_bidding_schema.compatibility_dict(),
+        }
+        if bidding_payload != expected_bidding_payload or (
+            manifest.bidding_head_version != BIDDING_HEAD_VERSION
+            or manifest.bidding_action_schema != BIDDING_ACTION_SCHEMA_VERSION
+            or manifest.bidding_feature_schema_hash
+            != runtime_bidding_schema.stable_hash()
+        ):
+            raise ModelPackageError(
+                "bidding_schema.json identity does not match manifest or runtime"
+            )
+
     # Validate the manifest-bearing checkpoint sidecar itself, not only the
     # outer package metadata. A release pipeline must not approve a package
     # whose checksums are internally consistent but whose weights were replaced
@@ -304,6 +796,7 @@ def verify_model_package(
             expected_schema_hash=manifest.feature_schema_hash,
             expected_model_config_hash=manifest.model_config_hash,
             expected_ruleset=packaged_ruleset,
+            runtime_model_config=packaged_model_config,
             training_device="cpu",
         )
     except (CheckpointCompatibilityError, OSError, KeyError, TypeError, RuntimeError) as exc:
@@ -314,6 +807,30 @@ def verify_model_package(
         raise ModelPackageError(
             "weights.pt git_sha does not match the outer deployment manifest"
         )
+    expected_inner_config = {
+        "training_config_hash": manifest.training_config_hash,
+        "training_config_payload_policy": "hash_only",
+        "source_checkpoint_sha256": manifest.source_checkpoint_sha256,
+        "source_checkpoint_manifest_sha256": manifest.source_checkpoint_manifest_sha256,
+        "source_git_sha": manifest.source_git_sha,
+        "source_ruleset_hash": manifest.source_ruleset_hash,
+        "source_feature_schema_hash": manifest.source_feature_schema_hash,
+        "source_model_config_hash": manifest.source_model_config_hash,
+        "source_checkpoint_kind": manifest.source_checkpoint_kind,
+        "release_eligible": manifest.release_eligible,
+    }
+    if checkpoint_manifest.effective_config != expected_inner_config:
+        raise ModelPackageError(
+            "weights.pt training configuration identity does not match the "
+            "outer package hash-only policy"
+        )
+    if (
+        manifest.source_ruleset_hash != manifest.ruleset_hash
+        or manifest.source_feature_schema_hash != manifest.feature_schema_hash
+        or manifest.source_model_config_hash != manifest.model_config_hash
+        or manifest.source_training_config_hash != manifest.training_config_hash
+    ):
+        raise ModelPackageError("source checkpoint provenance does not match the package")
     floating_dtypes = {
         str(tensor.dtype).removeprefix("torch.")
         for tensor in state_dict.values()
@@ -324,6 +841,36 @@ def verify_model_package(
             f"weights dtype {sorted(floating_dtypes)} does not match manifest "
             f"dtype {manifest.dtype!r}"
         )
+    non_tensors = [
+        name for name, value in state_dict.items()
+        if not isinstance(name, str) or not isinstance(value, torch.Tensor)
+    ]
+    if non_tensors:
+        raise ModelPackageError(
+            "weights.pt state_dict must map parameter names to tensors"
+        )
+    nonfinite = [
+        name for name, tensor in state_dict.items()
+        if (tensor.is_floating_point() or tensor.is_complex())
+        and not bool(torch.isfinite(tensor).all().item())
+    ]
+    if nonfinite:
+        raise ModelPackageError(
+            f"weights.pt contains non-finite tensors: {sorted(nonfinite)}"
+        )
+    # Verification and loading share the same architectural compatibility
+    # boundary: a package is not verified until strict runtime construction and
+    # state loading have succeeded. Checksums alone cannot establish loadability.
+    from douzero.models_v2.model import ModelV2
+
+    try:
+        checked_model = ModelV2(packaged_schema, packaged_model_config)
+        checked_model.load_state_dict(state_dict, strict=True)
+        checked_model.eval()
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise ModelPackageError(
+            f"weights.pt cannot strict-load into the packaged runtime model: {exc}"
+        ) from exc
     if expected_schema_hash and expected_schema_hash != manifest.feature_schema_hash:
         raise ModelPackageError("runtime feature schema does not match packaged model")
     if expected_feature_version and expected_feature_version != manifest.feature_version:
@@ -335,6 +882,11 @@ def verify_model_package(
         and expected_belief_enabled != manifest.belief_enabled
     ):
         raise ModelPackageError("runtime belief setting does not match packaged model")
+    if (
+        expected_bidding_enabled is not None
+        and expected_bidding_enabled != manifest.bidding_enabled
+    ):
+        raise ModelPackageError("runtime bidding setting does not match packaged model")
 
     if check_package_versions:
         incompatible = {
@@ -355,7 +907,13 @@ def load_model_package(
     config: "ModelV2Config",
     device: str | torch.device = "cpu",
 ) -> "ModelV2":
-    """Strictly verify a public package and return its eval-mode Model V2."""
+    """Strictly load an eval-mode Model V2 and its packaged public belief model.
+
+    Belief-disabled packages preserve the long-standing return contract: the
+    result is a :class:`ModelV2`. A belief-enabled result is the same type and
+    has its verified, eval-mode :class:`BeliefModel` attached as
+    ``model.belief_model`` for direct ``DeepAgentV2`` construction.
+    """
 
     from douzero.evaluation.deep_agent import load_v2_model
 
@@ -366,15 +924,48 @@ def load_model_package(
         expected_feature_version=schema.feature_version,
         expected_model_config_hash=config.stable_hash(),
         expected_belief_enabled=config.belief_enabled,
-    )
-    model = load_v2_model(
-        str(Path(package_dir) / "weights.pt"), schema, ruleset, config
+        expected_bidding_enabled=config.bidding_enabled,
     )
     target = torch.device(device)
     if target.type == "cuda" and not torch.cuda.is_available():
         raise ModelPackageError("CUDA device requested but CUDA is unavailable")
+    root = Path(package_dir)
+    model = load_v2_model(
+        str(root / "weights.pt"), schema, ruleset, config
+    )
     target_dtype = getattr(torch, manifest.dtype)
     model.to(device=target, dtype=target_dtype)
     model.eval()
     model.deployment_manifest = manifest
+    if manifest.belief_enabled:
+        try:
+            belief_payload = json.loads(
+                (root / "belief_config.json").read_text(encoding="utf-8")
+            )
+            belief_config = _parse_belief_config_payload(belief_payload)
+            from douzero.belief.checkpoint import load_belief_checkpoint
+
+            belief_model = load_belief_checkpoint(
+                str(root / "belief_weights.pt"),
+                expected_ruleset=ruleset,
+                expected_feature_version=schema.feature_version,
+                expected_belief_config=belief_config,
+                map_location="cpu",
+                require_full_git_sha=True,
+            )
+        except (
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as exc:
+            raise ModelPackageError(
+                f"failed to load packaged belief model: {exc}"
+            ) from exc
+        belief_model.to(device=target)
+        belief_model.eval()
+        belief_model.deployment_manifest = manifest
+        model.belief_model = belief_model
     return model

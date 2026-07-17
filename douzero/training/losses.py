@@ -116,6 +116,10 @@ class LossConfig:
     #: cross-entropy over the legal-action list on human BC samples. Requires a
     #: model built with ``human_prior_enabled=True`` and a BC sample source.
     lambda_bc: float = 0.0
+    lambda_bid_policy: float = 0.0
+    lambda_bid_win: float = 0.0
+    lambda_bid_score: float = 0.0
+    lambda_bid_regret: float = 0.0
     lambda_min_turns: float = 0.0
     lambda_regain_initiative: float = 0.0
     lambda_teammate_finish: float = 0.0
@@ -135,6 +139,10 @@ class LossConfig:
             ("lambda_score", self.lambda_score),
             ("lambda_uncertainty", self.lambda_uncertainty),
             ("lambda_bc", self.lambda_bc),
+            ("lambda_bid_policy", self.lambda_bid_policy),
+            ("lambda_bid_win", self.lambda_bid_win),
+            ("lambda_bid_score", self.lambda_bid_score),
+            ("lambda_bid_regret", self.lambda_bid_regret),
             ("lambda_min_turns", self.lambda_min_turns),
             ("lambda_regain_initiative", self.lambda_regain_initiative),
             ("lambda_teammate_finish", self.lambda_teammate_finish),
@@ -159,6 +167,10 @@ class LossConfig:
             "lambda_score": float(self.lambda_score),
             "lambda_uncertainty": float(self.lambda_uncertainty),
             "lambda_bc": float(self.lambda_bc),
+            "lambda_bid_policy": float(self.lambda_bid_policy),
+            "lambda_bid_win": float(self.lambda_bid_win),
+            "lambda_bid_score": float(self.lambda_bid_score),
+            "lambda_bid_regret": float(self.lambda_bid_regret),
             "lambda_min_turns": float(self.lambda_min_turns),
             "lambda_regain_initiative": float(self.lambda_regain_initiative),
             "lambda_teammate_finish": float(self.lambda_teammate_finish),

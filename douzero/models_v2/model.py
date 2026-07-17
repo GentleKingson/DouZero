@@ -67,9 +67,9 @@ from douzero.observation.schema import (
 from .action_encoder import ActionEncoder
 from .config import HISTORY_ENCODER_TRANSFORMER, ModelV2Config, SUPPORTED_ROLES
 from .fusion import StateActionFusion
-from .heads import PriorHead, StrategyAuxiliaryHeads, ValueHeads
+from .heads import BiddingHeads, PriorHead, StrategyAuxiliaryHeads, ValueHeads
 from .history_encoder import build_history_encoder
-from .output import ModelOutput
+from .output import BiddingModelOutput, ModelOutput
 from .state_encoder import StateEncoder
 
 #: The number of card-set sub-blocks the state encoder consumes from the state
@@ -188,6 +188,23 @@ class ModelV2(nn.Module):
             score_clamp=cfg.score_clamp,
         )
 
+        # Bidding is a distinct neutral-seat decision space. It never calls
+        # ActionEncoder (which represents candidate card moves) and is absent
+        # from the module/state_dict when disabled.
+        self.bidding_schema = None
+        self.bidding_heads: BiddingHeads | None = None
+        if cfg.bidding_enabled:
+            from douzero.observation.bidding import BIDDING_ACTIONS, build_bidding_schema
+
+            self.bidding_schema = build_bidding_schema()
+            self.bidding_heads = BiddingHeads(
+                self.bidding_schema.input_width,
+                cfg.bidding_hidden_size,
+                num_bid_actions=len(BIDDING_ACTIONS),
+                score_clamp=cfg.score_clamp,
+                uncertainty_enabled=cfg.bidding_uncertainty_enabled,
+            )
+
         # P07: optional belief fusion. When ``belief_enabled`` the model gains
         # a projection that maps the (frozen, externally-computed) belief
         # posterior features into the trunk and adds them to the state
@@ -249,6 +266,45 @@ class ModelV2(nn.Module):
             raise ValueError(
                 f"Unknown acting role {role!r}. Supported roles: {SUPPORTED_ROLES}"
             ) from exc
+
+    def forward_bidding(self, observation) -> BiddingModelOutput:
+        """Run the public bidding path without encoding card-play actions."""
+        from douzero.observation.bidding import BiddingObservationV2
+
+        if self.bidding_heads is None or self.bidding_schema is None:
+            raise RuntimeError(
+                "forward_bidding requires ModelV2Config(bidding_enabled=True)"
+            )
+        if not isinstance(observation, BiddingObservationV2):
+            raise TypeError("forward_bidding requires a public BiddingObservationV2")
+        expected_hash = self.bidding_schema.stable_hash()
+        if observation.feature_schema_hash != expected_hash:
+            raise ValueError(
+                "bidding feature schema mismatch: observation was encoded under "
+                f"{observation.feature_schema_hash}, model expects {expected_hash}"
+            )
+        parameter = next(self.bidding_heads.parameters())
+        features = observation.to_tensor(parameter.device).to(parameter.dtype)
+        head_out = self.bidding_heads(features)
+        mask = torch.from_numpy(observation.bid_action_mask.copy()).to(
+            device=parameter.device, dtype=torch.bool
+        )
+        if self.config.nan_guard:
+            from .numerical import assert_finite
+
+            for name in (
+                "bid_logits", "landlord_win_logit", "expected_landlord_score"
+            ):
+                assert_finite(head_out[name], name)
+            if head_out["uncertainty"] is not None:
+                assert_finite(head_out["uncertainty"], "bidding_uncertainty")
+        return BiddingModelOutput(
+            bid_logits=head_out["bid_logits"],
+            bid_action_mask=mask,
+            landlord_win_logit=head_out["landlord_win_logit"],
+            expected_landlord_score=head_out["expected_landlord_score"],
+            uncertainty=head_out["uncertainty"],
+        )
 
     def strategy_feature_config(self):
         """Return the public feature config, or ``None`` for the P08 path."""
@@ -321,7 +377,7 @@ class ModelV2(nn.Module):
             ``"landlord_down"``).
         belief_features:
             Optional ``(BELIEF_FEATURE_DIM,)`` float tensor — the **constrained**
-            belief posterior features from a frozen
+            belief posterior features from a
             :class:`~douzero.belief.model.BeliefModel`. Only consumed when
             ``config.belief_enabled``; passing it to a belief-disabled model
             raises ``ValueError``. When ``belief_enabled`` and ``None``, the
@@ -329,14 +385,13 @@ class ModelV2(nn.Module):
             not silently degrade to a zero-feature baseline) — pass
             ``allow_missing_belief_features=True`` to opt into the zero-vector
             behaviour for ablations only. The features are cast to the trunk's
-            device/dtype and detached before fusion.
+            device/dtype and detached before fusion only when
+            ``belief_stop_gradient`` is true.
         belief_stop_gradient:
-            Always True in effect. The "pretrain belief, freeze its features,
-            train ``belief_proj``" path is the only supported one. Passing
-            ``False`` raises ``NotImplementedError`` — joint value+belief
-            training (value loss updating the BeliefModel) is not implemented
-            because the constrained-marginal DP and the feature projection are
-            non-differentiable (NumPy).
+            ``True`` preserves the pretrained/frozen path. ``False`` keeps the
+            incoming feature graph intact, allowing value loss to update the
+            belief encoder when the features came from the differentiable
+            PyTorch constrained-marginal path.
         allow_missing_belief_features:
             When ``belief_enabled`` and ``belief_features`` is None, the model
             raises by default; set this True only for explicit ablations that
@@ -391,28 +446,9 @@ class ModelV2(nn.Module):
         # degrade to a zero-feature baseline at deployment). Pass
         # ``allow_missing_belief_features=True`` to opt into the zero-vector
         # behaviour for ablations / unit tests.
-        #
-        # Joint training (``belief_stop_gradient=False``) is NOT supported in
-        # P07: the constrained-marginal DP and the feature projection run in
-        # NumPy, which permanently cuts the graph between the value loss and
-        # the belief parameters. Passing ``belief_stop_gradient=False`` raises
-        # ``NotImplementedError`` so the API never promises a path it cannot
-        # deliver (review blocker #1). The default (``True``) keeps the
-        # ``belief_proj`` layer trainable while treating the (frozen) belief
-        # features as constants.
         if self.belief_proj is not None:
             from douzero.belief.model import BELIEF_FEATURE_DIM
 
-            if not belief_stop_gradient:
-                raise NotImplementedError(
-                    "Joint value+belief training (belief_stop_gradient=False) "
-                    "is not implemented in P07: the constrained-marginal DP "
-                    "and the belief-feature projection are non-differentiable "
-                    "(NumPy), so value loss cannot reach the BeliefModel "
-                    "parameters. Use the pretrained-then-frozen path "
-                    "(belief_stop_gradient=True, the default); a differentiable "
-                    "belief path is future work."
-                )
             if belief_features is None:
                 if not allow_missing_belief_features:
                     raise ValueError(
@@ -436,7 +472,9 @@ class ModelV2(nn.Module):
                 # receiving CPU belief features does not mismatch.
                 belief_features = belief_features.to(
                     device=state_trunk.device, dtype=state_trunk.dtype
-                ).detach()
+                )
+                if belief_stop_gradient:
+                    belief_features = belief_features.detach()
             state_trunk = state_trunk + self.belief_proj(belief_features)
         elif belief_features is not None:
             raise ValueError(
@@ -566,6 +604,8 @@ class ModelV2(nn.Module):
             submodules.append(("prior_head", self.prior_head))
         if self.strategy_aux_heads is not None:
             submodules.append(("strategy_aux_heads", self.strategy_aux_heads))
+        if self.bidding_heads is not None:
+            submodules.append(("bidding_heads", self.bidding_heads))
         for name, module in submodules:
             counts[name] = sum(p.numel() for p in module.parameters() if p.requires_grad)
         counts["total"] = sum(counts.values())

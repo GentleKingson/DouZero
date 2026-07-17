@@ -1,0 +1,87 @@
+# Standard full-game V2 training with a public learned score-bidding head.
+# Run a short CPU closure with:
+#   python train_v2.py --config configs/standard_v2.yaml \
+#     --episodes 2 --optimizer_steps 1 --batch_size 1
+
+xpid: douzero_standard_v2
+objective: adp
+feature_version: v2
+ruleset: standard
+model_version: v2
+
+seed: 0
+deterministic: false
+batch_size: 32
+exp_epsilon: 0.05
+max_grad_norm: 40.0
+
+amp_enabled: false
+amp_dtype: float16
+amp_fallback_on_nonfinite: true
+ddp_enabled: false
+ddp_backend: auto
+compile_model: false
+
+optimizer:
+  learning_rate: 0.0001
+  alpha: 0.99
+  momentum: 0.0
+  epsilon: 1.0e-5
+
+model:
+  version: v2
+  hidden_size: 256
+  history_encoder: transformer
+  history_layers: 4
+  history_heads: 8
+  role_embedding_dim: 32
+  belief_enabled: false
+  human_prior_enabled: false
+  style_enabled: false
+  strategy_features_enabled: false
+  strategy_aux_enabled: false
+  bidding_enabled: true
+  bidding_hidden_size: 128
+  bidding_uncertainty_enabled: false
+
+loss:
+  lambda_win: 1.0
+  lambda_score: 0.5
+  lambda_uncertainty: 0.0
+  lambda_bc: 0.0
+  lambda_min_turns: 0.0
+  lambda_regain_initiative: 0.0
+  lambda_teammate_finish: 0.0
+  lambda_spring: 0.0
+  lambda_structure: 0.0
+  # Rule demonstrations use masked CE. Learned/exploratory actions fit only
+  # the selected bid's actor-win value logit, so a loss pushes that bid down
+  # instead of imitating it as a positive label.
+  lambda_bid_policy: 1.0
+  lambda_bid_win: 0.5
+  lambda_bid_score: 0.25
+  # Reserved for a future separate regret head; v2 fails closed if non-zero.
+  lambda_bid_regret: 0.0
+  score_delta: 1.0
+  score_target_transform: raw
+  score_clamp: 32.0
+
+decision_policy:
+  mode: pure_win
+  abs_tol: 0.0
+  rel_tol: 0.0
+  risk_penalty: 0.0
+  prior_alpha: 0.0
+
+bidding:
+  enabled: true
+  policy: learned
+  warm_start_policy: rule
+  # This controls the behavior mixture, not the training label. Rule bids are
+  # expert CE targets; learned and epsilon-random bids receive selected-action
+  # actor-win value targets under the physical seat's eventual role.
+  learned_probability: 0.10
+
+# Rotate the neutral opening bidder across games. seeded_random is also
+# reproducible and uses the trainer-owned RNG.
+first_bidder_mode: rotate

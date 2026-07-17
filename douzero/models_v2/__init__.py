@@ -45,7 +45,7 @@ from douzero.models_v2.config import (
     SUPPORTED_ROLES,
 )
 from douzero.models_v2.fusion import StateActionFusion
-from douzero.models_v2.heads import ValueHeads
+from douzero.models_v2.heads import BiddingHeads, ValueHeads
 from douzero.models_v2.history_encoder import (
     LSTMHistoryEncoder,
     TransformerHistoryEncoder,
@@ -53,7 +53,7 @@ from douzero.models_v2.history_encoder import (
 )
 from douzero.models_v2.model import ModelV2
 from douzero.models_v2.numerical import NumericalError, assert_finite
-from douzero.models_v2.output import ModelOutput
+from douzero.models_v2.output import BiddingModelOutput, ModelOutput
 from douzero.models_v2.state_encoder import StateEncoder
 
 __all__ = [
@@ -61,6 +61,7 @@ __all__ = [
     "ModelV2",
     "ModelV2Config",
     "ModelOutput",
+    "BiddingModelOutput",
     "SUPPORTED_ROLES",
     "HISTORY_ENCODER_TRANSFORMER",
     "HISTORY_ENCODER_LSTM",
@@ -74,6 +75,7 @@ __all__ = [
     "StateEncoder",
     "StateActionFusion",
     "ValueHeads",
+    "BiddingHeads",
     "TransformerHistoryEncoder",
     "LSTMHistoryEncoder",
     "build_history_encoder",

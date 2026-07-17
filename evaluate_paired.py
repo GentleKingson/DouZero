@@ -15,6 +15,8 @@ from douzero.evaluation.ablation import (
 )
 from douzero.evaluation.gates import RegressionGateConfig, evaluate_regression_gates
 from douzero.evaluation.reporting import write_report
+from douzero.evaluation.paired import validate_evaluation_runtime_identity
+from douzero.evaluation.provenance import inspect_formal_git_checkout
 from douzero.evaluation.scenario import (
     BundleSpec,
     EvaluationScenario,
@@ -61,7 +63,7 @@ def generate_deals(mode: str, count: int, seed: int, ruleset: RuleSet):
     return tuple(deals)
 
 
-def _load_matrix(path: str):
+def _load_matrix(path: str, *, require_checkpoint_digests: bool = False):
     if not path:
         return {}, {}
     with open(path, "r", encoding="utf-8") as handle:
@@ -77,7 +79,10 @@ def _load_matrix(path: str):
     if any(not isinstance(config, dict) for config in bundle_rows.values()):
         raise TypeError("each model-matrix bundle must be an object")
     bundles = {
-        name: bundle_from_dict({**config, "name": name})
+        name: bundle_from_dict(
+            {**config, "name": name},
+            require_checkpoint_digests=require_checkpoint_digests,
+        )
         for name, config in bundle_rows.items()
     }
     ablations = raw.get("ablations", {})
@@ -121,16 +126,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline", default="random")
     parser.add_argument(
         "--candidate-bidding",
-        choices=("rule", "random", "pass", "max"),
+        choices=("rule", "random", "pass", "max", "learned"),
         default="rule",
     )
     parser.add_argument(
         "--baseline-bidding",
-        choices=("rule", "random", "pass", "max"),
+        choices=("rule", "random", "pass", "max", "learned"),
         default="rule",
     )
     parser.add_argument("--model-matrix", default="", help="JSON bundle and ablation registry")
-    parser.add_argument("--eval-data", default="", help="Trusted fixed .pkl deal set")
+    parser.add_argument(
+        "--eval-data",
+        default="",
+        help=(
+            "fixed deal set; --formal-release requires strict formal JSON, "
+            "while local runs retain trusted legacy pickle compatibility"
+        ),
+    )
     parser.add_argument("--dataset-scope", choices=("public", "private_holdout"), default="public")
     parser.add_argument("--num-deals", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
@@ -140,6 +152,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gates", default="", help="Predeclared regression-gate JSON")
     parser.add_argument("--run-ablations", action="store_true")
     parser.add_argument("--require-complete-ablations", action="store_true")
+    parser.add_argument(
+        "--formal-release",
+        action="store_true",
+        help="require a stable clean real Git checkout suitable for attestation",
+    )
+    parser.add_argument(
+        "--expected-source-git-sha",
+        default="",
+        help="approved full Git SHA required by --formal-release",
+    )
     return parser
 
 
@@ -149,6 +171,23 @@ def main(argv=None) -> int:
         raise ValueError("--num-deals must be positive")
     if args.dataset_scope == "private_holdout" and not args.eval_data:
         raise ValueError("private_holdout evaluation requires an explicit --eval-data path")
+    formal_source = None
+    if args.formal_release:
+        if not args.expected_source_git_sha:
+            raise ValueError("--formal-release requires --expected-source-git-sha")
+        if not args.model_matrix:
+            raise ValueError("--formal-release requires an explicit --model-matrix")
+        if not args.eval_data:
+            raise ValueError(
+                "--formal-release requires an explicit --eval-data JSON deal set"
+            )
+        formal_source = inspect_formal_git_checkout()
+        if formal_source.head_sha != args.expected_source_git_sha:
+            raise ValueError(
+                "formal evaluator Git HEAD does not match --expected-source-git-sha"
+            )
+    elif args.dataset_scope == "private_holdout":
+        raise ValueError("private_holdout evaluation requires --formal-release")
 
     if args.mode == "full_game":
         if args.ruleset_config:
@@ -163,19 +202,31 @@ def main(argv=None) -> int:
         ruleset = RuleSet.legacy()
 
     if args.eval_data:
-        from douzero.evaluation.legacy_data_adapter import load_eval_data
+        if args.formal_release:
+            from douzero.evaluation.formal_eval_data import load_formal_eval_data
 
-        deals = tuple(load_eval_data(
-            args.eval_data,
-            ruleset="standard" if args.mode == "full_game" else "legacy",
-            expected_ruleset=ruleset,
-        ))
+            deals = tuple(load_formal_eval_data(
+                args.eval_data,
+                expected_mode=args.mode,
+                expected_ruleset=ruleset,
+            ))
+        else:
+            from douzero.evaluation.legacy_data_adapter import load_eval_data
+
+            deals = tuple(load_eval_data(
+                args.eval_data,
+                ruleset="standard" if args.mode == "full_game" else "legacy",
+                expected_ruleset=ruleset,
+            ))
         deal_set_name = Path(args.eval_data).stem
     else:
         deals = generate_deals(args.mode, args.num_deals, args.seed, ruleset)
         deal_set_name = f"generated-seed-{args.seed}"
 
-    bundles, ablation_names = _load_matrix(args.model_matrix)
+    bundles, ablation_names = _load_matrix(
+        args.model_matrix,
+        require_checkpoint_digests=args.formal_release,
+    )
     scenario = EvaluationScenario(
         mode=args.mode,
         ruleset=ruleset,
@@ -224,6 +275,18 @@ def main(argv=None) -> int:
             result.metrics["regression_gates"] = gate_report
             gates_failed = gates_failed or not gate_report["passed"]
         prefix = args.output if name == "base" else f"{args.output}-{name}"
+        if args.formal_release:
+            payload = result.to_dict()
+            validate_evaluation_runtime_identity(
+                payload,
+                expected_mode=result.scenario["mode"],
+                expected_source_git_shas=[args.expected_source_git_sha],
+                require_formal_source=True,
+            )
+            if result.source_identity != formal_source:
+                raise RuntimeError(
+                    "formal evaluator source identity changed after startup"
+                )
         paths = write_report(result, prefix)
         ci = result.metrics["paired_estimate_ci"]
         print(

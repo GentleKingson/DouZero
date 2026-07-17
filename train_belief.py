@@ -63,6 +63,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--lambda_count_reg", type=float, default=0.0)
     p.add_argument("--lambda_entropy_reg", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--ruleset",
+        choices=("legacy", "standard"),
+        default="legacy",
+        help="ruleset identity and synthetic collection state machine",
+    )
     return p.parse_args(argv)
 
 
@@ -83,9 +89,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         model.parameters(), lr=args.learning_rate, alpha=0.99, eps=1e-5
     )
 
-    print(f"[train_belief] collecting {args.num_episodes} random episodes...",
-          file=sys.stderr)
-    dataset = collect_random_dataset(args.num_episodes, seed=args.seed)
+    ruleset = RuleSet.standard() if args.ruleset == "standard" else RuleSet.legacy()
+    print(
+        f"[train_belief] collecting {args.num_episodes} random {args.ruleset} episodes...",
+        file=sys.stderr,
+    )
+    dataset = collect_random_dataset(
+        args.num_episodes,
+        seed=args.seed,
+        ruleset=ruleset if args.ruleset == "standard" else None,
+    )
     n = len(dataset)
     print(f"[train_belief] collected {n} labelled samples", file=sys.stderr)
     if n == 0:
@@ -139,11 +152,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    # The P07 collector runs on the legacy card-play env (``Env("adp")``, which
-    # is ruleset=None = legacy). Standard-ruleset bidding/redeal collection is
-    # NOT implemented in this phase, so the checkpoint is always stamped legacy
-    # — never mislabeled as standard (Blocker #2 fix).
-    ruleset = RuleSet.legacy()
     import os
     os.makedirs(args.save_dir, exist_ok=True)
     out_path = os.path.join(args.save_dir, args.save_name)
@@ -160,6 +168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "seed": args.seed,
             "style_enabled": args.style_enabled,
             "style_embedding_dim": args.style_embedding_dim,
+            "ruleset": args.ruleset,
         },
     )
     print(f"[train_belief] saved checkpoint to {out_path}", file=sys.stderr)

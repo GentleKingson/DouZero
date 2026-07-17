@@ -1,0 +1,589 @@
+# Public, synthetic engineering smoke for the formal-evaluation plumbing.
+#
+# This workflow never uses the protected Environment, self-hosted runner,
+# private holdout, or release checkpoints. Its attestations have this distinct
+# signer-workflow identity and cannot satisfy the protected producer policy.
+name: Synthetic Formal Evaluation Dry Run
+run-name: >-
+  Synthetic formal dry run at
+  ${{ github.event.pull_request.head.sha || inputs.expected_source_sha }}
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      expected_source_sha:
+        description: Exact selected ref SHA to exercise (full Git SHA)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: >-
+    synthetic-formal-${{
+      github.event.pull_request.head.sha || inputs.expected_source_sha
+    }}
+  cancel-in-progress: false
+
+jobs:
+  synthetic-dry-run:
+    # Fork code never receives an attestation-writing token. Same-repository
+    # branches require repository write access, and this workflow has a
+    # synthetic-only signer identity that the protected policy rejects.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Attestations on pull_request bind github.sha, which is the tested merge
+      # commit. Evaluate that exact checkout so the result identity and the
+      # GitHub attestation subject share one source digest. Keep the PR head as
+      # a separate evidence dimension rather than pretending it was attested.
+      EXPECTED_SOURCE_SHA: ${{ github.sha }}
+      EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      TESTED_MERGE_SHA: ${{ github.sha }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      EXPECTED_REPOSITORY: GentleKingson/DouZero
+      EXPECTED_WORKFLOW: >-
+        GentleKingson/DouZero/.github/workflows/formal-evaluation-dry-run.yml
+      DOUZERO_GIT_SHA: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONNOUSERSITE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      # actions/checkout@v6.0.2
+      - name: Checkout exact synthetic source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+
+      - name: Bind dispatch, workflow, and checkout identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "$EXPECTED_REPOSITORY" ]]
+          [[ "$GITHUB_WORKFLOW_REF" == "$EXPECTED_WORKFLOW@$GITHUB_REF" ]]
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]+$ ]]
+          (( ${#EXPECTED_SOURCE_SHA} == 40 || ${#EXPECTED_SOURCE_SHA} == 64 ))
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              [[ "$EVENT_HEAD_SHA" =~ ^[0-9a-f]+$ ]]
+              (( ${#EVENT_HEAD_SHA} == 40 || ${#EVENT_HEAD_SHA} == 64 ))
+              [[ "$GITHUB_REF" =~ ^refs/pull/[0-9]+/merge$ ]]
+              [[ "$EXPECTED_SOURCE_SHA" == "$TESTED_MERGE_SHA" ]]
+              [[ "$TESTED_MERGE_SHA" == "$GITHUB_SHA" ]]
+              ;;
+            workflow_dispatch)
+              [[ "$REQUESTED_SOURCE_SHA" == "$EXPECTED_SOURCE_SHA" ]]
+              [[ "$EXPECTED_SOURCE_SHA" == "$GITHUB_SHA" ]]
+              ;;
+            *)
+              echo "unsupported synthetic workflow event: $GITHUB_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          [[ "$(git rev-parse --verify 'HEAD^{commit}')" == "$EXPECTED_SOURCE_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          git diff --quiet HEAD --
+          git diff --cached --quiet HEAD --
+          command -v docker >/dev/null
+          command -v gh >/dev/null
+
+      - name: Create isolated synthetic run root
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          shopt -s nullglob
+          stale=("$RUNNER_TEMP"/douzero-synthetic-formal-*)
+          if (( ${#stale[@]} != 0 )); then
+            echo "Refusing to run with a stale synthetic run root" >&2
+            exit 1
+          fi
+          run_root="$RUNNER_TEMP/douzero-synthetic-formal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [[ ! -e "$run_root" && ! -L "$run_root" ]]
+          mkdir -m 0700 \
+            "$run_root" \
+            "$run_root/audit" \
+            "$run_root/inputs" \
+            "$run_root/evaluator-snapshot" \
+            "$run_root/p17-snapshot" \
+            "$run_root/result" \
+            "$run_root/p17"
+          {
+            echo "SYNTHETIC_RUN_ROOT=$run_root"
+            echo "SYNTHETIC_AUDIT_ROOT=$run_root/audit"
+            echo "SYNTHETIC_RESULT_JSON=$run_root/result/formal-evaluation-result.json"
+            echo "SYNTHETIC_P17_OUTPUT=$run_root/p17"
+            echo "SYNTHETIC_SUMMARY_JSON=$run_root/audit/synthetic-dry-run-summary.json"
+          } >>"$GITHUB_ENV"
+
+      - name: Build and pin local evaluator image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_tag="douzero-synthetic-formal:$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker build --pull --file .docker/Dockerfile.test --tag "$image_tag" .
+          image_id="$(docker image inspect --format '{{.Id}}' "$image_tag")"
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$(docker image inspect --format '{{.Id}}' "$image_id")" == "$image_id" ]]
+          {
+            echo "SYNTHETIC_EVALUATOR_IMAGE=$image_id"
+            echo "DOUZERO_EVALUATOR_IMAGE_DIGEST=$image_id"
+          } >>"$GITHUB_ENV"
+
+      - name: Audit hardened container runtime controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id="$(docker create \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            "$SYNTHETIC_EVALUATOR_IMAGE" \
+            sh -ec 'gh attestation verify --help | grep -q -- --custom-trusted-root')"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          [[ "$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$container_id")" == "none" ]]
+          [[ "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$container_id")" == "true" ]]
+          [[ "$(docker inspect --format '{{json .HostConfig.CapDrop}}' "$container_id")" == '["ALL"]' ]]
+          [[ "$(docker inspect --format '{{json .HostConfig.SecurityOpt}}' "$container_id")" == '["no-new-privileges"]' ]]
+          docker start --attach "$container_id"
+
+      - name: Generate public synthetic inputs in the pinned image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --workdir "$GITHUB_WORKSPACE" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs,dst=$SYNTHETIC_RUN_ROOT/inputs" \
+            --env DOUZERO_GIT_SHA= \
+            --env PYTHONDONTWRITEBYTECODE \
+            --env PYTHONNOUSERSITE \
+            --env PYTHONPATH="$GITHUB_WORKSPACE" \
+            --env HOME=/tmp/synthetic-home \
+            "$SYNTHETIC_EVALUATOR_IMAGE" \
+            python tools/formal_evaluation_dry_run.py prepare \
+            --output "$SYNTHETIC_RUN_ROOT/inputs" \
+            --source-sha "$EXPECTED_SOURCE_SHA" \
+            --num-deals 2
+          inputs="$SYNTHETIC_RUN_ROOT/inputs/inputs.json"
+          [[ -f "$inputs" && ! -L "$inputs" ]]
+          [[ "$(jq -r .synthetic "$inputs")" == "true" ]]
+          [[ "$(jq -r .release_eligible "$inputs")" == "false" ]]
+          [[ "$(jq -r .source_sha "$inputs")" == "$EXPECTED_SOURCE_SHA" ]]
+          {
+            echo "SYNTHETIC_EVAL_DATA=$(jq -r .eval_data_path "$inputs")"
+            echo "SYNTHETIC_MODEL_MATRIX=$(jq -r .model_matrix_path "$inputs")"
+            echo "SYNTHETIC_P17_MATRIX=$(jq -r .p17_matrix_path "$inputs")"
+            echo "SYNTHETIC_CHECKPOINT_ROOT=$(jq -r .checkpoint_root "$inputs")"
+            echo "SYNTHETIC_DEAL_SET_ID=$(jq -r .deal_set_id "$inputs")"
+          } >>"$GITHUB_ENV"
+
+      - name: Snapshot synthetic checkpoints with production isolation flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=(
+            docker run --rm
+            --pull never
+            --entrypoint ""
+            --network none
+            --read-only
+            --user "$(id -u):$(id -g)"
+            --security-opt no-new-privileges
+            --cap-drop ALL
+            --tmpfs "/tmp:rw,nosuid,nodev,size=256m"
+            --workdir "$GITHUB_WORKSPACE"
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly"
+            --env PYTHONDONTWRITEBYTECODE
+            --env PYTHONNOUSERSITE
+            --env PYTHONPATH="$GITHUB_WORKSPACE"
+            --env HOME=/tmp/synthetic-home
+          )
+          "${container[@]}" \
+            --mount "type=bind,src=$SYNTHETIC_MODEL_MATRIX,dst=$SYNTHETIC_MODEL_MATRIX,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_CHECKPOINT_ROOT,dst=$SYNTHETIC_CHECKPOINT_ROOT,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/evaluator-snapshot,dst=$SYNTHETIC_RUN_ROOT/evaluator-snapshot" \
+            "$SYNTHETIC_EVALUATOR_IMAGE" \
+            python -I -B -m douzero.evaluation.snapshot_cli \
+            --matrix "$SYNTHETIC_MODEL_MATRIX" \
+            --kind evaluator \
+            --source-root "$SYNTHETIC_CHECKPOINT_ROOT" \
+            --checkpoint-dir "$SYNTHETIC_RUN_ROOT/evaluator-snapshot/checkpoints" \
+            --output "$SYNTHETIC_RUN_ROOT/evaluator-snapshot/model-matrix.json"
+          "${container[@]}" \
+            --mount "type=bind,src=$SYNTHETIC_P17_MATRIX,dst=$SYNTHETIC_P17_MATRIX,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_CHECKPOINT_ROOT,dst=$SYNTHETIC_CHECKPOINT_ROOT,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/p17-snapshot,dst=$SYNTHETIC_RUN_ROOT/p17-snapshot" \
+            "$SYNTHETIC_EVALUATOR_IMAGE" \
+            python -I -B -m douzero.evaluation.snapshot_cli \
+            --matrix "$SYNTHETIC_P17_MATRIX" \
+            --kind p17 \
+            --source-root "$SYNTHETIC_CHECKPOINT_ROOT" \
+            --checkpoint-dir "$SYNTHETIC_RUN_ROOT/p17-snapshot/checkpoints" \
+            --output "$SYNTHETIC_RUN_ROOT/p17-snapshot/p17-matrix.json"
+
+      - name: Run synthetic formal-source evaluation offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+            --workdir "$GITHUB_WORKSPACE" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_EVAL_DATA,dst=$SYNTHETIC_EVAL_DATA,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/evaluator-snapshot,dst=$SYNTHETIC_RUN_ROOT/evaluator-snapshot,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/result,dst=$SYNTHETIC_RUN_ROOT/result" \
+            --env GITHUB_ACTIONS=true \
+            --env GITHUB_REPOSITORY \
+            --env GITHUB_WORKFLOW_REF \
+            --env GITHUB_WORKFLOW_SHA \
+            --env GITHUB_REF \
+            --env GITHUB_SHA="$EXPECTED_SOURCE_SHA" \
+            --env GITHUB_RUN_ID \
+            --env GITHUB_RUN_ATTEMPT \
+            --env RUNNER_ENVIRONMENT=github-hosted \
+            --env DOUZERO_EVALUATOR_IMAGE_DIGEST \
+            --env DOUZERO_GIT_SHA= \
+            --env PYTHONDONTWRITEBYTECODE \
+            --env PYTHONNOUSERSITE \
+            --env PYTHONPATH="$GITHUB_WORKSPACE" \
+            --env HOME=/tmp/synthetic-home \
+            "$SYNTHETIC_EVALUATOR_IMAGE" \
+            python evaluate_paired.py \
+            --formal-release \
+            --expected-source-git-sha "$EXPECTED_SOURCE_SHA" \
+            --mode cardplay_only \
+            --dataset-scope public \
+            --eval-data "$SYNTHETIC_EVAL_DATA" \
+            --model-matrix "$SYNTHETIC_RUN_ROOT/evaluator-snapshot/model-matrix.json" \
+            --candidate v2_full_stack \
+            --baseline legacy_wp \
+            --bootstrap-samples 2000 \
+            --output "$SYNTHETIC_RUN_ROOT/result/formal-evaluation-result"
+          [[ -f "$SYNTHETIC_RESULT_JSON" && ! -L "$SYNTHETIC_RESULT_JSON" ]]
+
+      - name: Calculate synthetic result digest
+        id: result-digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(sha256sum "$SYNTHETIC_RESULT_JSON" | cut -d' ' -f1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$digest" >>"$GITHUB_OUTPUT"
+
+      # Synthetic signer identity is intentionally different from the protected
+      # formal producer and is rejected by the release attestation policy.
+      - name: Attest exact synthetic result
+        id: attest-result
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: ${{ env.SYNTHETIC_RESULT_JSON }}
+          show-summary: true
+
+      - name: Snapshot trusted root for synthetic result
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_root="$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl"
+          [[ ! -e "$trusted_root" && ! -L "$trusted_root" ]]
+          set -o noclobber
+          gh attestation trusted-root >"$trusted_root"
+          set +o noclobber
+          [[ -s "$trusted_root" && ! -L "$trusted_root" ]]
+          [[ "$(stat -c '%F' "$trusted_root")" == "regular file" ]]
+          digest="$(sha256sum "$trusted_root" | cut -d' ' -f1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          chmod 0444 "$trusted_root"
+          echo "SYNTHETIC_RESULT_TRUSTED_ROOT_SHA256=$digest" >>"$GITHUB_ENV"
+
+      - name: Verify synthetic result attestation offline
+        shell: bash
+        env:
+          EXPECTED_RESULT_SHA256: ${{ steps.result-digest.outputs.sha256 }}
+          ATTESTATION_BUNDLE: ${{ steps.attest-result.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          [[ "$(sha256sum "$SYNTHETIC_RESULT_JSON" | cut -d' ' -f1)" == "$EXPECTED_RESULT_SHA256" ]]
+          install -m 0400 "$ATTESTATION_BUNDLE" "$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json"
+          docker run --rm \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            --workdir /tmp \
+            --mount "type=bind,src=$SYNTHETIC_RESULT_JSON,dst=$SYNTHETIC_RESULT_JSON,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json,dst=/tmp/attestation.json,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl,dst=/tmp/trusted-root.jsonl,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT,dst=$SYNTHETIC_AUDIT_ROOT" \
+            --env HOME=/tmp/synthetic-home \
+            "$SYNTHETIC_EVALUATOR_IMAGE" \
+            sh -ec 'gh attestation verify "$1" \
+              --bundle /tmp/attestation.json \
+              --custom-trusted-root /tmp/trusted-root.jsonl \
+              --repo "$2" \
+              --signer-workflow "$3" \
+              --signer-digest "$4" \
+              --source-digest "$5" \
+              --source-ref "$6" \
+              --format json >"$7/result-attestation-verification.json"' sh \
+            "$SYNTHETIC_RESULT_JSON" \
+            "$EXPECTED_REPOSITORY" \
+            "$EXPECTED_WORKFLOW" \
+            "$GITHUB_WORKFLOW_SHA" \
+            "$GITHUB_SHA" \
+            "$GITHUB_REF" \
+            "$SYNTHETIC_AUDIT_ROOT"
+
+      - name: Replay and collate through the production attestation boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+            --workdir "$GITHUB_WORKSPACE" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RESULT_JSON,dst=$SYNTHETIC_RESULT_JSON,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_EVAL_DATA,dst=$SYNTHETIC_EVAL_DATA,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json,dst=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl,dst=$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/p17-snapshot,dst=$SYNTHETIC_RUN_ROOT/p17-snapshot,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_P17_OUTPUT,dst=$SYNTHETIC_P17_OUTPUT" \
+            --env PYTHONDONTWRITEBYTECODE \
+            --env PYTHONNOUSERSITE \
+            --env PYTHONPATH="$GITHUB_WORKSPACE" \
+            --env HOME=/tmp/synthetic-home \
+            "$SYNTHETIC_EVALUATOR_IMAGE" \
+            python tools/prepare_p17_evaluation.py \
+            --matrix "$SYNTHETIC_RUN_ROOT/p17-snapshot/p17-matrix.json" \
+            --cardplay-result "$SYNTHETIC_RESULT_JSON" \
+            --cardplay-attestation \
+              "$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json" \
+            --expected-evaluator-git-sha "$EXPECTED_SOURCE_SHA" \
+            --expected-cardplay-deal-set-id "$SYNTHETIC_DEAL_SET_ID" \
+            --approved-cardplay-eval-data "$SYNTHETIC_EVAL_DATA" \
+            --attestation-repository "$EXPECTED_REPOSITORY" \
+            --attestation-signer-workflow "$EXPECTED_WORKFLOW" \
+            --attestation-signer-digest "$GITHUB_WORKFLOW_SHA" \
+            --attestation-source-ref "$GITHUB_REF" \
+            --attestation-trusted-root \
+              "$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl" \
+            --attestation-trusted-root-sha256 \
+              "$SYNTHETIC_RESULT_TRUSTED_ROOT_SHA256" \
+            --output "$SYNTHETIC_P17_OUTPUT"
+          manifest="$SYNTHETIC_P17_OUTPUT/manifest.json"
+          [[ "$(jq -r .release_status.cardplay_only "$manifest")" == "insufficient" ]]
+          result_sha="$(sha256sum "$SYNTHETIC_RESULT_JSON" | cut -d' ' -f1)"
+          manifest_sha="$(sha256sum "$manifest" | cut -d' ' -f1)"
+          jq -n \
+            --arg schema_version "p17-synthetic-formal-dry-run-v1" \
+            --arg source_sha "$EXPECTED_SOURCE_SHA" \
+            --arg result_sha256 "$result_sha" \
+            --arg p17_manifest_sha256 "$manifest_sha" \
+            '{
+              schema_version: $schema_version,
+              synthetic: true,
+              release_eligible: false,
+              source_sha: $source_sha,
+              result_sha256: $result_sha256,
+              p17_manifest_sha256: $p17_manifest_sha256,
+              p17_release_status: "insufficient"
+            }' >"$SYNTHETIC_SUMMARY_JSON"
+          chmod 0444 "$SYNTHETIC_SUMMARY_JSON"
+
+      - name: Calculate synthetic P17 manifest digest
+        id: manifest-digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$SYNTHETIC_P17_OUTPUT/manifest.json"
+          digest="$(sha256sum "$manifest" | cut -d' ' -f1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          echo "sha256=$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Attest exact synthetic P17 manifest
+        id: attest-manifest
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763
+        with:
+          subject-path: ${{ env.SYNTHETIC_P17_OUTPUT }}/manifest.json
+          show-summary: true
+
+      - name: Snapshot trusted root for synthetic P17 manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          trusted_root="$SYNTHETIC_AUDIT_ROOT/manifest-trusted-root.jsonl"
+          [[ ! -e "$trusted_root" && ! -L "$trusted_root" ]]
+          set -o noclobber
+          gh attestation trusted-root >"$trusted_root"
+          set +o noclobber
+          [[ -s "$trusted_root" && ! -L "$trusted_root" ]]
+          [[ "$(stat -c '%F' "$trusted_root")" == "regular file" ]]
+          digest="$(sha256sum "$trusted_root" | cut -d' ' -f1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          chmod 0444 "$trusted_root"
+          echo "SYNTHETIC_MANIFEST_TRUSTED_ROOT_SHA256=$digest" >>"$GITHUB_ENV"
+
+      - name: Verify synthetic P17 manifest attestation offline
+        shell: bash
+        env:
+          EXPECTED_MANIFEST_SHA256: ${{ steps.manifest-digest.outputs.sha256 }}
+          ATTESTATION_BUNDLE: ${{ steps.attest-manifest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          manifest="$SYNTHETIC_P17_OUTPUT/manifest.json"
+          [[ "$(sha256sum "$manifest" | cut -d' ' -f1)" == "$EXPECTED_MANIFEST_SHA256" ]]
+          install -m 0400 "$ATTESTATION_BUNDLE" "$SYNTHETIC_RUN_ROOT/inputs/manifest-attestation.json"
+          docker run --rm \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+            --workdir /tmp \
+            --mount "type=bind,src=$manifest,dst=/tmp/manifest.json,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/manifest-attestation.json,dst=/tmp/attestation.json,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT/manifest-trusted-root.jsonl,dst=/tmp/trusted-root.jsonl,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT,dst=$SYNTHETIC_AUDIT_ROOT" \
+            --env HOME=/tmp/synthetic-home \
+            "$SYNTHETIC_EVALUATOR_IMAGE" \
+            sh -ec 'gh attestation verify /tmp/manifest.json \
+              --bundle /tmp/attestation.json \
+              --custom-trusted-root /tmp/trusted-root.jsonl \
+              --repo "$1" \
+              --signer-workflow "$2" \
+              --signer-digest "$3" \
+              --source-digest "$4" \
+              --source-ref "$5" \
+              --format json >"$6/manifest-attestation-verification.json"' sh \
+            "$EXPECTED_REPOSITORY" \
+            "$EXPECTED_WORKFLOW" \
+            "$GITHUB_WORKFLOW_SHA" \
+            "$GITHUB_SHA" \
+            "$GITHUB_REF" \
+            "$SYNTHETIC_AUDIT_ROOT"
+
+      - name: Prove failed evaluation cannot authorize upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          failure_root="$SYNTHETIC_RUN_ROOT/failure-case"
+          mkdir -m 0700 "$failure_root"
+          set +e
+          docker run --rm \
+            --pull never \
+            --entrypoint "" \
+            --network none \
+            --read-only \
+            --user "$(id -u):$(id -g)" \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /tmp:rw,nosuid,nodev,size=16m \
+            "$SYNTHETIC_EVALUATOR_IMAGE" sh -ec 'exit 23'
+          status=$?
+          set -e
+          [[ "$status" -eq 23 ]]
+          [[ ! -e "$failure_root/upload-authorized" ]]
+          rmdir "$failure_root"
+
+      - name: Authorize synthetic-only artifact upload
+        id: synthetic-gate
+        shell: bash
+        env:
+          EXPECTED_RESULT_SHA256: ${{ steps.result-digest.outputs.sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.manifest-digest.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          summary="$SYNTHETIC_SUMMARY_JSON"
+          [[ "$(jq -r .release_eligible "$summary")" == "false" ]]
+          [[ "$(jq -r .p17_release_status "$summary")" == "insufficient" ]]
+          [[ "$(jq -r .result_sha256 "$summary")" == "$EXPECTED_RESULT_SHA256" ]]
+          [[ "$(jq -r .p17_manifest_sha256 "$summary")" == "$EXPECTED_MANIFEST_SHA256" ]]
+          [[ "$(sha256sum "$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl" | cut -d' ' -f1)" == \
+            "$SYNTHETIC_RESULT_TRUSTED_ROOT_SHA256" ]]
+          [[ "$(sha256sum "$SYNTHETIC_AUDIT_ROOT/manifest-trusted-root.jsonl" | cut -d' ' -f1)" == \
+            "$SYNTHETIC_MANIFEST_TRUSTED_ROOT_SHA256" ]]
+          echo "authorized=true" >>"$GITHUB_OUTPUT"
+
+      # actions/upload-artifact@v4.6.2. The name cannot be confused with a
+      # protected formal result and upload is unreachable on any prior failure.
+      - name: Upload synthetic dry-run evidence
+        if: success() && steps.synthetic-gate.outputs.authorized == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: synthetic-formal-dry-run-${{ env.EXPECTED_SOURCE_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.SYNTHETIC_RESULT_JSON }}
+            ${{ env.SYNTHETIC_P17_OUTPUT }}/
+            ${{ env.SYNTHETIC_AUDIT_ROOT }}/
+            ${{ steps.attest-result.outputs.bundle-path }}
+            ${{ steps.attest-manifest.outputs.bundle-path }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove all synthetic run state
+        if: always()
+        shell: bash
+        env:
+          RESULT_BUNDLE: ${{ steps.attest-result.outputs.bundle-path }}
+          MANIFEST_BUNDLE: ${{ steps.attest-manifest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          [[ -n "$RUNNER_TEMP" && "$RUNNER_TEMP" != "/" ]]
+          run_root="$RUNNER_TEMP/douzero-synthetic-formal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [[ "$run_root" == "$RUNNER_TEMP"/douzero-synthetic-formal-* ]]
+          chmod -R u+rwX -- "$run_root" 2>/dev/null || true
+          rm -rf -- "$run_root"
+          [[ ! -e "$run_root" && ! -L "$run_root" ]]
+          for bundle in "${RESULT_BUNDLE:-}" "${MANIFEST_BUNDLE:-}"; do
+            if [[ -n "$bundle" && -f "$bundle" ]]; then
+              [[ "$bundle" == "$RUNNER_TEMP"/* ]]
+              rm -f -- "$bundle"
+            fi
+          done

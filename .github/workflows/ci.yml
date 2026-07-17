@@ -45,6 +45,10 @@ jobs:
       # which it is for shallow CI checkouts / containers).
       CUDA_VISIBLE_DEVICES: ""
       DOUZERO_GIT_SHA: ${{ github.sha }}
+      # On pull_request, github.sha is the tested merge commit. Keep the PR
+      # head separate so evidence never mistakes one identity for the other.
+      DOUZERO_CI_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      DOUZERO_CI_MERGE_SHA: ${{ github.sha }}
 
     steps:
       # Pinned to the v6 tag's commit SHA for supply-chain integrity.
@@ -52,6 +56,17 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           persist-credentials: false
+
+      - name: Bind tested head and merge identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DOUZERO_CI_HEAD_SHA" =~ ^[0-9a-f]+$ ]]
+          [[ "$DOUZERO_CI_MERGE_SHA" =~ ^[0-9a-f]+$ ]]
+          (( ${#DOUZERO_CI_HEAD_SHA} == 40 || ${#DOUZERO_CI_HEAD_SHA} == 64 ))
+          (( ${#DOUZERO_CI_MERGE_SHA} == 40 || ${#DOUZERO_CI_MERGE_SHA} == 64 ))
+          [[ "$(git rev-parse HEAD)" == "$DOUZERO_CI_MERGE_SHA" ]]
+          [[ "$DOUZERO_GIT_SHA" == "$DOUZERO_CI_MERGE_SHA" ]]
 
       # actions/setup-python@v6
       - name: Set up Python ${{ matrix.python-version }}
@@ -67,17 +82,42 @@ jobs:
           pip install -e .
 
       - name: compileall
-        run: python -m compileall -q douzero train.py evaluate.py evaluate_paired.py generate_eval_data.py
+        run: python -m compileall -q douzero tools benchmarks ./*.py
 
       - name: CLI --help
         run: |
           python train.py --help >/dev/null
+          python train_v2.py --help >/dev/null
+          python train_coach.py --help >/dev/null
           python evaluate.py --help >/dev/null
           python evaluate_paired.py --help >/dev/null
           python generate_eval_data.py --help >/dev/null
+          python train_belief.py --help >/dev/null
+          python evaluate_belief.py --help >/dev/null
+          python ingest_human_games.py --help >/dev/null
+          python validate_human_games.py --help >/dev/null
+          python pretrain_bc.py --help >/dev/null
+          python tools/package_model.py --help >/dev/null
+          python tools/prepare_p17_evaluation.py --help >/dev/null
+          python tools/formal_evaluation_dry_run.py --help >/dev/null
+          python tools/rebuild_human_dataset.py --help >/dev/null
+          python tools/validate_pr_evidence.py --help >/dev/null
+          python tools/validate_amp_fallback.py --help >/dev/null
+          bash scripts/validate_gpu_training.sh --help >/dev/null
 
       - name: pytest
         run: python -m pytest -q
 
       - name: baseline smoke (2 deals)
         run: python tools/capture_baseline.py --num_deals 2 --output artifacts/baseline/ci_smoke.json
+
+      # Upload one canonical baseline per run; the other matrix entries still
+      # execute the same tests but do not duplicate evidence.
+      - name: Upload commit-bound baseline evidence
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: baseline-${{ env.DOUZERO_CI_HEAD_SHA }}-${{ env.DOUZERO_CI_MERGE_SHA }}
+          path: artifacts/baseline/ci_smoke.json
+          if-no-files-found: error
+          retention-days: 14
