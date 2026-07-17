@@ -130,8 +130,21 @@ aggregate counts only and never prints the excluded ID or record contents:
 
 Revalidate and regenerate every downstream split/checkpoint from the rebuilt
 file; do not edit an already trained package and call that deletion complete.
-The rebuilt sidecar is regenerated atomically and binds the source dataset
-SHA-256 without disclosing excluded IDs.
+The rebuild writes the JSONL and manifest into one private immutable version,
+fsyncs both files and their directories, then publishes them with one atomic
+pointer replacement. Supported readers pin one pointer/version for the whole
+read, so a concurrent switch cannot mix data and manifest. A pre-commit
+failure leaves the prior complete version active. After pointer replacement,
+`RebuildPostCommitError` reports `committed=true` plus explicit `durable` and
+`current` state; the CLI returns status 3 and emits that state as JSON rather
+than implying rollback. An uncertain switch returns status 4 and retains the
+staged version for recovery. Publication locks are advisory, so the dataset
+parent must be an owner-controlled trusted directory; versioned publication is
+POSIX-only and fails closed when `flock` is unavailable. The new manifest binds
+the same pinned source snapshot SHA-256 without disclosing excluded IDs.
+After the first publication, the active output is the authoritative base for
+later deletion requests; `--input` is bootstrap-only, so removed games cannot
+be resurrected by retrying with an older export.
 
 ## Canary Gates
 

@@ -32,7 +32,7 @@ from typing import Sequence
 from douzero.human_data.schema import (
     HumanGameRecord,
     iter_jsonl_resilient,
-    verify_jsonl_manifest,
+    open_verified_jsonl_snapshot,
     write_jsonl,
 )
 from douzero.human_data.synthetic import generate_synthetic_records
@@ -73,6 +73,29 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _validate_and_collect(
+    record: HumanGameRecord,
+    valid: list[HumanGameRecord],
+    quarantined: list[str],
+) -> None:
+    result = validate_record(record)
+    if result.ok:
+        valid.append(record)
+        return
+    quarantined.append(
+        json.dumps(
+            {
+                "game_id": record.game_id,
+                "reason": result.reason,
+                "error": result.error,
+                "record": record.to_dict(),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
 
@@ -87,62 +110,40 @@ def main(argv: Sequence[str] | None = None) -> int:
             num_games=args.num_synthetic, base_seed=args.synthetic_seed
         ):
             total += 1
-            result = validate_record(record)
-            if result.ok:
-                valid.append(record)
-            else:
-                quarantined.append(
-                    json.dumps(
-                        {
-                            "game_id": record.game_id,
-                            "reason": result.reason,
-                            "error": result.error,
-                            "record": record.to_dict(),
-                        },
-                        sort_keys=True, ensure_ascii=False,
-                    )
-                )
+            _validate_and_collect(record, valid, quarantined)
     else:
         if not args.input:
             raise SystemExit("--input is required when --synthetic is not set")
-        if not args.allow_unverified_input:
-            input_manifest = verify_jsonl_manifest(args.input)
-        # Canonical inputs were verified above and cannot contain malformed
-        # lines. The migration-only opt-out reaches this resilient reader so
-        # legacy JSON/schema errors can be quarantined alongside replay errors;
-        # its output is explicitly marked as unverified lineage.
-        for line_result in iter_jsonl_resilient(args.input):
-            total += 1
-            if line_result.error:
-                n_parse_errors += 1
-                quarantined.append(
-                    json.dumps(
-                        {
-                            "lineno": line_result.lineno,
-                            "reason": "parse_error",
-                            "error": line_result.error,
-                        },
-                        sort_keys=True, ensure_ascii=False,
+        if args.allow_unverified_input:
+            # Migration-only inputs have no trusted manifest, so malformed
+            # records remain quarantinable rather than aborting the whole run.
+            for line_result in iter_jsonl_resilient(args.input):
+                total += 1
+                if line_result.error:
+                    n_parse_errors += 1
+                    quarantined.append(
+                        json.dumps(
+                            {
+                                "lineno": line_result.lineno,
+                                "reason": "parse_error",
+                                "error": line_result.error,
+                            },
+                            sort_keys=True,
+                            ensure_ascii=False,
+                        )
                     )
-                )
-                continue
-            record = line_result.record
-            assert record is not None  # guaranteed when error is empty
-            result = validate_record(record)
-            if result.ok:
-                valid.append(record)
-            else:
-                quarantined.append(
-                    json.dumps(
-                        {
-                            "game_id": record.game_id,
-                            "reason": result.reason,
-                            "error": result.error,
-                            "record": record.to_dict(),
-                        },
-                        sort_keys=True, ensure_ascii=False,
-                    )
-                )
+                    continue
+                record = line_result.record
+                assert record is not None
+                _validate_and_collect(record, valid, quarantined)
+        else:
+            # Manifest identity and records are consumed from one immutable
+            # verified spool, so an atomic pointer switch cannot cross-bind them.
+            with open_verified_jsonl_snapshot(args.input) as snapshot:
+                input_manifest = dict(snapshot.manifest)
+                for record in snapshot.iter_records():
+                    total += 1
+                    _validate_and_collect(record, valid, quarantined)
 
     valid_path = args.output + ".jsonl"
     quarantine_path = args.output + ".quarantine.jsonl"

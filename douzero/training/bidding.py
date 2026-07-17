@@ -6,7 +6,7 @@ import math
 import random
 from collections import Counter, deque
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 import torch
 import torch.nn.functional as F
@@ -14,9 +14,10 @@ import torch.nn.functional as F
 from douzero.models_v2.output import BiddingModelOutput
 from douzero.observation.bidding import BIDDING_ACTIONS, BiddingObservationV2
 
-_POLICIES = frozenset({
-    "random", "rule", "max", "pass", "learned", "epsilon_random"
-})
+_CONFIGURABLE_POLICIES = frozenset({"random", "rule", "max", "pass", "learned"})
+_TRANSITION_SOURCES = _CONFIGURABLE_POLICIES | {"epsilon_random"}
+_BIDDING_ROLES = frozenset({"landlord", "landlord_up", "landlord_down"})
+_IMITATION_POLICIES = frozenset({"rule"})
 
 
 @dataclass(frozen=True)
@@ -24,9 +25,9 @@ class BiddingPolicyConfig:
     """How bidding actions are initialized before/while learning.
 
     ``policy='learned'`` mixes the learned head with ``warm_start_policy`` at
-    ``learned_probability``.  Setting the probability gradually from 0 to 1
-    provides the requested rule-to-learned handoff without ever mislabelling a
-    rule bid as a learned one in transition provenance.
+    ``learned_probability``. The probability changes behavior collection, not
+    target semantics: rule bids remain explicit CE demonstrations, while
+    learned and exploratory bids receive selected-action actor-win targets.
     """
 
     policy: str = "rule"
@@ -34,9 +35,9 @@ class BiddingPolicyConfig:
     learned_probability: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.policy not in _POLICIES:
+        if self.policy not in _CONFIGURABLE_POLICIES:
             raise ValueError(f"unsupported bidding policy {self.policy!r}")
-        if self.warm_start_policy not in _POLICIES - {"learned"}:
+        if self.warm_start_policy not in _CONFIGURABLE_POLICIES - {"learned"}:
             raise ValueError("warm_start_policy must be random/rule/max/pass")
         if not math.isfinite(self.learned_probability) or not 0 <= self.learned_probability <= 1:
             raise ValueError("learned_probability must be finite and in [0, 1]")
@@ -94,18 +95,41 @@ class BiddingTransition:
     bid_action: int
     policy_version: str
     source_policy: str
-    policy_target_valid: bool = True
+    # This gates source-appropriate policy credit. Only rule demonstrations use
+    # plain CE; behavior actions train the selected bid's actor-win value logit.
+    policy_credit_valid: bool = True
+    actor_role: str = ""
     target_landlord_win: float = float("nan")
     target_landlord_score: float = float("nan")
-    target_regret: float = float("nan")
+    target_actor_win: float = float("nan")
+
+    def assign_actor_role(self, seat_to_role: Mapping[str, str]) -> None:
+        """Resolve the bidding observation's physical seat after the auction."""
+
+        role = seat_to_role.get(self.obs.current_seat)
+        if role not in _BIDDING_ROLES:
+            raise ValueError(
+                "resolved bidding seat_to_role is missing the actor's physical seat"
+            )
+        self.actor_role = role
 
     def label_from_terminal(self, terminal: dict) -> None:
-        # These are deliberately landlord-side labels for every neutral bidder.
-        targets = terminal.get("team_targets", {}).get("landlord")
-        if targets is None:
+        team_targets = terminal.get("team_targets", {})
+        landlord_targets = team_targets.get("landlord")
+        if landlord_targets is None:
             raise ValueError("terminal result is missing landlord team_targets")
-        self.target_landlord_win = float(targets["target_win"])
-        self.target_landlord_score = float(targets["target_score"])
+        if self.actor_role not in _BIDDING_ROLES:
+            raise ValueError(
+                "bidding transition actor_role must be resolved before terminal labelling"
+            )
+        actor_targets = team_targets.get(self.actor_role)
+        if actor_targets is None:
+            raise ValueError(
+                f"terminal result is missing {self.actor_role} team_targets"
+            )
+        self.target_landlord_win = float(landlord_targets["target_win"])
+        self.target_landlord_score = float(landlord_targets["target_score"])
+        self.target_actor_win = float(actor_targets["target_win"])
 
     def validate(self) -> None:
         if self.bid_action not in BIDDING_ACTIONS:
@@ -114,16 +138,27 @@ class BiddingTransition:
             raise ValueError("bid_action was not legal in its observation")
         if not self.policy_version:
             raise ValueError("bidding transition must record policy_version")
-        if self.source_policy not in _POLICIES:
+        if self.source_policy not in _TRANSITION_SOURCES:
             raise ValueError("bidding transition source_policy is invalid")
-        if not isinstance(self.policy_target_valid, bool):
-            raise ValueError("policy_target_valid must be bool")
-        if self.source_policy == "epsilon_random" and self.policy_target_valid:
-            raise ValueError("epsilon-random bids cannot be imitation policy targets")
+        if not isinstance(self.policy_credit_valid, bool):
+            raise ValueError("policy_credit_valid must be bool")
+        if self.actor_role not in _BIDDING_ROLES:
+            raise ValueError("bidding transition actor_role is invalid")
         if self.target_landlord_win not in (0.0, 1.0):
             raise ValueError("target_landlord_win must be binary")
         if not math.isfinite(self.target_landlord_score):
             raise ValueError("target_landlord_score must be finite")
+        if self.target_actor_win not in (0.0, 1.0):
+            raise ValueError("target_actor_win must be binary")
+        expected_actor_win = (
+            self.target_landlord_win
+            if self.actor_role == "landlord"
+            else 1.0 - self.target_landlord_win
+        )
+        if self.target_actor_win != expected_actor_win:
+            raise ValueError(
+                "target_actor_win is inconsistent with actor_role and landlord result"
+            )
 
 
 @dataclass
@@ -198,10 +233,22 @@ def bidding_loss(
     score_target_transform: str = "raw",
     score_clamp: float = 32.0,
 ) -> BiddingLossComponents:
-    """Masked listwise policy CE plus landlord-perspective outcome losses."""
+    """Actor-outcome bid credit plus landlord-perspective auxiliary losses.
+
+    Rule demonstrations remain a supervised warm start. Every other source is
+    a behavior action, so only its selected bid logit receives a bounded binary
+    actor-win target instead of being treated as an always-correct class label.
+    """
 
     if len(outputs) != batch.batch_size or not outputs:
         raise ValueError("bidding outputs and minibatch must have equal non-zero size")
+    if float(lambda_regret) != 0.0:
+        raise ValueError(
+            "lambda_bid_regret is unsupported by bid-policy-value-v2; "
+            "per-bid regret requires a separate action-value head"
+        )
+    for transition in batch.transitions:
+        transition.validate()
     logits = torch.stack([out.bid_logits.float() for out in outputs])
     masks = torch.stack([out.bid_action_mask for out in outputs])
     actions = torch.tensor(
@@ -212,15 +259,38 @@ def bidding_loss(
     if not bool(masks[torch.arange(len(outputs), device=logits.device), actions].all()):
         raise ValueError("bidding policy label points to an illegal action")
     masked_logits = logits.masked_fill(~masks, torch.finfo(logits.dtype).min)
-    policy_mask = torch.tensor(
-        [transition.policy_target_valid for transition in batch.transitions],
+    selected_logits = logits.gather(1, actions[:, None]).squeeze(1)
+    credit_mask = torch.tensor(
+        [transition.policy_credit_valid for transition in batch.transitions],
         device=logits.device,
         dtype=torch.bool,
     )
+    imitation_mask = torch.tensor(
+        [
+            transition.source_policy in _IMITATION_POLICIES
+            for transition in batch.transitions
+        ],
+        device=logits.device,
+        dtype=torch.bool,
+    )
+    actor_win_targets = torch.tensor(
+        [transition.target_actor_win for transition in batch.transitions],
+        device=logits.device,
+        dtype=logits.dtype,
+    )
+    imitation_terms = F.cross_entropy(masked_logits, actions, reduction="none")
+    behavior_terms = F.binary_cross_entropy_with_logits(
+        selected_logits, actor_win_targets, reduction="none"
+    )
+    policy_terms = torch.where(
+        imitation_mask,
+        imitation_terms,
+        behavior_terms,
+    )
     policy = (
-        F.cross_entropy(masked_logits[policy_mask], actions[policy_mask])
-        if bool(policy_mask.any())
-        else masked_logits.sum() * 0.0
+        policy_terms[credit_mask].mean()
+        if bool(credit_mask.any())
+        else logits.sum() * 0.0
     )
     win_logits = torch.stack([out.landlord_win_logit.float() for out in outputs])
     target_win = torch.tensor(
@@ -246,22 +316,10 @@ def bidding_loss(
     )
     score = F.huber_loss(score_predictions, target_score, delta=score_delta)
     regret = logits.new_zeros(())
-    if lambda_regret > 0:
-        regrets = [transition.target_regret for transition in batch.transitions]
-        if not all(math.isfinite(value) for value in regrets):
-            raise ValueError(
-                "bid regret loss is enabled but rollout regret labels are missing"
-            )
-        # A conservative scalar auxiliary: lower regret should correspond to a
-        # larger selected logit. It is opt-in until candidate rollouts exist.
-        chosen = logits.gather(1, actions[:, None]).squeeze(1)
-        regret_target = -torch.tensor(regrets, device=logits.device)
-        regret = F.huber_loss(chosen, regret_target, delta=score_delta)
     total = (
         float(lambda_policy) * policy
         + float(lambda_landlord_win) * win
         + float(lambda_landlord_score) * score
-        + float(lambda_regret) * regret
     )
     return BiddingLossComponents(
         total=total,

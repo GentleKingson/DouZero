@@ -105,8 +105,22 @@ bidding:
 ```
 
 `policy` accepts `random`, `rule`, `max`, `pass`, or `learned`. In learned
-mode, `learned_probability` controls a gradual handoff from the non-learned
-warm-start policy; each collected auction transition records its true source.
+mode, `learned_probability` controls the behavior mixture with the non-learned
+warm-start policy; it does not turn the selected action into an unconditional
+classification label. Each auction transition records its true source and the
+acting physical seat. Rule demonstrations use masked policy CE. Learned,
+random, epsilon-random, max, and pass behavior actions instead use the acting
+seat's eventual role to fit the selected entry of the four-dimensional bid
+logits as an actor-win action value. The bounded selected-logit BCE lowers a
+losing bid and raises a winning bid; unselected bids receive no behavior-label
+gradient. The scalar landlord win/score heads stay auxiliary state-outcome
+predictors rather than the action-value signal used for bid selection.
+This policy-credit term optimizes terminal team win probability, not per-bid
+ADP score. `lambda_bid_score` supervises only the scalar landlord-state score
+auxiliary and must not be presented as action-conditioned score optimization.
+`lambda_bid_regret` is reserved and must remain zero: reusing the actor-win
+logit as a regret regressor would violate the v2 head semantics, so training
+fails closed until a separate per-bid regret head exists.
 The bidding architecture and its versioned public schema enter checkpoint
 identity only when `bidding_enabled=true`, preserving the hashes of prior
 bidding-disabled V2 checkpoints.

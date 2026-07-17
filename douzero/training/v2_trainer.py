@@ -485,6 +485,11 @@ class V2Trainer:
         #     zero-gradient step that silently changes nothing.
         # (b) optimizer_steps > 0 with buffer_capacity < batch_size means
         #     step() can never sample a minibatch and silently skips.
+        if loss_cfg.lambda_bid_regret != 0:
+            raise ValueError(
+                "lambda_bid_regret is unsupported by bid-policy-value-v2; "
+                "per-bid regret requires a separate action-value head"
+            )
         active_loss = (
             loss_cfg.lambda_win + loss_cfg.lambda_score + loss_cfg.lambda_uncertainty
             + self.strategy_aux_weight
@@ -619,7 +624,6 @@ class V2Trainer:
                 current_bidding_selector=(
                     self._choose_bidding_action if self.standard_mode else None
                 ),
-                bidding_policy_config=self.bidding_policy_config,
                 ruleset=self.ruleset,
                 max_steps=self.config.max_steps_per_episode,
                 logger=matchup_logger,
@@ -752,7 +756,6 @@ class V2Trainer:
                     bid_action=bid,
                     policy_version=policy_version_at_start,
                     source_policy=source_policy,
-                    policy_target_valid=source_policy != "epsilon_random",
                 ))
                 _obs_out, _reward, done, info = env.step(None, bid_value=bid)
                 if done and info.get("redeal"):
@@ -782,6 +785,8 @@ class V2Trainer:
                     continue
                 # Landlord assignment and bottom reveal completed; roles now
                 # exist and the next iteration enters ordinary card play.
+                for transition in episode.bidding_transitions:
+                    transition.assign_actor_role(env._env._seat_to_role)
                 continue
             position = env._acting_player_position
             infoset = env.infoset

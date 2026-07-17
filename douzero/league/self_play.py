@@ -24,7 +24,7 @@ from douzero.training.v2_buffer import Episode, Transition
 from .policy_pool import LoadedPolicySelector, PolicyBundle, PolicyPool
 
 ActionSelector = Callable[[ObservationV2], int]
-BiddingSelector = Callable[[BiddingObservationV2], tuple[int, str] | int]
+BiddingSelector = Callable[[BiddingObservationV2], tuple[int, str]]
 
 
 @dataclass(frozen=True)
@@ -77,7 +77,6 @@ class PopulationEpisodeRunner:
         *,
         opponent_selectors: Mapping[str, LoadedPolicySelector] | None = None,
         current_bidding_selector: BiddingSelector | None = None,
-        bidding_policy_config: BiddingPolicyConfig | None = None,
         ruleset: RuleSet | None = None,
         max_steps: int = 600,
         logger: MatchupLogger | None = None,
@@ -100,7 +99,6 @@ class PopulationEpisodeRunner:
             pool.validate_loaded_selector(selector)
         self.ruleset = ruleset
         self.current_bidding_selector = current_bidding_selector
-        self.bidding_policy_config = bidding_policy_config or BiddingPolicyConfig()
         self.max_steps = max_steps
         self.logger = logger
 
@@ -152,10 +150,18 @@ class PopulationEpisodeRunner:
                 source_policy = "learned"
                 if policy_id == self.pool.current.policy_id:
                     selected = self.current_bidding_selector(bidding_obs)
-                    if isinstance(selected, tuple):
-                        bid, source_policy = int(selected[0]), str(selected[1])
-                    else:
-                        bid = int(selected)
+                    if (
+                        not isinstance(selected, tuple)
+                        or len(selected) != 2
+                        or isinstance(selected[0], bool)
+                        or not isinstance(selected[0], int)
+                        or not isinstance(selected[1], str)
+                    ):
+                        raise TypeError(
+                            "current_bidding_selector must return "
+                            "(bid: int, source_policy: str)"
+                        )
+                    bid, source_policy = selected
                 elif policy_id == "builtin-random":
                     bid = int(rng.choice(bidding_obs.legal_bids))
                     source_policy = "random"
@@ -181,7 +187,6 @@ class PopulationEpisodeRunner:
                         bid_action=bid,
                         policy_version=policy_version_at_start,
                         source_policy=source_policy,
-                        policy_target_valid=source_policy != "epsilon_random",
                     ))
                 _obs, _reward, done, info = env.step(None, bid_value=bid)
                 if done and info.get("redeal"):
@@ -205,6 +210,8 @@ class PopulationEpisodeRunner:
                 role_to_neutral = {
                     role: neutral for neutral, role in env._env._seat_to_role.items()
                 }
+                for transition in episode.bidding_transitions:
+                    transition.assign_actor_role(env._env._seat_to_role)
                 actual_assignments = {
                     role: bundle.policy_ids_by_seat[
                         neutral_to_bundle_seat[neutral]

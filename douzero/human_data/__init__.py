@@ -44,11 +44,13 @@ from .schema import (
     HumanGameRecord,
     JsonlLineResult,
     RecordValidationError,
+    VerifiedJsonlSnapshot,
     iter_jsonl_resilient,
     record_from_dict,
     record_from_jsonl_line,
     read_jsonl,
     read_verified_jsonl,
+    open_verified_jsonl_snapshot,
     dataset_manifest_path,
     verify_jsonl_manifest,
     write_jsonl,
@@ -66,7 +68,13 @@ from .identifiers import (
 from .adapters import Adapter, AttestedAdapterRecord
 from .validate import assert_legacy_ruleset
 from .ingest import dedupe_by_game_id
-from .rebuild import RebuildReport, rebuild_without_game_ids
+from .rebuild import (
+    ConcurrentDatasetUpdateError,
+    RebuildCommitUncertainError,
+    RebuildPostCommitError,
+    RebuildReport,
+    rebuild_without_game_ids,
+)
 
 __all__ = [
     "CANONICAL_FORMAT_VERSION",
@@ -78,11 +86,13 @@ __all__ = [
     "HumanGameRecord",
     "JsonlLineResult",
     "RecordValidationError",
+    "VerifiedJsonlSnapshot",
     "iter_jsonl_resilient",
     "record_from_dict",
     "record_from_jsonl_line",
     "read_jsonl",
     "read_verified_jsonl",
+    "open_verified_jsonl_snapshot",
     "dataset_manifest_path",
     "verify_jsonl_manifest",
     "write_jsonl",
@@ -99,5 +109,8 @@ __all__ = [
     "make_internal_game_id",
     "pseudonymize_external_game_id",
     "RebuildReport",
+    "ConcurrentDatasetUpdateError",
+    "RebuildCommitUncertainError",
+    "RebuildPostCommitError",
     "rebuild_without_game_ids",
 ]

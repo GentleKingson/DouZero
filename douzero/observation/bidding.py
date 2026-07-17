@@ -25,7 +25,7 @@ from .schema import BIDDING_ENCODING_VERSION
 BIDDING_FEATURE_VERSION = "v2-bidding"
 BIDDING_SCHEMA_VERSION = "v2-bidding-2"
 BIDDING_ACTION_SCHEMA_VERSION = "score-0-1-2-3-v1"
-BIDDING_HEAD_VERSION = "bid-policy-value-v1"
+BIDDING_HEAD_VERSION = "bid-policy-value-v2"
 BIDDING_ACTIONS: tuple[int, ...] = (0, 1, 2, 3)
 NUM_NEUTRAL_SEATS = 3
 NEUTRAL_SEATS: tuple[str, ...] = ("0", "1", "2")

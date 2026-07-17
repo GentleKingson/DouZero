@@ -127,6 +127,36 @@ def _raw_bidding_obs(
     }
 
 
+def _labelled_bidding_transition(
+    obs,
+    action: int,
+    *,
+    source_policy: str = "learned",
+    policy_credit_valid: bool = True,
+) -> BiddingTransition:
+    transition = BiddingTransition(
+        obs=obs,
+        bid_action=action,
+        policy_version="test-policy",
+        source_policy=source_policy,
+        policy_credit_valid=policy_credit_valid,
+    )
+    other_seats = [seat for seat in ("0", "1", "2") if seat != obs.current_seat]
+    transition.assign_actor_role({
+        obs.current_seat: "landlord",
+        other_seats[0]: "landlord_down",
+        other_seats[1]: "landlord_up",
+    })
+    transition.label_from_terminal({
+        "team_targets": {
+            "landlord": {"target_win": 1.0, "target_score": 2.0},
+            "landlord_down": {"target_win": 0.0, "target_score": -1.0},
+            "landlord_up": {"target_win": 0.0, "target_score": -1.0},
+        }
+    })
+    return transition
+
+
 def _bidding_feature_field(obs, name: str) -> np.ndarray:
     offset = 0
     for field in obs.schema.fields:
@@ -245,16 +275,23 @@ def test_bidding_head_is_separate_from_card_action_encoder_and_masks_illegal():
     assert output.argmax_bid() in obs.legal_bids
 
 
-def test_masked_listwise_bid_loss_uses_landlord_perspective_and_gradients():
+def test_masked_bid_loss_uses_actor_return_and_landlord_value_gradients():
     ruleset = RuleSet.standard()
     obs = get_bidding_obs_v2(
         _raw_bidding_obs(history=(("0", 1),)), ruleset=ruleset
     )
     transition = BiddingTransition(obs, 3, "policy-7", "learned")
+    transition.assign_actor_role({
+        "0": "landlord",
+        "1": "landlord_down",
+        "2": "landlord_up",
+    })
     transition.label_from_terminal(
         {
             "team_targets": {
-                "landlord": {"target_win": 1.0, "target_score": 8.0}
+                "landlord": {"target_win": 1.0, "target_score": 8.0},
+                "landlord_down": {"target_win": 0.0, "target_score": -4.0},
+                "landlord_up": {"target_win": 0.0, "target_score": -4.0},
             }
         }
     )
@@ -276,10 +313,91 @@ def test_masked_listwise_bid_loss_uses_landlord_perspective_and_gradients():
     )
     assert torch.isfinite(components.total)
     components.total.backward()
-    assert logits.grad is not None and logits.grad[1].item() == 0.0
+    assert logits.grad is not None
+    assert logits.grad[3].item() > 0.0
+    assert torch.equal(logits.grad[:3], torch.zeros_like(logits.grad[:3]))
     assert win.grad is not None and score.grad is not None
     assert transition.target_landlord_win == 1.0
     assert transition.target_landlord_score == 8.0
+    assert transition.actor_role == "landlord_down"
+    assert transition.target_actor_win == 0.0
+
+
+def test_all_disabled_bid_credit_is_finite_with_illegal_actions_and_zero_gradient():
+    ruleset = RuleSet.standard()
+    observations = [
+        get_bidding_obs_v2(
+            _raw_bidding_obs(history=(("0", 1),)), ruleset=ruleset
+        ),
+        get_bidding_obs_v2(
+            _raw_bidding_obs(history=(("0", 1), ("1", 2))), ruleset=ruleset
+        ),
+    ]
+    transitions = [
+        _labelled_bidding_transition(
+            obs,
+            max(obs.legal_bids),
+            policy_credit_valid=False,
+        )
+        for obs in observations
+    ]
+    logits = [
+        torch.tensor([0.0, 1.0, 2.0, 3.0], requires_grad=True),
+        torch.tensor([3.0, 2.0, 1.0, 0.0], requires_grad=True),
+    ]
+    outputs = [
+        BiddingModelOutput(
+            row,
+            torch.as_tensor(obs.bid_action_mask.copy()),
+            torch.tensor(0.0),
+            torch.tensor(0.0),
+        )
+        for row, obs in zip(logits, observations)
+    ]
+    components = bidding_loss(
+        outputs,
+        BiddingMinibatch(transitions),
+        lambda_policy=1.0,
+        lambda_landlord_win=0.0,
+        lambda_landlord_score=0.0,
+    )
+    assert components.policy == 0.0
+    assert torch.isfinite(components.total)
+    components.total.backward()
+    assert all(
+        row.grad is not None and torch.equal(row.grad, torch.zeros_like(row))
+        for row in logits
+    )
+
+
+def test_bid_regret_fails_closed_without_a_separate_action_value_head():
+    ruleset = RuleSet.standard()
+    obs = get_bidding_obs_v2(_raw_bidding_obs(), ruleset=ruleset)
+    transition = _labelled_bidding_transition(obs, max(obs.legal_bids))
+    output = BiddingModelOutput(
+        torch.zeros(4),
+        torch.as_tensor(obs.bid_action_mask.copy()),
+        torch.tensor(0.0),
+        torch.tensor(0.0),
+    )
+    with pytest.raises(ValueError, match="lambda_bid_regret is unsupported"):
+        bidding_loss(
+            [output],
+            BiddingMinibatch([transition]),
+            lambda_policy=1.0,
+            lambda_landlord_win=0.0,
+            lambda_landlord_score=0.0,
+            lambda_regret=0.1,
+        )
+
+    with pytest.raises(ValueError, match="lambda_bid_regret is unsupported"):
+        V2Trainer(
+            ModelV2(build_v2_schema(), _tiny_config()),
+            ruleset=ruleset,
+            loss_config=LossConfig(lambda_bid_regret=0.1),
+            bidding_policy_config=BiddingPolicyConfig(policy="max"),
+            config=TrainerConfig(max_episodes=0, optimizer_steps=0),
+        )
 
 
 def test_warm_start_bid_is_not_mislabelled_as_learned():
@@ -302,6 +420,14 @@ def test_warm_start_bid_is_not_mislabelled_as_learned():
         lambda _obs: 3,
     )
     assert bid == 3 and source == "learned"
+
+
+@pytest.mark.parametrize("field", ("policy", "warm_start_policy"))
+def test_epsilon_random_is_provenance_only_not_a_configurable_policy(field):
+    with pytest.raises(
+        ValueError, match="unsupported bidding policy|warm_start_policy"
+    ):
+        BiddingPolicyConfig(**{field: "epsilon_random"})
 
 
 def test_all_pass_redeal_discards_abandoned_bid_transitions():
@@ -359,9 +485,6 @@ def test_standard_population_runner_records_only_learner_policy_decisions():
         pool,
         lambda _obs: 0,
         current_bidding_selector=lambda obs: (max(obs.legal_bids), "learned"),
-        bidding_policy_config=BiddingPolicyConfig(
-            policy="learned", learned_probability=1.0
-        ),
         ruleset=ruleset,
     )
     episode, record = runner.run(
@@ -372,6 +495,10 @@ def test_standard_population_runner_records_only_learner_policy_decisions():
     assert episode.bidding_transitions
     assert all(
         transition.policy_version == current.policy_id
+        for transition in episode.bidding_transitions
+    )
+    assert all(
+        transition.actor_role == "landlord"
         for transition in episode.bidding_transitions
     )
     assert episode.transitions
@@ -388,6 +515,26 @@ def test_standard_population_runner_records_only_learner_policy_decisions():
     assert record.bidding_transitions == len(episode.bidding_transitions)
 
 
+def test_population_runner_rejects_bidding_selector_without_source_provenance():
+    ruleset = RuleSet.standard()
+    model = ModelV2(build_v2_schema(), _tiny_config())
+    _current, pool = _standard_policy_pool(model, ruleset)
+    game_index = next(
+        index
+        for index in range(100)
+        if pool.sample_bundle(index).learner_controlled_seats == ("landlord",)
+    )
+    runner = PopulationEpisodeRunner(
+        pool,
+        lambda _obs: 0,
+        current_bidding_selector=lambda obs: max(obs.legal_bids),
+        ruleset=ruleset,
+    )
+
+    with pytest.raises(TypeError, match="must return.*source_policy"):
+        runner.run(game_index)
+
+
 def test_population_runner_audits_cap_and_discards_all_pass_bids():
     ruleset = replace(RuleSet.standard(), max_redeals=1)
     model = ModelV2(build_v2_schema(), _tiny_config())
@@ -398,9 +545,6 @@ def test_population_runner_audits_cap_and_discards_all_pass_bids():
         pool,
         lambda _obs: 0,
         current_bidding_selector=lambda _obs: (0, "learned"),
-        bidding_policy_config=BiddingPolicyConfig(
-            policy="learned", learned_probability=1.0
-        ),
         ruleset=ruleset,
     )
 
@@ -520,6 +664,10 @@ def test_standard_training_step_and_strict_resume(tmp_path):
     assert stats.optimizer_steps == 1
     assert stats.bidding_transitions_collected >= 1
     assert all(
+        transition.obs.current_seat == "0" and transition.actor_role == "landlord"
+        for transition in trainer.bidding_buffer._transitions
+    )
+    assert all(
         transition.policy_id == "current"
         for transition in trainer.buffer._episodes[-1].transitions
     )
@@ -565,7 +713,7 @@ def test_v2_checkpoint_carries_and_validates_explicit_bidding_identity(tmp_path)
     path = tmp_path / "bidding-model.tar"
     save_v2_checkpoint(str(path), model, ruleset=RuleSet.standard())
     bundle = torch.load(path, weights_only=True)
-    assert bundle["bidding_head_version"]
+    assert bundle["bidding_head_version"] == "bid-policy-value-v2"
     assert bundle["bidding_action_schema"] == "score-0-1-2-3-v1"
     assert bundle["bidding_feature_schema_hash"] == model.bidding_schema.stable_hash()
     state, _manifest = load_v2_checkpoint(
@@ -576,6 +724,19 @@ def test_v2_checkpoint_carries_and_validates_explicit_bidding_identity(tmp_path)
         runtime_model_config=cfg,
     )
     assert set(state) == set(model.state_dict())
+
+    old_semantics = copy.deepcopy(bundle)
+    old_semantics["bidding_head_version"] = "bid-policy-value-v1"
+    old_path = tmp_path / "old-bidding-semantics.tar"
+    torch.save(old_semantics, old_path)
+    with pytest.raises(CheckpointCompatibilityError, match="bidding_head_version"):
+        load_v2_checkpoint(
+            str(old_path),
+            expected_schema_hash=schema.stable_hash(),
+            expected_model_config_hash=cfg.stable_hash(),
+            expected_ruleset=RuleSet.standard(),
+            runtime_model_config=cfg,
+        )
 
     bundle["bidding_action_schema"] = "wrong-action-contract"
     tampered = tmp_path / "tampered.tar"

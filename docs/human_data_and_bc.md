@@ -221,9 +221,20 @@ bc:                            # BC-specific settings (no enabled/lambda_bc here
 - Canonical schema v2 rejects raw external game IDs. Existing draft schema-v1
   JSONL must be re-ingested from the authorized source with keyed HMAC IDs;
   there is deliberately no converter that would copy old raw IDs forward.
-- Deletion: removing a record from the canonical JSONL and re-running
-  `validate_human_games.py` fully removes it from the pipeline (records are
-  never copied elsewhere).
+- Deletion: `tools/rebuild_human_dataset.py` writes a private immutable
+  JSONL/manifest version and atomically replaces one active pointer only after
+  both artifacts and directories are fsynced. Supported readers pin a complete
+  version. A pre-commit failure leaves the prior version active; an error after
+  pointer replacement raises `RebuildPostCommitError` with explicit
+  `committed`, `durable`, and `current` state instead of implying rollback.
+  Rebuilds are serialized by an advisory lock and require an owner-controlled,
+  trusted dataset parent directory. Re-run validation and every downstream
+  split/checkpoint from that rebuilt dataset; records are never copied into
+  deployment packages.
+- Versioned publication currently requires POSIX `flock` support and fails
+  closed without it. Legacy plain-JSONL human-data reads and writes retain
+  their no-lock compatibility path on Windows; the model and other CPU runtime
+  features remain portable.
 - License provenance is recorded in `source_metadata.license` and audited in
   [third_party_review.md](third_party_review.md).
 

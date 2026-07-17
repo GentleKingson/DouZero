@@ -88,6 +88,19 @@ not synchronized; only `belief_training_mode=frozen` can participate in a
 compatible DDP run. These are implementation limitations, not merely missing
 GPU measurements, and a successful base V2 DDP smoke does not clear them.
 
+In single-process standard training, bidding policy credit is source-aware.
+Explicit rule demonstrations use masked CE. Learned and exploratory behavior
+actions are resolved from their neutral physical seat to the final role and
+fit only the selected bid's actor-win value logit with a bounded binary loss. A
+failed selected bid is therefore pushed down while a successful bid is pushed
+up; neither is treated as a self-imitation class label. All-pass redeals and
+the redeal-cap guard remain excluded from this objective.
+This fitted bidding value is a terminal win-probability target. It does not
+claim to optimize an action-conditioned ADP score; the scalar landlord score
+head remains an auxiliary state prediction.
+The reserved `lambda_bid_regret` setting must remain zero because regret needs
+a separate action-value head; nonzero values fail before collection.
+
 ```bash
 torchrun --standalone --nproc-per-node=2 train_v2.py \
   --config configs/enhanced.yaml --ddp_enabled --ddp_backend nccl \

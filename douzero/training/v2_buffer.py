@@ -183,8 +183,8 @@ class Episode:
     """All transitions of one game, plus the terminal result dict."""
 
     transitions: list[Transition] = field(default_factory=list)
-    # P17 bidding transitions use neutral seats and landlord-perspective labels,
-    # so they live beside (not inside) the role-perspective card replay.
+    # P17 bidding observations use neutral seats; terminal labelling adds the
+    # resolved actor role for policy credit and landlord-side value targets.
     bidding_transitions: list[object] = field(default_factory=list)
     redeal_count: int = 0
     max_redeals_exceeded: bool = False

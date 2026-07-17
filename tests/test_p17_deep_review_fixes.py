@@ -653,7 +653,88 @@ def test_package_training_identity_must_come_from_source_checkpoint(tmp_path):
     assert manifest.source_checkpoint_sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
 
 
-def test_epsilon_random_bid_has_no_policy_imitation_gradient():
+@pytest.mark.parametrize(
+    "source_policy", ("learned", "random", "epsilon_random", "max", "pass")
+)
+@pytest.mark.parametrize("actor_win", (0.0, 1.0))
+def test_behavior_bid_follows_actor_outcome_value_gradient(source_policy, actor_win):
+    ruleset = RuleSet.standard()
+    deck = list(range(3, 15)) * 4 + [17] * 4 + [20, 30]
+    env = GameEnv(
+        {role: RuleAgent() for role in ("landlord", "landlord_up", "landlord_down")},
+        ruleset=ruleset,
+    )
+    env.card_play_init_standard(deal_standard_deck(deck))
+    obs = get_bidding_obs_v2(env.get_bidding_obs(), ruleset=ruleset)
+    action = 0 if source_policy == "pass" else max(obs.legal_bids)
+    transition = BiddingTransition(
+        obs,
+        action,
+        "policy",
+        source_policy,
+    )
+    other_seats = [seat for seat in ("0", "1", "2") if seat != obs.current_seat]
+    transition.assign_actor_role({
+        obs.current_seat: "landlord",
+        other_seats[0]: "landlord_down",
+        other_seats[1]: "landlord_up",
+    })
+    transition.label_from_terminal({
+        "team_targets": {
+            "landlord": {
+                "target_win": actor_win,
+                "target_score": 2.0 if actor_win else -2.0,
+            },
+            "landlord_down": {
+                "target_win": 1.0 - actor_win,
+                "target_score": -1.0 if actor_win else 1.0,
+            },
+            "landlord_up": {
+                "target_win": 1.0 - actor_win,
+                "target_score": -1.0 if actor_win else 1.0,
+            },
+        }
+    })
+    logits = torch.zeros(4, requires_grad=True)
+    action_mask = torch.as_tensor(obs.bid_action_mask.copy())
+    output = BiddingModelOutput(
+        logits,
+        action_mask,
+        torch.tensor(0.0, requires_grad=True),
+        torch.tensor(0.0, requires_grad=True),
+    )
+    before = torch.softmax(logits.detach().masked_fill(~action_mask, -torch.inf), dim=0)[
+        action
+    ]
+    loss = bidding_loss(
+        [output],
+        BiddingMinibatch([transition]),
+        lambda_policy=1.0,
+        lambda_landlord_win=0.0,
+        lambda_landlord_score=0.0,
+    )
+    loss.total.backward()
+    chosen_gradient = logits.grad[action].item()
+    if actor_win == 0.0:
+        assert chosen_gradient > 0.0
+    else:
+        assert chosen_gradient < 0.0
+    assert all(
+        logits.grad[index].item() == 0.0
+        for index in range(len(logits))
+        if index != action
+    )
+    updated_logits = logits.detach() - 0.1 * logits.grad
+    after = torch.softmax(updated_logits.masked_fill(~action_mask, -torch.inf), dim=0)[
+        action
+    ]
+    if actor_win == 0.0:
+        assert after < before
+    else:
+        assert after > before
+
+
+def test_failed_rule_bid_remains_an_explicit_imitation_target():
     ruleset = RuleSet.standard()
     deck = list(range(3, 15)) * 4 + [17] * 4 + [20, 30]
     env = GameEnv(
@@ -663,22 +744,26 @@ def test_epsilon_random_bid_has_no_policy_imitation_gradient():
     env.card_play_init_standard(deal_standard_deck(deck))
     obs = get_bidding_obs_v2(env.get_bidding_obs(), ruleset=ruleset)
     action = max(obs.legal_bids)
-    transition = BiddingTransition(
-        obs,
-        action,
-        "policy",
-        "epsilon_random",
-        policy_target_valid=False,
-    )
+    transition = BiddingTransition(obs, action, "policy", "rule")
+    other_seats = [seat for seat in ("0", "1", "2") if seat != obs.current_seat]
+    transition.assign_actor_role({
+        obs.current_seat: "landlord",
+        other_seats[0]: "landlord_down",
+        other_seats[1]: "landlord_up",
+    })
     transition.label_from_terminal({
-        "team_targets": {"landlord": {"target_win": 1.0, "target_score": 2.0}}
+        "team_targets": {
+            "landlord": {"target_win": 0.0, "target_score": -2.0},
+            "landlord_down": {"target_win": 1.0, "target_score": 1.0},
+            "landlord_up": {"target_win": 1.0, "target_score": 1.0},
+        }
     })
     logits = torch.zeros(4, requires_grad=True)
     output = BiddingModelOutput(
         logits,
         torch.as_tensor(obs.bid_action_mask.copy()),
-        torch.tensor(0.0, requires_grad=True),
-        torch.tensor(0.0, requires_grad=True),
+        torch.tensor(0.0),
+        torch.tensor(0.0),
     )
     loss = bidding_loss(
         [output],
@@ -688,8 +773,7 @@ def test_epsilon_random_bid_has_no_policy_imitation_gradient():
         lambda_landlord_score=0.0,
     )
     loss.total.backward()
-    assert loss.policy == 0.0
-    assert torch.equal(logits.grad, torch.zeros_like(logits))
+    assert logits.grad[action].item() < 0.0
 
 
 def test_frozen_belief_resume_rejects_same_config_different_weights(tmp_path):

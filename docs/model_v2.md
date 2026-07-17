@@ -60,7 +60,7 @@ acting role ──────────────────────�
 | `StateEncoder` | `state_encoder.py` | Encode the per-decision state block + public context block into one role-agnostic trunk vector. Runs **once per decision**. |
 | `StateActionFusion` | `fusion.py` | Combine the shared state trunk + history summary + per-action embedding + role embedding, via pre-norm residual MLP blocks. |
 | `ValueHeads` | `heads.py` | Multi-head output: `win_logit`, `score_if_win`, `score_if_loss`, derived `p_win` and `score_mean`. Score heads are clamped for numerical stability. |
-| `BiddingHeads` | `heads.py` | Default-off P17 auction path: masked logits over fixed bids `0/1/2/3`, landlord-win logit, expected landlord score, and optional uncertainty. It consumes only the separate public bidding feature vector. |
+| `BiddingHeads` | `heads.py` | Default-off P17 auction path: actor-win value logits over fixed bids `0/1/2/3`, landlord-win logit, expected landlord score, and optional uncertainty. It consumes only the separate public bidding feature vector. |
 | `ModelV2` | `model.py` | The top-level model: wires the encoders → fusion → heads, and exposes `forward()` + `parameter_count()`. |
 | `ModelOutput` | `output.py` | Typed return value: the head tensors + the action mask + `argmax_win()` selection helper. |
 | `observation_to_model_inputs` | `batch.py` | Bridge from `ObservationV2` to the model's tensor contract (splits the state/context blocks into card-vector and flat-field portions). |
@@ -81,6 +81,9 @@ They are not reindexed relative to the rotated bidding order, so all three
 first-bidder rotations remain distinguishable to the model. This semantic
 change is included in the bidding feature-schema hash; `v2-bidding-1`
 checkpoints fail strict identity validation rather than loading silently.
+Head identity `bid-policy-value-v2` additionally binds the fitted per-bid
+actor-win semantics. Checkpoints from `bid-policy-value-v1`, whose behavior
+actions could be self-imitation labels, fail strict identity validation.
 
 ### Key invariants (tested in `tests/test_model_v2.py`)
 
@@ -374,7 +377,12 @@ coverage.
   and `policy_league_and_style.md`.
 - P17 learned bidding is default-off and requires the standard ruleset. Its
   separate observation/head/loss/checkpoint identities are not present in a
-  bidding-disabled model.
+  bidding-disabled model. The policy head is warm-started only from explicit
+  rule demonstrations; self-selected and exploratory bids fit the selected
+  per-bid actor-win value from the acting seat's terminal role. Losing behavior
+  lowers its selected bid logit instead of being recycled as a positive
+  imitation label. The scalar landlord outcome heads are auxiliary state-value
+  predictors, not the per-action selection signal.
 - P14 DDP remains available for compatible legacy-ruleset V2 card-play runs.
   Standard learned bidding and joint/alternating belief are explicitly
   rejected under DDP. `torch.compile` is limited to the base eager-equivalent

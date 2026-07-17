@@ -6,8 +6,10 @@ import copy
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -15,6 +17,8 @@ import pytest
 import torch
 
 import ingest_human_games
+import douzero.human_data.rebuild as human_data_rebuild
+import douzero.human_data.schema as human_data_schema
 import douzero.evaluation.p17 as p17_evaluation
 from douzero.belief import BeliefConfig, BeliefModel
 from douzero.belief.checkpoint import save_belief_checkpoint
@@ -53,10 +57,16 @@ from douzero.evaluation.agents import RuleAgent
 from douzero.evaluation.deep_agent import DeepAgentV2
 from douzero.evaluation.legacy_data_adapter import deal_standard_deck
 from douzero.human_data import (
+    RecordValidationError,
+    RebuildCommitUncertainError,
+    RebuildPostCommitError,
     dataset_manifest_path,
     dedupe_by_game_id,
+    iter_jsonl_resilient,
     load_hmac_project_key,
+    open_verified_jsonl_snapshot,
     read_jsonl,
+    read_verified_jsonl,
     rebuild_without_game_ids,
     verify_jsonl_manifest,
     write_jsonl,
@@ -66,6 +76,7 @@ from douzero.models_v2 import ModelV2, ModelV2Config
 from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.search import SearchConfig
 import tools.gpu_validation_probe as gpu_validation_probe
+import tools.rebuild_human_dataset as rebuild_human_dataset_tool
 from tools.gpu_validation_probe import probe_environment
 from tools.validate_amp_fallback import validate_amp_fallback
 from train_v2 import _build_training_metrics
@@ -73,6 +84,12 @@ from evaluate_paired import generate_deals
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _active_manifest_path(path: Path) -> Path:
+    """Test-only resolver; production consumers use the pinned snapshot API."""
+
+    return human_data_schema._resolve_jsonl_paths(path)[1]
 
 
 def _model(
@@ -390,7 +407,7 @@ def test_learned_bidding_package_requires_identity_bound_schema(tmp_path):
     package = tmp_path / "bidding-release"
     manifest = create_model_package(package, model, ruleset)
     assert manifest.bidding_enabled is True
-    assert manifest.bidding_head_version
+    assert manifest.bidding_head_version == "bid-policy-value-v2"
     assert manifest.bidding_action_schema
     assert len(manifest.bidding_feature_schema_hash) == 64
     payload = json.loads((package / "bidding_schema.json").read_text())
@@ -423,6 +440,25 @@ def test_learned_bidding_package_requires_identity_bound_schema(tmp_path):
     loaded_action = loaded_agent.act_v2(play_observation)
     assert loaded_action in play_observation.actions.legal_actions
     assert loaded_action == original_agent.act_v2(play_observation)
+
+    manifest_path = package / "manifest.json"
+    manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    old_semantics_payload = copy.deepcopy(payload)
+    old_semantics_manifest = copy.deepcopy(manifest_payload)
+    old_semantics_payload["bidding_head_version"] = "bid-policy-value-v1"
+    old_semantics_manifest["bidding_head_version"] = "bid-policy-value-v1"
+    (package / "bidding_schema.json").write_text(
+        json.dumps(old_semantics_payload), encoding="utf-8"
+    )
+    manifest_path.write_text(json.dumps(old_semantics_manifest), encoding="utf-8")
+    _refresh_checksums(package)
+    with pytest.raises(ModelPackageError, match="bidding_schema.json identity"):
+        verify_model_package(package)
+
+    (package / "bidding_schema.json").write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+    manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
 
     payload["bidding_actions"] = [0, 1, 2]
     (package / "bidding_schema.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -561,19 +597,530 @@ def test_game_id_deletion_rebuild_removes_complete_record_without_logging_ids(tm
         "requested_ids": 1,
     }
     rebuilt = list(read_jsonl(str(output)))
+    assert [record.game_id for record in read_verified_jsonl(str(output))] == [
+        record.game_id for record in rebuilt
+    ]
+    resilient = list(iter_jsonl_resilient(str(output)))
+    assert not [result.error for result in resilient if result.error]
+    assert [result.record.game_id for result in resilient if result.record] == [
+        record.game_id for record in rebuilt
+    ]
     rebuilt_manifest = verify_jsonl_manifest(output)
     assert rebuilt_manifest["record_count"] == 2
-    assert dataset_manifest_path(output).is_file()
+    assert _active_manifest_path(output).is_file()
     assert removed not in {record.game_id for record in rebuilt}
     assert removed not in json.dumps(report.to_dict())
     assert {record.game_id for record in rebuilt} == {
         records[0].game_id, records[2].game_id
     }
 
-    with output.open("a", encoding="utf-8") as handle:
+    active_payload = _active_manifest_path(output).parent / "dataset.jsonl"
+    assert stat.S_IMODE(active_payload.stat().st_mode) == 0o400
+    assert stat.S_IMODE(active_payload.parent.stat().st_mode) == 0o500
+    assert stat.S_IMODE(active_payload.parent.parent.stat().st_mode) == 0o700
+    active_payload.parent.chmod(0o700)
+    active_payload.chmod(0o600)
+    with active_payload.open("a", encoding="utf-8") as handle:
         handle.write("\n")
     with pytest.raises(Exception, match="checksum mismatch"):
         verify_jsonl_manifest(output)
+
+
+@pytest.mark.parametrize("old_layout", ["legacy", "versioned"])
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("injected publish failure"), KeyboardInterrupt()],
+    ids=["replace-error", "interruption"],
+)
+def test_game_id_deletion_publish_failure_preserves_old_dataset(
+    tmp_path, monkeypatch, old_layout, failure
+):
+    records = list(generate_synthetic_records(num_games=4, base_seed=71))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    if old_layout == "legacy":
+        write_jsonl(records, str(output), config_identity={"generation": "old"})
+    else:
+        rebuild_without_game_ids(source, output, [records[1].game_id])
+
+    old_records = [record.game_id for record in read_jsonl(str(output))]
+    old_pointer_or_payload = output.read_bytes()
+    old_manifest_path = _active_manifest_path(output)
+    old_manifest = old_manifest_path.read_bytes()
+    version_root = output.parent / f".{output.name}.versions"
+    versions_before = (
+        {entry.name for entry in version_root.iterdir()}
+        if version_root.exists()
+        else set()
+    )
+    fsynced_files = []
+    real_fsync_file = human_data_rebuild._fsync_file
+
+    def track_fsync(path):
+        real_fsync_file(path)
+        fsynced_files.append(path.name)
+
+    def fail_publish(_source, _destination):
+        raise failure
+
+    monkeypatch.setattr(human_data_rebuild, "_fsync_file", track_fsync)
+    monkeypatch.setattr(human_data_rebuild.os, "replace", fail_publish)
+    with pytest.raises(type(failure)):
+        rebuild_without_game_ids(source, output, [records[2].game_id])
+
+    assert fsynced_files == ["dataset.jsonl", "dataset.jsonl.manifest.json"]
+    assert output.read_bytes() == old_pointer_or_payload
+    assert _active_manifest_path(output) == old_manifest_path
+    assert old_manifest_path.read_bytes() == old_manifest
+    assert [record.game_id for record in read_jsonl(str(output))] == old_records
+    assert verify_jsonl_manifest(output)["dataset_sha256"] == json.loads(
+        old_manifest.decode("utf-8")
+    )["dataset_sha256"]
+    assert records[2].game_id in old_records
+    versions_after = {entry.name for entry in version_root.iterdir()}
+    assert versions_after == versions_before
+    assert not list(tmp_path.glob(f".{output.name}.*.pointer.tmp"))
+
+
+def test_game_id_deletion_rejects_non_private_version_root(tmp_path):
+    records = list(generate_synthetic_records(num_games=2, base_seed=72))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    version_root = output.parent / f".{output.name}.versions"
+    version_root.mkdir()
+    version_root.chmod(0o755)
+
+    with pytest.raises(ValueError, match="group or other permissions"):
+        rebuild_without_game_ids(source, output, [records[1].game_id])
+
+    assert not output.exists()
+    assert not list(version_root.iterdir())
+    assert verify_jsonl_manifest(source)["record_count"] == 2
+
+
+def test_versioned_dataset_pointer_target_tampering_fails_closed(tmp_path):
+    records = list(generate_synthetic_records(num_games=2, base_seed=73))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, output, [records[1].game_id])
+
+    magic, body = output.read_bytes().split(b"\n", maxsplit=1)
+    pointer = json.loads(body)
+    pointer["version"] = "v-" + "f" * 32
+    output.write_bytes(
+        magic
+        + b"\n"
+        + json.dumps(pointer, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+    with pytest.raises(RecordValidationError, match="version directory is missing"):
+        verify_jsonl_manifest(output)
+    with pytest.raises(RecordValidationError, match="version directory is missing"):
+        list(read_jsonl(str(output)))
+    with pytest.raises(RecordValidationError, match="version directory is missing"):
+        dataset_manifest_path(output)
+
+
+def test_versioned_dataset_reader_rejects_broadened_permissions(tmp_path):
+    records = list(generate_synthetic_records(num_games=2, base_seed=74))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, output, [records[1].game_id])
+    version_root = _active_manifest_path(output).parent.parent
+    version_root.chmod(0o755)
+
+    with pytest.raises(RecordValidationError, match="group or other permissions"):
+        verify_jsonl_manifest(output)
+    with pytest.raises(RecordValidationError, match="group or other permissions"):
+        list(read_jsonl(str(output)))
+    with pytest.raises(RecordValidationError, match="group or other permissions"):
+        dataset_manifest_path(output)
+
+
+def test_reader_pins_version_during_atomic_switch_and_retirement(tmp_path):
+    records = list(generate_synthetic_records(num_games=4, base_seed=79))
+    source = tmp_path / "source.jsonl"
+    output = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, output, [records[0].game_id])
+    old_versions = {
+        entry.name
+        for entry in (output.parent / f".{output.name}.versions").iterdir()
+    }
+
+    pinned_reader = read_jsonl(str(output))
+    first = next(pinned_reader)
+    rebuild_without_game_ids(source, output, [records[1].game_id])
+    pinned = [first, *list(pinned_reader)]
+
+    assert [record.game_id for record in pinned] == [
+        records[1].game_id,
+        records[2].game_id,
+        records[3].game_id,
+    ]
+    assert [record.game_id for record in read_verified_jsonl(str(output))] == [
+        records[2].game_id,
+        records[3].game_id,
+    ]
+    current_versions = {
+        entry.name
+        for entry in (output.parent / f".{output.name}.versions").iterdir()
+    }
+    assert len(current_versions) == 1
+    assert old_versions.isdisjoint(current_versions)
+
+
+def test_verified_snapshot_keeps_manifest_and_records_bound_during_switch(tmp_path):
+    records = list(generate_synthetic_records(num_games=3, base_seed=83))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+
+    with open_verified_jsonl_snapshot(active) as snapshot:
+        pinned_manifest = dict(snapshot.manifest)
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+        pinned_records = list(snapshot.iter_records())
+
+    pinned_bytes = "".join(
+        record.to_jsonl_line() + "\n" for record in pinned_records
+    ).encode("utf-8")
+    assert hashlib.sha256(pinned_bytes).hexdigest() == pinned_manifest["dataset_sha256"]
+    assert [record.game_id for record in pinned_records] == [
+        records[1].game_id,
+        records[2].game_id,
+    ]
+    assert [record.game_id for record in read_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+
+
+def test_concurrent_deletions_are_serialized_and_cumulative(tmp_path):
+    records = list(generate_synthetic_records(num_games=4, base_seed=89))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reports = list(
+            executor.map(
+                lambda game_id: rebuild_without_game_ids(
+                    source, active, [game_id]
+                ),
+                [records[0].game_id, records[1].game_id],
+            )
+        )
+
+    active_ids = {record.game_id for record in read_verified_jsonl(str(active))}
+    assert records[0].game_id not in active_ids
+    assert records[1].game_id not in active_ids
+    assert active_ids == {records[2].game_id, records[3].game_id}
+    assert sorted(report.input_records for report in reports) == [3, 4]
+    version_root = active.parent / f".{active.name}.versions"
+    assert len(list(version_root.iterdir())) == 1
+
+
+def test_retired_pointer_rollback_fails_closed(tmp_path):
+    records = list(generate_synthetic_records(num_games=3, base_seed=97))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+    retired_pointer = active.read_bytes()
+    retired_version = json.loads(retired_pointer.split(b"\n", maxsplit=1)[1])[
+        "version"
+    ]
+
+    rebuild_without_game_ids(source, active, [records[1].game_id])
+    current_pointer = active.read_bytes()
+    version_root = active.parent / f".{active.name}.versions"
+    assert not (version_root / retired_version).exists()
+
+    active.write_bytes(retired_pointer)
+    with pytest.raises(RecordValidationError, match="version directory"):
+        verify_jsonl_manifest(active)
+    active.write_bytes(current_pointer)
+    assert verify_jsonl_manifest(active)["record_count"] == 1
+
+
+def test_replace_then_interrupt_reports_committed_state(tmp_path, monkeypatch):
+    records = list(generate_synthetic_records(num_games=3, base_seed=101))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+    real_replace = human_data_rebuild.os.replace
+
+    def replace_then_interrupt(source_path, destination_path):
+        real_replace(source_path, destination_path)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(human_data_rebuild.os, "replace", replace_then_interrupt)
+    with pytest.raises(RebuildPostCommitError) as raised:
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+
+    assert raised.value.committed is True
+    assert raised.value.durable is True
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+    version_root = active.parent / f".{active.name}.versions"
+    assert len(list(version_root.iterdir())) == 1
+
+
+def test_post_replace_fsync_failure_is_explicit_and_keeps_recovery_version(
+    tmp_path, monkeypatch
+):
+    records = list(generate_synthetic_records(num_games=3, base_seed=103))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+    real_fsync_directory = human_data_rebuild._fsync_directory
+    parent_fsync_calls = 0
+
+    def fail_second_parent_fsync(path):
+        nonlocal parent_fsync_calls
+        if Path(path) == active.parent:
+            parent_fsync_calls += 1
+            if parent_fsync_calls == 2:
+                raise OSError("injected post-replace fsync failure")
+        real_fsync_directory(path)
+
+    monkeypatch.setattr(
+        human_data_rebuild, "_fsync_directory", fail_second_parent_fsync
+    )
+    with pytest.raises(RebuildPostCommitError) as raised:
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+
+    assert raised.value.committed is True
+    assert raised.value.durable is False
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+    version_root = active.parent / f".{active.name}.versions"
+    assert len(list(version_root.iterdir())) == 2
+
+
+def test_retirement_failure_is_explicit_after_durable_commit(
+    tmp_path, monkeypatch
+):
+    records = list(generate_synthetic_records(num_games=3, base_seed=104))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+
+    def fail_retirement(*_args, **_kwargs):
+        raise OSError("injected retirement failure")
+
+    monkeypatch.setattr(
+        human_data_rebuild,
+        "_retire_version_directories",
+        fail_retirement,
+    )
+    with pytest.raises(RebuildPostCommitError) as raised:
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+
+    assert raised.value.committed is True
+    assert raised.value.durable is True
+    assert raised.value.current is True
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+
+
+def test_ambiguous_pointer_switch_retains_target_version(tmp_path, monkeypatch):
+    records = list(generate_synthetic_records(num_games=3, base_seed=105))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+    real_replace = human_data_rebuild.os.replace
+
+    def replace_then_interrupt(source_path, destination_path):
+        real_replace(source_path, destination_path)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(human_data_rebuild.os, "replace", replace_then_interrupt)
+    monkeypatch.setattr(
+        human_data_rebuild,
+        "_publication_state",
+        lambda *_args, **_kwargs: "unknown",
+    )
+    with pytest.raises(RebuildCommitUncertainError) as raised:
+        rebuild_without_game_ids(source, active, [records[1].game_id])
+
+    assert raised.value.committed is None
+    assert raised.value.durable is None
+    version_root = active.parent / f".{active.name}.versions"
+    assert len(list(version_root.iterdir())) == 2
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[2].game_id
+    ]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_rc", "expected_status"),
+    [
+        (
+            RebuildPostCommitError("injected", durable=False),
+            3,
+            "post_commit_error",
+        ),
+        (
+            RebuildCommitUncertainError("injected"),
+            4,
+            "commit_uncertain",
+        ),
+    ],
+)
+def test_rebuild_cli_reports_commit_state(
+    monkeypatch, capsys, error, expected_rc, expected_status
+):
+    def fail_rebuild(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        rebuild_human_dataset_tool,
+        "rebuild_without_game_ids",
+        fail_rebuild,
+    )
+    rc = rebuild_human_dataset_tool.main(
+        [
+            "--input",
+            "source.jsonl",
+            "--output",
+            "active.jsonl",
+            "--exclude-game-id",
+            "dzg_" + "0" * 64,
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().err)
+    assert rc == expected_rc
+    assert payload["status"] == expected_status
+    assert payload["committed"] is error.committed
+    assert payload["durable"] is error.durable
+
+
+def test_plain_writer_refuses_to_overwrite_version_pointer(tmp_path):
+    records = list(generate_synthetic_records(num_games=3, base_seed=106))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[0].game_id])
+
+    with pytest.raises(RecordValidationError, match="version-managed"):
+        write_jsonl(records, str(active))
+
+    assert [record.game_id for record in read_verified_jsonl(str(active))] == [
+        records[1].game_id,
+        records[2].game_id,
+    ]
+
+
+def test_legacy_plain_io_survives_without_posix_locking(tmp_path, monkeypatch):
+    records = list(generate_synthetic_records(num_games=2, base_seed=110))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    monkeypatch.setattr(human_data_schema, "_fcntl", None)
+
+    assert write_jsonl(records, str(source)) == 2
+    assert verify_jsonl_manifest(source)["record_count"] == 2
+    assert list(read_verified_jsonl(str(source))) == records
+    with pytest.raises(RecordValidationError, match="POSIX advisory locks"):
+        rebuild_without_game_ids(source, active, [records[0].game_id])
+
+
+def test_rebuild_binds_lock_and_publication_to_resolved_parent(
+    tmp_path, monkeypatch
+):
+    records = list(generate_synthetic_records(num_games=2, base_seed=109))
+    source = tmp_path / "source.jsonl"
+    parent_a = tmp_path / "parent-a"
+    parent_b = tmp_path / "parent-b"
+    parent_a.mkdir()
+    parent_b.mkdir()
+    alias = tmp_path / "publication"
+    alias.symlink_to(parent_a, target_is_directory=True)
+    write_jsonl(records, str(source))
+    real_destination_token = human_data_rebuild._destination_token
+    swapped = False
+
+    def swap_alias_then_token(path):
+        nonlocal swapped
+        if not swapped:
+            alias.unlink()
+            alias.symlink_to(parent_b, target_is_directory=True)
+            swapped = True
+        return real_destination_token(path)
+
+    monkeypatch.setattr(
+        human_data_rebuild,
+        "_destination_token",
+        swap_alias_then_token,
+    )
+    rebuild_without_game_ids(
+        source,
+        alias / "active.jsonl",
+        [records[0].game_id],
+    )
+
+    assert (parent_a / "active.jsonl").is_file()
+    assert not (parent_b / "active.jsonl").exists()
+    assert (parent_a / ".active.jsonl.lock").is_file()
+    assert not (parent_b / ".active.jsonl.lock").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO requires POSIX")
+@pytest.mark.parametrize("artifact", ["data", "manifest"])
+def test_verified_reader_rejects_fifo_without_blocking(tmp_path, artifact):
+    records = list(generate_synthetic_records(num_games=1, base_seed=108))
+    source = tmp_path / "source.jsonl"
+    write_jsonl(records, str(source))
+    target = source if artifact == "data" else dataset_manifest_path(source)
+    target.unlink()
+    os.mkfifo(target, 0o600)
+
+    with pytest.raises(RecordValidationError, match="regular|missing"):
+        verify_jsonl_manifest(source)
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ["dataset.jsonl", "dataset.jsonl.manifest.json"],
+)
+def test_versioned_reader_rejects_artifact_symlink_swap(
+    tmp_path, artifact_name
+):
+    records = list(generate_synthetic_records(num_games=2, base_seed=107))
+    source = tmp_path / "source.jsonl"
+    active = tmp_path / "active.jsonl"
+    outside = tmp_path / "outside"
+    write_jsonl(records, str(source))
+    rebuild_without_game_ids(source, active, [records[1].game_id])
+    version_directory = _active_manifest_path(active).parent
+    artifact = version_directory / artifact_name
+    outside.write_bytes(artifact.read_bytes())
+    version_directory.chmod(0o700)
+    artifact.unlink()
+    artifact.symlink_to(outside)
+    version_directory.chmod(0o500)
+
+    try:
+        with pytest.raises(RecordValidationError, match="symlink"):
+            verify_jsonl_manifest(active)
+    finally:
+        version_directory.chmod(0o700)
+        artifact.unlink(missing_ok=True)
+        for sibling in version_directory.iterdir():
+            sibling.chmod(0o600)
 
 
 def test_human_dataset_manifest_rejects_fabricated_counts_and_rulesets(tmp_path):
@@ -605,7 +1152,9 @@ def test_human_dataset_training_reader_rejects_missing_or_unverified_lineage(tmp
     with pytest.raises(Exception, match="unverified migration lineage"):
         list(read_verified_jsonl(str(source)))
 
-    dataset_manifest_path(source).unlink()
+    missing_manifest = dataset_manifest_path(source)
+    missing_manifest.unlink()
+    assert dataset_manifest_path(source) == missing_manifest
     with pytest.raises(Exception, match="manifest is missing"):
         list(read_verified_jsonl(str(source)))
 

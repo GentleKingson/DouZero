@@ -20,7 +20,12 @@ import torch
 
 @dataclass(frozen=True)
 class BiddingModelOutput:
-    """Learned bid output; outcome values use the landlord-side perspective."""
+    """Learned bid values plus landlord-perspective outcome auxiliaries.
+
+    Each legal ``bid_logits`` entry is selected by argmax and behavior-trained
+    as that physical bidder's eventual team-win logit. Explicit rule examples
+    may also initialize their relative ranking with masked CE.
+    """
 
     bid_logits: torch.Tensor
     bid_action_mask: torch.Tensor
