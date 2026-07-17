@@ -37,7 +37,7 @@ DouZero is a reinforcement learning framework for [DouDizhu](https://en.wikipedi
 	*  Group 5: 189203636
 
 **News:**
-*   Thanks for the contribution of [@Vincentzyx](https://github.com/Vincentzyx) for enabling CPU training. Now Windows users can train with CPUs.
+*   Thanks to [@Vincentzyx](https://github.com/Vincentzyx) for the portable CPU actor/training path, which is also useful on Windows.
 
 <img width="500" src="https://douzero.org/public/demo.gif" alt="Demo" />
 
@@ -93,7 +93,11 @@ or install the up-to-date version (it could be not stable) with
 ```
 pip3 install -e .
 ```
-Note that Windows users can only use CPU as actors. See [Issues in Windows](README.md#issues-in-windows) about why GPUs are not supported. Nonetheless, Windows users can still [run the demo locally](https://github.com/datamllab/rlcard-showdown).  
+Windows is not limited to a blanket "CPU-only" mode: the legacy trainer can
+separate CPU actors from a CUDA learner, and the single-process V2 trainer can
+select CPU or CUDA. Native Windows CUDA is not continuously tested, and legacy
+CUDA actors and CUDA DDP remain outside the documented native Windows boundary.
+See [Windows training](docs/windows_training.md) before choosing a topology.
 
 ## Project documentation
 
@@ -101,6 +105,7 @@ Engineering docs live under [`docs/`](docs/):
 
 - [Architecture (current)](docs/architecture/current.md) — the legacy baseline reference.
 - [Reproducibility](docs/reproducibility.md) — seeding, the determinism contract, and the CI Python matrix.
+- [Windows training](docs/windows_training.md) — native Windows/WSL2 choices, CPU actors versus CUDA learners, V2, checkpoints, and DDP limits.
 - [Configuration](docs/configuration.md) — the typed config system and `--config` YAML support.
 - [Packaging](docs/packaging.md) — Python support policy and dependencies.
 - [Checkpoint compatibility](docs/checkpoint_compatibility.md) — the versioned checkpoint manifest.
@@ -109,9 +114,27 @@ Engineering docs live under [`docs/`](docs/):
 - [Model card](docs/model_card.md) — required release documentation template.
 
 ## Training
-To use GPU for training, run
+The current code has two distinct training entry points. Legacy `train.py` uses
+spawned actors and learner threads. V2 `train_v2.py` is single-process by
+default, selects its device with `--device`, and supports V2 checkpoints and
+metrics.
+
+| Path | CPU | Single CUDA GPU | Multiple GPUs | Native Windows status |
+|---|---|---|---|---|
+| Legacy CPU actors + CPU learner | Yes | N/A | N/A | Code-supported; no native Windows CI |
+| Legacy CPU actors + CUDA learner | N/A | Yes | One learner device | Code-supported; native Windows CUDA not continuously validated |
+| Legacy CUDA actors | N/A | Shared CUDA multiprocessing | Linux-oriented path | Not supported/validated on native Windows |
+| V2 single process | Default | `--device cuda` or `auto` | N/A | Code-supported; native Windows CUDA not continuously validated |
+| Base V2 DDP | CPU/Gloo | CUDA/NCCL | `torchrun` | Use WSL2/Linux for CUDA DDP |
+| P17 standard/full-game V2 | Yes | Yes | No; fails closed | Single process only |
+
+The continuous CI matrix is Ubuntu CPU-only. "Code-supported" does not mean a
+path has passed native Windows CUDA or long-running validation. Full Windows
+setup and troubleshooting live in [docs/windows_training.md](docs/windows_training.md).
+
+For the original Linux-oriented legacy GPU topology, run
 ```
-python3 train.py
+python train.py
 ```
 This will train DouZero on one GPU. To train DouZero on multiple GPUs. Use the following arguments.
 *   `--gpu_devices`: what gpu devices are visible
@@ -121,26 +144,78 @@ This will train DouZero on one GPU. To train DouZero on multiple GPUs. Use the f
 
 For example, if we have 4 GPUs, where we want to use the first 3 GPUs to have 15 actors each for simulating and the 4th GPU for training, we can run the following command:
 ```
-python3 train.py --gpu_devices 0,1,2,3 --num_actor_devices 3 --num_actors 15 --training_device 3
+python train.py --gpu_devices 0,1,2,3 --num_actor_devices 3 --num_actors 15 --training_device 3
 ```
-To use CPU training or simulation (Windows can only use CPU for actors), use the following arguments:
+The legacy actor and learner devices are independent:
 *   `--training_device cpu`: Use CPU to train the model
 *   `--actor_device_cpu`: Use CPU as actors
 
-For example, use the following command to run everything on CPU:
+Legacy all-CPU (PowerShell):
+
+```powershell
+python train.py `
+  --actor_device_cpu `
+  --training_device cpu
 ```
-python3 train.py --actor_device_cpu --training_device cpu
+
+Legacy CPU actors with logical CUDA learner 0 (PowerShell):
+
+```powershell
+python train.py `
+  --actor_device_cpu `
+  --gpu_devices 0 `
+  --training_device 0
 ```
-The following command only runs actors on CPU:
+
+V2 CPU smoke (PowerShell):
+
+```powershell
+python train_v2.py `
+  --device cpu `
+  --episodes 4 `
+  --optimizer_steps 1 `
+  --batch_size 1 `
+  --seed 1
 ```
-python3 train.py --actor_device_cpu
+
+V2 single GPU with checkpoint and metrics output (PowerShell):
+
+```powershell
+python train_v2.py `
+  --config configs\enhanced.yaml `
+  --device cuda `
+  --episodes 8 `
+  --optimizer_steps 2 `
+  --checkpoint_path artifacts\windows\v2-checkpoint.pt `
+  --metrics_path artifacts\windows\v2-metrics.json
 ```
+
+P17 standard/full-game single-process smoke (PowerShell):
+
+```powershell
+python train_v2.py `
+  --config configs\standard_v2.yaml `
+  --device cuda `
+  --episodes 2 `
+  --optimizer_steps 1 `
+  --batch_size 1 `
+  --checkpoint_path artifacts\windows\standard-v2.pt `
+  --metrics_path artifacts\windows\standard-v2-metrics.json
+```
+
+Change the P17 command to `--device cpu` for a CPU smoke. Standard learned
+bidding is single-process and eager; DDP and `compile_model` fail closed. P17 is
+infrastructure, not a released model: **Release candidate: NONE. Release
+status: NOT READY.** V2 AMP, strict checkpoint resume, and DDP boundaries are
+documented in [Windows training](docs/windows_training.md) and
+[the P14 training system](docs/training_system.md).
 For more customized configuration of training, see the following optional arguments:
 ```
 --xpid XPID           Experiment id (default: douzero)
 --save_interval SAVE_INTERVAL
                       Time interval (in minutes) at which to save the model
---objective {adp,wp}  Use ADP or WP as reward (default: ADP)
+--objective {adp,wp,logadp}
+                      Use ADP, WP, or log-ADP as reward (default: ADP)
 --actor_device_cpu    Use CPU as actor device
 --gpu_devices GPU_DEVICES
                       Which GPUs to be used for training
@@ -233,7 +308,18 @@ sh get_most_recent.sh douzero_checkpoints/douzero/
 The most recent model will be in `most_recent_model`.
 
 ## Issues in Windows
-You may encounter `operation not supported` error if you use a Windows system to train with GPU as actors. This is because doing multiprocessing on CUDA tensors is not supported in Windows. However, our code extensively operates on the CUDA tensors since the code is optimized for GPUs. Please contact us if you find any solutions!
+Do not treat "GPU actors" and a "GPU learner" as the same mode. With
+`--actor_device_cpu`, legacy shared actor models and replay buffers stay on CPU,
+while `--training_device 0` can place the learner on CUDA. The V2 entry point is
+single-process and independently selects CPU/CUDA with `--device`.
+
+Legacy CUDA actors share CUDA models and buffers across spawned processes; that
+topology is not a supported or continuously validated native Windows path. The
+repository also has no native Windows CUDA CI. Use bounded smokes for the
+code-supported single-GPU paths, and prefer WSL2/Linux for legacy CUDA actors,
+CUDA DDP/NCCL, multi-GPU, and formal long-running training. See
+[Windows training](docs/windows_training.md) for installation, verified CUDA
+operations, checkpoint/resume commands, and error-specific guidance.
 
 ## Core Team
 *   Algorithm: [Daochen Zha](https://github.com/daochenzha), [Jingru Xie](https://github.com/karoka), Wenye Ma, Sheng Zhang, [Xiangru Lian](https://xrlian.com/), Xia Hu, [Ji Liu](http://jiliu-ml.org/)
@@ -243,9 +329,6 @@ You may encounter `operation not supported` error if you use a Windows system to
 ## Acknowlegements
 *   The demo is largely based on [RLCard-Showdown](https://github.com/datamllab/rlcard-showdown)
 *   Code implementation is inspired by [TorchBeast](https://github.com/facebookresearch/torchbeast)
-
-
-
 
 
 

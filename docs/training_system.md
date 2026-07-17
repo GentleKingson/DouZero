@@ -6,6 +6,10 @@ measured training profiler. Legacy rules, observations, rewards, model outputs,
 and checkpoint layouts are unchanged. Later default-off graphs have narrower
 support boundaries described below.
 
+For native Windows, WSL2, and Linux device/topology boundaries, including the
+difference between legacy CUDA actors and a CUDA learner, see
+[`docs/windows_training.md`](windows_training.md).
+
 ## Actor policy publication
 
 The legacy learner no longer calls `load_state_dict()` on a model that an actor
