@@ -390,7 +390,7 @@ jobs:
             --mount "type=bind,src=$SYNTHETIC_EVAL_DATA,dst=$SYNTHETIC_EVAL_DATA,readonly" \
             --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json,dst=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json,readonly" \
             --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl,dst=$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl,readonly" \
-            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/p17-snapshot/p17-matrix.json,dst=$SYNTHETIC_RUN_ROOT/p17-snapshot/p17-matrix.json,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/p17-snapshot,dst=$SYNTHETIC_RUN_ROOT/p17-snapshot,readonly" \
             --mount "type=bind,src=$SYNTHETIC_P17_OUTPUT,dst=$SYNTHETIC_P17_OUTPUT" \
             --env PYTHONDONTWRITEBYTECODE \
             --env PYTHONNOUSERSITE \
