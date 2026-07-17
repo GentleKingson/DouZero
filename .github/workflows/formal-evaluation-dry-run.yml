@@ -337,7 +337,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$(sha256sum "$SYNTHETIC_RESULT_JSON" | cut -d' ' -f1)" == "$EXPECTED_RESULT_SHA256" ]]
-          install -m 0400 "$ATTESTATION_BUNDLE" "$SYNTHETIC_RUN_ROOT/inputs/result-attestation.bundle"
+          install -m 0400 "$ATTESTATION_BUNDLE" "$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json"
           docker run --rm \
             --pull never \
             --entrypoint "" \
@@ -349,13 +349,13 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=64m \
             --workdir /tmp \
             --mount "type=bind,src=$SYNTHETIC_RESULT_JSON,dst=$SYNTHETIC_RESULT_JSON,readonly" \
-            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.bundle,dst=/tmp/attestation.bundle,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json,dst=/tmp/attestation.json,readonly" \
             --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl,dst=/tmp/trusted-root.jsonl,readonly" \
             --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT,dst=$SYNTHETIC_AUDIT_ROOT" \
             --env HOME=/tmp/synthetic-home \
             "$SYNTHETIC_EVALUATOR_IMAGE" \
             sh -ec 'gh attestation verify "$1" \
-              --bundle /tmp/attestation.bundle \
+              --bundle /tmp/attestation.json \
               --custom-trusted-root /tmp/trusted-root.jsonl \
               --repo "$2" \
               --signer-workflow "$3" \
@@ -388,7 +388,7 @@ jobs:
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=$GITHUB_WORKSPACE,readonly" \
             --mount "type=bind,src=$SYNTHETIC_RESULT_JSON,dst=$SYNTHETIC_RESULT_JSON,readonly" \
             --mount "type=bind,src=$SYNTHETIC_EVAL_DATA,dst=$SYNTHETIC_EVAL_DATA,readonly" \
-            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.bundle,dst=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.bundle,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json,dst=$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json,readonly" \
             --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl,dst=$SYNTHETIC_AUDIT_ROOT/result-trusted-root.jsonl,readonly" \
             --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/p17-snapshot/p17-matrix.json,dst=$SYNTHETIC_RUN_ROOT/p17-snapshot/p17-matrix.json,readonly" \
             --mount "type=bind,src=$SYNTHETIC_P17_OUTPUT,dst=$SYNTHETIC_P17_OUTPUT" \
@@ -401,7 +401,7 @@ jobs:
             --matrix "$SYNTHETIC_RUN_ROOT/p17-snapshot/p17-matrix.json" \
             --cardplay-result "$SYNTHETIC_RESULT_JSON" \
             --cardplay-attestation \
-              "$SYNTHETIC_RUN_ROOT/inputs/result-attestation.bundle" \
+              "$SYNTHETIC_RUN_ROOT/inputs/result-attestation.json" \
             --expected-evaluator-git-sha "$EXPECTED_SOURCE_SHA" \
             --expected-cardplay-deal-set-id "$SYNTHETIC_DEAL_SET_ID" \
             --approved-cardplay-eval-data "$SYNTHETIC_EVAL_DATA" \
@@ -476,7 +476,7 @@ jobs:
           set -euo pipefail
           manifest="$SYNTHETIC_P17_OUTPUT/manifest.json"
           [[ "$(sha256sum "$manifest" | cut -d' ' -f1)" == "$EXPECTED_MANIFEST_SHA256" ]]
-          install -m 0400 "$ATTESTATION_BUNDLE" "$SYNTHETIC_RUN_ROOT/inputs/manifest-attestation.bundle"
+          install -m 0400 "$ATTESTATION_BUNDLE" "$SYNTHETIC_RUN_ROOT/inputs/manifest-attestation.json"
           docker run --rm \
             --pull never \
             --entrypoint "" \
@@ -488,13 +488,13 @@ jobs:
             --tmpfs /tmp:rw,nosuid,nodev,size=64m \
             --workdir /tmp \
             --mount "type=bind,src=$manifest,dst=/tmp/manifest.json,readonly" \
-            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/manifest-attestation.bundle,dst=/tmp/attestation.bundle,readonly" \
+            --mount "type=bind,src=$SYNTHETIC_RUN_ROOT/inputs/manifest-attestation.json,dst=/tmp/attestation.json,readonly" \
             --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT/manifest-trusted-root.jsonl,dst=/tmp/trusted-root.jsonl,readonly" \
             --mount "type=bind,src=$SYNTHETIC_AUDIT_ROOT,dst=$SYNTHETIC_AUDIT_ROOT" \
             --env HOME=/tmp/synthetic-home \
             "$SYNTHETIC_EVALUATOR_IMAGE" \
             sh -ec 'gh attestation verify /tmp/manifest.json \
-              --bundle /tmp/attestation.bundle \
+              --bundle /tmp/attestation.json \
               --custom-trusted-root /tmp/trusted-root.jsonl \
               --repo "$1" \
               --signer-workflow "$2" \

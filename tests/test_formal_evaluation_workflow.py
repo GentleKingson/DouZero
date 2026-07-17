@@ -1060,6 +1060,11 @@ def test_exact_result_is_sigstore_attested_verified_and_uploaded() -> None:
         "dst=$FORMAL_ATTESTATION_TRUSTED_ROOT,readonly" in collation
     )
     assert 'install -m 0400 "$ATTESTATION_BUNDLE"' in collation
+    assert (
+        'attestation_snapshot="$FORMAL_RUN_ROOT/inputs/result-attestation.json"'
+        in collation
+    )
+    assert "result-attestation.bundle" not in collation
     assert "tools/prepare_p17_evaluation.py" in collation
     assert "--approved-cardplay-eval-data" in collation
     assert "--approved-full-game-eval-data" in collation

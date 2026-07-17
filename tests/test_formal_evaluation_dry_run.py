@@ -111,7 +111,8 @@ def test_dry_run_exercises_snapshot_formal_source_replay_and_offline_attestation
     assert "--attestation-signer-workflow" in collate
     assert "--attestation-signer-digest" in collate
     assert "--attestation-source-ref" in collate
-    assert "result-attestation.bundle" in collate
+    assert "result-attestation.json" in collate
+    assert "/tmp/attestation.bundle" not in scripts
     assert "allow_unverified_results" not in (
         ROOT / "tools" / "formal_evaluation_dry_run.py"
     ).read_text(encoding="utf-8")

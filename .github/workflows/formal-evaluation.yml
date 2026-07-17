@@ -798,7 +798,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ -f "$ATTESTATION_BUNDLE" && ! -L "$ATTESTATION_BUNDLE" ]]
-          attestation_snapshot="$FORMAL_RUN_ROOT/inputs/result-attestation.bundle"
+          attestation_snapshot="$FORMAL_RUN_ROOT/inputs/result-attestation.json"
           install -m 0400 "$ATTESTATION_BUNDLE" "$attestation_snapshot"
           [[ "$(sha256sum "$attestation_snapshot" | cut -d' ' -f1)" == \
             "$(sha256sum "$ATTESTATION_BUNDLE" | cut -d' ' -f1)" ]]
