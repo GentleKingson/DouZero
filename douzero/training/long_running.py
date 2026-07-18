@@ -15,12 +15,15 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Event, current_thread, main_thread
 from typing import Callable
+
+from douzero.runtime.cleanup import run_cleanup_steps
 
 
 _RUN_STATE_VERSION = 3
@@ -847,8 +850,8 @@ class LongRunningTrainer:
         )
         records: list[dict] = []
         reason = ""
-        self.stop.install()
         try:
+            self.stop.install()
             while True:
                 elapsed = self.clock() - started
                 self.state.total_wall_seconds = base_wall_seconds + elapsed
@@ -1170,9 +1173,14 @@ class LongRunningTrainer:
                     reason = boundary_reason
                     break
         finally:
-            self.stop.restore()
-            self.lifecycle.shutdown()
-            self.checkpoints.release()
+            run_cleanup_steps(
+                (
+                    self.stop.restore,
+                    self.lifecycle.shutdown,
+                    self.checkpoints.release,
+                ),
+                preserve_active_exception=sys.exc_info()[0] is not None,
+            )
         return self.state, reason, records
 
 

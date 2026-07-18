@@ -43,10 +43,25 @@ CPU smoke (no GPU required):
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from douzero.config import load_config
 from douzero.runtime import maybe_set_global_deterministic, set_global_seed
+from douzero.runtime.cleanup import run_cleanup_steps
+
+
+def _cleanup_training_runtime(
+    trainer,
+    distributed,
+    *,
+    preserve_active_exception: bool,
+) -> None:
+    """Always release trainer and distributed resources in priority order."""
+    run_cleanup_steps(
+        (trainer.shutdown, distributed.close),
+        preserve_active_exception=preserve_active_exception,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1165,8 +1180,6 @@ def main() -> None:
     # bc_aux_samples, and bc.schedule -> BCSchedule, so the YAML config
     # ACTUALLY drives the BC auxiliary term end-to-end (not just the
     # programmatic interface tested in isolation).
-    import sys  # noqa: F811 — local import keeps the BC block self-contained
-
     bc_aux_samples = None
     bc_schedule = None
     bc_cfg = getattr(yaml_cfg, "bc", None) if yaml_cfg is not None else None
@@ -1520,8 +1533,11 @@ def main() -> None:
                 ),
             )
     finally:
-        trainer.shutdown()
-        distributed.close()
+        _cleanup_training_runtime(
+            trainer,
+            distributed,
+            preserve_active_exception=sys.exc_info()[0] is not None,
+        )
     if distributed.is_rank_zero:
         print(
         f"[train_v2] episodes_completed={stats.episodes_completed} "

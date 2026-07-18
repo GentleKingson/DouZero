@@ -140,6 +140,22 @@ def _run(tmp_path, trainer, *, cycles, state=None, stop=None, keep=3):
     return runner.run()
 
 
+def _cleanup_test_runner(tmp_path, trainer, stop):
+    series = CheckpointSeries(str(tmp_path / "cleanup.pt"), 1)
+    runner = LongRunningTrainer(
+        trainer,
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=0,
+            max_cycles=1,
+            checkpoint_every_cycles=0,
+        ),
+        series,
+        stop_controller=stop,
+    )
+    return runner, series
+
+
 def _assert_nested_equal(left, right):
     if isinstance(left, torch.Tensor):
         assert torch.equal(left, right)
@@ -1112,6 +1128,89 @@ def test_checkpoint_series_lock_is_exclusive_across_processes(tmp_path, run_id):
             process.join()
     assert process.exitcode == 0
     assert not CheckpointSeries(base, 1).lock_path.exists()
+
+
+def test_shutdown_failure_still_releases_checkpoint_series_lock(tmp_path):
+    trainer = _DeterministicTrainer()
+    shutdown_calls = 0
+
+    def failing_shutdown():
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        raise RuntimeError("injected trainer shutdown failure")
+
+    trainer.shutdown = failing_shutdown
+    stop = StopController()
+    stop.request("stop_event")
+    runner, series = _cleanup_test_runner(tmp_path, trainer, stop)
+    assert series.lock_path.exists()
+
+    with pytest.raises(RuntimeError, match="injected trainer shutdown failure"):
+        runner.run()
+
+    assert shutdown_calls == 1
+    assert not series.lock_path.exists()
+    contender = CheckpointSeries(str(series.base), 1)
+    contender.acquire("next-run")
+    contender.release()
+
+
+def test_stop_restore_failure_still_runs_shutdown_and_releases_lock(tmp_path):
+    cleanup_order = []
+
+    class FailingRestoreStop(StopController):
+        def restore(self):
+            super().restore()
+            cleanup_order.append("restore")
+            raise RuntimeError("injected signal restore failure")
+
+    trainer = _DeterministicTrainer()
+
+    def failing_shutdown():
+        cleanup_order.append("shutdown")
+        raise RuntimeError("later shutdown cleanup failure")
+
+    trainer.shutdown = failing_shutdown
+    stop = FailingRestoreStop()
+    stop.request("stop_event")
+    runner, series = _cleanup_test_runner(tmp_path, trainer, stop)
+
+    with pytest.raises(RuntimeError, match="injected signal restore failure"):
+        runner.run()
+
+    assert cleanup_order == ["restore", "shutdown"]
+    assert not series.lock_path.exists()
+
+
+def test_training_failure_keeps_priority_over_all_cleanup_failures(tmp_path):
+    cleanup_order = []
+
+    class FailingRestoreStop(StopController):
+        def restore(self):
+            super().restore()
+            cleanup_order.append("restore")
+            raise RuntimeError("cleanup restore must not replace training failure")
+
+    trainer = _DeterministicTrainer()
+
+    def failing_collection(_count):
+        raise ValueError("injected original training failure")
+
+    def failing_shutdown():
+        cleanup_order.append("shutdown")
+        raise RuntimeError("cleanup shutdown must not replace training failure")
+
+    trainer.collect_episodes = failing_collection
+    trainer.shutdown = failing_shutdown
+    runner, series = _cleanup_test_runner(
+        tmp_path, trainer, FailingRestoreStop()
+    )
+
+    with pytest.raises(ValueError, match="injected original training failure"):
+        runner.run()
+
+    assert cleanup_order == ["restore", "shutdown"]
+    assert not series.lock_path.exists()
 
 
 def test_production_loop_streams_metrics_without_retaining_history(tmp_path):

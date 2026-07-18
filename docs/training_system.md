@@ -199,8 +199,12 @@ other actors blocked on slots without waiting for their request timeout. Main
 inference-service and collection exceptions publish the same abort signal
 before they propagate. Shutdown publishes its shared state before joining
 workers, and cleanup errors do not replace an exception already in flight.
-Cycle
-quiescence requires no active games,
+Long-running cleanup always attempts signal restoration, trainer shutdown, and
+checkpoint-lock release even when an earlier cleanup step fails. The CLI uses
+the same rule for trainer shutdown and distributed-process-group close. With
+no active training exception, the first cleanup error is reported after all
+steps run; with an active exception, that original failure keeps priority.
+Cycle quiescence requires no active games,
 no WRITING/READY/RUNNING slots, and no completed episode waiting to enter
 compact replay. Replay is then cleared through the trainer lifecycle API,
 preserving the existing P0 cycle-boundary rule.
