@@ -82,6 +82,7 @@ from douzero.training.bidding import (
 # different process topology.
 _TRAINER_CHECKPOINT_VERSION = 3
 _SINGLE_PROCESS_TOPOLOGY = "single_process"
+_POLICY_STEP_SEMANTICS = "absolute_v1"
 
 
 @dataclass
@@ -572,6 +573,7 @@ class V2Trainer:
         self.coach_label_store = coach_label_store
         self.policy_version = policy_version
         self.policy_step = policy_step
+        self._policy_step_origin = policy_step
         if opening_sampler is not None:
             sampler_policy_version = getattr(opening_sampler, "policy_version", None)
             if sampler_policy_version != policy_version:
@@ -684,7 +686,10 @@ class V2Trainer:
         # Episode also remains correct if collection and optimization are
         # interleaved between games.
         policy_version_at_start = self.policy_version
-        policy_step_at_start = self.policy_step + self.stats.optimizer_steps
+        policy_step_at_start = max(
+            self.policy_step,
+            self._policy_step_origin + self.stats.optimizer_steps,
+        )
         opening = None
         sampling_record = None
         if self.opening_sampler is not None:
@@ -1160,7 +1165,9 @@ class V2Trainer:
                 "distributed resume/checkpoint publication is not implemented"
             )
 
-    def save_training_checkpoint(self, path: str) -> dict:
+    def save_training_checkpoint(
+        self, path: str, *, long_running_state: dict | None = None
+    ) -> dict:
         """Atomically save resumable optimizer/counter/RNG and identity state."""
         self._require_single_process_checkpoint_io("save")
         from douzero.observation.bidding import (
@@ -1201,6 +1208,7 @@ class V2Trainer:
             "stats": asdict(self.stats),
             "policy_version": self.policy_version,
             "policy_step": self.policy_step,
+            "policy_step_semantics": _POLICY_STEP_SEMANTICS,
             "feature_schema_hash": self.model.schema.stable_hash(),
             "model_config_hash": self.model.config.stable_hash(),
             "model_config_identity_version": self.model.config.IDENTITY_VERSION,
@@ -1234,6 +1242,7 @@ class V2Trainer:
             },
             "mixed_precision": self.mixed_precision.state_dict(),
             "replay_resume_policy": "flushed_checkpoint_boundary_v1",
+            "long_running_state": long_running_state,
             "rng": {
                 "trainer": self.rng.getstate(),
                 "python": random.getstate(),
@@ -1255,9 +1264,15 @@ class V2Trainer:
             })
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name + ".tmp")
-        torch.save(bundle, temporary)
-        os.replace(temporary, destination)
+        temporary = destination.with_name(
+            f".{destination.name}.{os.getpid()}.{id(bundle)}.tmp"
+        )
+        try:
+            torch.save(bundle, temporary)
+            os.replace(temporary, destination)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
         # Replay observations contain rich Python objects that are deliberately
         # excluded from the weights-only checkpoint. A successful save defines
         # an explicit empty-replay boundary for both the continuing trainer and
@@ -1267,6 +1282,7 @@ class V2Trainer:
         identity_keys = [
             "checkpoint_version", "training_topology", "training_world_size",
             "source_git_sha", "policy_version",
+            "policy_step_semantics",
             "feature_schema_hash", "model_config_hash",
             "ruleset_id", "ruleset_version", "ruleset_hash",
             "bidding_head_version", "bidding_action_schema",
@@ -1281,10 +1297,12 @@ class V2Trainer:
                 "belief_supervised_weight", "belief_alternating_interval",
                 "belief_supervised_batch_size",
             ])
-        return {
+        identity = {
             key: bundle[key]
             for key in identity_keys
         }
+        identity["long_running_state"] = long_running_state
+        return identity
 
     def load_training_checkpoint(self, path: str) -> dict:
         """Strictly restore a checkpoint saved by :meth:`save_training_checkpoint`."""
@@ -1361,6 +1379,15 @@ class V2Trainer:
                     f"V2 trainer checkpoint {name} mismatch: checkpoint has "
                     f"{bundle.get(name)!r}, runtime expects {value!r}"
                 )
+        policy_step_semantics = bundle.get(
+            "policy_step_semantics", "base_plus_optimizer_steps_v1"
+        )
+        if policy_step_semantics not in {
+            _POLICY_STEP_SEMANTICS, "base_plus_optimizer_steps_v1"
+        }:
+            raise CheckpointCompatibilityError(
+                "V2 trainer checkpoint has unknown policy_step semantics"
+            )
         counters = bundle.get("counters")
         required_counters = {
             "curriculum_game_index", "league_game_index",
@@ -1440,6 +1467,8 @@ class V2Trainer:
                 or policy_step < 0
             ):
                 raise ValueError("checkpoint policy_step must be a non-negative int")
+            if policy_step_semantics == "base_plus_optimizer_steps_v1":
+                policy_step += restored_stats.optimizer_steps
             temp_model, temp_belief, temp_optimizer, temp_mixed = copy.deepcopy((
                 self.model, self.belief_model, self.optimizer, self.mixed_precision
             ))
@@ -1479,6 +1508,7 @@ class V2Trainer:
         self.bidding_buffer.clear()
         self.policy_version = str(bundle["policy_version"])
         self.policy_step = policy_step
+        self._policy_step_origin = policy_step - restored_stats.optimizer_steps
         self._curriculum_game_index = int(counters["curriculum_game_index"])
         self._league_game_index = int(counters["league_game_index"])
         self._opening_prediction_sum = float(counters["opening_prediction_sum"])
@@ -1494,7 +1524,10 @@ class V2Trainer:
         if self.belief_model is not None:
             self.belief_model.eval()
         self._restore_belief_trainability()
-        return {name: bundle[name] for name in expected}
+        identity = {name: bundle[name] for name in expected}
+        identity["policy_step_semantics"] = policy_step_semantics
+        identity["long_running_state"] = bundle.get("long_running_state")
+        return identity
 
     def step(self) -> LossComponents | None:
         """Run one optimizer step on a sampled minibatch.
@@ -1695,6 +1728,7 @@ class V2Trainer:
             grad_norm = step_result.grad_norm
             self.stats.amp_fallbacks = self.mixed_precision.fallback_count
             self.stats.optimizer_steps += 1
+            self.policy_step += 1
             if belief_diag:
                 self.stats.belief_supervised_steps += 1
             # Merge BC diagnostics into the last_loss log dict when active.

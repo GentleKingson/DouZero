@@ -127,6 +127,77 @@ format 3 records `training_topology=single_process` and
 `training_world_size=1`; formats 1/2 and any topology mismatch are rejected
 rather than inferred to be compatible.
 
+## Long-running V2 state machine
+
+`train_v2.py` keeps its original one-shot behavior unless `--long_running` is
+explicitly present. Long-running single-process V2 uses this state machine:
+
+```text
+check limits -> collect K episodes -> optimize U steps -> advance policy step
+-> cycle boundary -> atomic checkpoint -> optional evaluation -> metrics -> repeat
+```
+
+Any configured maximum is a stop condition: cycles, cumulative episodes,
+cumulative optimizer steps, or wall-clock minutes. Episode and optimizer-step
+targets are clipped in the final cycle. Wall-clock expiry, `SIGINT`, and
+`SIGTERM` request a stop; collection and optimization finish the current cycle,
+then the process checkpoints at the safe boundary and exits with an explicit
+`stop_reason`. `--no-save_on_interrupt` disables the extra signal/stop-event
+save, but not a checkpoint already due by another schedule.
+
+Checkpoints are immutable sequence files written to a temporary file and
+published with `os.replace`. Only after that succeeds is `*-latest.json`
+atomically replaced. Rotation retains the newest `--keep_last_checkpoints`
+files. A failed save never removes or repoints the previous valid checkpoint.
+Each checkpoint includes cumulative trainer statistics, cycle state, policy
+version and step, optimizer/mixed-precision state, all RNG state, and the
+existing strict source/model/feature/rules/loss/bidding/belief identity.
+
+Replay is deliberately not checkpointed. Every completed cycle is an
+empty-replay boundary, including cycles where no file is due. Resume therefore
+continues only from a clean cycle boundary and never fabricates in-progress
+replay. With the same seed, identity, `episodes_per_cycle`, and
+`optimizer_steps_per_cycle`, N+M uninterrupted cycles match N cycles followed
+by resume for M cycles in cumulative counts, policy step, model weights, and
+optimizer state. Changing either cycle-shape field fails closed; operational
+stop limits and retention may change on resume.
+
+```bash
+python train_v2.py --long_running --config configs/enhanced.yaml --seed 17 \
+  --episodes_per_cycle 64 --optimizer_steps_per_cycle 16 \
+  --max_wall_time_minutes 720 --max_total_optimizer_steps 100000 \
+  --checkpoint_path runs/v2/train.pt --checkpoint_every_cycles 1 \
+  --checkpoint_every_steps 100 --checkpoint_every_minutes 30 \
+  --keep_last_checkpoints 5 --metrics_path runs/v2/metrics.json
+```
+
+Resume through the stable manifest:
+
+```bash
+python train_v2.py --long_running --config configs/enhanced.yaml --seed 17 \
+  --episodes_per_cycle 64 --optimizer_steps_per_cycle 16 \
+  --max_total_optimizer_steps 200000 --checkpoint_path runs/v2/train.pt \
+  --resume_checkpoint runs/v2/train-latest.json
+```
+
+Periodic evaluation delegates to an existing evaluation command. It does not
+implement rules or another evaluator. The command is tokenized without a shell;
+`{checkpoint}` and `{cycle}` are replaced at runtime. Evaluation failures are
+recorded and fail fast by default; `--no-eval_fail_fast` explicitly records and
+continues.
+
+```bash
+python train_v2.py --long_running --episodes_per_cycle 32 \
+  --optimizer_steps_per_cycle 8 --max_cycles 20 --eval_every_cycles 5 \
+  --eval_command ".venv/bin/python evaluate_paired.py --candidate {checkpoint} --baseline /path/to/baseline --num-deals 1000 --output runs/v2/eval-{cycle}.json"
+```
+
+Cycle metrics contain cumulative counts, cycle/collection/optimization time,
+AMP fallback delta, checkpoint path/status/error, resume source, evaluation
+status/error, and peak CUDA memory when available. CPU reports peak memory as
+unavailable. These semantics are CPU-tested; CUDA soak and long-duration GPU
+stability are not validated here.
+
 ## Compile and transfer controls
 
 `pin_memory` enables pinned CPU batches and non-blocking learner transfers.

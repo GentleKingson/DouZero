@@ -118,7 +118,8 @@ checkpoint 与 metrics 输出。
 | P17 standard/full-game V2 | 支持 | 支持 | 不支持，会 fail closed | 仅单进程 |
 
 持续 CI 是 Ubuntu CPU-only。这里的“代码路径支持”不代表已经通过原生
-Windows CUDA 或长时间训练验证。完整安装、边界与排错见
+Windows CUDA 验证。长期循环、checkpoint 与恢复已通过 CPU 测试，但没有
+宣称 CUDA soak 已完成。完整安装、边界与排错见
 [docs/windows_training.md](docs/windows_training.md)。
 
 原有面向 Linux 的 legacy GPU 拓扑可运行：
@@ -166,6 +167,29 @@ python train_v2.py `
   --batch_size 1 `
   --seed 1
 ```
+
+V2 长期训练必须显式传入 `--long_running`；上面的原有一次性命令行为不变。
+下面的例子训练 100 个 cycle，并只保留最近 5 个原子 checkpoint：
+
+```bash
+python train_v2.py --long_running --device cpu --seed 17 \
+  --episodes_per_cycle 32 --optimizer_steps_per_cycle 8 --max_cycles 100 \
+  --checkpoint_path artifacts/v2/train.pt --checkpoint_every_cycles 1 \
+  --keep_last_checkpoints 5 --metrics_path artifacts/v2/metrics.json
+```
+
+可用稳定的 latest 清单恢复；累计计数、policy step、优化器、模型和 RNG
+都会从保存边界继续：
+
+```bash
+python train_v2.py --long_running --device cpu --seed 17 \
+  --episodes_per_cycle 32 --optimizer_steps_per_cycle 8 --max_cycles 200 \
+  --checkpoint_path artifacts/v2/train.pt \
+  --resume_checkpoint artifacts/v2/train-latest.json
+```
+
+每个 cycle 边界都会清空 replay。恢复只发生在该边界，不会序列化或伪造
+中途 replay。细节见 [V2 长期训练状态机](docs/training_system.md#long-running-v2-state-machine)。
 
 V2 单 GPU，并输出 checkpoint 与 metrics（PowerShell）：
 

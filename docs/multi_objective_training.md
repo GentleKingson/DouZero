@@ -204,6 +204,12 @@ CPU smoke (no GPU required):
 python train_v2.py --episodes 4 --optimizer_steps 1 --seed 0
 ```
 
+The command remains a one-shot collect-then-optimize run. Unattended repeated
+training is explicitly enabled with `--long_running`; cycle limits, strict
+cycle-boundary resume, atomic checkpoint rotation, signals, and structured
+metrics are documented in
+[the training system guide](training_system.md#long-running-v2-state-machine).
+
 The legacy `train.py` multiprocessing path is **untouched**. The training
 gate in `douzero/dmc/dmc.py` that rejects `model_version != "legacy"` is
 preserved on purpose — V2 training goes through `train_v2.py`.

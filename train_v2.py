@@ -5,7 +5,8 @@ This is the single-process trainer CLI for the P06 acceptance criterion:
 optimizer step and changes the parameters). It loads a YAML config
 (``configs/enhanced.yaml`` by convention), builds a
 :class:`~douzero.models_v2.model.ModelV2`, and runs
-:class:`~douzero.training.v2_trainer.V2Trainer`.
+:class:`~douzero.training.v2_trainer.V2Trainer`. Its default remains that
+one-shot flow; ``--long_running`` explicitly enables resumable training cycles.
 
 The legacy :file:`train.py` path is unchanged. This entry point exists so
 the multi-objective loss + decision-policy + team-perspective labels can be
@@ -170,6 +171,37 @@ def _build_parser() -> argparse.ArgumentParser:
         type=str,
         default=argparse.SUPPRESS,
         help="Atomically write sanitized machine-readable training metrics.",
+    )
+    parser.add_argument(
+        "--long_running",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Explicitly enable collect/optimize/checkpoint cycles. Absent: "
+        "run the legacy one-shot V2 flow.",
+    )
+    parser.add_argument("--episodes_per_cycle", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--optimizer_steps_per_cycle", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max_cycles", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max_total_episodes", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max_total_optimizer_steps", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max_wall_time_minutes", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--checkpoint_every_cycles", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--checkpoint_every_steps", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--checkpoint_every_minutes", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--keep_last_checkpoints", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--save_on_interrupt", action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--eval_every_cycles", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--eval_command", type=str, default=argparse.SUPPRESS,
+        help="Existing evaluator command; {checkpoint} and {cycle} placeholders "
+        "are expanded without a shell.",
+    )
+    parser.add_argument(
+        "--eval_fail_fast", action=argparse.BooleanOptionalAction,
+        default=argparse.SUPPRESS,
     )
     return parser
 
@@ -610,8 +642,37 @@ def _write_metrics_atomic(path: str, payload: dict[str, object]) -> None:
     temporary.replace(target)
 
 
+def _resolve_resume_checkpoint(path: str) -> str:
+    """Resolve a long-running ``*-latest.json`` manifest to its checkpoint."""
+    import json
+    from pathlib import Path
+
+    source = Path(path)
+    if source.suffix.lower() != ".json":
+        return path
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    latest = payload.get("latest") if isinstance(payload, dict) else None
+    if not isinstance(latest, str) or not latest:
+        raise ValueError("resume manifest must contain a non-empty 'latest' path")
+    resolved = source.parent / latest
+    if not resolved.is_file():
+        raise FileNotFoundError(f"latest checkpoint does not exist: {resolved}")
+    return str(resolved)
+
+
 def main() -> None:
     args = _build_parser().parse_args()
+
+    long_option_names = {
+        "episodes_per_cycle", "optimizer_steps_per_cycle", "max_cycles",
+        "max_total_episodes", "max_total_optimizer_steps",
+        "max_wall_time_minutes", "checkpoint_every_cycles",
+        "checkpoint_every_steps", "checkpoint_every_minutes",
+        "keep_last_checkpoints", "save_on_interrupt", "eval_every_cycles",
+        "eval_command", "eval_fail_fast",
+    }
+    if not args.long_running and any(hasattr(args, name) for name in long_option_names):
+        raise ValueError("long-running options require explicit --long_running")
 
     yaml_cfg = _load_yaml_config(args.config)
 
@@ -661,7 +722,13 @@ def main() -> None:
         defaults.belief_training_mode,
     )
     resume_checkpoint = getattr(args, "resume_checkpoint", "")
+    if resume_checkpoint:
+        resume_checkpoint = _resolve_resume_checkpoint(resume_checkpoint)
     output_checkpoint = getattr(args, "checkpoint_path", "")
+    if args.long_running and not output_checkpoint:
+        output_checkpoint = "douzero_checkpoints/v2-long-running.pt"
+    if args.long_running and ddp_enabled:
+        raise NotImplementedError("long-running V2 training is single-process only")
 
     # This must remain before initialize_distributed. Unsupported feature
     # combinations and checkpoint I/O are configuration errors, not reasons to
@@ -1038,10 +1105,14 @@ def main() -> None:
         distributed_context=distributed,
     )
 
+    resume_identity = None
     if resume_checkpoint:
-        identity = trainer.load_training_checkpoint(resume_checkpoint)
+        resume_identity = trainer.load_training_checkpoint(resume_checkpoint)
         if distributed.is_rank_zero:
-            print(f"[train_v2] resumed checkpoint={resume_checkpoint!r} identity={identity}")
+            print(
+                f"[train_v2] resumed checkpoint={resume_checkpoint!r} "
+                f"identity={resume_identity}"
+            )
 
     if distributed.is_rank_zero:
         print(
@@ -1064,8 +1135,104 @@ def main() -> None:
     import time
 
     training_started = time.perf_counter()
+    stop_reason = "one_shot_complete"
     try:
-        stats = trainer.train()
+        if args.long_running:
+            import json
+
+            from douzero.training.long_running import (
+                CheckpointSeries,
+                LongRunningConfig,
+                LongRunningState,
+                LongRunningTrainer,
+                command_evaluator,
+            )
+
+            long_cfg = LongRunningConfig(
+                episodes_per_cycle=getattr(
+                    args, "episodes_per_cycle", trainer_cfg.max_episodes
+                ),
+                optimizer_steps_per_cycle=getattr(
+                    args, "optimizer_steps_per_cycle", trainer_cfg.optimizer_steps
+                ),
+                max_cycles=getattr(args, "max_cycles", 0),
+                max_total_episodes=getattr(args, "max_total_episodes", 0),
+                max_total_optimizer_steps=getattr(
+                    args, "max_total_optimizer_steps", 0
+                ),
+                max_wall_time_minutes=getattr(args, "max_wall_time_minutes", 0.0),
+                checkpoint_every_cycles=getattr(
+                    args, "checkpoint_every_cycles", 1
+                ),
+                checkpoint_every_steps=getattr(args, "checkpoint_every_steps", 0),
+                checkpoint_every_minutes=getattr(
+                    args, "checkpoint_every_minutes", 0.0
+                ),
+                keep_last_checkpoints=getattr(args, "keep_last_checkpoints", 3),
+                save_on_interrupt=getattr(args, "save_on_interrupt", True),
+                eval_every_cycles=getattr(args, "eval_every_cycles", 0),
+                eval_fail_fast=getattr(args, "eval_fail_fast", True),
+            )
+            eval_command = getattr(args, "eval_command", "")
+            if long_cfg.eval_every_cycles and not eval_command:
+                raise ValueError("--eval_every_cycles requires --eval_command")
+            evaluator = command_evaluator(eval_command) if eval_command else None
+            state = None
+            if resume_checkpoint:
+                state_payload = resume_identity.get("long_running_state")
+                if state_payload is None:
+                    raise ValueError(
+                        "--long_running resume requires a cycle-boundary long-running checkpoint"
+                    )
+                state = LongRunningState.from_dict(state_payload)
+                state.resume_source = resume_checkpoint
+
+            cycle_metrics: list[dict] = []
+
+            def emit_cycle(record: dict) -> None:
+                cycle_metrics.append(record)
+                if distributed.is_rank_zero:
+                    print("[train_v2] cycle_metric=" + json.dumps(record, sort_keys=True))
+                    if metrics_path:
+                        _write_metrics_atomic(
+                            metrics_path,
+                            {
+                                "schema_version": "v2-long-running-run-v1",
+                                "status": "running",
+                                "resume_source": resume_checkpoint,
+                                "cycles": cycle_metrics,
+                            },
+                        )
+
+            peak_memory = (
+                lambda: int(torch.cuda.max_memory_allocated(learner_device))
+                if learner_device.type == "cuda" else None
+            )
+            runner = LongRunningTrainer(
+                trainer,
+                long_cfg,
+                CheckpointSeries(output_checkpoint, long_cfg.keep_last_checkpoints),
+                state=state,
+                evaluator=evaluator,
+                metric_sink=emit_cycle,
+                peak_memory=peak_memory,
+            )
+            final_state, stop_reason, _records = runner.run()
+            stats = trainer.stats
+            if metrics_path and distributed.is_rank_zero:
+                _write_metrics_atomic(
+                    metrics_path,
+                    {
+                        "schema_version": "v2-long-running-run-v1",
+                        "status": "stopped",
+                        "stop_reason": stop_reason,
+                        "resume_source": resume_checkpoint,
+                        "state": __import__("dataclasses").asdict(final_state),
+                        "cycles": cycle_metrics,
+                    },
+                )
+        else:
+            stats = trainer.train()
         if learner_device.type == "cuda":
             torch.cuda.synchronize(learner_device)
         training_wall_seconds = time.perf_counter() - training_started
@@ -1079,13 +1246,13 @@ def main() -> None:
             if learner_device.type == "cuda"
             else None
         )
-        if output_checkpoint and distributed.is_rank_zero:
+        if output_checkpoint and distributed.is_rank_zero and not args.long_running:
             identity = trainer.save_training_checkpoint(output_checkpoint)
             print(
                 f"[train_v2] saved checkpoint={output_checkpoint!r} "
                 f"identity={identity}"
             )
-        if metrics_path and distributed.is_rank_zero:
+        if metrics_path and distributed.is_rank_zero and not args.long_running:
             changed = getattr(trainer, "stats_last_run_changed", None)
             if not isinstance(changed, bool):
                 changed = None
@@ -1118,6 +1285,7 @@ def main() -> None:
         f"redeals={stats.redeals} "
         f"max_redeals_exceeded={stats.max_redeals_exceeded} "
         f"optimizer_steps={stats.optimizer_steps} "
+        f"stop_reason={stop_reason} "
         f"parameters_changed={getattr(trainer, 'stats_last_run_changed', 'unknown')} "
         f"last_loss={stats.last_loss} "
         f"grad_norm={stats.grad_norm_last_step:.4f} "

@@ -129,8 +129,9 @@ metrics.
 | P17 standard/full-game V2 | Yes | Yes | No; fails closed | Single process only |
 
 The continuous CI matrix is Ubuntu CPU-only. "Code-supported" does not mean a
-path has passed native Windows CUDA or long-running validation. Full Windows
-setup and troubleshooting live in [docs/windows_training.md](docs/windows_training.md).
+path has passed native Windows CUDA validation. Long-running control,
+checkpoint, and resume are CPU-tested, but no CUDA soak claim is made. Full
+Windows setup and troubleshooting live in [docs/windows_training.md](docs/windows_training.md).
 
 For the original Linux-oriented legacy GPU topology, run
 ```
@@ -177,6 +178,31 @@ python train_v2.py `
   --batch_size 1 `
   --seed 1
 ```
+
+V2 long-running mode is opt-in; the existing one-shot command above is
+unchanged. This example stops after 100 cycles and retains the newest five
+atomic cycle-boundary checkpoints:
+
+```bash
+python train_v2.py --long_running --device cpu --seed 17 \
+  --episodes_per_cycle 32 --optimizer_steps_per_cycle 8 --max_cycles 100 \
+  --checkpoint_path artifacts/v2/train.pt --checkpoint_every_cycles 1 \
+  --keep_last_checkpoints 5 --metrics_path artifacts/v2/metrics.json
+```
+
+Resume from the stable latest manifest; cumulative counters, policy step,
+optimizer, model, and RNG state continue from the saved boundary:
+
+```bash
+python train_v2.py --long_running --device cpu --seed 17 \
+  --episodes_per_cycle 32 --optimizer_steps_per_cycle 8 --max_cycles 200 \
+  --checkpoint_path artifacts/v2/train.pt \
+  --resume_checkpoint artifacts/v2/train-latest.json
+```
+
+Replay is deliberately empty at every cycle boundary. Resume occurs only at
+that boundary; replay is not serialized or reconstructed. See
+[the V2 long-running state machine](docs/training_system.md#long-running-v2-state-machine).
 
 V2 single GPU with checkpoint and metrics output (PowerShell):
 
@@ -329,8 +355,6 @@ operations, checkpoint/resume commands, and error-specific guidance.
 ## Acknowlegements
 *   The demo is largely based on [RLCard-Showdown](https://github.com/datamllab/rlcard-showdown)
 *   Code implementation is inspired by [TorchBeast](https://github.com/facebookresearch/torchbeast)
-
-
 
 
 

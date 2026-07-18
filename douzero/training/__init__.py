@@ -78,6 +78,13 @@ from douzero.training.v2_trainer import (
     TrainerStats,
     V2Trainer,
 )
+from douzero.training.long_running import (
+    CheckpointSeries,
+    LongRunningConfig,
+    LongRunningState,
+    LongRunningTrainer,
+    StopController,
+)
 
 __all__ = [
     "FARMER_POSITIONS",
@@ -117,4 +124,9 @@ __all__ = [
     "TrainerConfig",
     "TrainerStats",
     "V2Trainer",
+    "CheckpointSeries",
+    "LongRunningConfig",
+    "LongRunningState",
+    "LongRunningTrainer",
+    "StopController",
 ]
