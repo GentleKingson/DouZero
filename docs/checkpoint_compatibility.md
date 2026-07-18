@@ -159,6 +159,18 @@ by default — arbitrary code execution via pickle is never the default path.
 The removed `TRAINING_CHECKPOINT_TRUSTED` constant (always `True`) was a
 pseudo-gate that provided no real protection; it has been deleted.
 
+## Resumable V2 trainer topology
+
+Long-running `single_process` checkpoints remain format 3 and load through the
+existing strict identity path. Format 4 is reserved for `async_single_gpu` and
+adds `num_actors`, compact replay schema version,
+`cycle_quiescent_atomic_copy_v1` snapshot publication, and
+`policy_bucket_role_fifo_microbatch_v1` request semantics. A v3 checkpoint is
+accepted only by `single_process`; v3 to async, v4 async to single-process,
+unknown versions, and unknown topology fail before model or optimizer state is
+mutated. Async resume is a safe empty cycle boundary, not a claim of bitwise
+N+M determinism.
+
 ## Round-trip and tests
 
 `tests/test_checkpoint_manifest.py` pins:

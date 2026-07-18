@@ -123,9 +123,40 @@ unknown or different source SHA before restoring model/optimizer state; a
 wheel or source archive without Git metadata must set `DOUZERO_GIT_SHA` to the
 exact build commit. Standard and joint trainer checkpoint save/resume remains
 single-process only and fails closed when DDP is enabled. Trainer-checkpoint
-format 3 records `training_topology=single_process` and
-`training_world_size=1`; formats 1/2 and any topology mismatch are rejected
-rather than inferred to be compatible.
+format 3 remains the single-process format and records
+`training_topology=single_process` plus `training_world_size=1`. Async runs use
+format 4 and additionally bind actor count, compact replay schema, snapshot
+publication semantics, and request ordering/batching semantics. Format 3 has
+an explicit single-process compatibility path; formats 1/2, unknown versions,
+unknown topology, and cross-topology resume are rejected.
+
+## V2 single-GPU throughput topology
+
+`--v2_training_mode` defaults to `single_process`. The opt-in
+`async_single_gpu` topology uses `spawn` CPU actors, preallocated CPU shared
+observation/replay slots, and queues containing only slot IDs plus small
+metadata. Actors make epsilon decisions with their local RNG and never own a
+CUDA tensor. The main process owns an independent inference model and learner
+model in one CUDA context, groups requests by immutable policy snapshot,
+action-count bucket and role, and publishes a complete inference state only at
+a quiescent boundary.
+
+| Combination | `single_process` | `async_single_gpu` |
+|---|---:|---:|
+| Legacy-ruleset base V2 | yes | yes |
+| Standard bidding | yes | fail closed |
+| League / curriculum | yes | fail closed |
+| RL+BC / human prior | yes | fail closed |
+| Style / strategy | yes | fail closed |
+| Frozen/joint/alternating belief | yes | fail closed |
+| DDP | existing scoped support | rejected |
+
+Async startup requires CUDA and never silently falls back. Request timeout,
+worker exit, invalid state transition, and bounded shutdown all fail the run
+instead of waiting indefinitely. Cycle quiescence requires no active games,
+no WRITING/READY/RUNNING slots, and no completed episode waiting to enter
+compact replay. Replay is then cleared through the trainer lifecycle API,
+preserving the existing P0 cycle-boundary rule.
 
 ## Long-running V2 state machine
 
@@ -234,7 +265,10 @@ python train_v2.py --long_running --episodes_per_cycle 32 \
 Cycle metrics contain cumulative counts, cycle/collection/optimization time,
 AMP fallback delta, checkpoint path/status/error, resume source, evaluation
 status/error, and peak CUDA memory when available. CPU reports peak memory as
-unavailable. Per-cycle records append to `<metrics-stem>-cycles.jsonl`; the
+unavailable. They also include decisions/transitions/learner-steps per second,
+requests/actions per microbatch, inference queue p50/p95, inference GPU time,
+replay occupancy, active/in-flight slots, policy lag, and quiesce time.
+Per-cycle records append to `<metrics-stem>-cycles.jsonl`; the
 requested `--metrics_path` is a small atomically replaced run summary. Resume
 appends to the existing JSONL history, and failure paths publish a `failed`
 summary with an error type. Metrics retain only checkpoint basenames and error

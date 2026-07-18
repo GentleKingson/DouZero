@@ -71,6 +71,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimizer_steps", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--batch_size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--buffer_capacity", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--v2_training_mode",
+        choices=["single_process", "async_single_gpu"],
+        default="single_process",
+        help="V2 execution topology (default: single_process).",
+    )
+    parser.add_argument(
+        "--num_actors", type=int, default=argparse.SUPPRESS,
+        help="CPU actor count for --v2_training_mode async_single_gpu.",
+    )
     parser.add_argument("--exp_epsilon", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--learning_rate", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--rmsprop_alpha", type=float, default=argparse.SUPPRESS)
@@ -849,6 +859,10 @@ def main() -> None:
     ddp_backend = resolve(
         "ddp_backend", yaml_cfg.ddp_backend if yaml_cfg else None, "auto"
     )
+    v2_training_mode = args.v2_training_mode
+    num_actors = resolve("num_actors", None, 4 if v2_training_mode == "async_single_gpu" else 1)
+    if v2_training_mode == "async_single_gpu" and ddp_enabled:
+        raise ValueError("async_single_gpu rejects DDP; use one main GPU process")
     loss_cfg = _build_loss_config(yaml_cfg)
     model_cfg = _build_model_cfg(yaml_cfg)
     belief_training_mode = resolve(
@@ -885,6 +899,12 @@ def main() -> None:
 
     import torch
 
+    if v2_training_mode == "async_single_gpu" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "--v2_training_mode async_single_gpu requires CUDA; CUDA is unavailable. "
+            "The trainer will not fall back to single_process."
+        )
+
     from douzero.runtime.distributed import initialize_distributed
 
     distributed = initialize_distributed(
@@ -894,7 +914,11 @@ def main() -> None:
         import atexit
 
         atexit.register(distributed.close)
-    requested_device = resolve("device", None, "cpu")
+    requested_device = resolve(
+        "device", None, "cuda" if v2_training_mode == "async_single_gpu" else "cpu"
+    )
+    if v2_training_mode == "async_single_gpu" and requested_device == "cpu":
+        raise ValueError("async_single_gpu requires --device cuda or --device auto")
     if distributed.enabled:
         learner_device = distributed.device
     elif requested_device == "auto":
@@ -927,6 +951,11 @@ def main() -> None:
         "compile_model", yaml_cfg.compile_model if yaml_cfg else None, False
     )
     if compile_enabled:
+        if v2_training_mode == "async_single_gpu":
+            raise NotImplementedError(
+                "async_single_gpu torch.compile is disabled until fixed-bucket "
+                "graphs are validated"
+            )
         if belief_training_mode != "frozen":
             raise NotImplementedError(
                 "compile_model has not been validated with joint/alternating "
@@ -1015,6 +1044,8 @@ def main() -> None:
             yaml_cfg.first_bidder_mode if yaml_cfg else None,
             defaults.first_bidder_mode,
         ),
+        v2_training_mode=v2_training_mode,
+        num_actors=num_actors,
     )
     if distributed.enabled and trainer_cfg.belief_training_mode != "frozen":
         raise NotImplementedError(
@@ -1023,6 +1054,27 @@ def main() -> None:
         )
 
     ruleset = _resolve_ruleset(yaml_cfg)
+    if v2_training_mode == "async_single_gpu":
+        unsupported = []
+        if ruleset is not None:
+            unsupported.append("standard bidding")
+        for name in (
+            "belief_enabled", "style_enabled", "strategy_features_enabled",
+            "strategy_aux_enabled", "human_prior_enabled",
+        ):
+            if bool(getattr(model_cfg, name, False)):
+                unsupported.append(name)
+        if loss_cfg.lambda_bc > 0:
+            unsupported.append("RL+BC")
+        if yaml_cfg is not None and getattr(yaml_cfg, "curriculum", None) is not None:
+            curriculum = yaml_cfg.curriculum
+            if getattr(curriculum, "enabled", False):
+                unsupported.append("curriculum")
+        if unsupported:
+            raise NotImplementedError(
+                "async_single_gpu currently supports only the base legacy-ruleset "
+                "V2 path; unsupported: " + ", ".join(sorted(set(unsupported)))
+            )
     decision_cfg = _build_decision_config(yaml_cfg)
     bidding_policy_cfg = None
     if ruleset is not None:
@@ -1314,6 +1366,13 @@ def main() -> None:
                 save_on_interrupt=getattr(args, "save_on_interrupt", True),
                 eval_every_cycles=getattr(args, "eval_every_cycles", 0),
                 eval_fail_fast=getattr(args, "eval_fail_fast", True),
+                v2_training_mode=trainer_cfg.v2_training_mode,
+                num_actors=trainer_cfg.num_actors,
+                replay_schema_version=trainer_cfg.replay_schema_version,
+                snapshot_publication_semantics=(
+                    trainer_cfg.snapshot_publication_semantics
+                ),
+                request_ordering_semantics=trainer_cfg.request_ordering_semantics,
             )
             eval_command = getattr(args, "eval_command", "")
             if long_cfg.eval_every_cycles and not eval_command:
@@ -1461,6 +1520,7 @@ def main() -> None:
                 ),
             )
     finally:
+        trainer.shutdown()
         distributed.close()
     if distributed.is_rank_zero:
         print(

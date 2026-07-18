@@ -37,6 +37,22 @@ from typing import Iterable
 import torch
 
 from douzero.observation.encode_v2 import ObservationV2
+from douzero.models_v2.batch import ModelInputBundle, observation_to_model_inputs
+
+COMPACT_REPLAY_SCHEMA_VERSION = 1
+ACTION_BUCKET_LIMITS: tuple[int, ...] = (8, 16, 32, 64, 128)
+
+
+def action_count_bucket(action_count: int) -> int | str:
+    """Return the smallest configured action bucket, or ``"overflow"``."""
+    if isinstance(action_count, bool) or not isinstance(action_count, int):
+        raise TypeError("action_count must be an int")
+    if action_count <= 0:
+        raise ValueError("action_count must be positive")
+    for limit in ACTION_BUCKET_LIMITS:
+        if action_count <= limit:
+            return limit
+    return "overflow"
 
 #: Valid acting positions (mirrors douzero.env.scoring.ALL_POSITIONS).
 _VALID_POSITIONS: frozenset[str] = frozenset(
@@ -73,6 +89,11 @@ class Transition:
     # P11 provenance. Empty values preserve pre-P11/manual transitions.
     policy_id: str = ""
     teammate_policy_id: str | None = None
+    # Exact inference snapshot provenance.  ``policy_id`` remains the league
+    # identity; these fields identify the immutable snapshot used throughout
+    # the game and survive compact replay serialization.
+    policy_version: str = ""
+    policy_step: int = -1
 
     def has_labels(self) -> bool:
         """Quick NaN check for the label-stamping loop.
@@ -137,6 +158,12 @@ class Transition:
             raise TypeError("Transition.trace_index must be int")
         if self.trace_index < -1:
             raise ValueError("Transition.trace_index must be -1 or non-negative")
+        if not isinstance(self.policy_version, str):
+            raise TypeError("Transition.policy_version must be a string")
+        if isinstance(self.policy_step, bool) or not isinstance(self.policy_step, int):
+            raise TypeError("Transition.policy_step must be an int")
+        if self.policy_step < -1:
+            raise ValueError("Transition.policy_step must be -1 or non-negative")
         n_actions = len(self.obs.actions.legal_actions)
         if not (0 <= self.action_index < n_actions):
             raise ValueError(
@@ -176,6 +203,158 @@ class Transition:
                     raise ValueError(f"Transition.{name} must be binary")
             if self.target_min_turns_after < 0 or self.target_structure_cost < 0:
                 raise ValueError("strategy regression labels must be non-negative")
+
+
+@dataclass
+class CompactTensorTransition:
+    """Versioned CPU-tensor replay record for one card-play decision.
+
+    It stores every public tensor consumed by ``ModelV2`` plus every learner
+    label and provenance field.  Legal-action descriptors are intentionally
+    absent: training consumes the versioned action feature rows, while bidding
+    remains in its independent replay type.
+    """
+
+    model_inputs: ModelInputBundle
+    action_index: int
+    position: str
+    targets: dict[str, float]
+    trace_index: int
+    policy_id: str
+    teammate_policy_id: str | None
+    policy_version: str
+    policy_step: int
+    schema_version: int = COMPACT_REPLAY_SCHEMA_VERSION
+
+    @classmethod
+    def from_transition(
+        cls,
+        transition: Transition,
+        *,
+        strategy_config=None,
+        style_enabled: bool = False,
+    ) -> "CompactTensorTransition":
+        transition.validate()
+        bundle = observation_to_model_inputs(
+            transition.obs,
+            strategy_config=strategy_config,
+            style_enabled=style_enabled,
+        )
+        bundle = ModelInputBundle(
+            state_card_vectors=tuple(value.to(torch.int8) for value in bundle.state_card_vectors),
+            state_context_flat=bundle.state_context_flat.to(torch.int8),
+            context_card_vectors=tuple(value.to(torch.int8) for value in bundle.context_card_vectors),
+            context_flat=bundle.context_flat.to(torch.int32),
+            history_tokens=bundle.history_tokens.to(torch.int8),
+            history_key_padding_mask=bundle.history_key_padding_mask,
+            action_features=bundle.action_features.to(torch.int8),
+            action_mask=bundle.action_mask,
+            acting_role=bundle.acting_role,
+            feature_schema_hash=bundle.feature_schema_hash,
+            strategy_features=bundle.strategy_features,
+            style_features=bundle.style_features,
+        )
+        # Compact records are always detached CPU tensors.  Integral public
+        # encodings use their narrow source dtype where practical; model input
+        # conversion remains centralized in the batch bridge.
+        for tensor in (
+            *bundle.state_card_vectors,
+            bundle.state_context_flat,
+            *bundle.context_card_vectors,
+            bundle.context_flat,
+            bundle.history_tokens,
+            bundle.history_key_padding_mask,
+            bundle.action_features,
+            bundle.action_mask,
+        ):
+            if tensor.device.type != "cpu":
+                raise ValueError("compact replay accepts CPU model inputs only")
+        target_names = (
+            "target_win", "target_score", "target_log_score",
+            "target_min_turns_after", "target_min_turns_exact_mask",
+            "target_regain_initiative", "target_teammate_finish",
+            "target_teammate_finish_mask", "target_spring_probability",
+            "target_structure_cost",
+        )
+        return cls(
+            model_inputs=bundle,
+            action_index=transition.action_index,
+            position=transition.position,
+            targets={name: float(getattr(transition, name)) for name in target_names},
+            trace_index=transition.trace_index,
+            policy_id=transition.policy_id,
+            teammate_policy_id=transition.teammate_policy_id,
+            policy_version=transition.policy_version,
+            policy_step=transition.policy_step,
+        )
+
+    @property
+    def action_count(self) -> int:
+        return int(self.model_inputs.action_features.shape[0])
+
+    @property
+    def bucket(self) -> int | str:
+        return action_count_bucket(self.action_count)
+
+    def state_dict(self) -> dict:
+        bundle = self.model_inputs
+        tensor_fields = {
+            "state_card_vectors": bundle.state_card_vectors,
+            "state_context_flat": bundle.state_context_flat,
+            "context_card_vectors": bundle.context_card_vectors,
+            "context_flat": bundle.context_flat,
+            "history_tokens": bundle.history_tokens,
+            "history_key_padding_mask": bundle.history_key_padding_mask,
+            "action_features": bundle.action_features,
+            "action_mask": bundle.action_mask,
+            "strategy_features": bundle.strategy_features,
+            "style_features": bundle.style_features,
+        }
+        return {
+            "schema_version": self.schema_version,
+            "model_inputs": tensor_fields,
+            "acting_role": bundle.acting_role,
+            "feature_schema_hash": bundle.feature_schema_hash,
+            "action_index": self.action_index,
+            "position": self.position,
+            "targets": dict(self.targets),
+            "trace_index": self.trace_index,
+            "policy_id": self.policy_id,
+            "teammate_policy_id": self.teammate_policy_id,
+            "policy_version": self.policy_version,
+            "policy_step": self.policy_step,
+        }
+
+    @classmethod
+    def from_state_dict(cls, raw: dict) -> "CompactTensorTransition":
+        if not isinstance(raw, dict) or raw.get("schema_version") != COMPACT_REPLAY_SCHEMA_VERSION:
+            raise ValueError("unknown compact replay schema_version")
+        values = raw["model_inputs"]
+        bundle = ModelInputBundle(
+            state_card_vectors=tuple(values["state_card_vectors"]),
+            state_context_flat=values["state_context_flat"],
+            context_card_vectors=tuple(values["context_card_vectors"]),
+            context_flat=values["context_flat"],
+            history_tokens=values["history_tokens"],
+            history_key_padding_mask=values["history_key_padding_mask"],
+            action_features=values["action_features"],
+            action_mask=values["action_mask"],
+            acting_role=raw["acting_role"],
+            feature_schema_hash=raw["feature_schema_hash"],
+            strategy_features=values.get("strategy_features"),
+            style_features=values.get("style_features"),
+        )
+        return cls(
+            model_inputs=bundle,
+            action_index=int(raw["action_index"]),
+            position=str(raw["position"]),
+            targets={str(k): float(v) for k, v in raw["targets"].items()},
+            trace_index=int(raw["trace_index"]),
+            policy_id=str(raw["policy_id"]),
+            teammate_policy_id=raw["teammate_policy_id"],
+            policy_version=str(raw["policy_version"]),
+            policy_step=int(raw["policy_step"]),
+        )
 
 
 @dataclass
@@ -334,6 +513,7 @@ class Minibatch:
     target_teammate_finish_mask: torch.Tensor | None = None
     target_spring_probability: torch.Tensor | None = None
     target_structure_cost: torch.Tensor | None = None
+    model_inputs: list[ModelInputBundle] | None = None
 
     @property
     def batch_size(self) -> int:
@@ -346,7 +526,7 @@ class Minibatch:
         three label tensors all have the same length ``B``, so the trainer's
         per-decision gather loop cannot index out of bounds.
         """
-        b_obs = len(self.observations)
+        b_obs = len(self.model_inputs) if self.model_inputs is not None else len(self.observations)
         b_act = int(self.action_indices.shape[0])
         b_win = int(self.target_win.shape[0])
         b_score = int(self.target_score.shape[0])
@@ -390,6 +570,10 @@ class V2ReplayBuffer:
         self._capacity = int(capacity_transitions)
         self._episodes: deque[Episode] = deque()
         self._size = 0
+        self._buckets: dict[int | str, list[Transition]] = {
+            **{limit: [] for limit in ACTION_BUCKET_LIMITS},
+            "overflow": [],
+        }
 
     def __len__(self) -> int:
         return self._size
@@ -398,6 +582,8 @@ class V2ReplayBuffer:
         """Drop replay at an explicit checkpoint-safe boundary."""
         self._episodes.clear()
         self._size = 0
+        for transitions in self._buckets.values():
+            transitions.clear()
 
     @property
     def capacity(self) -> int:
@@ -425,6 +611,18 @@ class V2ReplayBuffer:
         while self._size > self._capacity and self._episodes:
             evicted = self._episodes.popleft()
             self._size -= len(evicted.transitions)
+        self._rebuild_buckets()
+
+    def _rebuild_buckets(self) -> None:
+        for transitions in self._buckets.values():
+            transitions.clear()
+        for episode in self._episodes:
+            for transition in episode.transitions:
+                bucket = action_count_bucket(len(transition.obs.actions.legal_actions))
+                self._buckets[bucket].append(transition)
+
+    def bucket_occupancy(self) -> dict[int | str, int]:
+        return {name: len(values) for name, values in self._buckets.items()}
 
     def extend(self, episodes: Iterable[Episode]) -> None:
         for ep in episodes:
@@ -445,12 +643,25 @@ class V2ReplayBuffer:
         if self._size < batch_size:
             return None
         rng = rng or random
-        # Flatten transitions across episodes (preserving episode identity
-        # is not needed for the off-policy MC value update).
-        flat: list[Transition] = []
-        for ep in self._episodes:
-            flat.extend(ep.transitions)
-        picks = rng.sample(flat, batch_size)
+        # Prefer one action-count bucket to minimize padding.  Selecting among
+        # eligible buckets by occupancy preserves transition-level weighting;
+        # if none can fill the batch, retain the established uniform fallback.
+        eligible = [values for values in self._buckets.values() if len(values) >= batch_size]
+        if eligible:
+            total = sum(len(values) for values in eligible)
+            needle = rng.randrange(total)
+            selected = eligible[-1]
+            for values in eligible:
+                if needle < len(values):
+                    selected = values
+                    break
+                needle -= len(values)
+            picks = rng.sample(selected, batch_size)
+        else:
+            flat: list[Transition] = []
+            for ep in self._episodes:
+                flat.extend(ep.transitions)
+            picks = rng.sample(flat, batch_size)
         has_aux = all(math.isfinite(p.target_min_turns_after) for p in picks)
         aux_tensor = lambda name: torch.tensor(
             [getattr(p, name) for p in picks], dtype=torch.float32
@@ -477,3 +688,82 @@ class V2ReplayBuffer:
         )
         minibatch.validate()
         return minibatch
+
+
+class CompactTensorReplayBuffer:
+    """Bounded bucketed replay containing no environment Python objects."""
+
+    def __init__(self, capacity_transitions: int = 4096) -> None:
+        if capacity_transitions < 1:
+            raise ValueError("capacity_transitions must be positive")
+        self._capacity = int(capacity_transitions)
+        self._records: deque[CompactTensorTransition] = deque()
+        self._buckets: dict[int | str, list[CompactTensorTransition]] = {
+            **{limit: [] for limit in ACTION_BUCKET_LIMITS}, "overflow": []
+        }
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def clear(self) -> None:
+        self._records.clear()
+        for records in self._buckets.values():
+            records.clear()
+
+    def add(self, record: CompactTensorTransition) -> None:
+        if record.schema_version != COMPACT_REPLAY_SCHEMA_VERSION:
+            raise ValueError("unknown compact replay schema version")
+        self._records.append(record)
+        if len(self._records) > self._capacity:
+            self._records.popleft()
+        self._rebuild_buckets()
+
+    def _rebuild_buckets(self) -> None:
+        for records in self._buckets.values():
+            records.clear()
+        for record in self._records:
+            self._buckets[record.bucket].append(record)
+
+    def bucket_occupancy(self) -> dict[int | str, int]:
+        return {name: len(records) for name, records in self._buckets.items()}
+
+    def sample_minibatch(
+        self, batch_size: int, rng: random.Random | None = None
+    ) -> Minibatch | None:
+        if len(self) < batch_size:
+            return None
+        rng = rng or random
+        eligible = [records for records in self._buckets.values() if len(records) >= batch_size]
+        source = rng.choice(eligible) if eligible else list(self._records)
+        picks = rng.sample(source, batch_size)
+        target = lambda name: torch.tensor(
+            [record.targets[name] for record in picks], dtype=torch.float32
+        )
+        has_aux = all(
+            math.isfinite(record.targets["target_min_turns_after"])
+            for record in picks
+        )
+        auxiliary = lambda name: target(name) if has_aux else None
+        batch = Minibatch(
+            observations=[],
+            model_inputs=[record.model_inputs for record in picks],
+            action_indices=torch.tensor(
+                [record.action_index for record in picks], dtype=torch.long
+            ),
+            target_win=target("target_win"),
+            target_score=target("target_score"),
+            target_log_score=target("target_log_score"),
+            target_min_turns_after=auxiliary("target_min_turns_after"),
+            target_min_turns_exact_mask=auxiliary("target_min_turns_exact_mask"),
+            target_regain_initiative=auxiliary("target_regain_initiative"),
+            target_teammate_finish=auxiliary("target_teammate_finish"),
+            target_teammate_finish_mask=auxiliary("target_teammate_finish_mask"),
+            target_spring_probability=auxiliary("target_spring_probability"),
+            target_structure_cost=auxiliary("target_structure_cost"),
+        )
+        batch.validate()
+        return batch

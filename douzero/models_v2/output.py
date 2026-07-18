@@ -166,6 +166,10 @@ class ModelOutput:
         masked[~self.action_mask] = float("-inf")
         return masked
 
+    def argmax_prior(self) -> int:
+        """Index of the highest-prior-logit VALID action (P08 ablation)."""
+        return int(torch.argmax(self.selected_prior_logit()).item())
+
     def argmax_win(self) -> int:
         """Index of the highest-win-probability VALID action."""
         return int(torch.argmax(self.selected_win_logit()).item())
@@ -189,6 +193,66 @@ class ModelOutput:
         masked[~self.action_mask] = float("-inf")
         return masked
 
-    def argmax_prior(self) -> int:
-        """Index of the highest-prior-logit VALID action (P08 ablation)."""
-        return int(torch.argmax(self.selected_prior_logit()).item())
+
+@dataclass(frozen=True)
+class BatchedModelOutput:
+    """Model V2 output for padded decisions, with shape ``(B, A, 1)``."""
+
+    win_logit: torch.Tensor
+    score_if_win: torch.Tensor
+    score_if_loss: torch.Tensor
+    p_win: torch.Tensor
+    score_mean: torch.Tensor
+    action_mask: torch.Tensor
+    prior_logit: torch.Tensor | None = None
+    min_turns_after: torch.Tensor | None = None
+    regain_initiative_logit: torch.Tensor | None = None
+    teammate_finish_logit: torch.Tensor | None = None
+    spring_probability_logit: torch.Tensor | None = None
+    structure_cost: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.win_logit.ndim != 3 or self.win_logit.shape[-1] != 1:
+            raise ValueError("batched win_logit must have shape (B, A, 1)")
+        batch_actions = self.win_logit.shape[:2]
+        if self.action_mask.shape != batch_actions or self.action_mask.dtype != torch.bool:
+            raise ValueError("batched action_mask must be bool with shape (B, A)")
+        if bool((~self.action_mask.any(dim=1)).any()):
+            raise ValueError("every batched decision must contain a legal action")
+        names = ("score_if_win", "score_if_loss", "p_win", "score_mean")
+        for name in names:
+            if getattr(self, name).shape != self.win_logit.shape:
+                raise ValueError(f"{name} shape must match win_logit")
+        optional = (
+            "prior_logit", "min_turns_after", "regain_initiative_logit",
+            "teammate_finish_logit", "spring_probability_logit", "structure_cost",
+        )
+        for name in optional:
+            value = getattr(self, name)
+            if value is not None and value.shape != self.win_logit.shape:
+                raise ValueError(f"{name} shape must match win_logit")
+
+    def gather_chosen(self, indices: torch.Tensor) -> dict[str, torch.Tensor | None]:
+        """Gather one legal action per decision without exposing padding."""
+        if indices.shape != (self.win_logit.shape[0],) or indices.dtype != torch.long:
+            raise ValueError("chosen indices must be long with shape (B,)")
+        rows = torch.arange(indices.shape[0], device=indices.device)
+        if bool(((indices < 0) | (indices >= self.action_mask.shape[1])).any()):
+            raise ValueError("chosen action index is outside the padded action range")
+        if not bool(self.action_mask[rows, indices].all()):
+            raise ValueError("chosen action index points at padding")
+
+        def gather(value):
+            return None if value is None else value[rows, indices]
+
+        return {
+            "win_logit": gather(self.win_logit),
+            "score_if_win": gather(self.score_if_win),
+            "score_if_loss": gather(self.score_if_loss),
+            "prior_logit": gather(self.prior_logit),
+            "min_turns_after": gather(self.min_turns_after),
+            "regain_initiative_logit": gather(self.regain_initiative_logit),
+            "teammate_finish_logit": gather(self.teammate_finish_logit),
+            "spring_probability_logit": gather(self.spring_probability_logit),
+            "structure_cost": gather(self.structure_cost),
+        }

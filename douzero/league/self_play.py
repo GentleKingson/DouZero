@@ -287,6 +287,8 @@ class PopulationEpisodeRunner:
                         trace_index=len(episode.action_trace),
                         policy_id=policy_id,
                         teammate_policy_id=teammate_policy_id,
+                        policy_version=policy_version_at_start,
+                        policy_step=policy_step_at_start,
                     ))
             episode.action_trace.append((position, tuple(sorted(action))))
             _obs, _reward, done, info = env.step(action)

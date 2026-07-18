@@ -200,6 +200,18 @@ checkpoint artifact 冲突时会在写入前失败。
 细节见
 [V2 长期训练状态机](docs/training_system.md#long-running-v2-state-machine)。
 
+V2 还提供显式的多 CPU Actor + 单 GPU 集中推理模式。CUDA 不可用时会直接
+失败，不会回退；该模式也拒绝 DDP：
+
+```bash
+python train_v2.py --v2_training_mode async_single_gpu --device cuda \
+  --num_actors 4 --episodes 64 --optimizer_steps 8 --batch_size 64
+```
+
+当前异步支持范围刻意限定为 legacy ruleset 的基础 V2 出牌训练。standard
+bidding、league、curriculum、RL+BC、style、strategy 和 belief 组合都会在
+worker 启动前 fail closed。默认仍是 `single_process`，原有组合保持不变。
+
 V2 单 GPU，并输出 checkpoint 与 metrics（PowerShell）：
 
 ```powershell

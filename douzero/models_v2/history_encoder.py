@@ -67,9 +67,9 @@ class _HistoryBase(nn.Module):
             raise ValueError(
                 f"tokens trailing dim {tokens.shape[-1]} != token_width {self.token_width}"
             )
-        if tokens.shape[0] != self.max_history_len:
+        if tokens.shape[-2] != self.max_history_len:
             raise ValueError(
-                f"tokens seq len {tokens.shape[0]} != max_history_len {self.max_history_len}"
+                f"tokens seq len {tokens.shape[-2]} != max_history_len {self.max_history_len}"
             )
         positions = torch.arange(self.max_history_len, device=tokens.device)
         return self.input_proj(tokens.float()) + self.pos_embed(positions)
@@ -156,26 +156,38 @@ class TransformerHistoryEncoder(_HistoryBase):
             Shape ``(hidden_size,)``. The masked-mean summary of the encoded
             sequence, LayerNorm-stabilized.
         """
-        embedded = self._embed_tokens(tokens)  # (S, H)
+        scalar = tokens.ndim == 2
+        if scalar:
+            tokens = tokens.unsqueeze(0)
+            key_padding_mask = key_padding_mask.unsqueeze(0)
+        if tokens.ndim != 3 or key_padding_mask.shape != tokens.shape[:2]:
+            raise ValueError("history batch must have shapes (B, S, W) and (B, S)")
+        embedded = self._embed_tokens(tokens)  # (B, S, H)
         # Transformer expects (S, H) with batch_first=False; here "batch" is the
         # single decision. key_padding_mask is (S,) -> broadcast to (1, S).
-        kpm = key_padding_mask.reshape(1, -1)
-        encoded = self.transformer(embedded.unsqueeze(1), mask=None,
-                                   src_key_padding_mask=kpm)
-        encoded = encoded.squeeze(1)  # (S, H)
+        # Fully masked attention rows are undefined in several torch kernels.
+        # Temporarily expose slot zero; the tensor-native fallback below still
+        # defines the public empty-history result.
+        safe_kpm = key_padding_mask.clone()
+        all_padding = safe_kpm.all(dim=1)
+        safe_kpm[all_padding, 0] = False
+        encoded = self.transformer(
+            embedded.transpose(0, 1), mask=None, src_key_padding_mask=safe_kpm
+        ).transpose(0, 1)  # (B, S, H)
 
         # Masked mean over valid positions. Avoid division by zero when every
         # slot is padding (first move of a game): fall back to the first slot's
         # positional embedding so the output stays finite and well-defined.
-        valid = (~key_padding_mask).to(encoded.dtype)  # (S,), 1 for real
-        denom = valid.sum()
+        valid = (~key_padding_mask).to(encoded.dtype)  # (B, S), 1 for real
+        denom = valid.sum(dim=1, keepdim=True)
         # Keep the empty-history branch tensor-native so torch.export can trace
         # it without guarding on ``Tensor.item()``. clamp_min prevents a zero
         # divisor; torch.where selects the deterministic empty token exactly
         # when every position is padding.
-        mean = (encoded * valid.unsqueeze(-1)).sum(dim=0) / denom.clamp_min(1.0)
-        pooled = torch.where(denom > 0, mean, embedded[0])
-        return self.out_norm(pooled)
+        mean = (encoded * valid.unsqueeze(-1)).sum(dim=1) / denom.clamp_min(1.0)
+        pooled = torch.where(denom > 0, mean, embedded[:, 0])
+        result = self.out_norm(pooled)
+        return result.squeeze(0) if scalar else result
 
 
 class LSTMHistoryEncoder(_HistoryBase):
@@ -215,21 +227,28 @@ class LSTMHistoryEncoder(_HistoryBase):
         See :meth:`TransformerHistoryEncoder.forward` for the contract. The LSTM
         summary is the hidden state at the last valid position.
         """
-        embedded = self._embed_tokens(tokens)  # (S, H)
+        scalar = tokens.ndim == 2
+        if scalar:
+            tokens = tokens.unsqueeze(0)
+            key_padding_mask = key_padding_mask.unsqueeze(0)
+        if tokens.ndim != 3 or key_padding_mask.shape != tokens.shape[:2]:
+            raise ValueError("history batch must have shapes (B, S, W) and (B, S)")
+        embedded = self._embed_tokens(tokens)  # (B, S, H)
         # Zero out padded slots before the LSTM so they cannot inject the
         # positional embedding of a padding position into the recurrent state.
-        valid = (~key_padding_mask).to(embedded.dtype).unsqueeze(-1)  # (S, 1)
+        valid = (~key_padding_mask).to(embedded.dtype).unsqueeze(-1)  # (B, S, 1)
         embedded = embedded * valid
         # (S, H) -> (S, 1, H) for batch_first=False (batch dim is 1 = one decision).
-        out, (h_n, _) = self.lstm(embedded.unsqueeze(1))
-        out = out.squeeze(1)  # (S, H)
+        out, _ = self.lstm(embedded.transpose(0, 1))
+        out = out.transpose(0, 1)  # (B, S, H)
 
         # Summary: hidden state at the last valid position. If all padding,
         # fall back to slot 0's output (which is positional-only here).
         valid_counts = valid.squeeze(-1)
-        last_valid_index = (valid_counts.sum().to(torch.long) - 1).clamp_min(0)
-        pooled = out[last_valid_index]
-        return self.out_norm(pooled)
+        last_valid_index = (valid_counts.sum(dim=1).to(torch.long) - 1).clamp_min(0)
+        pooled = out[torch.arange(out.shape[0], device=out.device), last_valid_index]
+        result = self.out_norm(pooled)
+        return result.squeeze(0) if scalar else result
 
 
 def build_history_encoder(

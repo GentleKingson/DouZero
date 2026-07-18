@@ -214,6 +214,19 @@ writers, and metrics paths are rejected if they overlap checkpoint artifacts.
 See
 [the V2 long-running state machine](docs/training_system.md#long-running-v2-state-machine).
 
+V2 also has an explicit multi-CPU-actor, centralized single-GPU mode. It never
+falls back when CUDA is unavailable and it rejects DDP:
+
+```bash
+python train_v2.py --v2_training_mode async_single_gpu --device cuda \
+  --num_actors 4 --episodes 64 --optimizer_steps 8 --batch_size 64
+```
+
+The current async support scope is deliberately narrow: base legacy-ruleset
+V2 card play only. Standard bidding, league, curriculum, RL+BC, style,
+strategy features/auxiliaries, and belief fusion fail before workers start.
+`single_process` remains the default and retains all existing combinations.
+
 V2 single GPU with checkpoint and metrics output (PowerShell):
 
 ```powershell
@@ -365,6 +378,5 @@ operations, checkpoint/resume commands, and error-specific guidance.
 ## Acknowlegements
 *   The demo is largely based on [RLCard-Showdown](https://github.com/datamllab/rlcard-showdown)
 *   Code implementation is inspired by [TorchBeast](https://github.com/facebookresearch/torchbeast)
-
 
 

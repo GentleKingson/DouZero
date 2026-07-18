@@ -40,6 +40,9 @@ import numpy as np
 import torch
 
 from douzero.observation.encode_v2 import ObservationV2
+from douzero.models_v2.config import SUPPORTED_ROLES
+
+SUPPORTED_ROLE_TO_INDEX = {role: index for index, role in enumerate(SUPPORTED_ROLES)}
 
 #: The canonical set of card-vector field names, as documented by the V2 schema
 #: (``build_v2_schema`` in ``douzero/observation/schema.py``). A field is routed
@@ -136,6 +139,178 @@ class ModelInputBundle:
         if self.style_features is not None:
             self.style_features = self.style_features.to(device)
         return self
+
+
+@dataclass
+class BatchedModelInputBundle:
+    """Padded tensor inputs for multiple independent V2 decisions.
+
+    The scalar :class:`ModelInputBundle` contract remains unchanged.  This
+    companion type adds only a leading decision dimension and pads legal
+    actions to ``Amax``; ``action_mask`` is the sole authority for which rows
+    are real.  ``chosen_action_index`` is optional for inference and required
+    by the learner's gathered loss path.
+    """
+
+    state_card_vectors: tuple[torch.Tensor, ...]
+    state_context_flat: torch.Tensor
+    context_card_vectors: tuple[torch.Tensor, ...]
+    context_flat: torch.Tensor
+    history_tokens: torch.Tensor
+    history_key_padding_mask: torch.Tensor
+    action_features: torch.Tensor
+    action_mask: torch.Tensor
+    acting_role: torch.Tensor
+    chosen_action_index: torch.Tensor | None
+    feature_schema_hashes: tuple[str, ...]
+    strategy_features: torch.Tensor | None = None
+    style_features: torch.Tensor | None = None
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.action_features.shape[0])
+
+    @property
+    def max_actions(self) -> int:
+        return int(self.action_features.shape[1])
+
+    def to(self, device) -> "BatchedModelInputBundle":
+        """Move tensor fields to ``device`` and return this bundle."""
+        self.state_card_vectors = tuple(t.to(device) for t in self.state_card_vectors)
+        self.state_context_flat = self.state_context_flat.to(device)
+        self.context_card_vectors = tuple(t.to(device) for t in self.context_card_vectors)
+        self.context_flat = self.context_flat.to(device)
+        self.history_tokens = self.history_tokens.to(device)
+        self.history_key_padding_mask = self.history_key_padding_mask.to(device)
+        self.action_features = self.action_features.to(device)
+        self.action_mask = self.action_mask.to(device)
+        self.acting_role = self.acting_role.to(device)
+        if self.chosen_action_index is not None:
+            self.chosen_action_index = self.chosen_action_index.to(device)
+        if self.strategy_features is not None:
+            self.strategy_features = self.strategy_features.to(device)
+        if self.style_features is not None:
+            self.style_features = self.style_features.to(device)
+        return self
+
+
+def observation_batch_to_model_inputs(
+    observations: list[ObservationV2] | tuple[ObservationV2, ...],
+    chosen_action_indices: torch.Tensor | list[int] | tuple[int, ...] | None = None,
+    *,
+    strategy_config=None,
+    style_enabled: bool = False,
+    pad_to_actions: int | None = None,
+) -> BatchedModelInputBundle:
+    """Tensorize and pad a decision batch without changing scalar semantics.
+
+    ``pad_to_actions`` is used by action-count buckets.  It may exceed the
+    largest decision but may never truncate it.  A batch containing an empty
+    legal-action set fails closed before any model work is attempted.
+    """
+    if not observations:
+        raise ValueError("observation batch must contain at least one decision")
+    bundles = [
+        observation_to_model_inputs(
+            obs, strategy_config=strategy_config, style_enabled=style_enabled
+        )
+        for obs in observations
+    ]
+    return model_input_bundles_to_batch(
+        bundles, chosen_action_indices, pad_to_actions=pad_to_actions
+    )
+
+
+def model_input_bundles_to_batch(
+    bundles: list[ModelInputBundle] | tuple[ModelInputBundle, ...],
+    chosen_action_indices: torch.Tensor | list[int] | tuple[int, ...] | None = None,
+    *,
+    pad_to_actions: int | None = None,
+) -> BatchedModelInputBundle:
+    """Stack already tensorized scalar bundles into one padded batch."""
+    if not bundles:
+        raise ValueError("model input bundle batch must not be empty")
+    hashes = tuple(bundle.feature_schema_hash for bundle in bundles)
+    if len(set(hashes)) != 1:
+        raise ValueError("all observations in a model batch must share one schema")
+    counts = [int(bundle.action_features.shape[0]) for bundle in bundles]
+    if any(count <= 0 for count in counts):
+        raise ValueError("every batched decision must have at least one legal action")
+    max_actions = max(counts)
+    if pad_to_actions is not None:
+        if pad_to_actions < max_actions:
+            raise ValueError(
+                f"pad_to_actions={pad_to_actions} would truncate {max_actions} actions"
+            )
+        max_actions = int(pad_to_actions)
+
+    action_width = int(bundles[0].action_features.shape[1])
+    actions = bundles[0].action_features.new_zeros(
+        (len(bundles), max_actions, action_width)
+    )
+    action_mask = torch.zeros((len(bundles), max_actions), dtype=torch.bool)
+    strategy = None
+    if bundles[0].strategy_features is not None:
+        strategy_width = int(bundles[0].strategy_features.shape[1])
+        strategy = bundles[0].strategy_features.new_zeros(
+            (len(bundles), max_actions, strategy_width)
+        )
+    for index, bundle in enumerate(bundles):
+        count = counts[index]
+        actions[index, :count] = bundle.action_features
+        action_mask[index, :count] = bundle.action_mask
+        if strategy is not None:
+            if bundle.strategy_features is None:
+                raise ValueError("strategy features are partially populated")
+            strategy[index, :count] = bundle.strategy_features
+
+    chosen = None
+    if chosen_action_indices is not None:
+        chosen = torch.as_tensor(chosen_action_indices, dtype=torch.long)
+        if chosen.shape != (len(bundles),):
+            raise ValueError(
+                f"chosen_action_indices must have shape ({len(bundles)},), "
+                f"got {tuple(chosen.shape)}"
+            )
+        for row, count in enumerate(counts):
+            value = int(chosen[row].item())
+            if value < 0 or value >= count:
+                raise ValueError(
+                    f"chosen action {value} is outside row {row}'s legal range [0, {count})"
+                )
+
+    role_indices = torch.tensor(
+        [SUPPORTED_ROLE_TO_INDEX[bundle.acting_role] for bundle in bundles],
+        dtype=torch.long,
+    )
+    styles = None
+    if bundles[0].style_features is not None:
+        if any(bundle.style_features is None for bundle in bundles):
+            raise ValueError("style features are partially populated")
+        styles = torch.stack([bundle.style_features for bundle in bundles])
+    return BatchedModelInputBundle(
+        state_card_vectors=tuple(
+            torch.stack([bundle.state_card_vectors[i] for bundle in bundles])
+            for i in range(len(bundles[0].state_card_vectors))
+        ),
+        state_context_flat=torch.stack([b.state_context_flat for b in bundles]),
+        context_card_vectors=tuple(
+            torch.stack([bundle.context_card_vectors[i] for bundle in bundles])
+            for i in range(len(bundles[0].context_card_vectors))
+        ),
+        context_flat=torch.stack([b.context_flat for b in bundles]),
+        history_tokens=torch.stack([b.history_tokens for b in bundles]),
+        history_key_padding_mask=torch.stack(
+            [b.history_key_padding_mask for b in bundles]
+        ),
+        action_features=actions,
+        action_mask=action_mask,
+        acting_role=role_indices,
+        chosen_action_index=chosen,
+        feature_schema_hashes=hashes,
+        strategy_features=strategy,
+        style_features=styles,
+    )
 
 
 def observation_to_model_inputs(
