@@ -213,7 +213,8 @@ bidding、league、curriculum、RL+BC、style、strategy 和 belief 组合都会
 worker 启动前 fail closed。默认仍是 `single_process`，原有组合保持不变。
 compact replay 会在共享槽归还前和写入 replay 前分别校验 schema、Tensor、
 动作、标签及 provenance。Actor 故障与 shutdown 使用 spawn 进程共享信号，
-使正在等待槽位的其他 worker 能及时退出。
+主进程推理故障也会发布同一 abort 信号，使正在等待槽位的其他 worker 能
+及时退出；清理错误不会覆盖正在传播的训练异常。
 
 V2 单 GPU，并输出 checkpoint 与 metrics（PowerShell）：
 

@@ -245,12 +245,14 @@ class SharedReplaySlots:
 
     def write_transition(
         self, transition, bundle: ModelInputBundle, policy_step: int,
-        timeout_seconds: float, abort_event=None,
+        timeout_seconds: float, abort_event=None, shutdown_event=None,
     ) -> None:
         deadline = time.monotonic() + timeout_seconds
         while True:
             if abort_event is not None and abort_event.is_set():
                 raise RuntimeError("async runtime aborted while waiting for replay slot")
+            if shutdown_event is not None and shutdown_event.is_set():
+                raise RuntimeError("async runtime shut down while waiting for replay slot")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("timed out waiting for a shared replay slot")
@@ -512,12 +514,16 @@ class AsyncRequestCoordinator:
             raise RuntimeError("cannot quiesce with in-flight inference requests")
         return counts
 
-    def shutdown(self) -> None:
+    def request_shutdown(self) -> None:
+        """Publish shutdown before joins without closing shared queues."""
         if self.shutdown_event.is_set():
             return
         self.shutdown_event.set()
         for slot_id in range(len(self.states)):
             self.states[slot_id] = int(SlotState.SHUTDOWN)
+
+    def shutdown(self) -> None:
+        self.request_shutdown()
         self.ready_queue.close()
         self.free_queue.close()
 
@@ -554,6 +560,8 @@ def async_actor_main(
     request_id = actor_id << 48
     try:
         while True:
+            if coordinator.shutdown_event.is_set():
+                return
             coordinator._raise_if_failed()
             try:
                 task = task_queue.get(timeout=0.1)
@@ -640,6 +648,7 @@ def async_actor_main(
                     snapshot,
                     coordinator.request_timeout_seconds,
                     coordinator.abort_event,
+                    coordinator.shutdown_event,
                 )
             team = episode.terminal_result.get("winner_team", "landlord")
             event_queue.put((
@@ -648,6 +657,9 @@ def async_actor_main(
                 len(episode.action_trace),
             ))
     except BaseException as exc:
+        if coordinator.shutdown_event.is_set() and not coordinator.abort_event.is_set():
+            event_queue.put(("stopped", actor_id))
+            return
         message = f"actor {actor_id}: {type(exc).__name__}: {exc}"
         coordinator.fail(message)
         event_queue.put(("failed", actor_id, message))

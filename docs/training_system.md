@@ -143,7 +143,9 @@ a quiescent boundary. Both replay implementations sample uniformly across all
 resident transitions first, including action buckets smaller than the learner
 batch size. The learner then partitions the sampled records by action-count
 bucket and forwards each homogeneous sub-batch separately, reducing padding
-without starving rare decisions. Async replay drain uses incremental batched
+without starving rare decisions. Compact minibatches are forwarded directly
+from their stored `model_inputs`; they never index the deliberately empty
+`observations` list. Async replay drain uses incremental batched
 insertion and O(1) bucket eviction rather than rebuilding every bucket for each
 transition.
 
@@ -181,7 +183,11 @@ instead of waiting indefinitely. Abort and shutdown are spawn-shared events,
 not process-local flags; slot acquisition, response waits, replay-slot waits,
 actor task loops, and the coordinator service all observe the same state. The
 first failure reason is stored in shared memory so a failure in one actor wakes
-other actors blocked on slots without waiting for their request timeout. Cycle
+other actors blocked on slots without waiting for their request timeout. Main
+inference-service and collection exceptions publish the same abort signal
+before they propagate. Shutdown publishes its shared state before joining
+workers, and cleanup errors do not replace an exception already in flight.
+Cycle
 quiescence requires no active games,
 no WRITING/READY/RUNNING slots, and no completed episode waiting to enter
 compact replay. Replay is then cleared through the trainer lifecycle API,

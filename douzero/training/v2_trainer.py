@@ -48,6 +48,7 @@ import random
 import copy
 import hashlib
 import json
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -785,6 +786,16 @@ class V2Trainer:
         return len(records)
 
     def _service_async_requests(self, wait_seconds: float = 0.001) -> int:
+        """Service requests and publish any main-process failure globally."""
+        try:
+            return self._service_async_requests_impl(wait_seconds)
+        except BaseException as exc:
+            self._async_coordinator.fail(
+                f"main inference service failed: {type(exc).__name__}: {exc}"
+            )
+            raise
+
+    def _service_async_requests_impl(self, wait_seconds: float = 0.001) -> int:
         from collections import defaultdict
         from douzero.models_v2.batch import model_input_bundles_to_batch
 
@@ -879,6 +890,17 @@ class V2Trainer:
         self._async_snapshot = self.policy_step
 
     def _collect_episodes_async(self, target: int) -> None:
+        """Collect async episodes while propagating every coordinator failure."""
+        try:
+            self._collect_episodes_async_impl(target)
+        except BaseException as exc:
+            if self._async_runtime_started:
+                self._async_coordinator.fail(
+                    f"main async collection failed: {type(exc).__name__}: {exc}"
+                )
+            raise
+
+    def _collect_episodes_async_impl(self, target: int) -> None:
         if target < 0:
             raise ValueError("num_episodes must be non-negative")
         if not self._async_runtime_started:
@@ -1026,22 +1048,43 @@ class V2Trainer:
     def shutdown(self) -> None:
         """Release trainer background resources (none in single-process mode)."""
         if self.async_mode and self._async_runtime_started:
-            for _ in self._async_workers:
-                self._async_tasks.put(None)
-            deadline = time.monotonic() + 5.0
-            for process in self._async_workers:
-                process.join(max(0.0, deadline - time.monotonic()))
-            alive = [process for process in self._async_workers if process.is_alive()]
-            for process in alive:
-                process.terminate()
-                process.join(1.0)
-            self._async_coordinator.shutdown()
-            self._async_replay_slots.close()
-            self._async_tasks.close()
-            self._async_events.close()
-            self._async_runtime_started = False
-            if alive:
-                raise RuntimeError("async actor shutdown timed out")
+            active_exception = sys.exc_info()[0] is not None
+            cleanup_error: BaseException | None = None
+            alive = []
+            try:
+                # Wake actors blocked in acquire/wait_done/replay handoff before
+                # waiting for process joins. Queue sentinels alone cannot wake
+                # an actor that is already waiting on an inference request.
+                self._async_coordinator.request_shutdown()
+                for _ in self._async_workers:
+                    self._async_tasks.put(None)
+                deadline = time.monotonic() + 5.0
+                for process in self._async_workers:
+                    process.join(max(0.0, deadline - time.monotonic()))
+                alive = [process for process in self._async_workers if process.is_alive()]
+                if alive:
+                    cleanup_error = RuntimeError("async actor shutdown timed out")
+            except BaseException as exc:
+                cleanup_error = exc
+            finally:
+                for process in self._async_workers:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(1.0)
+                for close in (
+                    self._async_coordinator.shutdown,
+                    self._async_replay_slots.close,
+                    self._async_tasks.close,
+                    self._async_events.close,
+                ):
+                    try:
+                        close()
+                    except BaseException as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                self._async_runtime_started = False
+            if cleanup_error is not None and not active_exception:
+                raise cleanup_error
         return None
 
     def _run_one_episode(self) -> Episode:
@@ -2053,29 +2096,33 @@ class V2Trainer:
 
                     for indices in groups.values():
                         chosen = batch.action_indices[indices]
-                        observations = [batch.observations[i] for i in indices]
                         if batch.model_inputs is None:
+                            observations = [batch.observations[i] for i in indices]
                             bundle = observation_batch_to_model_inputs(
                                 observations,
                                 chosen,
                                 strategy_config=self.model.strategy_feature_config(),
                                 style_enabled=self.model.config.style_enabled,
                             )
+                            belief_values = [
+                                self._compute_belief_feature(
+                                    obs, differentiable=differentiable_belief
+                                )
+                                for obs in observations
+                            ]
+                            belief_features = (
+                                torch.stack(belief_values)
+                                if belief_values and belief_values[0] is not None
+                                else None
+                            )
                         else:
                             bundle = model_input_bundles_to_batch(
                                 [batch.model_inputs[i] for i in indices], chosen
                             )
-                        belief_values = [
-                            self._compute_belief_feature(
-                                obs, differentiable=differentiable_belief
-                            )
-                            for obs in observations
-                        ]
-                        belief_features = (
-                            torch.stack(belief_values)
-                            if belief_values and belief_values[0] is not None
-                            else None
-                        )
+                            # Compact replay is currently async-only, and async
+                            # startup rejects every belief mode. It intentionally
+                            # stores model tensors rather than ObservationV2.
+                            belief_features = None
                         out = self._forward_batched_bundle(bundle, belief_features)
                         gathered = out.gather_chosen(bundle.chosen_action_index)
                         for name in output_names:

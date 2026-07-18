@@ -410,6 +410,92 @@ def test_actor_failure_aborts_another_process_blocked_on_inference_slot():
         coordinator.shutdown()
 
 
+def test_main_inference_failure_aborts_process_blocked_on_slot():
+    coordinator = AsyncRequestCoordinator(
+        build_v2_schema(), num_slots=1, request_timeout_seconds=10.0
+    )
+    coordinator.acquire(actor_id=1)
+    output = coordinator.context.Queue()
+    blocked_ready = coordinator.context.Event()
+    blocked = coordinator.context.Process(
+        target=_blocked_acquire_probe, args=(coordinator, output, blocked_ready)
+    )
+
+    class Harness:
+        _async_coordinator = coordinator
+
+        @staticmethod
+        def _service_async_requests_impl(_wait_seconds):
+            raise RuntimeError("injected batched forward failure")
+
+    try:
+        blocked.start()
+        assert blocked_ready.wait(10.0)
+        with pytest.raises(RuntimeError, match="injected batched forward failure"):
+            V2Trainer._service_async_requests(Harness())
+        abort_observed = __import__("time").monotonic()
+        blocked.join(1.0)
+        assert blocked.exitcode == 0
+        assert __import__("time").monotonic() - abort_observed < 1.0
+        error_type, message, _elapsed = output.get(timeout=1.0)
+        assert error_type == "RuntimeError"
+        assert "main inference service failed" in message
+        assert "injected batched forward failure" in message
+    finally:
+        if blocked.is_alive():
+            blocked.terminate()
+            blocked.join(1.0)
+        output.close()
+        coordinator.shutdown()
+
+
+def test_shutdown_signals_before_join_and_preserves_active_exception():
+    coordinator = AsyncRequestCoordinator(build_v2_schema(), num_slots=1)
+
+    class QueueStub:
+        def put(self, _value):
+            pass
+
+        def close(self):
+            pass
+
+    class ReplayStub:
+        def close(self):
+            pass
+
+    class StuckProcess:
+        terminated = False
+        observed_shutdown = False
+
+        def join(self, _timeout):
+            self.observed_shutdown = coordinator.shutdown_event.is_set()
+
+        def is_alive(self):
+            return not self.terminated
+
+        def terminate(self):
+            self.terminated = True
+
+    process = StuckProcess()
+    trainer = object.__new__(V2Trainer)
+    trainer.async_mode = True
+    trainer._async_runtime_started = True
+    trainer._async_workers = [process]
+    trainer._async_tasks = QueueStub()
+    trainer._async_events = QueueStub()
+    trainer._async_replay_slots = ReplayStub()
+    trainer._async_coordinator = coordinator
+
+    with pytest.raises(ValueError, match="original inference failure"):
+        try:
+            raise ValueError("original inference failure")
+        finally:
+            trainer.shutdown()
+    assert process.observed_shutdown
+    assert process.terminated
+    assert not trainer._async_runtime_started
+
+
 def test_long_running_controller_has_no_concrete_buffer_access():
     source = inspect.getsource(LongRunningTrainer)
     assert "trainer.buffer" not in source
@@ -476,6 +562,43 @@ def test_single_process_learner_splits_uniform_sample_by_action_bucket():
     trainer._forward_batched_bundle = counted_forward
     assert trainer.step() is not None
     assert sorted(action_widths) == [8, 9]
+
+
+def test_compact_replay_minibatch_runs_real_cpu_learner_step():
+    schema = build_v2_schema()
+    model = ModelV2(
+        schema,
+        ModelV2Config(hidden_size=16, history_layers=1, history_heads=1),
+    )
+    trainer = V2Trainer(
+        model,
+        config=TrainerConfig(
+            max_episodes=0,
+            optimizer_steps=1,
+            batch_size=2,
+            buffer_capacity=8,
+        ),
+    )
+    compact = CompactTensorReplayBuffer(
+        capacity_transitions=8,
+        expected_schema_hash=schema.stable_hash(),
+        expected_tensor_shapes=compact_model_input_shapes(schema),
+    )
+    obs = _observations(1)[0]
+    compact.add_many([
+        _compact_with_action_count(obs, 8, 1),
+        _compact_with_action_count(obs, 9, 1),
+    ])
+    trainer.buffer = compact
+    before = {
+        name: value.detach().clone()
+        for name, value in trainer.model.state_dict().items()
+    }
+    assert trainer.step() is not None
+    assert any(
+        not torch.equal(before[name], value)
+        for name, value in trainer.model.state_dict().items()
+    )
 
 
 def test_decision_counter_includes_forced_non_replay_actions():
