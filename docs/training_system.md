@@ -180,6 +180,11 @@ CUDA model guards use asynchronous device assertions rather than Python
 `bool(tensor)` scalar reads, avoiding mask, role, and chosen-index host
 synchronization in the inference and learner hot paths.
 
+Both `v2_training_mode` and `num_actors` may be set in typed YAML. Explicit CLI
+flags override YAML. With no YAML or topology flags the default remains
+`single_process` with one Actor; selecting async mode from the CLI without a
+config defaults to four Actors. A loaded YAML uses its typed Actor count.
+
 | Combination | `single_process` | `async_single_gpu` |
 |---|---:|---:|
 | Legacy-ruleset base V2 | yes | yes |

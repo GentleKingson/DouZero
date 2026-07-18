@@ -270,6 +270,7 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "disable_checkpoint": bool, "savedir": str, "total_frames": int,
     "exp_epsilon": float, "batch_size": int, "unroll_length": int,
     "num_buffers": int, "num_threads": int, "max_grad_norm": float,
+    "v2_training_mode": str,
     "sync_interval_updates": int, "policy_snapshot_slots": int,
     "amp_enabled": bool, "amp_dtype": str,
     "amp_fallback_on_nonfinite": bool, "pin_memory": bool,
@@ -408,6 +409,10 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
     """Validate P14 concurrency and precision controls."""
     import math
 
+    if cfg.v2_training_mode not in {"single_process", "async_single_gpu"}:
+        raise ValueError(
+            "v2_training_mode must be 'single_process' or 'async_single_gpu'"
+        )
     if cfg.sync_interval_updates < 1:
         raise ValueError("sync_interval_updates must be >= 1")
     if cfg.policy_snapshot_slots < 2:

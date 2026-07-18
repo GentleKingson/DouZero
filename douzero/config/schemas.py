@@ -522,6 +522,7 @@ class TrainingConfig:
     # P14 training-system controls. Defaults preserve the legacy numerical
     # path; versioned snapshot publication replaces unsafe in-place actor
     # mutation even when AMP/DDP are disabled.
+    v2_training_mode: str = "single_process"
     sync_interval_updates: int = 1
     policy_snapshot_slots: int = 2
     amp_enabled: bool = False

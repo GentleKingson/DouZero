@@ -89,7 +89,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--v2_training_mode",
         choices=["single_process", "async_single_gpu"],
-        default="single_process",
+        default=argparse.SUPPRESS,
         help="V2 execution topology (default: single_process).",
     )
     parser.add_argument(
@@ -305,10 +305,10 @@ def _assert_v2_identity(cfg) -> None:
         )
 
 
-#: Legacy multiprocess fields the P06 V2 trainer does NOT consume. Each entry
+#: Legacy multiprocess fields the V2 trainer does NOT consume. Each entry
 #: maps the field name to its TrainingConfig default; a non-default value in a
 #: YAML config triggers a visible warning (P06 r3 fix: these were silently
-#: ignored in r0-r2). P14's high-throughput trainer will consume them.
+#: ignored in r0-r2).
 _UNSUPPORTED_LEGACY_FIELDS: dict[str, object] = {
     "xpid": "douzero",
     "save_interval": 30,
@@ -316,7 +316,6 @@ _UNSUPPORTED_LEGACY_FIELDS: dict[str, object] = {
     "actor_device_cpu": False,
     "gpu_devices": "0",
     "num_actor_devices": 1,
-    "num_actors": 5,
     "training_device": "0",
     "load_model": False,
     "disable_checkpoint": False,
@@ -329,13 +328,11 @@ _UNSUPPORTED_LEGACY_FIELDS: dict[str, object] = {
 
 def _warn_unsupported_legacy_fields(cfg) -> None:
     """Print a visible warning when a YAML config sets a legacy multiprocess
-    field to a non-default value the P06 V2 trainer will silently ignore.
+    field to a non-default value the V2 trainer will silently ignore.
 
-    P06 r3 fix: the enhanced.yaml carries these fields for TrainingConfig
-    schema compatibility, but the single-process trainer does not consume
-    them. Rather than silently accepting a user's tuned ``num_actors: 16``
-    (which would have NO effect), we print a stderr warning naming each
-    ignored field so the user knows the V2 trainer path does not use it.
+    The enhanced YAML carries these fields for TrainingConfig schema
+    compatibility. Print a stderr warning naming each ignored field rather
+    than accepting it silently.
     """
     if cfg is None:
         return
@@ -349,11 +346,25 @@ def _warn_unsupported_legacy_fields(cfg) -> None:
 
         print(
             "[train_v2] WARNING: the following legacy multiprocess fields are "
-            "set in the config but NOT consumed by the P06 single-process V2 "
-            "trainer. They will be consumed by P14's high-throughput trainer.\n"
+            "set in the config but NOT consumed by the V2 trainer.\n"
             + "\n".join(ignored),
             file=sys.stderr,
         )
+
+
+def _resolve_v2_topology(args, yaml_cfg) -> tuple[str, int]:
+    """Resolve topology fields with the CLI > YAML > default contract."""
+    yaml_mode = getattr(yaml_cfg, "v2_training_mode", None)
+    mode = getattr(args, "v2_training_mode", yaml_mode or "single_process")
+    yaml_actors = getattr(yaml_cfg, "num_actors", None)
+    actors = getattr(
+        args,
+        "num_actors",
+        yaml_actors if yaml_actors is not None else (
+            4 if mode == "async_single_gpu" else 1
+        ),
+    )
+    return mode, actors
 
 
 def _resolve_ruleset(cfg):
@@ -841,9 +852,7 @@ def main() -> None:
     # silently pair them with the wrong observation path.
     _assert_v2_identity(yaml_cfg)
 
-    # P06 r3: warn about legacy multiprocess fields the V2 trainer does not
-    # consume, so a user who tunes num_actors / gpu_devices / etc. in the
-    # YAML is alerted that the single-process trainer ignores them.
+    # Warn only for legacy fields the V2 trainer still does not consume.
     _warn_unsupported_legacy_fields(yaml_cfg)
 
     # Build the seed/deterministic resolver. ``resolve(cli_dest, yaml_value,
@@ -874,8 +883,7 @@ def main() -> None:
     ddp_backend = resolve(
         "ddp_backend", yaml_cfg.ddp_backend if yaml_cfg else None, "auto"
     )
-    v2_training_mode = args.v2_training_mode
-    num_actors = resolve("num_actors", None, 4 if v2_training_mode == "async_single_gpu" else 1)
+    v2_training_mode, num_actors = _resolve_v2_topology(args, yaml_cfg)
     if v2_training_mode == "async_single_gpu" and ddp_enabled:
         raise ValueError("async_single_gpu rejects DDP; use one main GPU process")
     loss_cfg = _build_loss_config(yaml_cfg)

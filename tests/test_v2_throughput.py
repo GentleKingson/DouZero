@@ -863,6 +863,66 @@ def test_async_mode_without_cuda_fails_before_startup(monkeypatch):
         )
 
 
+def test_v2_topology_defaults_without_cli_or_yaml():
+    import train_v2
+
+    args = train_v2._build_parser().parse_args([])
+    assert not hasattr(args, "v2_training_mode")
+    assert not hasattr(args, "num_actors")
+    assert train_v2._resolve_v2_topology(args, None) == ("single_process", 1)
+
+
+def test_v2_topology_yaml_only_and_no_legacy_warning(tmp_path):
+    import train_v2
+    from douzero.config import load_config
+
+    path = tmp_path / "async.yaml"
+    path.write_text(
+        "v2_training_mode: async_single_gpu\nnum_actors: 6\n",
+        encoding="utf-8",
+    )
+    yaml_cfg = load_config(str(path))
+    args = train_v2._build_parser().parse_args(["--config", str(path)])
+    assert train_v2._resolve_v2_topology(args, yaml_cfg) == (
+        "async_single_gpu", 6
+    )
+    assert "num_actors" not in train_v2._UNSUPPORTED_LEGACY_FIELDS
+
+
+def test_v2_topology_yaml_rejects_unknown_mode(tmp_path):
+    from douzero.config import load_config
+
+    path = tmp_path / "invalid.yaml"
+    path.write_text("v2_training_mode: surprise\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="v2_training_mode"):
+        load_config(str(path))
+
+
+def test_v2_topology_cli_overrides_yaml_independently(tmp_path):
+    import train_v2
+    from douzero.config import load_config
+
+    path = tmp_path / "async.yaml"
+    path.write_text(
+        "v2_training_mode: async_single_gpu\nnum_actors: 6\n",
+        encoding="utf-8",
+    )
+    yaml_cfg = load_config(str(path))
+    parser = train_v2._build_parser()
+    mode_override = parser.parse_args([
+        "--config", str(path), "--v2_training_mode", "single_process",
+    ])
+    assert train_v2._resolve_v2_topology(mode_override, yaml_cfg) == (
+        "single_process", 6
+    )
+    actor_override = parser.parse_args([
+        "--config", str(path), "--num_actors", "3",
+    ])
+    assert train_v2._resolve_v2_topology(actor_override, yaml_cfg) == (
+        "async_single_gpu", 3
+    )
+
+
 @pytest.mark.parametrize("mode", ["pure_prior", "uncertainty_gated_prior"])
 def test_async_prior_decision_modes_fail_before_cuda_or_worker_start(mode):
     model = ModelV2(
