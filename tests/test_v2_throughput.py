@@ -31,6 +31,32 @@ def _spawn_protocol_probe(coordinator, output_queue):
     output_queue.put((coordinator.context.get_start_method(), int(coordinator.states[0])))
 
 
+class _LocalDDPContext:
+    enabled = True
+    rank = 0
+    world_size = 1
+    local_rank = 0
+    backend = "gloo"
+    device = torch.device("cpu")
+    is_rank_zero = True
+
+    @staticmethod
+    def all_true(value):
+        return bool(value)
+
+
+class _LocalDDPWrapper(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.config = module.config
+        self.schema = module.schema
+        self.strategy_feature_config = module.strategy_feature_config
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+
 def _observations(count: int = 2):
     np.random.seed(41)
     env = Env("adp")
@@ -156,6 +182,26 @@ def test_long_running_controller_has_no_concrete_buffer_access():
     source = inspect.getsource(LongRunningTrainer)
     assert "trainer.buffer" not in source
     assert "trainer.bidding_buffer" not in source
+
+
+def test_ddp_scalar_learner_ignores_disabled_strategy_auxiliary_heads():
+    core = ModelV2(
+        build_v2_schema(),
+        ModelV2Config(hidden_size=16, history_layers=1, history_heads=1),
+    )
+    trainer = V2Trainer(
+        _LocalDDPWrapper(core),
+        config=TrainerConfig(
+            max_episodes=1,
+            optimizer_steps=1,
+            batch_size=1,
+            buffer_capacity=256,
+            exp_epsilon=0.0,
+        ),
+        distributed_context=_LocalDDPContext(),
+    )
+    trainer.collect_episodes()
+    assert trainer.step() is not None
 
 
 def test_async_mode_without_cuda_fails_before_startup(monkeypatch):

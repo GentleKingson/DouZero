@@ -2064,6 +2064,7 @@ class V2Trainer:
                     gathered_aux = {
                         name: torch.cat(values, dim=0).float()
                         for name, values in gathered_aux_lists.items()
+                        if values
                     }
                 labels = {
                     "target_win": batch.target_win.to(self.device),
