@@ -146,7 +146,10 @@ then the process checkpoints at the safe boundary and exits with an explicit
 save, but not a checkpoint already due by another schedule.
 Wall time is cumulative across resumes: every clean boundary stores
 `total_wall_seconds`, and a resumed process receives only the remaining part
-of `--max_wall_time_minutes`. A collect-only configuration with
+of `--max_wall_time_minutes`. The budget includes checkpoint publication,
+rotation, periodic evaluation, and metrics emission. Post-publication time is
+persisted atomically in the latest run-state manifest without rewriting the
+immutable model checkpoint. A collect-only configuration with
 `optimizer_steps_per_cycle=0` rejects an otherwise unreachable optimizer-step
 limit unless another cycle, episode, or wall-time limit can stop the run.
 
@@ -161,8 +164,11 @@ silently overwriting another run. Manifest resume also binds the output series:
 omitting `--checkpoint_path` continues the manifest's series, while an explicit
 mismatching path is rejected. Manifest identity and counters are checked
 against the checkpoint, and resuming an older sequence than `latest` fails
-closed. A copied standalone cycle file cannot implicitly create or fork a
-series; its matching latest manifest is required.
+closed. Direct checkpoint resume performs the same whole-series scan as
+manifest resume. Duplicate sequence numbers, skipped sequences, and ignored
+orphans fail closed. A copied standalone cycle file cannot implicitly create
+or fork a series; either its matching latest manifest or the initial
+publication-intent sidecar is required.
 Each checkpoint includes cumulative trainer statistics, cycle state, policy
 version and step, optimizer/mixed-precision state, all RNG state, and the
 existing strict source/model/feature/rules/loss/bidding/belief identity.
@@ -181,6 +187,9 @@ the latest manifest could be replaced, the next manifest resume validates the
 single contiguous orphan checkpoint and promotes it. Multiple or invalid
 orphans fail closed. Rotation cleanup failures are recorded separately and do
 not invalidate a checkpoint whose file and manifest were already published.
+An atomic pending-intent sidecar makes the same recovery possible when the
+very first checkpoint succeeds but creation of the first latest manifest
+fails; it is removed after successful manifest publication.
 
 ```bash
 python train_v2.py --long_running --config configs/enhanced.yaml --seed 17 \
@@ -204,7 +213,9 @@ Periodic evaluation delegates to an existing evaluation command. It does not
 implement rules or another evaluator. The command is tokenized without a shell;
 `{checkpoint}` and `{cycle}` are replaced at runtime. Evaluation failures are
 recorded and fail fast by default; `--no-eval_fail_fast` explicitly records and
-continues.
+continues. If the evaluation subprocess exits because the controller received
+`SIGINT` or `SIGTERM`, it is recorded as interrupted and the run follows normal
+safe-boundary signal shutdown instead of treating it as a fail-fast error.
 
 ```bash
 python train_v2.py --long_running --episodes_per_cycle 32 \

@@ -252,6 +252,51 @@ def test_wall_time_budget_accumulates_across_resume(tmp_path):
     assert final_state.total_wall_seconds > saved_wall_seconds
 
 
+def test_wall_time_persists_checkpoint_and_evaluation_work(tmp_path):
+    from train_v2 import _resolve_resume_checkpoint
+
+    class ManualClock:
+        value = 0.0
+
+        def __call__(self):
+            return self.value
+
+        def advance(self, seconds):
+            self.value += seconds
+
+    clock = ManualClock()
+    trainer = _DeterministicTrainer()
+    original_save = trainer.save_training_checkpoint
+
+    def slow_save(*args, **kwargs):
+        original_save(*args, **kwargs)
+        clock.advance(5.0)
+
+    def slow_evaluate(_checkpoint, _cycle):
+        clock.advance(7.0)
+
+    trainer.save_training_checkpoint = slow_save
+    state, reason, _ = LongRunningTrainer(
+        trainer,
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=1,
+            max_cycles=1,
+            eval_every_cycles=1,
+        ),
+        CheckpointSeries(str(tmp_path / "services.pt"), 2),
+        evaluator=slow_evaluate,
+        clock=clock,
+    ).run()
+    assert reason == "max_cycles"
+    assert state.total_wall_seconds == 12.0
+    manifest_path = tmp_path / "services-latest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["total_wall_seconds"] == 12.0
+    resolved = _resolve_resume_checkpoint(str(manifest_path))
+    assert resolved.total_wall_seconds == 12.0
+
+
 def test_unreachable_optimizer_only_limit_fails_closed(tmp_path):
     trainer = _DeterministicTrainer()
     with pytest.raises(ValueError, match="unreachable"):
@@ -401,6 +446,33 @@ def test_evaluation_failure_is_recorded_and_configurable(tmp_path, fail_fast):
     assert records[-1]["evaluation_error"] == "OSError"
 
 
+def test_signal_during_evaluation_stops_without_fail_fast_error(tmp_path):
+    stop = StopController(Event())
+
+    def interrupted_evaluation(_checkpoint, _cycle):
+        stop.request("sigint")
+        raise OSError("evaluation subprocess interrupted")
+
+    state, reason, records = LongRunningTrainer(
+        _DeterministicTrainer(),
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=0,
+            max_cycles=10,
+            eval_every_cycles=1,
+            eval_fail_fast=True,
+        ),
+        CheckpointSeries(str(tmp_path / "eval-signal.pt"), 2),
+        stop_controller=stop,
+        evaluator=interrupted_evaluation,
+        collect_records=True,
+    ).run()
+    assert reason == "sigint"
+    assert state.cycle == 1
+    assert records[-1]["evaluation_status"] == "interrupted"
+    assert records[-1]["evaluation_error"] == ""
+
+
 def test_resume_identity_mismatch_fails_closed(tmp_path):
     trainer = _DeterministicTrainer()
     state = LongRunningState(
@@ -449,9 +521,12 @@ def test_manifest_failure_is_reconciled_from_the_next_orphan(tmp_path):
     manifest_path = tmp_path / "train-latest.json"
     previous_manifest = manifest_path.read_bytes()
     series = CheckpointSeries(str(tmp_path / "train.pt"), 3)
+    original_write = series._write_json_atomic
 
-    def fail_manifest(_path, _payload):
-        raise OSError("injected manifest failure")
+    def fail_manifest(path, payload):
+        if path == series.latest_manifest:
+            raise OSError("injected manifest failure")
+        original_write(path, payload)
 
     series._write_json_atomic = fail_manifest
     runner = LongRunningTrainer(
@@ -490,6 +565,52 @@ def test_manifest_failure_is_reconciled_from_the_next_orphan(tmp_path):
     assert reason == "max_cycles"
     assert final_state.checkpoint_sequence == 2
     assert json.loads(manifest_path.read_text())["checkpoint_sequence"] == 2
+
+
+def test_first_manifest_failure_recovers_unique_initial_checkpoint(tmp_path):
+    from train_v2 import _resolve_resume_checkpoint
+
+    trainer = _DeterministicTrainer()
+    series = CheckpointSeries(str(tmp_path / "initial.pt"), 3)
+    original_write = series._write_json_atomic
+
+    def fail_latest(path, payload):
+        if path == series.latest_manifest:
+            raise OSError("injected initial manifest failure")
+        original_write(path, payload)
+
+    series._write_json_atomic = fail_latest
+    with pytest.raises(RuntimeError, match="checkpoint publication failed"):
+        LongRunningTrainer(
+            trainer,
+            LongRunningConfig(
+                episodes_per_cycle=1,
+                optimizer_steps_per_cycle=1,
+                max_cycles=1,
+            ),
+            series,
+        ).run()
+
+    checkpoint = next(tmp_path.glob("initial-run-*-seq-000001-*.pt"))
+    assert not (tmp_path / "initial-latest.json").exists()
+    resolved = _resolve_resume_checkpoint(str(checkpoint))
+    resumed = _DeterministicTrainer(seed=999)
+    state = LongRunningState.from_dict(
+        resumed.load_training_checkpoint(resolved.checkpoint)
+    )
+    state.resume_source = resolved.checkpoint
+    LongRunningTrainer(
+        resumed,
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=1,
+            max_cycles=1,
+        ),
+        CheckpointSeries(resolved.series_base, 3),
+        state=state,
+    )
+    manifest = json.loads((tmp_path / "initial-latest.json").read_text())
+    assert manifest["checkpoint_sequence"] == 1
 
 
 def test_rotation_failure_does_not_invalidate_published_checkpoint(tmp_path):
@@ -552,7 +673,7 @@ def test_resume_rejects_checkpoint_from_a_different_series(tmp_path):
         )
 
 
-def test_standalone_checkpoint_cannot_implicitly_fork_a_series(tmp_path):
+def test_copied_checkpoint_without_publication_intent_cannot_fork_series(tmp_path):
     trainer = _DeterministicTrainer()
     state, _, _ = _run(tmp_path / "source", trainer, cycles=1)
     manifest = json.loads(
@@ -563,7 +684,7 @@ def test_standalone_checkpoint_cannot_implicitly_fork_a_series(tmp_path):
     copied.parent.mkdir()
     copied.write_bytes(original.read_bytes())
     state.resume_source = str(copied)
-    with pytest.raises(ValueError, match="requires.*latest manifest"):
+    with pytest.raises(ValueError, match="publication intent"):
         LongRunningTrainer(
             trainer,
             LongRunningConfig(
@@ -595,6 +716,54 @@ def test_resume_rejects_rollback_behind_latest_sequence(tmp_path):
             CheckpointSeries(str(tmp_path / "train.pt"), 3),
             state=state,
         )
+
+
+def test_direct_old_checkpoint_resolves_unique_newer_orphan(tmp_path):
+    from train_v2 import _resolve_resume_checkpoint
+
+    trainer = _DeterministicTrainer()
+    state, _, _ = _run(tmp_path, trainer, cycles=1)
+    old = tmp_path / json.loads(
+        (tmp_path / "train-latest.json").read_text()
+    )["latest"]
+    series = CheckpointSeries(str(tmp_path / "train.pt"), 3)
+    original_write = series._write_json_atomic
+
+    def fail_latest(path, payload):
+        if path == series.latest_manifest:
+            raise OSError("injected manifest failure")
+        original_write(path, payload)
+
+    series._write_json_atomic = fail_latest
+    with pytest.raises(RuntimeError, match="checkpoint publication failed"):
+        LongRunningTrainer(
+            trainer,
+            LongRunningConfig(
+                episodes_per_cycle=2,
+                optimizer_steps_per_cycle=2,
+                max_cycles=2,
+            ),
+            series,
+            state=state,
+        ).run()
+    orphan = next(tmp_path.glob("train-run-*-seq-000002-*.pt"))
+    resolved = _resolve_resume_checkpoint(str(old))
+    assert Path(resolved.checkpoint) == orphan
+
+
+def test_duplicate_checkpoint_sequence_fails_closed(tmp_path):
+    from train_v2 import _resolve_resume_checkpoint
+
+    _run(tmp_path, _DeterministicTrainer(), cycles=1)
+    manifest_path = tmp_path / "train-latest.json"
+    payload = json.loads(manifest_path.read_text())
+    original = tmp_path / payload["latest"]
+    duplicate = original.with_name(
+        original.name.replace("cycle-000001", "cycle-000002")
+    )
+    duplicate.write_bytes(original.read_bytes())
+    with pytest.raises(ValueError, match="duplicate sequence"):
+        _resolve_resume_checkpoint(str(manifest_path))
 
 
 def test_manifest_counters_must_match_checkpoint_state(tmp_path):
@@ -637,9 +806,12 @@ def test_sequence_ordering_crosses_one_million_numerically(tmp_path):
     assert "seq-999999" in first.name
 
     state.cycle += 1
+    original_write = series._write_json_atomic
 
-    def fail_manifest(_path, _payload):
-        raise OSError("injected manifest failure")
+    def fail_manifest(path, payload):
+        if path == series.latest_manifest:
+            raise OSError("injected manifest failure")
+        original_write(path, payload)
 
     series._write_json_atomic = fail_manifest
     with pytest.raises(OSError, match="manifest failure"):

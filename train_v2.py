@@ -649,14 +649,19 @@ def _write_metrics_atomic(path: str, payload: dict[str, object]) -> None:
 
 
 class _ResumeCheckpoint:
-    __slots__ = ("checkpoint", "series_base", "manifest")
+    __slots__ = ("checkpoint", "series_base", "manifest", "total_wall_seconds")
 
     def __init__(
-        self, checkpoint: str, series_base: str = "", manifest: str = ""
+        self,
+        checkpoint: str,
+        series_base: str = "",
+        manifest: str = "",
+        total_wall_seconds: float | None = None,
     ) -> None:
         self.checkpoint = checkpoint
         self.series_base = series_base
         self.manifest = manifest
+        self.total_wall_seconds = total_wall_seconds
 
 
 def _resolve_resume_checkpoint(path: str) -> _ResumeCheckpoint:
@@ -666,7 +671,38 @@ def _resolve_resume_checkpoint(path: str) -> _ResumeCheckpoint:
 
     source = Path(path)
     if not source.name.endswith("-latest.json"):
-        return _ResumeCheckpoint(str(source))
+        try:
+            import torch
+
+            bundle = torch.load(source, map_location="cpu", weights_only=True)
+            state_payload = (
+                bundle.get("long_running_state")
+                if isinstance(bundle, dict) else None
+            )
+            if state_payload is None:
+                return _ResumeCheckpoint(str(source))
+            from douzero.training.long_running import (
+                CheckpointSeries,
+                LongRunningState,
+            )
+
+            state = LongRunningState.from_dict(state_payload)
+            series = CheckpointSeries.from_checkpoint(source, state, 1)
+            if series.latest_manifest.exists():
+                resolved = _resolve_resume_checkpoint(str(series.latest_manifest))
+                resolved_sequence = series.checkpoint_sequence(
+                    resolved.checkpoint, run_id=state.run_id
+                )
+                if state.checkpoint_sequence > resolved_sequence:
+                    raise ValueError(
+                        "resume checkpoint is ahead of the checkpoint series manifest"
+                    )
+                return resolved
+            return _ResumeCheckpoint(
+                str(source), str(series.base), total_wall_seconds=state.total_wall_seconds
+            )
+        except (FileNotFoundError, OSError, RuntimeError, ValueError):
+            raise
     try:
         payload = json.loads(source.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -700,18 +736,17 @@ def _resolve_resume_checkpoint(path: str) -> _ResumeCheckpoint:
         if isinstance(latest_bundle, dict) else None
     )
     latest_state = LongRunningState.from_dict(latest_state_payload)
+    if payload["total_wall_seconds"] < latest_state.total_wall_seconds:
+        raise ValueError("latest manifest wall time is older than checkpoint state")
+    latest_state.total_wall_seconds = payload["total_wall_seconds"]
     if payload != series._manifest_payload(latest_state, latest):
         raise ValueError("latest manifest does not match checkpoint state")
 
-    candidates = []
-    pattern = (
-        f"{series.prefix}-run-{payload['run_id']}-seq-*-cycle-*-step-*"
-        f"{series.suffix}"
-    )
-    for candidate in source.parent.glob(pattern):
-        sequence = series.checkpoint_sequence(candidate, run_id=payload["run_id"])
-        if sequence > payload["checkpoint_sequence"]:
-            candidates.append(candidate)
+    indexed = series._indexed_checkpoints(payload["run_id"])
+    candidates = [
+        candidate for sequence, candidate in indexed.items()
+        if sequence > payload["checkpoint_sequence"]
+    ]
     if candidates:
         if len(candidates) != 1:
             raise ValueError("checkpoint series contains multiple orphan sequences")
@@ -732,7 +767,15 @@ def _resolve_resume_checkpoint(path: str) -> _ResumeCheckpoint:
         if candidate.name != expected_orphan.name:
             raise ValueError("orphan checkpoint filename does not match its state")
         latest = candidate
-    return _ResumeCheckpoint(str(latest), str(series.base), str(source))
+        payload["total_wall_seconds"] = max(
+            payload["total_wall_seconds"], state.total_wall_seconds
+        )
+    return _ResumeCheckpoint(
+        str(latest),
+        str(series.base),
+        str(source),
+        total_wall_seconds=payload["total_wall_seconds"],
+    )
 
 
 def _select_long_running_checkpoint_path(
@@ -813,10 +856,13 @@ def main() -> None:
         yaml_cfg.belief_training_mode if yaml_cfg else None,
         defaults.belief_training_mode,
     )
+    if args.long_running and ddp_enabled:
+        raise NotImplementedError("long-running V2 training is single-process only")
     resume_argument = getattr(args, "resume_checkpoint", "")
     resume = (
         _resolve_resume_checkpoint(resume_argument)
-        if resume_argument else _ResumeCheckpoint("")
+        if resume_argument and args.long_running
+        else _ResumeCheckpoint(resume_argument)
     )
     resume_checkpoint = resume.checkpoint
     output_checkpoint = getattr(args, "checkpoint_path", "")
@@ -824,9 +870,6 @@ def main() -> None:
         output_checkpoint = _select_long_running_checkpoint_path(
             output_checkpoint, resume
         )
-    if args.long_running and ddp_enabled:
-        raise NotImplementedError("long-running V2 training is single-process only")
-
     # This must remain before initialize_distributed. Unsupported feature
     # combinations and checkpoint I/O are configuration errors, not reasons to
     # create a process group and only then abort each rank.
@@ -1283,6 +1326,12 @@ def main() -> None:
                         "--long_running resume requires a cycle-boundary long-running checkpoint"
                     )
                 state = LongRunningState.from_dict(state_payload)
+                if resume.total_wall_seconds is not None:
+                    if resume.total_wall_seconds < state.total_wall_seconds:
+                        raise ValueError(
+                            "resume manifest wall time is older than checkpoint state"
+                        )
+                    state.total_wall_seconds = resume.total_wall_seconds
                 state.resume_source = resume_checkpoint
                 derived_series = CheckpointSeries.from_checkpoint(
                     resume_checkpoint, state, long_cfg.keep_last_checkpoints

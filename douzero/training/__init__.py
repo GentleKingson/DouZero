@@ -129,5 +129,6 @@ __all__ = [
     "LongRunningConfig",
     "LongRunningState",
     "LongRunningTrainer",
+    "RunMetricsWriter",
     "StopController",
 ]

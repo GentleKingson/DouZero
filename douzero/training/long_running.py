@@ -163,6 +163,7 @@ class CheckpointSeries:
         self.prefix = stem
         self.suffix = suffix
         self.latest_manifest = self.base.with_name(f"{self.prefix}-latest.json")
+        self.pending_manifest = self.base.with_name(f".{self.prefix}-pending.json")
         self.last_rotation_error = ""
 
     @classmethod
@@ -267,10 +268,36 @@ class CheckpointSeries:
         if not source.is_file():
             raise FileNotFoundError(f"resume checkpoint does not exist: {source}")
 
-        if not self.latest_manifest.exists():
-            raise ValueError(
-                "long-running resume requires the checkpoint series latest manifest"
+        all_series_files = list(
+            self.base.parent.glob(
+                f"{self.prefix}-run-*-seq-*-cycle-*-step-*{self.suffix}"
             )
+        )
+        run_files = self._indexed_checkpoints(state.run_id)
+
+        if not self.latest_manifest.exists():
+            if (
+                state.checkpoint_sequence != 1
+                or len(all_series_files) != 1
+                or run_files != {1: source}
+                or not self.pending_manifest.is_file()
+            ):
+                raise ValueError(
+                    "long-running resume without a latest manifest requires exactly "
+                    "one matching sequence-1 checkpoint and publication intent"
+                )
+            pending = self._validate_manifest(
+                json.loads(self.pending_manifest.read_text(encoding="utf-8"))
+            )
+            if pending != self._manifest_payload(state, source):
+                raise ValueError(
+                    "initial checkpoint publication intent does not match resume state"
+                )
+            self._write_json_atomic(
+                self.latest_manifest, self._manifest_payload(state, source)
+            )
+            self.pending_manifest.unlink(missing_ok=True)
+            return
 
         payload = self._validate_manifest(
             json.loads(self.latest_manifest.read_text(encoding="utf-8"))
@@ -280,19 +307,52 @@ class CheckpointSeries:
         manifest_sequence = payload["checkpoint_sequence"]
         if not isinstance(manifest_sequence, int) or isinstance(manifest_sequence, bool):
             raise ValueError("latest manifest checkpoint_sequence must be an int")
+        higher_sequences = sorted(
+            sequence for sequence in run_files if sequence > manifest_sequence
+        )
+        if higher_sequences and higher_sequences != [manifest_sequence + 1]:
+            raise ValueError(
+                "checkpoint series contains multiple, non-contiguous, or skipped orphans"
+            )
+        if higher_sequences and state.checkpoint_sequence != higher_sequences[0]:
+            raise ValueError(
+                "refusing to ignore a newer orphan checkpoint; resume the latest manifest"
+            )
         if manifest_sequence > state.checkpoint_sequence:
             raise ValueError("refusing to resume an older checkpoint than latest")
         if manifest_sequence < state.checkpoint_sequence - 1:
             raise ValueError("checkpoint sequence is not contiguous with latest")
         if manifest_sequence == state.checkpoint_sequence - 1:
+            if run_files.get(state.checkpoint_sequence) != source:
+                raise ValueError("orphan checkpoint does not uniquely match resume state")
             self._write_json_atomic(
                 self.latest_manifest, self._manifest_payload(state, source)
             )
+            self.pending_manifest.unlink(missing_ok=True)
             return
 
+        state.total_wall_seconds = max(
+            state.total_wall_seconds, payload["total_wall_seconds"]
+        )
         expected_payload = self._manifest_payload(state, source)
         if payload != expected_payload:
             raise ValueError("latest manifest does not match checkpoint state")
+        self.pending_manifest.unlink(missing_ok=True)
+
+    def _indexed_checkpoints(self, run_id: str) -> dict[int, Path]:
+        """Return this run's files indexed by sequence, rejecting ambiguity."""
+        pattern = (
+            f"{self.prefix}-run-{run_id}-seq-*-cycle-*-step-*{self.suffix}"
+        )
+        indexed: dict[int, Path] = {}
+        for candidate in self.base.parent.glob(pattern):
+            sequence = self.checkpoint_sequence(candidate, run_id=run_id)
+            if sequence in indexed:
+                raise ValueError(
+                    f"checkpoint series contains duplicate sequence {sequence}"
+                )
+            indexed[sequence] = candidate
+        return indexed
 
     def ensure_available(self, state: LongRunningState) -> None:
         """Fail closed when a fresh run would reuse an existing series."""
@@ -343,16 +403,35 @@ class CheckpointSeries:
             raise FileExistsError(f"refusing to overwrite checkpoint {destination}")
         checkpoint_state = asdict(state)
         checkpoint_state["checkpoint_sequence"] = sequence
-        trainer.save_training_checkpoint(str(destination), long_running_state=checkpoint_state)
         manifest_state = LongRunningState.from_dict(checkpoint_state)
         manifest = self._manifest_payload(manifest_state, destination)
+        self._write_json_atomic(self.pending_manifest, manifest)
+        trainer.save_training_checkpoint(str(destination), long_running_state=checkpoint_state)
         self._write_json_atomic(self.latest_manifest, manifest)
+        self.pending_manifest.unlink(missing_ok=True)
         state.checkpoint_sequence = sequence
         try:
             self._rotate(destination)
         except OSError as exc:
             self.last_rotation_error = type(exc).__name__
         return destination
+
+    def update_runtime_state(
+        self, state: LongRunningState, checkpoint: str | Path
+    ) -> None:
+        """Atomically persist boundary work accounted after model publication."""
+        path = Path(checkpoint)
+        expected = self.cycle_path(
+            state.run_id,
+            state.checkpoint_sequence,
+            state.cycle,
+            state.total_optimizer_steps,
+        )
+        if path.resolve() != expected.resolve() or not path.is_file():
+            raise ValueError("runtime state checkpoint does not match checkpoint series")
+        self._write_json_atomic(
+            self.latest_manifest, self._manifest_payload(state, path)
+        )
 
     @staticmethod
     def _write_json_atomic(path: Path, payload: dict) -> None:
@@ -645,6 +724,18 @@ class LongRunningTrainer:
                             raise RuntimeError(
                                 f"checkpoint publication failed: {checkpoint_error}"
                             )
+                        self.state.total_wall_seconds = (
+                            base_wall_seconds + self.clock() - started
+                        )
+                        try:
+                            self.checkpoints.update_runtime_state(
+                                self.state, checkpoint_path
+                            )
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "checkpoint runtime-state publication failed: "
+                                f"{type(exc).__name__}"
+                            ) from exc
                     break
 
                 episodes = self.config.episodes_per_cycle
@@ -754,8 +845,28 @@ class LongRunningTrainer:
                             self.evaluator(checkpoint_path, self.state.cycle)
                             eval_status = "passed"
                         except Exception as exc:
-                            eval_status = "failed"
-                            eval_error = type(exc).__name__
+                            if self.stop.event.is_set():
+                                eval_status = "interrupted"
+                                boundary_reason = self.stop.reason or "stop_event"
+                                self.last_stop_reason = boundary_reason
+                            else:
+                                eval_status = "failed"
+                                eval_error = type(exc).__name__
+
+                # Checkpoint publication and evaluation are part of the cumulative
+                # controller wall budget. The model checkpoint remains immutable;
+                # the latest manifest carries this post-publication run state.
+                self.state.total_wall_seconds = (
+                    base_wall_seconds + self.clock() - started
+                )
+                post_service_reason = self._limit_reason(
+                    self.state.total_wall_seconds
+                )
+                if self.stop.event.is_set():
+                    post_service_reason = self.stop.reason or "stop_event"
+                if post_service_reason:
+                    boundary_reason = post_service_reason
+                    self.last_stop_reason = boundary_reason
 
                 record = {
                     "schema_version": "v2-long-running-cycle-v1",
@@ -785,6 +896,28 @@ class LongRunningTrainer:
                 if self.collect_records:
                     records.append(record)
                 self.metric_sink(record)
+                self.state.total_wall_seconds = (
+                    base_wall_seconds + self.clock() - started
+                )
+                final_boundary_reason = self._limit_reason(
+                    self.state.total_wall_seconds
+                )
+                if self.stop.event.is_set():
+                    final_boundary_reason = self.stop.reason or "stop_event"
+                if final_boundary_reason:
+                    # A request arriving inside metric emission still needs the
+                    # normal late-stop path to publish this dirty boundary.
+                    if checkpoint_path is not None or boundary_reason:
+                        boundary_reason = final_boundary_reason
+                        self.last_stop_reason = boundary_reason
+                if checkpoint_path is not None and checkpoint_status != "failed":
+                    try:
+                        self.checkpoints.update_runtime_state(
+                            self.state, checkpoint_path
+                        )
+                    except Exception as exc:
+                        checkpoint_status = "failed"
+                        checkpoint_error = type(exc).__name__
                 if checkpoint_status == "failed":
                     raise RuntimeError(f"checkpoint publication failed: {checkpoint_error}")
                 if eval_status == "failed" and self.config.eval_fail_fast:
