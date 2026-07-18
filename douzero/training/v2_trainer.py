@@ -100,6 +100,7 @@ _ASYNC_UNSUPPORTED_DECISION_MODES = frozenset({
 _POLICY_STEP_SEMANTICS = "absolute_v1"
 _SNAPSHOT_PUBLICATION_SEMANTICS = "cycle_quiescent_atomic_copy_v1"
 _REQUEST_ORDERING_SEMANTICS = "policy_bucket_role_fifo_microbatch_v1"
+_ACTOR_RNG_RESUME_SEMANTICS = "restart_from_configured_seeds_v1"
 
 
 @dataclass
@@ -727,6 +728,20 @@ class V2Trainer:
     # ------------------------------------------------------------------ #
     # Self-play episode collection
     # ------------------------------------------------------------------ #
+    def _async_actor_runtime_kwargs(self) -> dict:
+        """Bind the two actor RNG domains to their declared config fields."""
+        return {
+            "environment_seed": self.config.seed,
+            "action_rng_seed": self.config.rng_seed,
+            "epsilon": self.config.exp_epsilon,
+            "max_steps": self.config.max_steps_per_episode,
+            "decision_config": self.decision_config,
+            "ruleset": None,
+            "feature_schema_hash": self.model.schema.stable_hash(),
+            "policy_version": self.policy_version,
+            "policy_step": self._async_policy_step,
+        }
+
     def _start_async_runtime(self) -> None:
         from douzero.training.async_single_gpu import (
             AsyncRequestCoordinator,
@@ -759,16 +774,7 @@ class V2Trainer:
                     actor_id, self._async_tasks, self._async_events,
                     self._async_coordinator, self._async_replay_slots,
                 ),
-                kwargs={
-                    "seed": self.config.seed,
-                    "epsilon": self.config.exp_epsilon,
-                    "max_steps": self.config.max_steps_per_episode,
-                    "decision_config": self.decision_config,
-                    "ruleset": None,
-                    "feature_schema_hash": self.model.schema.stable_hash(),
-                    "policy_version": self.policy_version,
-                    "policy_step": self._async_policy_step,
-                },
+                kwargs=self._async_actor_runtime_kwargs(),
                 name=f"douzero-v2-actor-{actor_id}",
             )
             process.start()
@@ -1000,16 +1006,38 @@ class V2Trainer:
                     episode.bidding_transitions
                 )
 
-    def quiesce_cycle_boundary(self) -> dict[str, int | float]:
-        """Establish and report a checkpoint-safe single-process boundary."""
+    def _reset_cycle_interval_metrics(self) -> None:
+        self._learner_gpu_seconds = 0.0
+        if self.async_mode:
+            self._async_request_count = 0
+            self._async_action_count = 0
+            self._async_microbatch_count = 0
+            self._async_queue_latencies_ms = []
+            self._async_inference_seconds = 0.0
+
+    def _quiesce_cycle_boundary(
+        self, *, consume_interval_metrics: bool
+    ) -> dict[str, int | float]:
+        """Quiesce, optionally consuming metrics for one controller cycle."""
+        learner_gpu_seconds = self._learner_gpu_seconds
         if self.async_mode:
             if not self._async_runtime_started:
-                return {
+                status = {
                     "active_slots": 0, "in_flight_slots": 0,
                     "ready_requests": 0, "running_requests": 0,
                     "replay_occupancy": len(self.buffer),
                     "bidding_replay_occupancy": 0, "quiesce_seconds": 0.0,
+                    "requests_per_microbatch": 0.0,
+                    "actions_per_microbatch": 0.0,
+                    "inference_queue_p50_ms": 0.0,
+                    "inference_queue_p95_ms": 0.0,
+                    "inference_gpu_seconds": 0.0,
+                    "learner_gpu_seconds": learner_gpu_seconds,
+                    "policy_lag": 0,
                 }
+                if consume_interval_metrics:
+                    self._reset_cycle_interval_metrics()
+                return status
             started = time.perf_counter()
             self._drain_async_replay()
             counts = self._async_coordinator.quiesce()
@@ -1018,7 +1046,7 @@ class V2Trainer:
                 latencies[min(len(latencies) - 1, int((len(latencies) - 1) * q))]
                 if latencies else 0.0
             )
-            return {
+            status = {
                 "active_slots": counts["writing"] + counts["ready"] + counts["running"],
                 "in_flight_slots": counts["ready"] + counts["running"],
                 "ready_requests": counts["ready"],
@@ -1035,10 +1063,13 @@ class V2Trainer:
                 "inference_queue_p50_ms": percentile(0.50),
                 "inference_queue_p95_ms": percentile(0.95),
                 "inference_gpu_seconds": self._async_inference_seconds,
-                "learner_gpu_seconds": self._learner_gpu_seconds,
+                "learner_gpu_seconds": learner_gpu_seconds,
                 "policy_lag": self.policy_step - self._async_snapshot,
             }
-        return {
+            if consume_interval_metrics:
+                self._reset_cycle_interval_metrics()
+            return status
+        status = {
             "active_slots": 0,
             "in_flight_slots": 0,
             "ready_requests": 0,
@@ -1046,8 +1077,15 @@ class V2Trainer:
             "replay_occupancy": len(self.buffer),
             "bidding_replay_occupancy": len(self.bidding_buffer),
             "quiesce_seconds": 0.0,
-            "learner_gpu_seconds": self._learner_gpu_seconds,
+            "learner_gpu_seconds": learner_gpu_seconds,
         }
+        if consume_interval_metrics:
+            self._reset_cycle_interval_metrics()
+        return status
+
+    def quiesce_cycle_boundary(self) -> dict[str, int | float]:
+        """Establish a checkpoint-safe boundary and consume cycle metrics."""
+        return self._quiesce_cycle_boundary(consume_interval_metrics=True)
 
     def clear_replay(self) -> None:
         """Clear card-play and bidding replay at an explicit cycle boundary."""
@@ -1625,7 +1663,7 @@ class V2Trainer:
         """Atomically save resumable optimizer/counter/RNG and identity state."""
         self._require_single_process_checkpoint_io("save")
         if self.async_mode:
-            self.quiesce_cycle_boundary()
+            self._quiesce_cycle_boundary(consume_interval_metrics=False)
         from douzero.observation.bidding import (
             BIDDING_ACTION_SCHEMA_VERSION,
             BIDDING_HEAD_VERSION,
@@ -1731,6 +1769,7 @@ class V2Trainer:
                 "replay_schema_version": self.config.replay_schema_version,
                 "snapshot_publication_semantics": self.config.snapshot_publication_semantics,
                 "request_ordering_semantics": self.config.request_ordering_semantics,
+                "actor_rng_resume_semantics": _ACTOR_RNG_RESUME_SEMANTICS,
             })
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1771,6 +1810,7 @@ class V2Trainer:
             identity_keys.extend([
                 "num_actors", "replay_schema_version",
                 "snapshot_publication_semantics", "request_ordering_semantics",
+                "actor_rng_resume_semantics",
             ])
         identity = {
             key: bundle[key]
@@ -1783,7 +1823,7 @@ class V2Trainer:
         """Strictly restore a checkpoint saved by :meth:`save_training_checkpoint`."""
         self._require_single_process_checkpoint_io("resume")
         if self.async_mode and self._async_runtime_started:
-            self.quiesce_cycle_boundary()
+            self._quiesce_cycle_boundary(consume_interval_metrics=False)
         from douzero.checkpoint.io import CheckpointCompatibilityError
         from douzero.observation.bidding import (
             BIDDING_ACTION_SCHEMA_VERSION,
@@ -1854,6 +1894,7 @@ class V2Trainer:
                 "replay_schema_version": self.config.replay_schema_version,
                 "snapshot_publication_semantics": self.config.snapshot_publication_semantics,
                 "request_ordering_semantics": self.config.request_ordering_semantics,
+                "actor_rng_resume_semantics": _ACTOR_RNG_RESUME_SEMANTICS,
             })
         if self.belief_training_mode != "frozen":
             expected.update({

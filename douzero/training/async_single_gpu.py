@@ -361,6 +361,13 @@ class AsyncRequestCoordinator:
         self._shared_specs.append(((num_slots,), torch.int64))
         self.ready_queue = self.context.Queue()
         self.free_queue = self.context.Queue()
+        # Shared result tensors use RawArray storage, so publishing DONE in a
+        # separate RawArray is not a synchronization boundary.  A per-slot
+        # Event provides the release/acquire hand-off: the coordinator writes
+        # every result tensor before set(), and the actor waits before reading.
+        self.response_events = [
+            self.context.Event() for _ in range(num_slots)
+        ]
         for slot_id in range(num_slots):
             self.free_queue.put(slot_id)
         self.request_timeout_seconds = float(request_timeout_seconds)
@@ -414,6 +421,7 @@ class AsyncRequestCoordinator:
                 continue
         if int(self.states[slot_id]) != SlotState.FREE:
             raise RuntimeError("free queue returned a non-FREE slot")
+        self.response_events[slot_id].clear()
         self.states[slot_id] = int(SlotState.WRITING)
         self.actor_ids[slot_id] = actor_id
         return slot_id
@@ -467,10 +475,21 @@ class AsyncRequestCoordinator:
         if int(self.states[slot_id]) != SlotState.RUNNING:
             raise RuntimeError("only a RUNNING slot may complete")
         self.states[slot_id] = int(SlotState.DONE)
+        self.response_events[slot_id].set()
 
     def wait_done(self, slot_id: int, request_id: int) -> None:
         deadline = time.monotonic() + self.request_timeout_seconds
-        while time.monotonic() < deadline:
+        response_event = self.response_events[slot_id]
+        while True:
+            self._raise_if_failed()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not response_event.wait(timeout=min(0.05, remaining)):
+                continue
+            # Event.wait() is the acquire side of the result publication
+            # barrier.  Only inspect state and RawArray-backed outputs after it
+            # has observed complete(), fail(), or shutdown().
             self._raise_if_failed()
             state = SlotState(int(self.states[slot_id]))
             if state == SlotState.DONE:
@@ -479,7 +498,9 @@ class AsyncRequestCoordinator:
                 return
             if state in {SlotState.FAILED, SlotState.SHUTDOWN}:
                 raise RuntimeError(f"inference request ended in state {state.name}")
-            time.sleep(0.001)
+            raise RuntimeError(
+                f"inference response event published unexpected state {state.name}"
+            )
         self.fail(f"request {request_id} timed out")
         raise TimeoutError(f"inference request {request_id} timed out")
 
@@ -487,6 +508,7 @@ class AsyncRequestCoordinator:
         if int(self.states[slot_id]) != SlotState.DONE:
             raise RuntimeError("only a DONE slot may be released")
         self.states[slot_id] = int(SlotState.FREE)
+        self.response_events[slot_id].clear()
         self._submitted_at.pop(slot_id, None)
         self.free_queue.put(slot_id)
 
@@ -501,6 +523,7 @@ class AsyncRequestCoordinator:
                 SlotState.FREE, SlotState.DONE, SlotState.SHUTDOWN
             }:
                 self.states[slot_id] = int(SlotState.FAILED)
+            self.response_events[slot_id].set()
 
     def quiesce(self) -> dict[str, int]:
         self._raise_if_failed()
@@ -521,6 +544,7 @@ class AsyncRequestCoordinator:
         self.shutdown_event.set()
         for slot_id in range(len(self.states)):
             self.states[slot_id] = int(SlotState.SHUTDOWN)
+            self.response_events[slot_id].set()
 
     def shutdown(self) -> None:
         self.request_shutdown()
@@ -535,7 +559,8 @@ def async_actor_main(
     coordinator: AsyncRequestCoordinator,
     replay_slots: SharedReplaySlots,
     *,
-    seed: int,
+    environment_seed: int,
+    action_rng_seed: int,
     epsilon: float,
     max_steps: int,
     decision_config,
@@ -554,9 +579,13 @@ def async_actor_main(
     from douzero.training.decision_policy import select_action
     from douzero.training.v2_buffer import Episode, Transition
 
-    rng = random.Random(None if seed == 0 else seed + actor_id)
-    if seed:
-        np.random.seed(seed + actor_id)
+    rng = (
+        random.Random()
+        if action_rng_seed == 0
+        else random.Random(action_rng_seed + actor_id)
+    )
+    if environment_seed:
+        np.random.seed((environment_seed + actor_id) % (1 << 32))
     request_id = actor_id << 48
     try:
         while True:

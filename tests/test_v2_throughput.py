@@ -58,6 +58,49 @@ def _failing_actor_probe(coordinator):
     coordinator.fail("actor 4: injected replay write failure")
 
 
+def _response_barrier_probe(coordinator, actor_id, iterations, output_queue):
+    """Hammer one request slot at a time and validate response provenance."""
+    try:
+        for iteration in range(iterations):
+            request_id = actor_id * iterations + iteration + 1
+            slot_id = coordinator.acquire(actor_id=actor_id)
+            coordinator.slots.action_counts[slot_id] = 4
+            coordinator.slots.action_mask[slot_id].zero_()
+            coordinator.slots.action_mask[slot_id, :4] = True
+            coordinator.slots.roles[slot_id] = actor_id % 3
+            coordinator.submit(
+                slot_id,
+                request_id=request_id,
+                policy_snapshot=7,
+            )
+            coordinator.wait_done(slot_id, request_id)
+            outputs = (
+                coordinator.slots.output_win,
+                coordinator.slots.output_score_win,
+                coordinator.slots.output_score_loss,
+                coordinator.slots.output_p_win,
+                coordinator.slots.output_score,
+            )
+            for field_index, values in enumerate(outputs):
+                expected = [
+                    float(request_id * 100 + field_index * 10 + action_index)
+                    for action_index in range(4)
+                ]
+                actual = values[slot_id, :4].tolist()
+                if actual != expected:
+                    raise AssertionError(
+                        f"request {request_id} field {field_index}: "
+                        f"expected {expected}, got {actual}"
+                    )
+            coordinator.release(slot_id)
+        output_queue.put(("ok", actor_id))
+    except BaseException as exc:
+        coordinator.fail(
+            f"response barrier actor {actor_id}: {type(exc).__name__}: {exc}"
+        )
+        output_queue.put(("error", actor_id, type(exc).__name__, str(exc)))
+
+
 class _LocalDDPContext:
     enabled = True
     rank = 0
@@ -373,6 +416,63 @@ def test_shared_request_protocol_is_spawn_picklable():
     coordinator.shutdown()
 
 
+def test_shared_response_event_barrier_preserves_request_results_under_spawn():
+    actor_count = 4
+    iterations = 100
+    coordinator = AsyncRequestCoordinator(
+        build_v2_schema(),
+        num_slots=actor_count,
+        max_actions=8,
+        request_timeout_seconds=10.0,
+    )
+    output = coordinator.context.Queue()
+    processes = [
+        coordinator.context.Process(
+            target=_response_barrier_probe,
+            args=(coordinator, actor_id, iterations, output),
+        )
+        for actor_id in range(actor_count)
+    ]
+    completed = 0
+    deadline = __import__("time").monotonic() + 30.0
+    try:
+        for process in processes:
+            process.start()
+        while completed < actor_count * iterations:
+            if __import__("time").monotonic() >= deadline:
+                pytest.fail("spawn response barrier stress test timed out")
+            requests = coordinator.claim_ready(16, wait_seconds=0.05)
+            for request in requests:
+                for field_index, values in enumerate((
+                    coordinator.slots.output_win,
+                    coordinator.slots.output_score_win,
+                    coordinator.slots.output_score_loss,
+                    coordinator.slots.output_p_win,
+                    coordinator.slots.output_score,
+                )):
+                    values[request.slot_id, :4].copy_(
+                        torch.arange(4, dtype=torch.float32)
+                        + request.request_id * 100
+                        + field_index * 10
+                    )
+                coordinator.complete(request.slot_id)
+                completed += 1
+        for process in processes:
+            process.join(5.0)
+        assert all(process.exitcode == 0 for process in processes)
+        assert sorted(output.get(timeout=1.0) for _ in processes) == [
+            ("ok", actor_id) for actor_id in range(actor_count)
+        ]
+        assert coordinator.quiesce()["free"] == actor_count
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(1.0)
+        output.close()
+        coordinator.shutdown()
+
+
 def test_actor_failure_aborts_another_process_blocked_on_inference_slot():
     coordinator = AsyncRequestCoordinator(
         build_v2_schema(), num_slots=1, request_timeout_seconds=10.0
@@ -622,6 +722,92 @@ def test_decision_counter_includes_forced_non_replay_actions():
     trainer.collect_episodes()
     assert trainer.stats.decisions_collected >= trainer.stats.transitions_collected
     assert trainer.stats.decisions_collected > trainer.stats.transitions_collected
+
+
+def test_async_actor_seed_domains_follow_seed_and_rng_seed_independently():
+    trainer = V2Trainer(
+        ModelV2(
+            build_v2_schema(),
+            ModelV2Config(hidden_size=16, history_layers=1, history_heads=1),
+        ),
+        config=TrainerConfig(
+            max_episodes=0,
+            optimizer_steps=0,
+            seed=101,
+            rng_seed=909,
+        ),
+    )
+    trainer._async_policy_step = object()
+    kwargs = trainer._async_actor_runtime_kwargs()
+    assert kwargs["environment_seed"] == 101
+    assert kwargs["action_rng_seed"] == 909
+    assert "seed" not in kwargs
+
+
+def test_cycle_boundary_metrics_are_interval_scoped_and_checkpoint_safe():
+    class CoordinatorStub:
+        @staticmethod
+        def quiesce():
+            return {
+                "free": 2,
+                "writing": 0,
+                "ready": 0,
+                "running": 0,
+                "done": 0,
+                "failed": 0,
+                "shutdown": 0,
+            }
+
+    trainer = object.__new__(V2Trainer)
+    trainer.async_mode = True
+    trainer._async_runtime_started = True
+    trainer._async_coordinator = CoordinatorStub()
+    trainer._drain_async_replay = lambda: 0
+    trainer.buffer = [object(), object()]
+    trainer.policy_step = 9
+    trainer._async_snapshot = 8
+    trainer._async_request_count = 6
+    trainer._async_action_count = 30
+    trainer._async_microbatch_count = 2
+    trainer._async_queue_latencies_ms = [9.0, 1.0, 3.0, 2.0]
+    trainer._async_inference_seconds = 1.25
+    trainer._learner_gpu_seconds = 0.75
+
+    first = trainer.quiesce_cycle_boundary()
+    assert first["requests_per_microbatch"] == 3.0
+    assert first["actions_per_microbatch"] == 15.0
+    assert first["inference_queue_p50_ms"] == 2.0
+    assert first["inference_queue_p95_ms"] == 3.0
+    assert first["inference_gpu_seconds"] == 1.25
+    assert first["learner_gpu_seconds"] == 0.75
+    assert trainer._async_request_count == 0
+    assert trainer._async_queue_latencies_ms == []
+    assert trainer._learner_gpu_seconds == 0.0
+
+    trainer._async_request_count = 2
+    trainer._async_action_count = 8
+    trainer._async_microbatch_count = 1
+    trainer._async_queue_latencies_ms = [11.0]
+    trainer._async_inference_seconds = 0.25
+    trainer._learner_gpu_seconds = 0.5
+    second = trainer.quiesce_cycle_boundary()
+    assert second["requests_per_microbatch"] == 2.0
+    assert second["actions_per_microbatch"] == 8.0
+    assert second["inference_queue_p50_ms"] == 11.0
+    assert second["inference_gpu_seconds"] == 0.25
+    assert second["learner_gpu_seconds"] == 0.5
+
+    trainer._async_request_count = 4
+    trainer._async_action_count = 12
+    trainer._async_microbatch_count = 2
+    trainer._async_queue_latencies_ms = [5.0]
+    trainer._async_inference_seconds = 0.4
+    trainer._learner_gpu_seconds = 0.2
+    internal = trainer._quiesce_cycle_boundary(consume_interval_metrics=False)
+    assert internal["requests_per_microbatch"] == 2.0
+    assert trainer._async_request_count == 4
+    assert trainer._async_inference_seconds == 0.4
+    assert trainer._learner_gpu_seconds == 0.2
 
 
 def test_async_mode_without_cuda_fails_before_startup(monkeypatch):

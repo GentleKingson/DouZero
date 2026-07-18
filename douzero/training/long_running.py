@@ -84,6 +84,7 @@ class LongRunningConfig:
     replay_schema_version: int = 1
     snapshot_publication_semantics: str = "cycle_quiescent_atomic_copy_v1"
     request_ordering_semantics: str = "policy_bucket_role_fifo_microbatch_v1"
+    actor_rng_resume_semantics: str = "restart_from_configured_seeds_v1"
 
     def __post_init__(self) -> None:
         integer_nonnegative = (
@@ -114,6 +115,7 @@ class LongRunningConfig:
             "replay_schema_version": self.replay_schema_version,
             "snapshot_publication_semantics": self.snapshot_publication_semantics,
             "request_ordering_semantics": self.request_ordering_semantics,
+            "actor_rng_resume_semantics": self.actor_rng_resume_semantics,
         }
 
 

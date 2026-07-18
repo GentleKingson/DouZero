@@ -233,6 +233,12 @@ Compact replay records are schema-, tensor-, action-, label-, and provenance-
 validated before shared slots are released and before replay insertion. Actor
 or main inference failure and shutdown use spawn-shared signals so blocked
 peers exit promptly; cleanup does not replace an active training exception.
+Inference results are published only after a per-slot process-shared Event
+establishes the response memory barrier. Cycle metrics are interval values and
+reset only when the public lifecycle boundary consumes them. Actor deals use
+`seed + actor_id`; epsilon sampling uses `rng_seed + actor_id`. Async resume
+restarts those process-local streams from their configured seeds, so it is a
+safe cycle-boundary resume rather than bitwise N+M equivalence.
 
 V2 single GPU with checkpoint and metrics output (PowerShell):
 

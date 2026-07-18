@@ -160,7 +160,12 @@ Each inference group packs win, conditional-score, probability, and expected
 score outputs into one contiguous `[B, A, 5]` tensor and performs one blocking
 group-level device-to-host copy. CUDA events measure inference work without a
 hot-path global device synchronization; shared-slot writes then slice the
-single CPU staging tensor.
+single CPU staging tensor. Result tensors remain in lock-free shared storage,
+but completion is published through a per-slot spawn-shared `Event`. The main
+process writes every result and then sets the event; the Actor waits on that
+event before it reads the state, request ID, or output tensors. This explicit
+release/acquire hand-off prevents the `DONE` state from acting as an assumed
+RawArray memory barrier.
 
 Tensor value validation occurs while model-input bundles are still on CPU.
 CUDA model guards use asynchronous device assertions rather than Python
@@ -199,6 +204,23 @@ quiescence requires no active games,
 no WRITING/READY/RUNNING slots, and no completed episode waiting to enter
 compact replay. Replay is then cleared through the trainer lifecycle API,
 preserving the existing P0 cycle-boundary rule.
+
+Async throughput and GPU timing fields are interval metrics. The public cycle
+boundary captures and resets request/action/microbatch counters, queue latency
+samples, inference GPU time, and learner GPU time. Internal quiescence used by
+checkpoint save/load does not consume the interval, so checkpoint publication
+cannot turn the controller's cycle record into zeros or cumulative values.
+
+The two Actor random streams follow the existing config split. Environment
+deals use `seed + actor_id`, while epsilon/action sampling uses
+`rng_seed + actor_id`; zero independently preserves the unseeded behavior for
+that stream. Async checkpoints deliberately do not serialize process-local
+Actor RNG state. After a safe cycle-boundary resume, spawned Actors restart
+both streams from the configured seeds and can therefore repeat an earlier
+deal or exploration stream. Checkpoint v4 records this as
+`restart_from_configured_seeds_v1`. Async resume guarantees topology, config,
+counter, replay-boundary, and no-in-flight consistency, not bitwise N+M
+equivalence.
 
 ## Long-running V2 state machine
 
