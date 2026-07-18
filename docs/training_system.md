@@ -139,16 +139,24 @@ metadata. Actors make epsilon decisions with their local RNG and never own a
 CUDA tensor. The main process owns an independent inference model and learner
 model in one CUDA context, groups requests by immutable policy snapshot,
 action-count bucket and role, and publishes a complete inference state only at
-a quiescent boundary. Compact replay selects eligible action buckets by
-occupancy, preserving transition-level sampling probability while reducing
-padding. Async replay drain uses incremental batched insertion and O(1)
-bucket eviction rather than rebuilding every bucket for each transition.
+a quiescent boundary. Both replay implementations sample uniformly across all
+resident transitions first, including action buckets smaller than the learner
+batch size. The learner then partitions the sampled records by action-count
+bucket and forwards each homogeneous sub-batch separately, reducing padding
+without starving rare decisions. Async replay drain uses incremental batched
+insertion and O(1) bucket eviction rather than rebuilding every bucket for each
+transition.
 
 Each inference group packs win, conditional-score, probability, and expected
 score outputs into one contiguous `[B, A, 5]` tensor and performs one blocking
 group-level device-to-host copy. CUDA events measure inference work without a
 hot-path global device synchronization; shared-slot writes then slice the
 single CPU staging tensor.
+
+Tensor value validation occurs while model-input bundles are still on CPU.
+CUDA model guards use asynchronous device assertions rather than Python
+`bool(tensor)` scalar reads, avoiding mask, role, and chosen-index host
+synchronization in the inference and learner hot paths.
 
 | Combination | `single_process` | `async_single_gpu` |
 |---|---:|---:|
@@ -274,7 +282,8 @@ python train_v2.py --long_running --episodes_per_cycle 32 \
 Cycle metrics contain cumulative counts, cycle/collection/optimization time,
 AMP fallback delta, checkpoint path/status/error, resume source, evaluation
 status/error, and peak CUDA memory when available. CPU reports peak memory as
-unavailable. They also include decisions/transitions/learner-steps per second,
+unavailable. They also include total game decisions, trainable decisions,
+transitions, and learner steps per second,
 requests/actions per microbatch, inference queue p50/p95, inference GPU time,
 replay occupancy, active/in-flight slots, policy lag, and quiesce time.
 Per-cycle records append to `<metrics-stem>-cycles.jsonl`; the

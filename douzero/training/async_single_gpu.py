@@ -611,6 +611,7 @@ def async_actor_main(
             event_queue.put((
                 "completed", actor_id, episode_id, len(episode.transitions),
                 0 if team == "landlord" else 1, snapshot,
+                len(episode.action_trace),
             ))
     except BaseException as exc:
         coordinator.fail(f"actor {actor_id}: {type(exc).__name__}: {exc}")

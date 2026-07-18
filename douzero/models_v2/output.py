@@ -217,7 +217,12 @@ class BatchedModelOutput:
         batch_actions = self.win_logit.shape[:2]
         if self.action_mask.shape != batch_actions or self.action_mask.dtype != torch.bool:
             raise ValueError("batched action_mask must be bool with shape (B, A)")
-        if bool((~self.action_mask.any(dim=1)).any()):
+        legal_rows = self.action_mask.any(dim=1).all()
+        if self.action_mask.device.type == "cuda":
+            torch._assert_async(
+                legal_rows, "every batched decision must contain a legal action"
+            )
+        elif not bool(legal_rows):
             raise ValueError("every batched decision must contain a legal action")
         names = ("score_if_win", "score_if_loss", "p_win", "score_mean")
         for name in names:
@@ -237,10 +242,21 @@ class BatchedModelOutput:
         if indices.shape != (self.win_logit.shape[0],) or indices.dtype != torch.long:
             raise ValueError("chosen indices must be long with shape (B,)")
         rows = torch.arange(indices.shape[0], device=indices.device)
-        if bool(((indices < 0) | (indices >= self.action_mask.shape[1])).any()):
-            raise ValueError("chosen action index is outside the padded action range")
-        if not bool(self.action_mask[rows, indices].all()):
-            raise ValueError("chosen action index points at padding")
+        in_range = ((indices >= 0) & (indices < self.action_mask.shape[1])).all()
+        if indices.device.type == "cuda":
+            torch._assert_async(
+                in_range, "chosen action index is outside the padded action range"
+            )
+            indices = indices.clamp(0, self.action_mask.shape[1] - 1)
+            torch._assert_async(
+                self.action_mask[rows, indices].all(),
+                "chosen action index points at padding",
+            )
+        else:
+            if not bool(in_range):
+                raise ValueError("chosen action index is outside the padded action range")
+            if not bool(self.action_mask[rows, indices].all()):
+                raise ValueError("chosen action index points at padding")
 
         def gather(value):
             return None if value is None else value[rows, indices]

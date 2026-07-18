@@ -643,25 +643,14 @@ class V2ReplayBuffer:
         if self._size < batch_size:
             return None
         rng = rng or random
-        # Prefer one action-count bucket to minimize padding.  Selecting among
-        # eligible buckets by occupancy preserves transition-level weighting;
-        # if none can fill the batch, retain the established uniform fallback.
-        eligible = [values for values in self._buckets.values() if len(values) >= batch_size]
-        if eligible:
-            total = sum(len(values) for values in eligible)
-            needle = rng.randrange(total)
-            selected = eligible[-1]
-            for values in eligible:
-                if needle < len(values):
-                    selected = values
-                    break
-                needle -= len(values)
-            picks = rng.sample(selected, batch_size)
-        else:
-            flat: list[Transition] = []
-            for ep in self._episodes:
-                flat.extend(ep.transitions)
-            picks = rng.sample(flat, batch_size)
+        # Sample globally first so every resident transition has the same
+        # marginal probability, including buckets smaller than ``batch_size``.
+        # The learner splits these picks into homogeneous action buckets before
+        # forwarding, retaining low padding without starving rare decisions.
+        flat: list[Transition] = []
+        for ep in self._episodes:
+            flat.extend(ep.transitions)
+        picks = rng.sample(flat, batch_size)
         has_aux = all(math.isfinite(p.target_min_turns_after) for p in picks)
         aux_tensor = lambda name: torch.tensor(
             [getattr(p, name) for p in picks], dtype=torch.float32
@@ -744,20 +733,7 @@ class CompactTensorReplayBuffer:
         if len(self) < batch_size:
             return None
         rng = rng or random
-        eligible = [records for records in self._buckets.values() if len(records) >= batch_size]
-        if eligible:
-            total = sum(len(records) for records in eligible)
-            needle = rng.randrange(total)
-            selected = eligible[-1]
-            for records in eligible:
-                if needle < len(records):
-                    selected = records
-                    break
-                needle -= len(records)
-            source = list(selected)
-        else:
-            source = list(self._records)
-        picks = rng.sample(source, batch_size)
+        picks = rng.sample(list(self._records), batch_size)
         target = lambda name: torch.tensor(
             [record.targets[name] for record in picks], dtype=torch.float32
         )

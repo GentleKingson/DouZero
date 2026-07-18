@@ -236,6 +236,18 @@ def model_input_bundles_to_batch(
     counts = [int(bundle.action_features.shape[0]) for bundle in bundles]
     if any(count <= 0 for count in counts):
         raise ValueError("every batched decision must have at least one legal action")
+    for index, (bundle, count) in enumerate(zip(bundles, counts)):
+        if bundle.action_mask.shape != (count,) or bundle.action_mask.dtype != torch.bool:
+            raise ValueError(
+                f"bundle {index} action_mask must be bool with shape ({count},)"
+            )
+        if bundle.action_mask.device.type == "cuda":
+            torch._assert_async(
+                bundle.action_mask.any(),
+                f"bundle {index} must contain a legal action",
+            )
+        elif not bool(bundle.action_mask.any()):
+            raise ValueError(f"bundle {index} must contain a legal action")
     max_actions = max(counts)
     if pad_to_actions is not None:
         if pad_to_actions < max_actions:
@@ -279,10 +291,13 @@ def model_input_bundles_to_batch(
                     f"chosen action {value} is outside row {row}'s legal range [0, {count})"
                 )
 
-    role_indices = torch.tensor(
-        [SUPPORTED_ROLE_TO_INDEX[bundle.acting_role] for bundle in bundles],
-        dtype=torch.long,
-    )
+    try:
+        role_indices = torch.tensor(
+            [SUPPORTED_ROLE_TO_INDEX[bundle.acting_role] for bundle in bundles],
+            dtype=torch.long,
+        )
+    except KeyError as exc:
+        raise ValueError(f"unsupported acting role: {exc.args[0]!r}") from exc
     styles = None
     if bundles[0].style_features is not None:
         if any(bundle.style_features is None for bundle in bundles):

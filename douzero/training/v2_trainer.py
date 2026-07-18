@@ -71,7 +71,12 @@ from douzero.observation.bidding import get_bidding_obs_v2
 
 from douzero.training.decision_policy import DecisionConfig, select_action
 from douzero.training.losses import LossComponents, LossConfig, MultiObjectiveLoss
-from douzero.training.v2_buffer import Episode, Transition, V2ReplayBuffer
+from douzero.training.v2_buffer import (
+    Episode,
+    Transition,
+    V2ReplayBuffer,
+    action_count_bucket,
+)
 from douzero.training.bidding import (
     BiddingPolicyConfig,
     BiddingReplayBuffer,
@@ -230,6 +235,7 @@ class TrainerStats:
     episodes_completed: int = 0
     episodes_per_team: dict[str, int] = field(default_factory=dict)
     transitions_collected: int = 0
+    decisions_collected: int = 0
     optimizer_steps: int = 0
     last_loss: dict[str, float] = field(default_factory=dict)
     grad_norm_last_step: float = 0.0
@@ -891,9 +897,11 @@ class V2Trainer:
                 completed += 1
                 self._async_coordinator.active_games -= 1
                 count = int(event[3])
+                decision_count = int(event[6])
                 expected_transitions += count
                 self.stats.episodes_completed += 1
                 self.stats.transitions_collected += count
+                self.stats.decisions_collected += decision_count
                 team = "landlord" if int(event[4]) == 0 else "farmer"
                 self.stats.episodes_per_team[team] = (
                     self.stats.episodes_per_team.get(team, 0) + 1
@@ -915,6 +923,7 @@ class V2Trainer:
             return
         for _ in range(target):
             episode = self._run_one_episode()
+            self.stats.decisions_collected += len(episode.action_trace)
             self.stats.redeals += episode.redeal_count
             self.stats.max_redeals_exceeded += int(
                 episode.max_redeals_exceeded
@@ -2006,43 +2015,77 @@ class V2Trainer:
                 nonlocal win_logit, score_if_win, score_if_loss
                 gathered_aux: dict[str, torch.Tensor] = {}
                 if not self.distributed.enabled:
-                    if batch.model_inputs is None:
-                        bundle = observation_batch_to_model_inputs(
-                            batch.observations,
-                            batch.action_indices,
-                            strategy_config=self.model.strategy_feature_config(),
-                            style_enabled=self.model.config.style_enabled,
-                        )
-                    else:
-                        from douzero.models_v2.batch import model_input_bundles_to_batch
+                    from douzero.models_v2.batch import model_input_bundles_to_batch
 
-                        bundle = model_input_bundles_to_batch(
-                            batch.model_inputs, batch.action_indices
-                        )
-                    belief_values = [
-                        self._compute_belief_feature(
-                            obs, differentiable=differentiable_belief
-                        )
-                        for obs in batch.observations
-                    ] if batch.observations else []
-                    belief_features = (
-                        torch.stack(belief_values)
-                        if belief_values and belief_values[0] is not None
-                        else None
-                    )
-                    out = self._forward_batched_bundle(bundle, belief_features)
-                    gathered = out.gather_chosen(bundle.chosen_action_index)
-                    win_logit = gathered["win_logit"].float()
-                    score_if_win = gathered["score_if_win"].float()
-                    score_if_loss = gathered["score_if_loss"].float()
-                    for name in (
+                    output_names = (
+                        "win_logit", "score_if_win", "score_if_loss",
                         "min_turns_after", "regain_initiative_logit",
                         "teammate_finish_logit", "spring_probability_logit",
                         "structure_cost",
-                    ):
-                        value = gathered[name]
-                        if value is not None:
-                            gathered_aux[name] = value.float()
+                    )
+                    rows: dict[str, list[torch.Tensor | None]] = {
+                        name: [None] * len(batch.action_indices)
+                        for name in output_names
+                    }
+                    groups: dict[int | str, list[int]] = {}
+                    for index in range(len(batch.action_indices)):
+                        action_count = (
+                            len(batch.observations[index].actions.legal_actions)
+                            if batch.model_inputs is None
+                            else int(batch.model_inputs[index].action_features.shape[0])
+                        )
+                        groups.setdefault(
+                            action_count_bucket(action_count), []
+                        ).append(index)
+
+                    for indices in groups.values():
+                        chosen = batch.action_indices[indices]
+                        observations = [batch.observations[i] for i in indices]
+                        if batch.model_inputs is None:
+                            bundle = observation_batch_to_model_inputs(
+                                observations,
+                                chosen,
+                                strategy_config=self.model.strategy_feature_config(),
+                                style_enabled=self.model.config.style_enabled,
+                            )
+                        else:
+                            bundle = model_input_bundles_to_batch(
+                                [batch.model_inputs[i] for i in indices], chosen
+                            )
+                        belief_values = [
+                            self._compute_belief_feature(
+                                obs, differentiable=differentiable_belief
+                            )
+                            for obs in observations
+                        ]
+                        belief_features = (
+                            torch.stack(belief_values)
+                            if belief_values and belief_values[0] is not None
+                            else None
+                        )
+                        out = self._forward_batched_bundle(bundle, belief_features)
+                        gathered = out.gather_chosen(bundle.chosen_action_index)
+                        for name in output_names:
+                            value = gathered[name]
+                            if value is None:
+                                continue
+                            for row, original_index in enumerate(indices):
+                                rows[name][original_index] = value[row : row + 1].float()
+
+                    def combine(name: str) -> torch.Tensor:
+                        values = rows[name]
+                        if any(value is None for value in values):
+                            raise RuntimeError(
+                                f"batched learner output {name!r} is partially populated"
+                            )
+                        return torch.cat(values, dim=0)  # type: ignore[arg-type]
+
+                    win_logit = combine("win_logit")
+                    score_if_win = combine("score_if_win")
+                    score_if_loss = combine("score_if_loss")
+                    for name in output_names[3:]:
+                        if all(value is not None for value in rows[name]):
+                            gathered_aux[name] = combine(name)
                 else:
                     gathered_win: list[torch.Tensor] = []
                     gathered_siw: list[torch.Tensor] = []

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import inspect
 import random
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -18,12 +19,15 @@ from douzero.models_v2 import (
     observation_to_model_inputs,
 )
 from douzero.observation import build_v2_schema, get_obs_v2
+from douzero.observation.encode_v2 import LegalActionBatch
 from douzero.training.async_single_gpu import AsyncRequestCoordinator, SlotState
 from douzero.training.long_running import LongRunningTrainer
 from douzero.training.v2_buffer import (
     CompactTensorTransition,
     CompactTensorReplayBuffer,
     Transition,
+    Episode,
+    V2ReplayBuffer,
     action_count_bucket,
 )
 from douzero.training.v2_trainer import TrainerConfig, V2Trainer
@@ -102,6 +106,20 @@ def _compact_with_action_count(obs, action_count: int, policy_step: int):
     return record
 
 
+def _observation_with_action_count(obs, action_count: int):
+    legal_actions = tuple((3,) for _ in range(action_count))
+    actions = LegalActionBatch(
+        features=np.repeat(obs.actions.features[:1], action_count, axis=0),
+        action_mask=np.ones(action_count, dtype=bool),
+        legal_actions=legal_actions,
+    )
+    return replace(
+        obs,
+        public=replace(obs.public, legal_actions=legal_actions),
+        actions=actions,
+    )
+
+
 def test_scalar_and_batched_forward_padding_and_gather_parity():
     torch.manual_seed(7)
     model = ModelV2(
@@ -166,24 +184,59 @@ def test_compact_replay_round_trip_preserves_labels_and_provenance():
     )
 
 
-def test_compact_replay_bucket_selection_is_weighted_by_occupancy():
+def test_compact_replay_global_sampling_includes_sub_batch_bucket_and_is_uniform():
     obs = _observations(1)[0]
     small = _compact_with_action_count(obs, 8, 1)
     large = _compact_with_action_count(obs, 9, 2)
-    replay = CompactTensorReplayBuffer(capacity_transitions=4160)
-    replay.add_many([small] * 64 + [large] * 4096)
+    records = []
+    for marker in range(100):
+        record = copy.deepcopy(small if marker < 15 else large)
+        record.targets["target_score"] = float(marker)
+        records.append(record)
+    replay = CompactTensorReplayBuffer(capacity_transitions=100)
+    replay.add_many(records)
     rng = random.Random(20260718)
-    small_bucket_samples = 0
-    rounds = 2000
+    counts = [0] * 100
+    rounds = 1000
     for _ in range(rounds):
-        batch = replay.sample_minibatch(64, rng)
+        batch = replay.sample_minibatch(16, rng)
         assert batch is not None and batch.model_inputs is not None
-        small_bucket_samples += int(
-            batch.model_inputs[0].action_features.shape[0] == 8
-        )
-    # Occupancy weighting predicts about 31 selections. Equal bucket weighting
-    # would produce about 1000 and is rejected with a deliberately wide bound.
-    assert 1 <= small_bucket_samples < 100
+        for marker in batch.target_score.tolist():
+            counts[int(marker)] += 1
+    # Every record has expected marginal count 160. The broad deterministic
+    # bounds reject starvation or bucket weighting without making the test
+    # sensitive to harmless RNG variation.
+    assert min(counts[:15]) > 90
+    assert min(counts) > 90
+    assert max(counts) < 240
+
+
+def test_object_replay_global_sampling_includes_sub_batch_bucket():
+    base = _observations(1)[0]
+    small_obs = _observation_with_action_count(base, 8)
+    large_obs = _observation_with_action_count(base, 9)
+    transitions = []
+    for marker in range(100):
+        transitions.append(Transition(
+            obs=small_obs if marker < 15 else large_obs,
+            action_index=0,
+            position=base.public.acting_role,
+            target_win=1.0,
+            target_score=float(marker),
+            target_log_score=0.0,
+        ))
+    replay = V2ReplayBuffer(capacity_transitions=100)
+    replay.add_episode(Episode(transitions=transitions))
+    counts = [0] * 100
+    rng = random.Random(20260718)
+    for _ in range(1000):
+        batch = replay.sample_minibatch(16, rng)
+        assert batch is not None
+        for marker in batch.target_score.tolist():
+            counts[int(marker)] += 1
+    assert min(counts[:15]) > 90
+    assert min(counts) > 90
+    assert max(counts) < 240
 
 
 def test_compact_replay_add_many_updates_and_evicts_buckets_incrementally():
@@ -257,6 +310,69 @@ def test_ddp_scalar_learner_ignores_disabled_strategy_auxiliary_heads():
     )
     trainer.collect_episodes()
     assert trainer.step() is not None
+
+
+def test_single_process_learner_splits_uniform_sample_by_action_bucket():
+    base = _observations(1)[0]
+    observations = [
+        _observation_with_action_count(base, 8),
+        _observation_with_action_count(base, 9),
+    ]
+    model = ModelV2(
+        build_v2_schema(),
+        ModelV2Config(hidden_size=16, history_layers=1, history_heads=1),
+    )
+    trainer = V2Trainer(
+        model,
+        config=TrainerConfig(
+            max_episodes=0,
+            optimizer_steps=1,
+            batch_size=2,
+            buffer_capacity=2,
+        ),
+    )
+    trainer.buffer.add_episode(Episode(transitions=[
+        Transition(
+            obs=obs,
+            action_index=0,
+            position=obs.public.acting_role,
+            target_win=1.0,
+            target_score=1.0,
+            target_log_score=0.0,
+        )
+        for obs in observations
+    ]))
+    original_forward = trainer._forward_batched_bundle
+    action_widths = []
+
+    def counted_forward(bundle, belief_features=None):
+        action_widths.append(bundle.max_actions)
+        return original_forward(bundle, belief_features)
+
+    trainer._forward_batched_bundle = counted_forward
+    assert trainer.step() is not None
+    assert sorted(action_widths) == [8, 9]
+
+
+def test_decision_counter_includes_forced_non_replay_actions():
+    trainer = V2Trainer(
+        ModelV2(
+            build_v2_schema(),
+            ModelV2Config(hidden_size=16, history_layers=1, history_heads=1),
+        ),
+        config=TrainerConfig(
+            max_episodes=1,
+            optimizer_steps=0,
+            batch_size=1,
+            buffer_capacity=256,
+            exp_epsilon=1.0,
+            seed=27,
+            rng_seed=27,
+        ),
+    )
+    trainer.collect_episodes()
+    assert trainer.stats.decisions_collected >= trainer.stats.transitions_collected
+    assert trainer.stats.decisions_collected > trainer.stats.transitions_collected
 
 
 def test_async_mode_without_cuda_fails_before_startup(monkeypatch):

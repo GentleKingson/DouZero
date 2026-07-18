@@ -607,7 +607,12 @@ class ModelV2(nn.Module):
             raise ValueError("ModelV2.forward_batched requires a non-empty batch")
         if action_mask.shape != (batch, actions) or action_mask.dtype != torch.bool:
             raise ValueError("action_mask must be bool with shape (B, A)")
-        if bool((~action_mask.any(dim=1)).any()):
+        legal_rows = action_mask.any(dim=1).all()
+        if action_mask.device.type == "cuda":
+            torch._assert_async(
+                legal_rows, "every batched decision must contain a legal action"
+            )
+        elif not bool(legal_rows):
             raise ValueError("every batched decision must contain a legal action")
         if acting_role.shape != (batch,) or acting_role.dtype != torch.long:
             raise ValueError("acting_role must be long with shape (B,)")

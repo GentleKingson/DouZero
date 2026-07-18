@@ -942,6 +942,11 @@ class LongRunningTrainer:
                 cycle_started = self.clock()
                 amp_before = int(self.trainer.stats.amp_fallbacks)
                 transitions_before = int(self.trainer.stats.transitions_collected)
+                decisions_before = int(getattr(
+                    self.trainer.stats,
+                    "decisions_collected",
+                    transitions_before,
+                ))
                 collection_started = self.clock()
                 self.trainer.collect_episodes(episodes)
                 collection_seconds = self.clock() - collection_started
@@ -1079,6 +1084,17 @@ class LongRunningTrainer:
                         / max(collection_seconds, 1e-12), 6
                     ),
                     "decisions_per_second": round(
+                        (
+                            int(getattr(
+                                self.trainer.stats,
+                                "decisions_collected",
+                                self.state.total_transitions,
+                            ))
+                            - decisions_before
+                        )
+                        / max(collection_seconds, 1e-12), 6
+                    ),
+                    "trainable_decisions_per_second": round(
                         (self.state.total_transitions - transitions_before)
                         / max(collection_seconds, 1e-12), 6
                     ),
