@@ -10,17 +10,19 @@ objects.
 from __future__ import annotations
 
 import json
+import math
 import os
 import signal
 import subprocess
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from threading import Event, current_thread, main_thread
 from typing import Callable
 
 
-_RUN_STATE_VERSION = 1
+_RUN_STATE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -51,8 +53,10 @@ class LongRunningConfig:
         for name in integer_nonnegative:
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} must be >= 0")
-        if self.max_wall_time_minutes < 0 or self.checkpoint_every_minutes < 0:
-            raise ValueError("wall-time values must be >= 0")
+        for name in ("max_wall_time_minutes", "checkpoint_every_minutes"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and >= 0")
         if self.keep_last_checkpoints < 1:
             raise ValueError("keep_last_checkpoints must be >= 1")
 
@@ -74,6 +78,7 @@ class LongRunningState:
     policy_step: int = 0
     resume_source: str = ""
     checkpoint_sequence: int = 0
+    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     run_state_version: int = _RUN_STATE_VERSION
     cycle_identity: dict[str, int] = field(default_factory=dict)
 
@@ -81,9 +86,17 @@ class LongRunningState:
     def from_dict(cls, payload: dict) -> "LongRunningState":
         if not isinstance(payload, dict):
             raise ValueError("checkpoint long_running_state must be a dict")
-        state = cls(**payload)
+        migrated = dict(payload)
+        if migrated.get("run_state_version") == 1:
+            migrated["run_state_version"] = _RUN_STATE_VERSION
+            migrated.setdefault("run_id", "legacy")
+        state = cls(**migrated)
         if state.run_state_version != _RUN_STATE_VERSION:
             raise ValueError("unsupported long-running checkpoint state version")
+        if not isinstance(state.run_id, str) or not state.run_id:
+            raise ValueError("long-running state run_id must be non-empty text")
+        if not all(character.isalnum() or character in "-_" for character in state.run_id):
+            raise ValueError("long-running state run_id contains unsafe characters")
         for name in (
             "cycle", "total_episodes", "total_transitions",
             "total_optimizer_steps", "policy_step", "checkpoint_sequence",
@@ -136,14 +149,33 @@ class CheckpointSeries:
         self.suffix = suffix
         self.latest_manifest = self.base.with_name(f"{self.prefix}-latest.json")
 
-    def cycle_path(self, sequence: int, cycle: int, steps: int) -> Path:
+    def ensure_available(self, state: LongRunningState) -> None:
+        """Fail closed when a fresh run would reuse an existing series."""
+        if state.cycle or state.checkpoint_sequence:
+            return
+        legacy = list(self.base.parent.glob(f"{self.prefix}-seq-*{self.suffix}"))
+        current = list(self.base.parent.glob(f"{self.prefix}-run-*{self.suffix}"))
+        if self.latest_manifest.exists() or legacy or current:
+            raise FileExistsError(
+                f"checkpoint series already exists for {self.base}; resume from "
+                f"{self.latest_manifest} or choose a new --checkpoint_path"
+            )
+
+    def cycle_path(
+        self, run_id: str, sequence: int, cycle: int, steps: int
+    ) -> Path:
         return self.base.with_name(
-            f"{self.prefix}-seq-{sequence:06d}-cycle-{cycle:06d}-step-{steps:012d}{self.suffix}"
+            f"{self.prefix}-run-{run_id}-seq-{sequence:06d}-cycle-{cycle:06d}"
+            f"-step-{steps:012d}{self.suffix}"
         )
 
     def publish(self, trainer, state: LongRunningState) -> Path:
         sequence = state.checkpoint_sequence + 1
-        destination = self.cycle_path(sequence, state.cycle, state.total_optimizer_steps)
+        destination = self.cycle_path(
+            state.run_id, sequence, state.cycle, state.total_optimizer_steps
+        )
+        if destination.exists():
+            raise FileExistsError(f"refusing to overwrite checkpoint {destination}")
         checkpoint_state = asdict(state)
         checkpoint_state["checkpoint_sequence"] = sequence
         trainer.save_training_checkpoint(str(destination), long_running_state=checkpoint_state)
@@ -156,6 +188,7 @@ class CheckpointSeries:
             "policy_version": state.policy_version,
             "policy_step": state.policy_step,
             "checkpoint_sequence": sequence,
+            "run_id": state.run_id,
         }
         self._write_json_atomic(self.latest_manifest, manifest)
         state.checkpoint_sequence = sequence
@@ -176,13 +209,94 @@ class CheckpointSeries:
                 temporary.unlink()
 
     def _rotate(self, current: Path) -> None:
-        pattern = f"{self.prefix}-seq-*-cycle-*-step-*{self.suffix}"
+        marker = f"{self.prefix}-run-"
+        run_id = current.name[len(marker):].split("-seq-", 1)[0]
+        pattern = f"{self.prefix}-run-{run_id}-seq-*-cycle-*-step-*{self.suffix}"
         checkpoints = sorted(
             self.base.parent.glob(pattern), key=lambda path: path.name, reverse=True
         )
         for old in checkpoints[self.keep_last:]:
             if old != current:
                 old.unlink()
+
+
+class RunMetricsWriter:
+    """Append cycle records once and atomically maintain a constant-size summary."""
+
+    def __init__(self, summary_path: str, *, run_id: str, resume: bool) -> None:
+        self.summary_path = Path(summary_path)
+        self.run_id = run_id
+        suffix = self.summary_path.suffix or ".json"
+        stem = (
+            self.summary_path.name[:-len(suffix)]
+            if self.summary_path.name.endswith(suffix)
+            else self.summary_path.name
+        )
+        self.cycles_path = self.summary_path.with_name(f"{stem}-cycles.jsonl")
+        self.summary_path.parent.mkdir(parents=True, exist_ok=True)
+        if not resume and (self.summary_path.exists() or self.cycles_path.exists()):
+            raise FileExistsError(
+                f"metrics output already exists for {self.summary_path}; resume "
+                "the run or choose a new --metrics_path"
+            )
+        if resume and self.summary_path.exists():
+            payload = json.loads(self.summary_path.read_text(encoding="utf-8"))
+            if payload.get("run_id") != run_id:
+                raise ValueError(
+                    "metrics run_id does not match the resumed checkpoint"
+                )
+
+    def write_cycle(self, record: dict) -> None:
+        encoded = json.dumps(record, sort_keys=True, allow_nan=False) + "\n"
+        with self.cycles_path.open("a", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._write_summary(
+            status="running",
+            stop_reason=str(record.get("stop_reason", "")),
+            state=None,
+            error="",
+            latest_cycle=record,
+        )
+
+    def finalize(
+        self,
+        *,
+        status: str,
+        stop_reason: str,
+        state: LongRunningState | None,
+        error: str = "",
+        latest_cycle: dict | None = None,
+    ) -> None:
+        self._write_summary(
+            status=status,
+            stop_reason=stop_reason,
+            state=state,
+            error=error,
+            latest_cycle=latest_cycle,
+        )
+
+    def _write_summary(
+        self,
+        *,
+        status: str,
+        stop_reason: str,
+        state: LongRunningState | None,
+        error: str,
+        latest_cycle: dict | None,
+    ) -> None:
+        payload = {
+            "schema_version": "v2-long-running-run-v2",
+            "run_id": self.run_id,
+            "status": status,
+            "stop_reason": stop_reason,
+            "error": error,
+            "cycles_path": self.cycles_path.name,
+            "state": asdict(state) if state is not None else None,
+            "latest_cycle": latest_cycle,
+        }
+        CheckpointSeries._write_json_atomic(self.summary_path, payload)
 
 
 class LongRunningTrainer:
@@ -223,6 +337,7 @@ class LongRunningTrainer:
                 f"{self.state.cycle_identity!r}, runtime expects {config.resume_identity()!r}"
             )
         self._validate_totals()
+        self.checkpoints.ensure_available(self.state)
 
     def _validate_totals(self) -> None:
         pairs = (
@@ -256,6 +371,9 @@ class LongRunningTrainer:
         started = self.clock()
         last_checkpoint_time = started
         last_checkpoint_steps = self.state.total_optimizer_steps
+        last_checkpointed_cycle = (
+            self.state.cycle if self.state.checkpoint_sequence else 0
+        )
         records: list[dict] = []
         reason = ""
         self.stop.install()
@@ -266,6 +384,51 @@ class LongRunningTrainer:
                 if self.stop.event.is_set():
                     reason = self.stop.reason or "stop_event"
                 if reason:
+                    interrupt = reason in {"sigint", "sigterm", "stop_event"}
+                    save_dirty_boundary = (
+                        self.state.cycle > last_checkpointed_cycle
+                        and (not interrupt or self.config.save_on_interrupt)
+                    )
+                    if save_dirty_boundary:
+                        checkpoint_path = None
+                        checkpoint_error = ""
+                        try:
+                            checkpoint_path = self.checkpoints.publish(
+                                self.trainer, self.state
+                            )
+                            last_checkpointed_cycle = self.state.cycle
+                        except Exception as exc:
+                            checkpoint_error = f"{type(exc).__name__}: {exc}"
+                        record = {
+                            "schema_version": "v2-long-running-cycle-v1",
+                            "event": "late_stop_checkpoint",
+                            "cycle": self.state.cycle,
+                            "total_episodes": self.state.total_episodes,
+                            "total_transitions": self.state.total_transitions,
+                            "total_optimizer_steps": self.state.total_optimizer_steps,
+                            "policy_version": self.state.policy_version,
+                            "policy_step": self.state.policy_step,
+                            "cycle_wall_seconds": 0.0,
+                            "collection_seconds": 0.0,
+                            "optimization_seconds": 0.0,
+                            "amp_fallback": 0,
+                            "checkpoint_path": str(checkpoint_path or ""),
+                            "checkpoint_status": (
+                                "saved" if checkpoint_path else "failed"
+                            ),
+                            "checkpoint_error": checkpoint_error,
+                            "resume_source": self.state.resume_source,
+                            "peak_memory_bytes": self.peak_memory(),
+                            "evaluation_status": "not_due",
+                            "evaluation_error": "",
+                            "stop_reason": reason,
+                        }
+                        records.append(record)
+                        self.metric_sink(record)
+                        if checkpoint_error:
+                            raise RuntimeError(
+                                f"checkpoint publication failed: {checkpoint_error}"
+                            )
                     break
 
                 episodes = self.config.episodes_per_cycle
@@ -309,29 +472,41 @@ class LongRunningTrainer:
                 boundary_reason = self._limit_reason(now - started)
                 if self.stop.event.is_set():
                     boundary_reason = self.stop.reason or "stop_event"
-                due = (
-                    (self.config.checkpoint_every_cycles and
-                     self.state.cycle % self.config.checkpoint_every_cycles == 0)
-                    or (self.config.checkpoint_every_steps and
-                        self.state.total_optimizer_steps - last_checkpoint_steps
-                        >= self.config.checkpoint_every_steps)
-                    or (self.config.checkpoint_every_minutes and
-                        now - last_checkpoint_time
-                        >= self.config.checkpoint_every_minutes * 60.0)
-                    or (self.config.eval_every_cycles and
-                        self.state.cycle % self.config.eval_every_cycles == 0)
-                    or bool(boundary_reason)
+                cycle_due = bool(
+                    self.config.checkpoint_every_cycles
+                    and self.state.cycle % self.config.checkpoint_every_cycles == 0
                 )
+                steps_due = bool(
+                    self.config.checkpoint_every_steps
+                    and self.state.total_optimizer_steps - last_checkpoint_steps
+                    >= self.config.checkpoint_every_steps
+                )
+                time_due = bool(
+                    self.config.checkpoint_every_minutes
+                    and now - last_checkpoint_time
+                    >= self.config.checkpoint_every_minutes * 60.0
+                )
+                evaluation_due = bool(
+                    self.config.eval_every_cycles
+                    and self.state.cycle % self.config.eval_every_cycles == 0
+                )
+                interrupt = boundary_reason in {"sigint", "sigterm", "stop_event"}
+                stop_save_due = bool(
+                    boundary_reason
+                    and (not interrupt or self.config.save_on_interrupt)
+                )
+                scheduled_due = cycle_due or steps_due or time_due
+                due = scheduled_due or evaluation_due or stop_save_due
                 checkpoint_path: Path | None = None
                 checkpoint_status = "not_due"
                 checkpoint_error = ""
-                if due and (not boundary_reason or self.config.save_on_interrupt
-                            or boundary_reason not in {"sigint", "sigterm", "stop_event"}):
+                if due:
                     try:
                         checkpoint_path = self.checkpoints.publish(self.trainer, self.state)
                         checkpoint_status = "saved"
                         last_checkpoint_time = self.clock()
                         last_checkpoint_steps = self.state.total_optimizer_steps
+                        last_checkpointed_cycle = self.state.cycle
                     except Exception as exc:
                         checkpoint_status = "failed"
                         checkpoint_error = f"{type(exc).__name__}: {exc}"
@@ -341,21 +516,27 @@ class LongRunningTrainer:
 
                 eval_status = "not_due"
                 eval_error = ""
-                if (self.config.eval_every_cycles and
-                        self.state.cycle % self.config.eval_every_cycles == 0):
+                if evaluation_due:
                     if self.evaluator is None:
                         raise ValueError("eval_every_cycles requires an evaluator")
-                    if checkpoint_path is None:
-                        raise RuntimeError("periodic evaluation requires a saved checkpoint")
-                    try:
-                        self.evaluator(checkpoint_path, self.state.cycle)
-                        eval_status = "passed"
-                    except Exception as exc:
-                        eval_status = "failed"
-                        eval_error = f"{type(exc).__name__}: {exc}"
+                    if checkpoint_status == "failed":
+                        eval_status = "skipped_checkpoint_failed"
+                        eval_error = checkpoint_error
+                    else:
+                        try:
+                            if checkpoint_path is None:
+                                raise RuntimeError(
+                                    "periodic evaluation requires a saved checkpoint"
+                                )
+                            self.evaluator(checkpoint_path, self.state.cycle)
+                            eval_status = "passed"
+                        except Exception as exc:
+                            eval_status = "failed"
+                            eval_error = f"{type(exc).__name__}: {exc}"
 
                 record = {
                     "schema_version": "v2-long-running-cycle-v1",
+                    "event": "cycle",
                     "cycle": self.state.cycle,
                     "total_episodes": self.state.total_episodes,
                     "total_transitions": self.state.total_transitions,

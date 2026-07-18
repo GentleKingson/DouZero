@@ -189,7 +189,9 @@ python train_v2.py --long_running --device cpu --seed 17 \
 ```
 
 每个 cycle 边界都会清空 replay。恢复只发生在该边界，不会序列化或伪造
-中途 replay。细节见 [V2 长期训练状态机](docs/training_system.md#long-running-v2-state-machine)。
+中途 replay。全新训练不会复用已有 checkpoint 系列：必须恢复该系列或使用
+新路径。逐 cycle 指标追加到 `metrics-cycles.jsonl`，`metrics.json` 保持为
+原子更新的运行摘要。细节见 [V2 长期训练状态机](docs/training_system.md#long-running-v2-state-machine)。
 
 V2 单 GPU，并输出 checkpoint 与 metrics（PowerShell）：
 

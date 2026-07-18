@@ -1145,6 +1145,7 @@ def main() -> None:
                 LongRunningConfig,
                 LongRunningState,
                 LongRunningTrainer,
+                RunMetricsWriter,
                 command_evaluator,
             )
 
@@ -1187,22 +1188,13 @@ def main() -> None:
                 state = LongRunningState.from_dict(state_payload)
                 state.resume_source = resume_checkpoint
 
-            cycle_metrics: list[dict] = []
+            metrics_writer = None
 
             def emit_cycle(record: dict) -> None:
-                cycle_metrics.append(record)
                 if distributed.is_rank_zero:
                     print("[train_v2] cycle_metric=" + json.dumps(record, sort_keys=True))
-                    if metrics_path:
-                        _write_metrics_atomic(
-                            metrics_path,
-                            {
-                                "schema_version": "v2-long-running-run-v1",
-                                "status": "running",
-                                "resume_source": resume_checkpoint,
-                                "cycles": cycle_metrics,
-                            },
-                        )
+                    if metrics_writer is not None:
+                        metrics_writer.write_cycle(record)
 
             peak_memory = (
                 lambda: int(torch.cuda.max_memory_allocated(learner_device))
@@ -1217,19 +1209,29 @@ def main() -> None:
                 metric_sink=emit_cycle,
                 peak_memory=peak_memory,
             )
-            final_state, stop_reason, _records = runner.run()
-            stats = trainer.stats
             if metrics_path and distributed.is_rank_zero:
-                _write_metrics_atomic(
+                metrics_writer = RunMetricsWriter(
                     metrics_path,
-                    {
-                        "schema_version": "v2-long-running-run-v1",
-                        "status": "stopped",
-                        "stop_reason": stop_reason,
-                        "resume_source": resume_checkpoint,
-                        "state": __import__("dataclasses").asdict(final_state),
-                        "cycles": cycle_metrics,
-                    },
+                    run_id=runner.state.run_id,
+                    resume=bool(resume_checkpoint),
+                )
+            try:
+                final_state, stop_reason, _records = runner.run()
+            except BaseException as exc:
+                if metrics_writer is not None:
+                    metrics_writer.finalize(
+                        status="failed",
+                        stop_reason=runner.stop.reason,
+                        state=runner.state,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                raise
+            stats = trainer.stats
+            if metrics_writer is not None:
+                metrics_writer.finalize(
+                    status="stopped",
+                    stop_reason=stop_reason,
+                    state=final_state,
                 )
         else:
             stats = trainer.train()

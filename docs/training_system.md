@@ -149,6 +149,10 @@ Checkpoints are immutable sequence files written to a temporary file and
 published with `os.replace`. Only after that succeeds is `*-latest.json`
 atomically replaced. Rotation retains the newest `--keep_last_checkpoints`
 files. A failed save never removes or repoints the previous valid checkpoint.
+Each series has a persistent run ID in its state and filenames. Starting a
+fresh run against an existing manifest or matching files fails closed; resume
+through the manifest, or choose a new `--checkpoint_path`, rather than
+silently overwriting another run.
 Each checkpoint includes cumulative trainer statistics, cycle state, policy
 version and step, optimizer/mixed-precision state, all RNG state, and the
 existing strict source/model/feature/rules/loss/bidding/belief identity.
@@ -195,8 +199,11 @@ python train_v2.py --long_running --episodes_per_cycle 32 \
 Cycle metrics contain cumulative counts, cycle/collection/optimization time,
 AMP fallback delta, checkpoint path/status/error, resume source, evaluation
 status/error, and peak CUDA memory when available. CPU reports peak memory as
-unavailable. These semantics are CPU-tested; CUDA soak and long-duration GPU
-stability are not validated here.
+unavailable. Per-cycle records append to `<metrics-stem>-cycles.jsonl`; the
+requested `--metrics_path` is a small atomically replaced run summary. Resume
+appends to the existing JSONL history, and failure paths publish a `failed`
+summary with the error. These semantics are CPU-tested; CUDA soak and
+long-duration GPU stability are not validated here.
 
 ## Compile and transfer controls
 
