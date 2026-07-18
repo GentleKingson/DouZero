@@ -120,6 +120,7 @@ def _run(tmp_path, trainer, *, cycles, state=None, stop=None, keep=3):
         CheckpointSeries(str(tmp_path / "train.pt"), keep),
         state=state,
         stop_controller=stop,
+        collect_records=True,
     )
     return runner.run()
 
@@ -193,6 +194,7 @@ def test_wall_time_stops_after_current_boundary(tmp_path):
         config,
         CheckpointSeries(str(tmp_path / "timed.pt"), 3),
         clock=AdvancingClock(),
+        collect_records=True,
     ).run()
     assert reason == "max_wall_time"
     assert state.cycle == 1
@@ -231,6 +233,7 @@ def test_stop_arriving_in_metric_sink_saves_completed_dirty_boundary(tmp_path):
         CheckpointSeries(str(tmp_path / "late.pt"), 2),
         stop_controller=stop,
         metric_sink=sink,
+        collect_records=True,
     )
     state, reason, _ = runner.run()
     assert reason == "stop_event"
@@ -255,6 +258,7 @@ def test_no_save_on_interrupt_does_not_cancel_scheduled_checkpoint(tmp_path):
         config,
         CheckpointSeries(str(tmp_path / "scheduled.pt"), 2),
         stop_controller=stop,
+        collect_records=True,
     ).run()
     assert reason == "stop_event"
     assert records[-1]["checkpoint_status"] == "saved"
@@ -277,6 +281,7 @@ def test_no_save_on_interrupt_still_saves_checkpoint_required_for_eval(tmp_path)
         CheckpointSeries(str(tmp_path / "evaluated.pt"), 2),
         stop_controller=stop,
         evaluator=lambda checkpoint, cycle: evaluated.append((checkpoint, cycle)),
+        collect_records=True,
     ).run()
     assert reason == "stop_event"
     assert records[-1]["checkpoint_status"] == "saved"
@@ -313,7 +318,7 @@ def test_evaluation_failure_is_recorded_and_configurable(tmp_path, fail_fast):
         _state, reason, _ = runner.run()
         assert reason == "max_cycles"
     assert records[-1]["evaluation_status"] == "failed"
-    assert "evaluation unavailable" in records[-1]["evaluation_error"]
+    assert records[-1]["evaluation_error"] == "OSError"
 
 
 def test_resume_identity_mismatch_fails_closed(tmp_path):
@@ -339,6 +344,83 @@ def test_checkpoint_failure_keeps_previous_valid_checkpoint_and_manifest(tmp_pat
     assert previous_checkpoint.is_file()
 
 
+def test_manifest_failure_is_reconciled_from_the_next_orphan(tmp_path):
+    from train_v2 import _resolve_resume_checkpoint
+
+    trainer = _DeterministicTrainer()
+    state, _, _ = _run(tmp_path, trainer, cycles=1)
+    manifest_path = tmp_path / "train-latest.json"
+    previous_manifest = manifest_path.read_bytes()
+    series = CheckpointSeries(str(tmp_path / "train.pt"), 3)
+
+    def fail_manifest(_path, _payload):
+        raise OSError("injected manifest failure")
+
+    series._write_json_atomic = fail_manifest
+    runner = LongRunningTrainer(
+        trainer,
+        LongRunningConfig(
+            episodes_per_cycle=2,
+            optimizer_steps_per_cycle=2,
+            max_cycles=2,
+            checkpoint_every_cycles=1,
+        ),
+        series,
+        state=state,
+    )
+    with pytest.raises(RuntimeError, match="checkpoint publication failed"):
+        runner.run()
+    assert manifest_path.read_bytes() == previous_manifest
+
+    resolved = _resolve_resume_checkpoint(str(manifest_path))
+    assert resolved.checkpoint != str(
+        tmp_path / json.loads(previous_manifest)["latest"]
+    )
+    resumed = _DeterministicTrainer(seed=999)
+    payload = resumed.load_training_checkpoint(resolved.checkpoint)
+    resumed_state = LongRunningState.from_dict(payload)
+    resumed_state.resume_source = resolved.checkpoint
+    final_state, reason, _ = LongRunningTrainer(
+        resumed,
+        LongRunningConfig(
+            episodes_per_cycle=2,
+            optimizer_steps_per_cycle=2,
+            max_cycles=2,
+        ),
+        CheckpointSeries(resolved.series_base, 3),
+        state=resumed_state,
+    ).run()
+    assert reason == "max_cycles"
+    assert final_state.checkpoint_sequence == 2
+    assert json.loads(manifest_path.read_text())["checkpoint_sequence"] == 2
+
+
+def test_rotation_failure_does_not_invalidate_published_checkpoint(tmp_path):
+    trainer = _DeterministicTrainer()
+    series = CheckpointSeries(str(tmp_path / "rotation.pt"), 1)
+
+    def fail_rotation(_current):
+        raise OSError("injected rotation failure")
+
+    series._rotate = fail_rotation
+    state, reason, records = LongRunningTrainer(
+        trainer,
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=1,
+            max_cycles=1,
+        ),
+        series,
+        collect_records=True,
+    ).run()
+    assert reason == "max_cycles"
+    assert state.checkpoint_sequence == 1
+    assert records[-1]["checkpoint_status"] == "saved_rotation_failed"
+    assert records[-1]["checkpoint_error"] == "OSError"
+    latest = json.loads((tmp_path / "rotation-latest.json").read_text())
+    assert (tmp_path / latest["latest"]).is_file()
+
+
 def test_fresh_run_refuses_to_reuse_existing_checkpoint_series(tmp_path):
     trainer = _DeterministicTrainer()
     _run(tmp_path, trainer, cycles=1)
@@ -352,6 +434,127 @@ def test_fresh_run_refuses_to_reuse_existing_checkpoint_series(tmp_path):
 
     assert manifest_path.read_bytes() == previous_manifest
     assert previous_checkpoint.read_bytes() == previous_bytes
+
+
+def test_resume_rejects_checkpoint_from_a_different_series(tmp_path):
+    trainer = _DeterministicTrainer()
+    state, _, _ = _run(tmp_path / "a", trainer, cycles=1)
+    manifest = json.loads((tmp_path / "a" / "train-latest.json").read_text())
+    checkpoint = tmp_path / "a" / manifest["latest"]
+    state.resume_source = str(checkpoint)
+    with pytest.raises(ValueError, match="does not belong"):
+        LongRunningTrainer(
+            trainer,
+            LongRunningConfig(
+                episodes_per_cycle=2,
+                optimizer_steps_per_cycle=2,
+                max_cycles=2,
+            ),
+            CheckpointSeries(str(tmp_path / "b" / "train.pt"), 3),
+            state=state,
+        )
+
+
+def test_standalone_checkpoint_cannot_implicitly_fork_a_series(tmp_path):
+    trainer = _DeterministicTrainer()
+    state, _, _ = _run(tmp_path / "source", trainer, cycles=1)
+    manifest = json.loads(
+        (tmp_path / "source" / "train-latest.json").read_text()
+    )
+    original = tmp_path / "source" / manifest["latest"]
+    copied = tmp_path / "copy" / original.name
+    copied.parent.mkdir()
+    copied.write_bytes(original.read_bytes())
+    state.resume_source = str(copied)
+    with pytest.raises(ValueError, match="requires.*latest manifest"):
+        LongRunningTrainer(
+            trainer,
+            LongRunningConfig(
+                episodes_per_cycle=2,
+                optimizer_steps_per_cycle=2,
+                max_cycles=2,
+            ),
+            CheckpointSeries(str(tmp_path / "copy" / "train.pt"), 3),
+            state=state,
+        )
+
+
+def test_resume_rejects_rollback_behind_latest_sequence(tmp_path):
+    trainer = _DeterministicTrainer()
+    _run(tmp_path, trainer, cycles=2)
+    checkpoints = sorted(tmp_path.glob("train-run-*-seq-*-cycle-*-step-*.pt"))
+    older = checkpoints[0]
+    resumed = _DeterministicTrainer(seed=999)
+    state = LongRunningState.from_dict(resumed.load_training_checkpoint(str(older)))
+    state.resume_source = str(older)
+    with pytest.raises(ValueError, match="older checkpoint"):
+        LongRunningTrainer(
+            resumed,
+            LongRunningConfig(
+                episodes_per_cycle=2,
+                optimizer_steps_per_cycle=2,
+                max_cycles=3,
+            ),
+            CheckpointSeries(str(tmp_path / "train.pt"), 3),
+            state=state,
+        )
+
+
+def test_manifest_counters_must_match_checkpoint_state(tmp_path):
+    from train_v2 import _resolve_resume_checkpoint
+
+    _run(tmp_path, _DeterministicTrainer(), cycles=1)
+    manifest_path = tmp_path / "train-latest.json"
+    payload = json.loads(manifest_path.read_text())
+    payload["total_episodes"] += 1
+    manifest_path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="does not match checkpoint state"):
+        _resolve_resume_checkpoint(str(manifest_path))
+
+
+def test_manifest_resume_reuses_series_when_checkpoint_path_is_omitted(tmp_path):
+    from train_v2 import (
+        _resolve_resume_checkpoint,
+        _select_long_running_checkpoint_path,
+    )
+
+    _run(tmp_path, _DeterministicTrainer(), cycles=1)
+    resolved = _resolve_resume_checkpoint(str(tmp_path / "train-latest.json"))
+    assert _select_long_running_checkpoint_path("", resolved) == str(
+        tmp_path / "train.pt"
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        _select_long_running_checkpoint_path(str(tmp_path / "other.pt"), resolved)
+
+
+def test_binary_json_checkpoint_is_not_misclassified_as_manifest(tmp_path):
+    from train_v2 import _resolve_resume_checkpoint
+
+    checkpoint = tmp_path / "model-latest.json"
+    torch.save({"model": {"weight": torch.ones(1)}}, checkpoint)
+    resolved = _resolve_resume_checkpoint(str(checkpoint))
+    assert resolved.checkpoint == str(checkpoint)
+    assert not resolved.manifest
+
+
+def test_one_shot_v2_checkpoint_with_json_suffix_roundtrips(tmp_path):
+    from train_v2 import _resolve_resume_checkpoint
+
+    from douzero.models_v2 import ModelV2, ModelV2Config
+    from douzero.observation import build_v2_schema
+    from douzero.training import TrainerConfig, V2Trainer
+
+    config = ModelV2Config(hidden_size=16, history_layers=1, history_heads=1)
+    trainer_config = TrainerConfig(max_episodes=0, optimizer_steps=0, rng_seed=8)
+    trainer = V2Trainer(ModelV2(build_v2_schema(), config), config=trainer_config)
+    checkpoint = tmp_path / "one-shot.json"
+    trainer.save_training_checkpoint(str(checkpoint))
+    resolved = _resolve_resume_checkpoint(str(checkpoint))
+    restored = V2Trainer(
+        ModelV2(build_v2_schema(), config), config=trainer_config
+    )
+    identity = restored.load_training_checkpoint(resolved.checkpoint)
+    assert identity["long_running_state"] is None
 
 
 def test_n_plus_m_resume_matches_uninterrupted_model_and_optimizer(tmp_path):
@@ -484,7 +687,9 @@ def test_metrics_are_append_only_across_resume_and_finalize_failure(tmp_path):
     summary = tmp_path / "metrics.json"
     writer = RunMetricsWriter(str(summary), run_id="run-1", resume=False)
     writer.write_cycle({"cycle": 1, "stop_reason": ""})
-    state = LongRunningState(cycle=1)
+    state = LongRunningState(
+        cycle=1, resume_source=str(tmp_path / "private" / "checkpoint.pt")
+    )
     writer.finalize(status="stopped", stop_reason="max_cycles", state=state)
 
     resumed = RunMetricsWriter(str(summary), run_id="run-1", resume=True)
@@ -492,7 +697,9 @@ def test_metrics_are_append_only_across_resume_and_finalize_failure(tmp_path):
     resumed.finalize(
         status="failed",
         stop_reason="",
-        state=LongRunningState(cycle=2),
+        state=LongRunningState(
+            cycle=2, resume_source=str(tmp_path / "private" / "checkpoint.pt")
+        ),
         error="RuntimeError: injected",
     )
 
@@ -500,8 +707,9 @@ def test_metrics_are_append_only_across_resume_and_finalize_failure(tmp_path):
     assert [json.loads(line)["cycle"] for line in lines] == [1, 2]
     payload = json.loads(summary.read_text())
     assert payload["status"] == "failed"
-    assert payload["error"] == "RuntimeError: injected"
+    assert payload["error"] == "RuntimeError"
     assert "cycles" not in payload
+    assert payload["state"]["resume_source"] == "checkpoint.pt"
 
 
 def test_fresh_metrics_writer_refuses_to_overwrite_existing_history(tmp_path):
@@ -518,3 +726,44 @@ def test_resumed_metrics_writer_rejects_a_different_run(tmp_path):
     writer.write_cycle({"cycle": 1})
     with pytest.raises(ValueError, match="run_id"):
         RunMetricsWriter(str(summary), run_id="run-2", resume=True)
+
+
+def test_production_loop_streams_metrics_without_retaining_history(tmp_path):
+    trainer = _DeterministicTrainer()
+    streamed = 0
+
+    def sink(_record):
+        nonlocal streamed
+        streamed += 1
+
+    state, reason, records = LongRunningTrainer(
+        trainer,
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=0,
+            max_cycles=2000,
+            checkpoint_every_cycles=0,
+        ),
+        CheckpointSeries(str(tmp_path / "bounded.pt"), 1),
+        metric_sink=sink,
+    ).run()
+    assert reason == "max_cycles"
+    assert state.cycle == streamed == 2000
+    assert records == []
+
+
+def test_cycle_metrics_do_not_expose_absolute_paths(tmp_path):
+    trainer = _DeterministicTrainer()
+    state, _, _ = _run(tmp_path, trainer, cycles=1)
+    manifest = json.loads((tmp_path / "train-latest.json").read_text())
+    checkpoint = tmp_path / manifest["latest"]
+    resumed = _DeterministicTrainer(seed=999)
+    payload = resumed.load_training_checkpoint(str(checkpoint))
+    resumed_state = LongRunningState.from_dict(payload)
+    resumed_state.resume_source = str(checkpoint)
+    _state, _reason, records = _run(
+        tmp_path, resumed, cycles=2, state=resumed_state
+    )
+    record = records[-1]
+    assert record["checkpoint_path"] == Path(record["checkpoint_path"]).name
+    assert record["resume_source"] == checkpoint.name

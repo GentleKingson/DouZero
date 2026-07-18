@@ -148,10 +148,124 @@ class CheckpointSeries:
         self.prefix = stem
         self.suffix = suffix
         self.latest_manifest = self.base.with_name(f"{self.prefix}-latest.json")
+        self.last_rotation_error = ""
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: str | Path, state: LongRunningState,
+                        keep_last: int) -> "CheckpointSeries":
+        """Derive and validate the series base encoded in a checkpoint name."""
+        source = Path(checkpoint)
+        marker = f"-run-{state.run_id}-seq-{state.checkpoint_sequence:06d}"
+        if marker not in source.name:
+            raise ValueError("resume checkpoint filename does not match its run state")
+        prefix, encoded = source.name.split(marker, 1)
+        suffix = source.suffix or ".pt"
+        expected_tail = (
+            f"-cycle-{state.cycle:06d}-step-"
+            f"{state.total_optimizer_steps:012d}{suffix}"
+        )
+        if encoded != expected_tail or not prefix:
+            raise ValueError("resume checkpoint filename does not match its counters")
+        return cls(str(source.with_name(f"{prefix}{suffix}")), keep_last)
+
+    def _manifest_payload(self, state: LongRunningState, checkpoint: Path) -> dict:
+        return {
+            "schema_version": 1,
+            "latest": checkpoint.name,
+            "cycle": state.cycle,
+            "total_episodes": state.total_episodes,
+            "total_optimizer_steps": state.total_optimizer_steps,
+            "policy_version": state.policy_version,
+            "policy_step": state.policy_step,
+            "checkpoint_sequence": state.checkpoint_sequence,
+            "run_id": state.run_id,
+        }
+
+    @staticmethod
+    def _validate_manifest(payload: dict) -> None:
+        required = {
+            "schema_version", "latest", "cycle", "total_episodes",
+            "total_optimizer_steps", "policy_version", "policy_step",
+            "checkpoint_sequence", "run_id",
+        }
+        if not isinstance(payload, dict) or set(payload) != required:
+            raise ValueError("latest manifest has an invalid field set")
+        if payload["schema_version"] != 1:
+            raise ValueError("latest manifest has an unsupported schema_version")
+        if (
+            not isinstance(payload["latest"], str)
+            or not payload["latest"]
+            or Path(payload["latest"]).name != payload["latest"]
+        ):
+            raise ValueError("latest manifest has an unsafe checkpoint name")
+        for name in (
+            "cycle", "total_episodes", "total_optimizer_steps", "policy_step",
+            "checkpoint_sequence",
+        ):
+            value = payload[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"latest manifest {name} must be a non-negative int")
+        if not isinstance(payload["policy_version"], str):
+            raise ValueError("latest manifest policy_version must be text")
+        run_id = payload["run_id"]
+        if (
+            not isinstance(run_id, str)
+            or not run_id
+            or not all(character.isalnum() or character in "-_" for character in run_id)
+        ):
+            raise ValueError("latest manifest run_id is invalid")
+
+    def bind_resume(self, state: LongRunningState, checkpoint: str | Path) -> None:
+        """Bind resume to this series and reconcile one committed orphan."""
+        source = Path(checkpoint)
+        expected = self.cycle_path(
+            state.run_id,
+            state.checkpoint_sequence,
+            state.cycle,
+            state.total_optimizer_steps,
+        )
+        if source.name != expected.name or source.parent.resolve() != expected.parent.resolve():
+            raise ValueError("resume checkpoint does not belong to checkpoint series")
+        if not source.is_file():
+            raise FileNotFoundError(f"resume checkpoint does not exist: {source}")
+
+        if not self.latest_manifest.exists():
+            raise ValueError(
+                "long-running resume requires the checkpoint series latest manifest"
+            )
+
+        payload = json.loads(self.latest_manifest.read_text(encoding="utf-8"))
+        self._validate_manifest(payload)
+        if payload["run_id"] != state.run_id:
+            raise ValueError("checkpoint series run_id mismatch")
+        manifest_sequence = payload["checkpoint_sequence"]
+        if not isinstance(manifest_sequence, int) or isinstance(manifest_sequence, bool):
+            raise ValueError("latest manifest checkpoint_sequence must be an int")
+        if manifest_sequence > state.checkpoint_sequence:
+            raise ValueError("refusing to resume an older checkpoint than latest")
+        if manifest_sequence < state.checkpoint_sequence - 1:
+            raise ValueError("checkpoint sequence is not contiguous with latest")
+        if manifest_sequence == state.checkpoint_sequence - 1:
+            self._write_json_atomic(
+                self.latest_manifest, self._manifest_payload(state, source)
+            )
+            return
+
+        expected_payload = self._manifest_payload(state, source)
+        if payload != expected_payload:
+            raise ValueError("latest manifest does not match checkpoint state")
 
     def ensure_available(self, state: LongRunningState) -> None:
         """Fail closed when a fresh run would reuse an existing series."""
-        if state.cycle or state.checkpoint_sequence:
+        if state.checkpoint_sequence:
+            source = state.resume_source
+            if not source and self.latest_manifest.exists():
+                payload = json.loads(self.latest_manifest.read_text(encoding="utf-8"))
+                self._validate_manifest(payload)
+                source = str(self.latest_manifest.parent / payload["latest"])
+            if not source:
+                raise ValueError("resumed long-running state has no checkpoint source")
+            self.bind_resume(state, source)
             return
         legacy = list(self.base.parent.glob(f"{self.prefix}-seq-*{self.suffix}"))
         current = list(self.base.parent.glob(f"{self.prefix}-run-*{self.suffix}"))
@@ -170,6 +284,7 @@ class CheckpointSeries:
         )
 
     def publish(self, trainer, state: LongRunningState) -> Path:
+        self.last_rotation_error = ""
         sequence = state.checkpoint_sequence + 1
         destination = self.cycle_path(
             state.run_id, sequence, state.cycle, state.total_optimizer_steps
@@ -179,20 +294,14 @@ class CheckpointSeries:
         checkpoint_state = asdict(state)
         checkpoint_state["checkpoint_sequence"] = sequence
         trainer.save_training_checkpoint(str(destination), long_running_state=checkpoint_state)
-        manifest = {
-            "schema_version": 1,
-            "latest": destination.name,
-            "cycle": state.cycle,
-            "total_episodes": state.total_episodes,
-            "total_optimizer_steps": state.total_optimizer_steps,
-            "policy_version": state.policy_version,
-            "policy_step": state.policy_step,
-            "checkpoint_sequence": sequence,
-            "run_id": state.run_id,
-        }
+        manifest_state = LongRunningState.from_dict(checkpoint_state)
+        manifest = self._manifest_payload(manifest_state, destination)
         self._write_json_atomic(self.latest_manifest, manifest)
         state.checkpoint_sequence = sequence
-        self._rotate(destination)
+        try:
+            self._rotate(destination)
+        except OSError as exc:
+            self.last_rotation_error = type(exc).__name__
         return destination
 
     @staticmethod
@@ -286,14 +395,22 @@ class RunMetricsWriter:
         error: str,
         latest_cycle: dict | None,
     ) -> None:
+        state_payload = asdict(state) if state is not None else None
+        if state_payload is not None and state_payload["resume_source"]:
+            state_payload["resume_source"] = Path(
+                state_payload["resume_source"]
+            ).name
+        error_type = error.split(":", 1)[0].strip() if error else ""
+        if error_type and not error_type.replace("_", "").isalnum():
+            error_type = "Error"
         payload = {
             "schema_version": "v2-long-running-run-v2",
             "run_id": self.run_id,
             "status": status,
             "stop_reason": stop_reason,
-            "error": error,
+            "error": error_type,
             "cycles_path": self.cycles_path.name,
-            "state": asdict(state) if state is not None else None,
+            "state": state_payload,
             "latest_cycle": latest_cycle,
         }
         CheckpointSeries._write_json_atomic(self.summary_path, payload)
@@ -314,6 +431,7 @@ class LongRunningTrainer:
         metric_sink: Callable[[dict], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         peak_memory: Callable[[], int | None] | None = None,
+        collect_records: bool = False,
     ) -> None:
         self.trainer = trainer
         self.config = config
@@ -323,6 +441,7 @@ class LongRunningTrainer:
         self.metric_sink = metric_sink or (lambda _record: None)
         self.clock = clock
         self.peak_memory = peak_memory or (lambda: None)
+        self.collect_records = collect_records
         self.state = state or LongRunningState(
             total_episodes=int(trainer.stats.episodes_completed),
             total_transitions=int(trainer.stats.transitions_collected),
@@ -391,14 +510,20 @@ class LongRunningTrainer:
                     )
                     if save_dirty_boundary:
                         checkpoint_path = None
+                        checkpoint_status = "failed"
                         checkpoint_error = ""
                         try:
                             checkpoint_path = self.checkpoints.publish(
                                 self.trainer, self.state
                             )
+                            checkpoint_status = (
+                                "saved_rotation_failed"
+                                if self.checkpoints.last_rotation_error else "saved"
+                            )
+                            checkpoint_error = self.checkpoints.last_rotation_error
                             last_checkpointed_cycle = self.state.cycle
                         except Exception as exc:
-                            checkpoint_error = f"{type(exc).__name__}: {exc}"
+                            checkpoint_error = type(exc).__name__
                         record = {
                             "schema_version": "v2-long-running-cycle-v1",
                             "event": "late_stop_checkpoint",
@@ -412,20 +537,24 @@ class LongRunningTrainer:
                             "collection_seconds": 0.0,
                             "optimization_seconds": 0.0,
                             "amp_fallback": 0,
-                            "checkpoint_path": str(checkpoint_path or ""),
-                            "checkpoint_status": (
-                                "saved" if checkpoint_path else "failed"
+                            "checkpoint_path": (
+                                checkpoint_path.name if checkpoint_path else ""
                             ),
+                            "checkpoint_status": checkpoint_status,
                             "checkpoint_error": checkpoint_error,
-                            "resume_source": self.state.resume_source,
+                            "resume_source": (
+                                Path(self.state.resume_source).name
+                                if self.state.resume_source else ""
+                            ),
                             "peak_memory_bytes": self.peak_memory(),
                             "evaluation_status": "not_due",
                             "evaluation_error": "",
                             "stop_reason": reason,
                         }
-                        records.append(record)
+                        if self.collect_records:
+                            records.append(record)
                         self.metric_sink(record)
-                        if checkpoint_error:
+                        if checkpoint_path is None:
                             raise RuntimeError(
                                 f"checkpoint publication failed: {checkpoint_error}"
                             )
@@ -503,13 +632,17 @@ class LongRunningTrainer:
                 if due:
                     try:
                         checkpoint_path = self.checkpoints.publish(self.trainer, self.state)
-                        checkpoint_status = "saved"
+                        checkpoint_status = (
+                            "saved_rotation_failed"
+                            if self.checkpoints.last_rotation_error else "saved"
+                        )
+                        checkpoint_error = self.checkpoints.last_rotation_error
                         last_checkpoint_time = self.clock()
                         last_checkpoint_steps = self.state.total_optimizer_steps
                         last_checkpointed_cycle = self.state.cycle
                     except Exception as exc:
                         checkpoint_status = "failed"
-                        checkpoint_error = f"{type(exc).__name__}: {exc}"
+                        checkpoint_error = type(exc).__name__
                 # Saving clears replay. Non-save boundaries deliberately do so too.
                 self.trainer.buffer.clear()
                 self.trainer.bidding_buffer.clear()
@@ -532,7 +665,7 @@ class LongRunningTrainer:
                             eval_status = "passed"
                         except Exception as exc:
                             eval_status = "failed"
-                            eval_error = f"{type(exc).__name__}: {exc}"
+                            eval_error = type(exc).__name__
 
                 record = {
                     "schema_version": "v2-long-running-cycle-v1",
@@ -547,16 +680,20 @@ class LongRunningTrainer:
                     "collection_seconds": round(collection_seconds, 6),
                     "optimization_seconds": round(optimization_seconds, 6),
                     "amp_fallback": int(self.trainer.stats.amp_fallbacks) - amp_before,
-                    "checkpoint_path": str(checkpoint_path or ""),
+                    "checkpoint_path": checkpoint_path.name if checkpoint_path else "",
                     "checkpoint_status": checkpoint_status,
                     "checkpoint_error": checkpoint_error,
-                    "resume_source": self.state.resume_source,
+                    "resume_source": (
+                        Path(self.state.resume_source).name
+                        if self.state.resume_source else ""
+                    ),
                     "peak_memory_bytes": self.peak_memory(),
                     "evaluation_status": eval_status,
                     "evaluation_error": eval_error,
                     "stop_reason": boundary_reason,
                 }
-                records.append(record)
+                if self.collect_records:
+                    records.append(record)
                 self.metric_sink(record)
                 if checkpoint_status == "failed":
                     raise RuntimeError(f"checkpoint publication failed: {checkpoint_error}")

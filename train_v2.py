@@ -43,6 +43,7 @@ CPU smoke (no GPU required):
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from douzero.config import load_config
 from douzero.runtime import maybe_set_global_deterministic, set_global_seed
@@ -642,22 +643,107 @@ def _write_metrics_atomic(path: str, payload: dict[str, object]) -> None:
     temporary.replace(target)
 
 
-def _resolve_resume_checkpoint(path: str) -> str:
-    """Resolve a long-running ``*-latest.json`` manifest to its checkpoint."""
+class _ResumeCheckpoint:
+    __slots__ = ("checkpoint", "series_base", "manifest")
+
+    def __init__(
+        self, checkpoint: str, series_base: str = "", manifest: str = ""
+    ) -> None:
+        self.checkpoint = checkpoint
+        self.series_base = series_base
+        self.manifest = manifest
+
+
+def _resolve_resume_checkpoint(path: str) -> _ResumeCheckpoint:
+    """Resolve only a valid ``*-latest.json`` manifest, including an orphan."""
     import json
     from pathlib import Path
 
     source = Path(path)
-    if source.suffix.lower() != ".json":
-        return path
-    payload = json.loads(source.read_text(encoding="utf-8"))
-    latest = payload.get("latest") if isinstance(payload, dict) else None
-    if not isinstance(latest, str) or not latest:
-        raise ValueError("resume manifest must contain a non-empty 'latest' path")
-    resolved = source.parent / latest
-    if not resolved.is_file():
-        raise FileNotFoundError(f"latest checkpoint does not exist: {resolved}")
-    return str(resolved)
+    if not source.name.endswith("-latest.json"):
+        return _ResumeCheckpoint(str(source))
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _ResumeCheckpoint(str(source))
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return _ResumeCheckpoint(str(source))
+
+    from douzero.training.long_running import CheckpointSeries, LongRunningState
+
+    CheckpointSeries._validate_manifest(payload)
+    latest = source.parent / payload["latest"]
+    if not latest.is_file():
+        raise FileNotFoundError(f"latest checkpoint does not exist: {latest}")
+    prefix = source.name[:-len("-latest.json")]
+    suffix = latest.suffix or ".pt"
+    series = CheckpointSeries(str(source.with_name(f"{prefix}{suffix}")), 1)
+    expected = series.cycle_path(
+        payload["run_id"],
+        payload["checkpoint_sequence"],
+        payload["cycle"],
+        payload["total_optimizer_steps"],
+    )
+    if latest.name != expected.name:
+        raise ValueError("latest manifest checkpoint name does not match its counters")
+
+    import torch
+
+    latest_bundle = torch.load(latest, map_location="cpu", weights_only=True)
+    latest_state_payload = (
+        latest_bundle.get("long_running_state")
+        if isinstance(latest_bundle, dict) else None
+    )
+    latest_state = LongRunningState.from_dict(latest_state_payload)
+    if payload != series._manifest_payload(latest_state, latest):
+        raise ValueError("latest manifest does not match checkpoint state")
+
+    candidates = []
+    pattern = (
+        f"{series.prefix}-run-{payload['run_id']}-seq-*-cycle-*-step-*"
+        f"{series.suffix}"
+    )
+    for candidate in source.parent.glob(pattern):
+        if candidate.name > latest.name:
+            candidates.append(candidate)
+    if candidates:
+        if len(candidates) != 1:
+            raise ValueError("checkpoint series contains multiple orphan sequences")
+        candidate = candidates[0]
+        bundle = torch.load(candidate, map_location="cpu", weights_only=True)
+        state_payload = bundle.get("long_running_state") if isinstance(bundle, dict) else None
+        state = LongRunningState.from_dict(state_payload)
+        if state.run_id != payload["run_id"] or (
+            state.checkpoint_sequence != payload["checkpoint_sequence"] + 1
+        ):
+            raise ValueError("orphan checkpoint is not the next series sequence")
+        expected_orphan = series.cycle_path(
+            state.run_id,
+            state.checkpoint_sequence,
+            state.cycle,
+            state.total_optimizer_steps,
+        )
+        if candidate.name != expected_orphan.name:
+            raise ValueError("orphan checkpoint filename does not match its state")
+        latest = candidate
+    return _ResumeCheckpoint(str(latest), str(series.base), str(source))
+
+
+def _select_long_running_checkpoint_path(
+    requested: str, resume: _ResumeCheckpoint
+) -> str:
+    """Keep manifest resume on its original series unless no resume exists."""
+    if resume.series_base:
+        if requested and Path(requested).resolve() != Path(resume.series_base).resolve():
+            raise ValueError(
+                "--checkpoint_path does not match the resumed manifest series"
+            )
+        return resume.series_base
+    if requested:
+        return requested
+    if resume.checkpoint:
+        return ""
+    return "douzero_checkpoints/v2-long-running.pt"
 
 
 def main() -> None:
@@ -721,12 +807,17 @@ def main() -> None:
         yaml_cfg.belief_training_mode if yaml_cfg else None,
         defaults.belief_training_mode,
     )
-    resume_checkpoint = getattr(args, "resume_checkpoint", "")
-    if resume_checkpoint:
-        resume_checkpoint = _resolve_resume_checkpoint(resume_checkpoint)
+    resume_argument = getattr(args, "resume_checkpoint", "")
+    resume = (
+        _resolve_resume_checkpoint(resume_argument)
+        if resume_argument else _ResumeCheckpoint("")
+    )
+    resume_checkpoint = resume.checkpoint
     output_checkpoint = getattr(args, "checkpoint_path", "")
-    if args.long_running and not output_checkpoint:
-        output_checkpoint = "douzero_checkpoints/v2-long-running.pt"
+    if args.long_running:
+        output_checkpoint = _select_long_running_checkpoint_path(
+            output_checkpoint, resume
+        )
     if args.long_running and ddp_enabled:
         raise NotImplementedError("long-running V2 training is single-process only")
 
@@ -1187,6 +1278,16 @@ def main() -> None:
                     )
                 state = LongRunningState.from_dict(state_payload)
                 state.resume_source = resume_checkpoint
+                derived_series = CheckpointSeries.from_checkpoint(
+                    resume_checkpoint, state, long_cfg.keep_last_checkpoints
+                )
+                if output_checkpoint and (
+                    Path(output_checkpoint).resolve() != derived_series.base.resolve()
+                ):
+                    raise ValueError(
+                        "--checkpoint_path does not match the resumed checkpoint series"
+                    )
+                output_checkpoint = str(derived_series.base)
 
             metrics_writer = None
 
@@ -1223,7 +1324,7 @@ def main() -> None:
                         status="failed",
                         stop_reason=runner.stop.reason,
                         state=runner.state,
-                        error=f"{type(exc).__name__}: {exc}",
+                        error=type(exc).__name__,
                     )
                 raise
             stats = trainer.stats

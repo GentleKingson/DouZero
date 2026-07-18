@@ -152,7 +152,12 @@ files. A failed save never removes or repoints the previous valid checkpoint.
 Each series has a persistent run ID in its state and filenames. Starting a
 fresh run against an existing manifest or matching files fails closed; resume
 through the manifest, or choose a new `--checkpoint_path`, rather than
-silently overwriting another run.
+silently overwriting another run. Manifest resume also binds the output series:
+omitting `--checkpoint_path` continues the manifest's series, while an explicit
+mismatching path is rejected. Manifest identity and counters are checked
+against the checkpoint, and resuming an older sequence than `latest` fails
+closed. A copied standalone cycle file cannot implicitly create or fork a
+series; its matching latest manifest is required.
 Each checkpoint includes cumulative trainer statistics, cycle state, policy
 version and step, optimizer/mixed-precision state, all RNG state, and the
 existing strict source/model/feature/rules/loss/bidding/belief identity.
@@ -165,6 +170,12 @@ replay. With the same seed, identity, `episodes_per_cycle`, and
 by resume for M cycles in cumulative counts, policy step, model weights, and
 optimizer state. Changing either cycle-shape field fails closed; operational
 stop limits and retention may change on resume.
+
+If a checkpoint file was atomically published but the process stopped before
+the latest manifest could be replaced, the next manifest resume validates the
+single contiguous orphan checkpoint and promotes it. Multiple or invalid
+orphans fail closed. Rotation cleanup failures are recorded separately and do
+not invalidate a checkpoint whose file and manifest were already published.
 
 ```bash
 python train_v2.py --long_running --config configs/enhanced.yaml --seed 17 \
@@ -202,7 +213,10 @@ status/error, and peak CUDA memory when available. CPU reports peak memory as
 unavailable. Per-cycle records append to `<metrics-stem>-cycles.jsonl`; the
 requested `--metrics_path` is a small atomically replaced run summary. Resume
 appends to the existing JSONL history, and failure paths publish a `failed`
-summary with the error. These semantics are CPU-tested; CUDA soak and
+summary with an error type. Metrics retain only checkpoint basenames and error
+classes, never absolute checkpoint/resume paths or exception messages. Cycle
+records are streamed rather than retained by the production controller, so
+metrics memory remains bounded. These semantics are CPU-tested; CUDA soak and
 long-duration GPU stability are not validated here.
 
 ## Compile and transfer controls
