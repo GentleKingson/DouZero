@@ -129,8 +129,9 @@ metrics.
 | P17 standard/full-game V2 | Yes | Yes | No; fails closed | Single process only |
 
 The continuous CI matrix is Ubuntu CPU-only. "Code-supported" does not mean a
-path has passed native Windows CUDA or long-running validation. Full Windows
-setup and troubleshooting live in [docs/windows_training.md](docs/windows_training.md).
+path has passed native Windows CUDA validation. Long-running control,
+checkpoint, and resume are CPU-tested, but no CUDA soak claim is made. Full
+Windows setup and troubleshooting live in [docs/windows_training.md](docs/windows_training.md).
 
 For the original Linux-oriented legacy GPU topology, run
 ```
@@ -177,6 +178,41 @@ python train_v2.py `
   --batch_size 1 `
   --seed 1
 ```
+
+V2 long-running mode is opt-in; the existing one-shot command above is
+unchanged. This example stops after 100 cycles and retains the newest five
+atomic cycle-boundary checkpoints:
+
+```bash
+python train_v2.py --long_running --device cpu --seed 17 \
+  --episodes_per_cycle 32 --optimizer_steps_per_cycle 8 --max_cycles 100 \
+  --checkpoint_path artifacts/v2/train.pt --checkpoint_every_cycles 1 \
+  --keep_last_checkpoints 5 --metrics_path artifacts/v2/metrics.json
+```
+
+Resume from the stable latest manifest; cumulative counters, policy step,
+optimizer, model, and RNG state continue from the saved boundary:
+
+```bash
+python train_v2.py --long_running --device cpu --seed 17 \
+  --episodes_per_cycle 32 --optimizer_steps_per_cycle 8 --max_cycles 200 \
+  --checkpoint_path artifacts/v2/train.pt \
+  --resume_checkpoint artifacts/v2/train-latest.json
+```
+
+Replay is deliberately empty at every cycle boundary. Resume occurs only at
+that boundary; replay is not serialized or reconstructed. A fresh run refuses
+to reuse an existing checkpoint series, so resume it or select a new path.
+Cycle metrics append to `metrics-cycles.jsonl` while `metrics.json` remains an
+atomic, path-sanitized run summary. Manifest resume automatically continues
+the same checkpoint series and rejects a conflicting `--checkpoint_path`.
+Direct cycle-file resume is reconciled against the same manifest, so it cannot
+ignore a newer committed orphan or duplicate a sequence. Wall-time limits are
+cumulative across resumes and include checkpoint, evaluation, and metrics
+boundary work. A per-series process lock prevents concurrent fresh or resumed
+writers, and metrics paths are rejected if they overlap checkpoint artifacts.
+See
+[the V2 long-running state machine](docs/training_system.md#long-running-v2-state-machine).
 
 V2 single GPU with checkpoint and metrics output (PowerShell):
 
@@ -329,13 +365,6 @@ operations, checkpoint/resume commands, and error-specific guidance.
 ## Acknowlegements
 *   The demo is largely based on [RLCard-Showdown](https://github.com/datamllab/rlcard-showdown)
 *   Code implementation is inspired by [TorchBeast](https://github.com/facebookresearch/torchbeast)
-
-
-
-
-
-
-
 
 
 

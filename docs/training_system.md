@@ -127,6 +127,139 @@ format 3 records `training_topology=single_process` and
 `training_world_size=1`; formats 1/2 and any topology mismatch are rejected
 rather than inferred to be compatible.
 
+## Long-running V2 state machine
+
+`train_v2.py` keeps its original one-shot behavior unless `--long_running` is
+explicitly present. Long-running single-process V2 uses this state machine:
+
+```text
+check limits -> collect K episodes -> optimize U steps -> advance policy step
+-> cycle boundary -> atomic checkpoint -> optional evaluation -> metrics -> repeat
+```
+
+Any configured maximum is a stop condition: cycles, cumulative episodes,
+cumulative optimizer steps, or wall-clock minutes. Episode and optimizer-step
+targets are clipped in the final cycle. Wall-clock expiry, `SIGINT`, and
+`SIGTERM` request a stop; collection and optimization finish the current cycle,
+then the process checkpoints at the safe boundary and exits with an explicit
+`stop_reason`. `--no-save_on_interrupt` disables the extra signal/stop-event
+save, but not a checkpoint already due by another schedule.
+Wall time is cumulative across resumes: every clean boundary stores
+`total_wall_seconds`, and a resumed process receives only the remaining part
+of `--max_wall_time_minutes`. The budget includes checkpoint publication,
+rotation, periodic evaluation, and metrics emission. Post-publication time is
+persisted atomically in the latest run-state manifest without rewriting the
+immutable model checkpoint. A collect-only configuration with
+`optimizer_steps_per_cycle=0` rejects an otherwise unreachable optimizer-step
+limit unless another cycle, episode, or wall-time limit can stop the run.
+
+Checkpoints are immutable sequence files written to a temporary file and
+published with `os.replace`. Only after that succeeds is `*-latest.json`
+atomically replaced. Rotation retains the newest `--keep_last_checkpoints`
+files. A failed save never removes or repoints the previous valid checkpoint.
+Before fresh-run checks or resume reconciliation, the controller atomically
+creates a per-series ownership lock and holds it until training exits. A second
+fresh or resumed process fails closed. Locks are never stolen automatically;
+after a crash, an operator must verify the recorded PID is gone before
+explicitly removing the stale lock.
+Each series has a persistent run ID in its state and filenames. Starting a
+fresh run against an existing manifest or matching files fails closed; resume
+through the manifest, or choose a new `--checkpoint_path`, rather than
+silently overwriting another run. Manifest resume also binds the output series:
+omitting `--checkpoint_path` continues the manifest's series, while an explicit
+mismatching path is rejected. Manifest identity and counters are checked
+against the checkpoint, and resuming an older sequence than `latest` fails
+closed. Direct checkpoint resume performs the same whole-series scan as
+manifest resume. Duplicate sequence numbers, skipped sequences, and ignored
+orphans fail closed. A copied standalone cycle file cannot implicitly create
+or fork a series; either its matching latest manifest or the initial
+publication-intent sidecar is required.
+Each checkpoint includes cumulative trainer statistics, cycle state, policy
+version and step, optimizer/mixed-precision state, all RNG state, and the
+existing strict source/model/feature/rules/loss/bidding/belief identity.
+
+Replay is deliberately not checkpointed. Every completed cycle is an
+empty-replay boundary, including cycles where no file is due. Resume therefore
+continues only from a clean cycle boundary and never fabricates in-progress
+replay. With the same seed, identity, `episodes_per_cycle`, and
+`optimizer_steps_per_cycle`, N+M uninterrupted cycles match N cycles followed
+by resume for M cycles in cumulative counts, policy step, model weights, and
+optimizer state. Changing either cycle-shape field fails closed; operational
+stop limits and retention may change on resume.
+
+If a checkpoint file was atomically published but the process stopped before
+the latest manifest could be replaced, the next manifest resume validates the
+single contiguous orphan checkpoint and promotes it. Multiple or invalid
+orphans fail closed. Rotation cleanup failures are recorded separately and do
+not invalidate a checkpoint whose file and manifest were already published.
+An atomic pending-intent sidecar makes the same recovery possible when the
+very first checkpoint succeeds but creation of the first latest manifest
+fails; it is removed after successful manifest publication.
+
+```bash
+python train_v2.py --long_running --config configs/enhanced.yaml --seed 17 \
+  --episodes_per_cycle 64 --optimizer_steps_per_cycle 16 \
+  --max_wall_time_minutes 720 --max_total_optimizer_steps 100000 \
+  --checkpoint_path runs/v2/train.pt --checkpoint_every_cycles 1 \
+  --checkpoint_every_steps 100 --checkpoint_every_minutes 30 \
+  --keep_last_checkpoints 5 --metrics_path runs/v2/metrics.json
+```
+
+Resume through the stable manifest:
+
+```bash
+python train_v2.py --long_running --config configs/enhanced.yaml --seed 17 \
+  --episodes_per_cycle 64 --optimizer_steps_per_cycle 16 \
+  --max_total_optimizer_steps 200000 --checkpoint_path runs/v2/train.pt \
+  --resume_checkpoint runs/v2/train-latest.json
+```
+
+Periodic evaluation delegates to an existing evaluation command. It does not
+implement rules or another evaluator. The command is tokenized without a shell;
+`{checkpoint}` and `{cycle}` are replaced at runtime. Evaluation failures are
+recorded and fail fast by default; `--no-eval_fail_fast` explicitly records and
+continues. If the evaluation subprocess exits because the controller received
+`SIGINT` or `SIGTERM`, it is recorded as interrupted and the run follows normal
+safe-boundary signal shutdown instead of treating it as a fail-fast error. The
+evaluator runs in a separate process group; the controller polls its stop event,
+requests group termination, and escalates to a kill after a bounded grace
+period rather than waiting indefinitely for evaluation to return.
+
+```bash
+python train_v2.py --long_running --episodes_per_cycle 32 \
+  --optimizer_steps_per_cycle 8 --max_cycles 20 --eval_every_cycles 5 \
+  --eval_command ".venv/bin/python evaluate_paired.py --candidate {checkpoint} --baseline /path/to/baseline --num-deals 1000 --output runs/v2/eval-{cycle}.json"
+```
+
+Cycle metrics contain cumulative counts, cycle/collection/optimization time,
+AMP fallback delta, checkpoint path/status/error, resume source, evaluation
+status/error, and peak CUDA memory when available. CPU reports peak memory as
+unavailable. Per-cycle records append to `<metrics-stem>-cycles.jsonl`; the
+requested `--metrics_path` is a small atomically replaced run summary. Resume
+appends to the existing JSONL history, and failure paths publish a `failed`
+summary with an error type. Metrics retain only checkpoint basenames and error
+classes, never absolute checkpoint/resume paths or exception messages. Cycle
+records are streamed rather than retained by the production controller, so
+metrics memory remains bounded. The summary retains its most recent cycle
+record after finalization, including failure finalization. Metrics summary and
+JSONL paths are resolved and rejected before any series write if they overlap
+the checkpoint base, latest/pending manifests, lock, or cycle namespace.
+Resume validates the complete metrics summary schema, run ID, and JSONL name;
+an orphan JSONL without its summary fails closed. These semantics are
+CPU-tested; CUDA soak and
+long-duration GPU stability are not validated here.
+
+Checkpoint sequence ordering is numeric rather than lexical, including after
+sequence 999999. Evaluation commands use platform-aware tokenization. A JSON
+string array is the unambiguous cross-platform form, especially for Windows
+paths containing backslashes or spaces:
+
+```powershell
+python train_v2.py --long_running ... `
+  --eval_every_cycles 5 `
+  --eval_command '["python", "evaluate_paired.py", "--candidate", "{checkpoint}"]'
+```
+
 ## Compile and transfer controls
 
 `pin_memory` enables pinned CPU batches and non-blocking learner transfers.
