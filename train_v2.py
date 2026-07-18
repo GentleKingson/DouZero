@@ -185,7 +185,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max_cycles", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--max_total_episodes", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--max_total_optimizer_steps", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--max_wall_time_minutes", type=float, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--max_wall_time_minutes",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Cumulative wall-time budget across checkpoint resume boundaries.",
+    )
     parser.add_argument("--checkpoint_every_cycles", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--checkpoint_every_steps", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--checkpoint_every_minutes", type=float, default=argparse.SUPPRESS)
@@ -666,12 +671,12 @@ def _resolve_resume_checkpoint(path: str) -> _ResumeCheckpoint:
         payload = json.loads(source.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return _ResumeCheckpoint(str(source))
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+    if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2}:
         return _ResumeCheckpoint(str(source))
 
     from douzero.training.long_running import CheckpointSeries, LongRunningState
 
-    CheckpointSeries._validate_manifest(payload)
+    payload = CheckpointSeries._validate_manifest(payload)
     latest = source.parent / payload["latest"]
     if not latest.is_file():
         raise FileNotFoundError(f"latest checkpoint does not exist: {latest}")
@@ -704,7 +709,8 @@ def _resolve_resume_checkpoint(path: str) -> _ResumeCheckpoint:
         f"{series.suffix}"
     )
     for candidate in source.parent.glob(pattern):
-        if candidate.name > latest.name:
+        sequence = series.checkpoint_sequence(candidate, run_id=payload["run_id"])
+        if sequence > payload["checkpoint_sequence"]:
             candidates.append(candidate)
     if candidates:
         if len(candidates) != 1:
@@ -1322,7 +1328,9 @@ def main() -> None:
                 if metrics_writer is not None:
                     metrics_writer.finalize(
                         status="failed",
-                        stop_reason=runner.stop.reason,
+                        stop_reason=(
+                            runner.last_stop_reason or runner.stop.reason
+                        ),
                         state=runner.state,
                         error=type(exc).__name__,
                     )

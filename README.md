@@ -205,7 +205,8 @@ that boundary; replay is not serialized or reconstructed. A fresh run refuses
 to reuse an existing checkpoint series, so resume it or select a new path.
 Cycle metrics append to `metrics-cycles.jsonl` while `metrics.json` remains an
 atomic, path-sanitized run summary. Manifest resume automatically continues
-the same checkpoint series and rejects a conflicting `--checkpoint_path`. See
+the same checkpoint series and rejects a conflicting `--checkpoint_path`.
+Wall-time limits are cumulative across resumes. See
 [the V2 long-running state machine](docs/training_system.md#long-running-v2-state-machine).
 
 V2 single GPU with checkpoint and metrics output (PowerShell):
@@ -359,7 +360,6 @@ operations, checkpoint/resume commands, and error-specific guidance.
 ## Acknowlegements
 *   The demo is largely based on [RLCard-Showdown](https://github.com/datamllab/rlcard-showdown)
 *   Code implementation is inspired by [TorchBeast](https://github.com/facebookresearch/torchbeast)
-
 
 
 

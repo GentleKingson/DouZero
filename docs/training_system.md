@@ -144,6 +144,11 @@ targets are clipped in the final cycle. Wall-clock expiry, `SIGINT`, and
 then the process checkpoints at the safe boundary and exits with an explicit
 `stop_reason`. `--no-save_on_interrupt` disables the extra signal/stop-event
 save, but not a checkpoint already due by another schedule.
+Wall time is cumulative across resumes: every clean boundary stores
+`total_wall_seconds`, and a resumed process receives only the remaining part
+of `--max_wall_time_minutes`. A collect-only configuration with
+`optimizer_steps_per_cycle=0` rejects an otherwise unreachable optimizer-step
+limit unless another cycle, episode, or wall-time limit can stop the run.
 
 Checkpoints are immutable sequence files written to a temporary file and
 published with `os.replace`. Only after that succeeds is `*-latest.json`
@@ -216,8 +221,21 @@ appends to the existing JSONL history, and failure paths publish a `failed`
 summary with an error type. Metrics retain only checkpoint basenames and error
 classes, never absolute checkpoint/resume paths or exception messages. Cycle
 records are streamed rather than retained by the production controller, so
-metrics memory remains bounded. These semantics are CPU-tested; CUDA soak and
+metrics memory remains bounded. The summary retains its most recent cycle
+record after finalization, including failure finalization. These semantics are
+CPU-tested; CUDA soak and
 long-duration GPU stability are not validated here.
+
+Checkpoint sequence ordering is numeric rather than lexical, including after
+sequence 999999. Evaluation commands use platform-aware tokenization. A JSON
+string array is the unambiguous cross-platform form, especially for Windows
+paths containing backslashes or spaces:
+
+```powershell
+python train_v2.py --long_running ... `
+  --eval_every_cycles 5 `
+  --eval_command '["python", "evaluate_paired.py", "--candidate", "{checkpoint}"]'
+```
 
 ## Compile and transfer controls
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import time
@@ -22,7 +23,7 @@ from threading import Event, current_thread, main_thread
 from typing import Callable
 
 
-_RUN_STATE_VERSION = 2
+_RUN_STATE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class LongRunningState:
     policy_step: int = 0
     resume_source: str = ""
     checkpoint_sequence: int = 0
+    total_wall_seconds: float = 0.0
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     run_state_version: int = _RUN_STATE_VERSION
     cycle_identity: dict[str, int] = field(default_factory=dict)
@@ -87,9 +89,12 @@ class LongRunningState:
         if not isinstance(payload, dict):
             raise ValueError("checkpoint long_running_state must be a dict")
         migrated = dict(payload)
-        if migrated.get("run_state_version") == 1:
+        if migrated.get("run_state_version") in {1, 2}:
+            previous_version = migrated["run_state_version"]
             migrated["run_state_version"] = _RUN_STATE_VERSION
-            migrated.setdefault("run_id", "legacy")
+            if previous_version == 1:
+                migrated.setdefault("run_id", "legacy")
+            migrated.setdefault("total_wall_seconds", 0.0)
         state = cls(**migrated)
         if state.run_state_version != _RUN_STATE_VERSION:
             raise ValueError("unsupported long-running checkpoint state version")
@@ -104,6 +109,16 @@ class LongRunningState:
             value = getattr(state, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"long-running state {name} must be a non-negative int")
+        if (
+            isinstance(state.total_wall_seconds, bool)
+            or not isinstance(state.total_wall_seconds, (int, float))
+            or not math.isfinite(state.total_wall_seconds)
+            or state.total_wall_seconds < 0
+        ):
+            raise ValueError(
+                "long-running state total_wall_seconds must be finite and non-negative"
+            )
+        state.total_wall_seconds = float(state.total_wall_seconds)
         return state
 
 
@@ -170,7 +185,7 @@ class CheckpointSeries:
 
     def _manifest_payload(self, state: LongRunningState, checkpoint: Path) -> dict:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "latest": checkpoint.name,
             "cycle": state.cycle,
             "total_episodes": state.total_episodes,
@@ -178,19 +193,30 @@ class CheckpointSeries:
             "policy_version": state.policy_version,
             "policy_step": state.policy_step,
             "checkpoint_sequence": state.checkpoint_sequence,
+            "total_wall_seconds": state.total_wall_seconds,
             "run_id": state.run_id,
         }
 
     @staticmethod
-    def _validate_manifest(payload: dict) -> None:
+    def _validate_manifest(payload: dict) -> dict:
+        if isinstance(payload, dict) and payload.get("schema_version") == 1:
+            old_required = {
+                "schema_version", "latest", "cycle", "total_episodes",
+                "total_optimizer_steps", "policy_version", "policy_step",
+                "checkpoint_sequence", "run_id",
+            }
+            if set(payload) == old_required:
+                payload = dict(payload)
+                payload["schema_version"] = 2
+                payload["total_wall_seconds"] = 0.0
         required = {
             "schema_version", "latest", "cycle", "total_episodes",
             "total_optimizer_steps", "policy_version", "policy_step",
-            "checkpoint_sequence", "run_id",
+            "checkpoint_sequence", "total_wall_seconds", "run_id",
         }
         if not isinstance(payload, dict) or set(payload) != required:
             raise ValueError("latest manifest has an invalid field set")
-        if payload["schema_version"] != 1:
+        if payload["schema_version"] != 2:
             raise ValueError("latest manifest has an unsupported schema_version")
         if (
             not isinstance(payload["latest"], str)
@@ -207,6 +233,17 @@ class CheckpointSeries:
                 raise ValueError(f"latest manifest {name} must be a non-negative int")
         if not isinstance(payload["policy_version"], str):
             raise ValueError("latest manifest policy_version must be text")
+        wall_seconds = payload["total_wall_seconds"]
+        if (
+            isinstance(wall_seconds, bool)
+            or not isinstance(wall_seconds, (int, float))
+            or not math.isfinite(wall_seconds)
+            or wall_seconds < 0
+        ):
+            raise ValueError(
+                "latest manifest total_wall_seconds must be finite and non-negative"
+            )
+        payload["total_wall_seconds"] = float(wall_seconds)
         run_id = payload["run_id"]
         if (
             not isinstance(run_id, str)
@@ -214,6 +251,7 @@ class CheckpointSeries:
             or not all(character.isalnum() or character in "-_" for character in run_id)
         ):
             raise ValueError("latest manifest run_id is invalid")
+        return payload
 
     def bind_resume(self, state: LongRunningState, checkpoint: str | Path) -> None:
         """Bind resume to this series and reconcile one committed orphan."""
@@ -234,8 +272,9 @@ class CheckpointSeries:
                 "long-running resume requires the checkpoint series latest manifest"
             )
 
-        payload = json.loads(self.latest_manifest.read_text(encoding="utf-8"))
-        self._validate_manifest(payload)
+        payload = self._validate_manifest(
+            json.loads(self.latest_manifest.read_text(encoding="utf-8"))
+        )
         if payload["run_id"] != state.run_id:
             raise ValueError("checkpoint series run_id mismatch")
         manifest_sequence = payload["checkpoint_sequence"]
@@ -260,8 +299,9 @@ class CheckpointSeries:
         if state.checkpoint_sequence:
             source = state.resume_source
             if not source and self.latest_manifest.exists():
-                payload = json.loads(self.latest_manifest.read_text(encoding="utf-8"))
-                self._validate_manifest(payload)
+                payload = self._validate_manifest(
+                    json.loads(self.latest_manifest.read_text(encoding="utf-8"))
+                )
                 source = str(self.latest_manifest.parent / payload["latest"])
             if not source:
                 raise ValueError("resumed long-running state has no checkpoint source")
@@ -282,6 +322,16 @@ class CheckpointSeries:
             f"{self.prefix}-run-{run_id}-seq-{sequence:06d}-cycle-{cycle:06d}"
             f"-step-{steps:012d}{self.suffix}"
         )
+
+    def checkpoint_sequence(self, path: str | Path, *, run_id: str) -> int:
+        pattern = re.compile(
+            rf"{re.escape(self.prefix)}-run-{re.escape(run_id)}-seq-(\d+)-"
+            rf"cycle-\d+-step-\d+{re.escape(self.suffix)}"
+        )
+        match = pattern.fullmatch(Path(path).name)
+        if match is None:
+            raise ValueError("checkpoint filename does not match its series")
+        return int(match.group(1))
 
     def publish(self, trainer, state: LongRunningState) -> Path:
         self.last_rotation_error = ""
@@ -322,7 +372,9 @@ class CheckpointSeries:
         run_id = current.name[len(marker):].split("-seq-", 1)[0]
         pattern = f"{self.prefix}-run-{run_id}-seq-*-cycle-*-step-*{self.suffix}"
         checkpoints = sorted(
-            self.base.parent.glob(pattern), key=lambda path: path.name, reverse=True
+            self.base.parent.glob(pattern),
+            key=lambda path: self.checkpoint_sequence(path, run_id=run_id),
+            reverse=True,
         )
         for old in checkpoints[self.keep_last:]:
             if old != current:
@@ -335,6 +387,7 @@ class RunMetricsWriter:
     def __init__(self, summary_path: str, *, run_id: str, resume: bool) -> None:
         self.summary_path = Path(summary_path)
         self.run_id = run_id
+        self._latest_cycle: dict | None = None
         suffix = self.summary_path.suffix or ".json"
         stem = (
             self.summary_path.name[:-len(suffix)]
@@ -354,8 +407,12 @@ class RunMetricsWriter:
                 raise ValueError(
                     "metrics run_id does not match the resumed checkpoint"
                 )
+            latest_cycle = payload.get("latest_cycle")
+            if isinstance(latest_cycle, dict):
+                self._latest_cycle = latest_cycle
 
     def write_cycle(self, record: dict) -> None:
+        self._latest_cycle = dict(record)
         encoded = json.dumps(record, sort_keys=True, allow_nan=False) + "\n"
         with self.cycles_path.open("a", encoding="utf-8") as stream:
             stream.write(encoded)
@@ -366,7 +423,7 @@ class RunMetricsWriter:
             stop_reason=str(record.get("stop_reason", "")),
             state=None,
             error="",
-            latest_cycle=record,
+            latest_cycle=self._latest_cycle,
         )
 
     def finalize(
@@ -383,7 +440,9 @@ class RunMetricsWriter:
             stop_reason=stop_reason,
             state=state,
             error=error,
-            latest_cycle=latest_cycle,
+            latest_cycle=(
+                latest_cycle if latest_cycle is not None else self._latest_cycle
+            ),
         )
 
     def _write_summary(
@@ -442,6 +501,7 @@ class LongRunningTrainer:
         self.clock = clock
         self.peak_memory = peak_memory or (lambda: None)
         self.collect_records = collect_records
+        self.last_stop_reason = ""
         self.state = state or LongRunningState(
             total_episodes=int(trainer.stats.episodes_completed),
             total_transitions=int(trainer.stats.transitions_collected),
@@ -456,7 +516,28 @@ class LongRunningTrainer:
                 f"{self.state.cycle_identity!r}, runtime expects {config.resume_identity()!r}"
             )
         self._validate_totals()
+        self._validate_reachable_limits()
         self.checkpoints.ensure_available(self.state)
+
+    def _validate_reachable_limits(self) -> None:
+        cfg = self.config
+        optimizer_limit_pending = (
+            cfg.max_total_optimizer_steps > self.state.total_optimizer_steps
+        )
+        alternate_limit = bool(
+            cfg.max_cycles
+            or cfg.max_total_episodes
+            or cfg.max_wall_time_minutes
+        )
+        if (
+            cfg.optimizer_steps_per_cycle == 0
+            and optimizer_limit_pending
+            and not alternate_limit
+        ):
+            raise ValueError(
+                "max_total_optimizer_steps is unreachable when "
+                "optimizer_steps_per_cycle is 0 without another stop limit"
+            )
 
     def _validate_totals(self) -> None:
         pairs = (
@@ -473,7 +554,7 @@ class LongRunningTrainer:
         if self.state.policy_version != str(self.trainer.policy_version):
             raise ValueError("long-running state policy_version does not match trainer")
 
-    def _limit_reason(self, elapsed: float) -> str:
+    def _limit_reason(self, total_wall_seconds: float) -> str:
         cfg, state = self.config, self.state
         if cfg.max_cycles and state.cycle >= cfg.max_cycles:
             return "max_cycles"
@@ -482,12 +563,16 @@ class LongRunningTrainer:
         if (cfg.max_total_optimizer_steps and
                 state.total_optimizer_steps >= cfg.max_total_optimizer_steps):
             return "max_total_optimizer_steps"
-        if cfg.max_wall_time_minutes and elapsed >= cfg.max_wall_time_minutes * 60.0:
+        if (
+            cfg.max_wall_time_minutes
+            and total_wall_seconds >= cfg.max_wall_time_minutes * 60.0
+        ):
             return "max_wall_time"
         return ""
 
     def run(self) -> tuple[LongRunningState, str, list[dict]]:
         started = self.clock()
+        base_wall_seconds = self.state.total_wall_seconds
         last_checkpoint_time = started
         last_checkpoint_steps = self.state.total_optimizer_steps
         last_checkpointed_cycle = (
@@ -499,10 +584,12 @@ class LongRunningTrainer:
         try:
             while True:
                 elapsed = self.clock() - started
-                reason = self._limit_reason(elapsed)
+                self.state.total_wall_seconds = base_wall_seconds + elapsed
+                reason = self._limit_reason(self.state.total_wall_seconds)
                 if self.stop.event.is_set():
                     reason = self.stop.reason or "stop_event"
                 if reason:
+                    self.last_stop_reason = reason
                     interrupt = reason in {"sigint", "sigterm", "stop_event"}
                     save_dirty_boundary = (
                         self.state.cycle > last_checkpointed_cycle
@@ -598,9 +685,12 @@ class LongRunningTrainer:
                 self.state.policy_version = str(self.trainer.policy_version)
 
                 now = self.clock()
-                boundary_reason = self._limit_reason(now - started)
+                self.state.total_wall_seconds = base_wall_seconds + now - started
+                boundary_reason = self._limit_reason(self.state.total_wall_seconds)
                 if self.stop.event.is_set():
                     boundary_reason = self.stop.reason or "stop_event"
+                if boundary_reason:
+                    self.last_stop_reason = boundary_reason
                 cycle_due = bool(
                     self.config.checkpoint_every_cycles
                     and self.state.cycle % self.config.checkpoint_every_cycles == 0
@@ -707,11 +797,30 @@ class LongRunningTrainer:
         return self.state, reason, records
 
 
-def command_evaluator(command: str) -> Callable[[Path, int], None]:
+def command_evaluator(
+    command: str, *, windows: bool | None = None
+) -> Callable[[Path, int], None]:
     """Build a no-shell callback for an existing evaluation CLI command."""
     import shlex
 
-    argv = shlex.split(command)
+    stripped = command.strip()
+    if stripped.startswith("["):
+        parsed = json.loads(stripped)
+        if not isinstance(parsed, list) or not all(
+            isinstance(part, str) and part for part in parsed
+        ):
+            raise ValueError("JSON eval_command must be a non-empty string array")
+        argv = parsed
+    else:
+        use_windows = os.name == "nt" if windows is None else windows
+        argv = shlex.split(command, posix=not use_windows)
+        if use_windows:
+            argv = [
+                part[1:-1]
+                if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'"
+                else part
+                for part in argv
+            ]
     if not argv:
         raise ValueError("eval_command must not be empty")
 

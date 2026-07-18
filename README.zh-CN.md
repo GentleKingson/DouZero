@@ -192,7 +192,8 @@ python train_v2.py --long_running --device cpu --seed 17 \
 中途 replay。全新训练不会复用已有 checkpoint 系列：必须恢复该系列或使用
 新路径。逐 cycle 指标追加到 `metrics-cycles.jsonl`，`metrics.json` 保持为
 原子更新且已清理路径信息的运行摘要。从 manifest 恢复会自动沿用原
-checkpoint 系列，并拒绝冲突的 `--checkpoint_path`。细节见
+checkpoint 系列，并拒绝冲突的 `--checkpoint_path`；墙钟上限会跨恢复累计。
+细节见
 [V2 长期训练状态机](docs/training_system.md#long-running-v2-state-machine)。
 
 V2 单 GPU，并输出 checkpoint 与 metrics（PowerShell）：

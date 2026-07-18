@@ -18,6 +18,7 @@ from douzero.training.long_running import (
     LongRunningTrainer,
     RunMetricsWriter,
     StopController,
+    command_evaluator,
 )
 
 
@@ -202,6 +203,85 @@ def test_wall_time_stops_after_current_boundary(tmp_path):
     assert records[-1]["checkpoint_status"] == "saved"
 
 
+def test_wall_time_budget_accumulates_across_resume(tmp_path):
+    class AdvancingClock:
+        def __init__(self):
+            self.value = 0.0
+
+        def __call__(self):
+            self.value += 1.0
+            return self.value
+
+    trainer = _DeterministicTrainer()
+    first = LongRunningTrainer(
+        trainer,
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=1,
+            max_cycles=1,
+            max_wall_time_minutes=10,
+        ),
+        CheckpointSeries(str(tmp_path / "wall.pt"), 2),
+        clock=AdvancingClock(),
+    )
+    state, reason, _ = first.run()
+    assert reason == "max_cycles"
+    saved_wall_seconds = state.total_wall_seconds
+    manifest = json.loads((tmp_path / "wall-latest.json").read_text())
+    checkpoint = tmp_path / manifest["latest"]
+
+    resumed = _DeterministicTrainer(seed=999)
+    resumed_state = LongRunningState.from_dict(
+        resumed.load_training_checkpoint(str(checkpoint))
+    )
+    resumed_state.resume_source = str(checkpoint)
+    second = LongRunningTrainer(
+        resumed,
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=1,
+            max_wall_time_minutes=(saved_wall_seconds + 0.5) / 60.0,
+        ),
+        CheckpointSeries(str(tmp_path / "wall.pt"), 2),
+        state=resumed_state,
+        clock=AdvancingClock(),
+    )
+    final_state, reason, _ = second.run()
+    assert reason == "max_wall_time"
+    assert final_state.cycle == 1
+    assert final_state.total_wall_seconds > saved_wall_seconds
+
+
+def test_unreachable_optimizer_only_limit_fails_closed(tmp_path):
+    trainer = _DeterministicTrainer()
+    with pytest.raises(ValueError, match="unreachable"):
+        LongRunningTrainer(
+            trainer,
+            LongRunningConfig(
+                episodes_per_cycle=1,
+                optimizer_steps_per_cycle=0,
+                max_total_optimizer_steps=1,
+                checkpoint_every_cycles=0,
+            ),
+            CheckpointSeries(str(tmp_path / "unreachable.pt"), 1),
+        )
+
+
+def test_zero_optimizer_steps_is_allowed_with_reachable_cycle_limit(tmp_path):
+    state, reason, _ = LongRunningTrainer(
+        _DeterministicTrainer(),
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=0,
+            max_total_optimizer_steps=1,
+            max_cycles=1,
+        ),
+        CheckpointSeries(str(tmp_path / "reachable.pt"), 1),
+    ).run()
+    assert reason == "max_cycles"
+    assert state.cycle == 1
+
+
 def test_stop_event_finishes_cycle_and_saves_boundary(tmp_path):
     stop = StopController(Event())
     trainer = _DeterministicTrainer(stop=stop)
@@ -342,6 +422,23 @@ def test_checkpoint_failure_keeps_previous_valid_checkpoint_and_manifest(tmp_pat
         _run(tmp_path, trainer, cycles=2, state=state)
     assert manifest_path.read_bytes() == previous_manifest
     assert previous_checkpoint.is_file()
+
+
+def test_checkpoint_failure_retains_boundary_stop_reason(tmp_path):
+    trainer = _DeterministicTrainer()
+    trainer.fail_save = True
+    runner = LongRunningTrainer(
+        trainer,
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=1,
+            max_cycles=1,
+        ),
+        CheckpointSeries(str(tmp_path / "failed.pt"), 1),
+    )
+    with pytest.raises(RuntimeError, match="checkpoint publication failed"):
+        runner.run()
+    assert runner.last_stop_reason == "max_cycles"
 
 
 def test_manifest_failure_is_reconciled_from_the_next_orphan(tmp_path):
@@ -527,6 +624,47 @@ def test_manifest_resume_reuses_series_when_checkpoint_path_is_omitted(tmp_path)
         _select_long_running_checkpoint_path(str(tmp_path / "other.pt"), resolved)
 
 
+def test_sequence_ordering_crosses_one_million_numerically(tmp_path):
+    trainer = _DeterministicTrainer()
+    state = LongRunningState(
+        cycle=999_998,
+        checkpoint_sequence=999_998,
+        policy_version=trainer.policy_version,
+        cycle_identity={"episodes_per_cycle": 1, "optimizer_steps_per_cycle": 0},
+    )
+    series = CheckpointSeries(str(tmp_path / "large.pt"), 2)
+    first = series.publish(trainer, state)
+    assert "seq-999999" in first.name
+
+    state.cycle += 1
+
+    def fail_manifest(_path, _payload):
+        raise OSError("injected manifest failure")
+
+    series._write_json_atomic = fail_manifest
+    with pytest.raises(OSError, match="manifest failure"):
+        series.publish(trainer, state)
+    orphan = next(tmp_path.glob("large-run-*-seq-1000000-*.pt"))
+    assert series.checkpoint_sequence(orphan, run_id=state.run_id) == 1_000_000
+
+    from train_v2 import _resolve_resume_checkpoint
+
+    resolved = _resolve_resume_checkpoint(str(tmp_path / "large-latest.json"))
+    assert Path(resolved.checkpoint) == orphan
+
+
+def test_rotation_orders_sequences_numerically_past_six_digits(tmp_path):
+    series = CheckpointSeries(str(tmp_path / "rotate-large.pt"), 1)
+    run_id = "numeric"
+    older = series.cycle_path(run_id, 999_999, 1, 1)
+    newest = series.cycle_path(run_id, 1_000_000, 2, 2)
+    older.write_bytes(b"older")
+    newest.write_bytes(b"newest")
+    series._rotate(newest)
+    assert newest.is_file()
+    assert not older.exists()
+
+
 def test_binary_json_checkpoint_is_not_misclassified_as_manifest(tmp_path):
     from train_v2 import _resolve_resume_checkpoint
 
@@ -578,6 +716,7 @@ def test_n_plus_m_resume_matches_uninterrupted_model_and_optimizer(tmp_path):
     continuous_payload = asdict(continuous_state)
     final_payload["resume_source"] = ""
     final_payload["run_id"] = continuous_payload["run_id"]
+    final_payload["total_wall_seconds"] = continuous_payload["total_wall_seconds"]
     assert final_payload == continuous_payload
     _assert_nested_equal(continuous.model.state_dict(), resumed.model.state_dict())
     _assert_nested_equal(
@@ -710,6 +849,7 @@ def test_metrics_are_append_only_across_resume_and_finalize_failure(tmp_path):
     assert payload["error"] == "RuntimeError"
     assert "cycles" not in payload
     assert payload["state"]["resume_source"] == "checkpoint.pt"
+    assert payload["latest_cycle"]["cycle"] == 2
 
 
 def test_fresh_metrics_writer_refuses_to_overwrite_existing_history(tmp_path):
@@ -767,3 +907,35 @@ def test_cycle_metrics_do_not_expose_absolute_paths(tmp_path):
     record = records[-1]
     assert record["checkpoint_path"] == Path(record["checkpoint_path"]).name
     assert record["resume_source"] == checkpoint.name
+
+
+def test_windows_evaluator_preserves_backslashes_and_quoted_paths(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "douzero.training.long_running.subprocess.run",
+        lambda argv, check: calls.append((argv, check)),
+    )
+    evaluator = command_evaluator(
+        '"C:\\Program Files\\Python\\python.exe" '
+        '--baseline "C:\\models\\baseline.pt" --candidate {checkpoint}',
+        windows=True,
+    )
+    evaluator(Path("candidate.pt"), 3)
+    argv, check = calls[0]
+    assert argv[0] == "C:\\Program Files\\Python\\python.exe"
+    assert argv[2] == "C:\\models\\baseline.pt"
+    assert argv[-1] == "candidate.pt"
+    assert check is True
+
+
+def test_evaluator_accepts_json_argv(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "douzero.training.long_running.subprocess.run",
+        lambda argv, check: calls.append(argv),
+    )
+    evaluator = command_evaluator(
+        '["python", "evaluate.py", "--candidate", "{checkpoint}"]'
+    )
+    evaluator(Path("candidate.pt"), 1)
+    assert calls == [["python", "evaluate.py", "--candidate", "candidate.pt"]]
