@@ -152,6 +152,11 @@ from their stored `model_inputs`; they never index the deliberately empty
 insertion and O(1) bucket eviction rather than rebuilding every bucket for each
 transition.
 
+Async checkpoint resume is accepted only before the runtime starts. Loading
+into a Trainer with live Actors fails before reading the checkpoint path;
+resume must construct a fresh Trainer so every Actor RNG really restarts from
+its configured environment and action seed domains.
+
 Every compact transition is validated twice at the async trust boundary:
 before its shared replay slot is returned to an actor, and again before
 batched insertion. Validation binds the feature-schema hash and compact schema

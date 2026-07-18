@@ -1823,7 +1823,10 @@ class V2Trainer:
         """Strictly restore a checkpoint saved by :meth:`save_training_checkpoint`."""
         self._require_single_process_checkpoint_io("resume")
         if self.async_mode and self._async_runtime_started:
-            self._quiesce_cycle_boundary(consume_interval_metrics=False)
+            raise RuntimeError(
+                "async checkpoint resume requires a fresh V2Trainer before "
+                "Actor startup; live Actors retain process-local RNG state"
+            )
         from douzero.checkpoint.io import CheckpointCompatibilityError
         from douzero.observation.bidding import (
             BIDDING_ACTION_SCHEMA_VERSION,

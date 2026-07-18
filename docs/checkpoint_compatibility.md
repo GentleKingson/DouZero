@@ -172,7 +172,9 @@ process-local Actor RNG states are not serialized. A v3 checkpoint is
 accepted only by `single_process`; v3 to async, v4 async to single-process,
 unknown versions, and unknown topology fail before model or optimizer state is
 mutated. Async resume is a safe empty cycle boundary, not a claim of bitwise
-N+M determinism.
+N+M determinism. Resume is rejected after Actor startup: callers must load into
+a fresh `V2Trainer`, then start Actors, so the declared restart-from-seeds RNG
+semantics cannot diverge from already-running process-local streams.
 
 ## Round-trip and tests
 

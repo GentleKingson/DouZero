@@ -921,6 +921,19 @@ def test_cross_topology_resume_is_rejected_before_restore(tmp_path):
     )
 
 
+def test_async_live_runtime_checkpoint_resume_fails_before_path_access():
+    class LocalRuntime:
+        enabled = False
+        world_size = 1
+
+    trainer = object.__new__(V2Trainer)
+    trainer.distributed = LocalRuntime()
+    trainer.async_mode = True
+    trainer._async_runtime_started = True
+    with pytest.raises(RuntimeError, match="requires a fresh V2Trainer"):
+        trainer.load_training_checkpoint("path-must-not-be-read.pt")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA host")
 def test_async_single_gpu_end_to_end_checkpoint_resume_and_shutdown(tmp_path):
     schema = build_v2_schema()
