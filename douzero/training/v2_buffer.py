@@ -698,8 +698,9 @@ class CompactTensorReplayBuffer:
             raise ValueError("capacity_transitions must be positive")
         self._capacity = int(capacity_transitions)
         self._records: deque[CompactTensorTransition] = deque()
-        self._buckets: dict[int | str, list[CompactTensorTransition]] = {
-            **{limit: [] for limit in ACTION_BUCKET_LIMITS}, "overflow": []
+        self._buckets: dict[int | str, deque[CompactTensorTransition]] = {
+            **{limit: deque() for limit in ACTION_BUCKET_LIMITS},
+            "overflow": deque(),
         }
 
     def __len__(self) -> int:
@@ -715,18 +716,24 @@ class CompactTensorReplayBuffer:
             records.clear()
 
     def add(self, record: CompactTensorTransition) -> None:
-        if record.schema_version != COMPACT_REPLAY_SCHEMA_VERSION:
-            raise ValueError("unknown compact replay schema version")
-        self._records.append(record)
-        if len(self._records) > self._capacity:
-            self._records.popleft()
-        self._rebuild_buckets()
+        self.add_many((record,))
 
-    def _rebuild_buckets(self) -> None:
-        for records in self._buckets.values():
-            records.clear()
-        for record in self._records:
+    def add_many(self, records: Iterable[CompactTensorTransition]) -> None:
+        """Append compact records while maintaining buckets incrementally."""
+        incoming = list(records)
+        for record in incoming:
+            if record.schema_version != COMPACT_REPLAY_SCHEMA_VERSION:
+                raise ValueError("unknown compact replay schema version")
+        for record in incoming:
+            self._records.append(record)
             self._buckets[record.bucket].append(record)
+            if len(self._records) <= self._capacity:
+                continue
+            evicted = self._records.popleft()
+            bucket = self._buckets[evicted.bucket]
+            bucket_record = bucket.popleft()
+            if bucket_record is not evicted:
+                raise RuntimeError("compact replay bucket order is corrupted")
 
     def bucket_occupancy(self) -> dict[int | str, int]:
         return {name: len(records) for name, records in self._buckets.items()}
@@ -738,7 +745,18 @@ class CompactTensorReplayBuffer:
             return None
         rng = rng or random
         eligible = [records for records in self._buckets.values() if len(records) >= batch_size]
-        source = rng.choice(eligible) if eligible else list(self._records)
+        if eligible:
+            total = sum(len(records) for records in eligible)
+            needle = rng.randrange(total)
+            selected = eligible[-1]
+            for records in eligible:
+                if needle < len(records):
+                    selected = records
+                    break
+                needle -= len(records)
+            source = list(selected)
+        else:
+            source = list(self._records)
         picks = rng.sample(source, batch_size)
         target = lambda name: torch.tensor(
             [record.targets[name] for record in picks], dtype=torch.float32

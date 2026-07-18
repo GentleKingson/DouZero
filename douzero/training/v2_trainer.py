@@ -762,8 +762,7 @@ class V2Trainer:
         records = self._async_replay_slots.read_ready(
             self.model.schema.stable_hash(), self.policy_version
         )
-        for record in records:
-            self.buffer.add(record)
+        self.buffer.add_many(records)
         return len(records)
 
     def _service_async_requests(self, wait_seconds: float = 0.001) -> int:
@@ -789,7 +788,9 @@ class V2Trainer:
                 for request in group
             ]
             batched = model_input_bundles_to_batch(bundles).to(self.device)
-            started = time.perf_counter()
+            gpu_started = torch.cuda.Event(enable_timing=True)
+            gpu_finished = torch.cuda.Event(enable_timing=True)
+            gpu_started.record()
             with torch.inference_mode(), self.mixed_precision.autocast():
                 output = self.inference_model.forward_batched(
                     batched.state_card_vectors,
@@ -802,25 +803,41 @@ class V2Trainer:
                     batched.action_mask,
                     batched.acting_role,
                 )
-            torch.cuda.synchronize(self.device)
-            self._async_inference_seconds += time.perf_counter() - started
+                packed_output = torch.stack(
+                    (
+                        output.win_logit.squeeze(-1),
+                        output.score_if_win.squeeze(-1),
+                        output.score_if_loss.squeeze(-1),
+                        output.p_win.squeeze(-1),
+                        output.score_mean.squeeze(-1),
+                    ),
+                    dim=-1,
+                ).float().contiguous()
+            gpu_finished.record()
+            # One group-level D2H transfer replaces five transfers per row.
+            # The blocking copy also completes the timing events, so no global
+            # device synchronization is needed on this request hot path.
+            packed_cpu = packed_output.cpu()
+            self._async_inference_seconds += (
+                gpu_started.elapsed_time(gpu_finished) / 1000.0
+            )
             for row, request in enumerate(group):
                 count = request.action_count
                 slots = self._async_coordinator.slots
                 slots.output_win[request.slot_id, :count].copy_(
-                    output.win_logit[row, :count, 0].detach().float().cpu()
+                    packed_cpu[row, :count, 0]
                 )
                 slots.output_score_win[request.slot_id, :count].copy_(
-                    output.score_if_win[row, :count, 0].detach().float().cpu()
+                    packed_cpu[row, :count, 1]
                 )
                 slots.output_score_loss[request.slot_id, :count].copy_(
-                    output.score_if_loss[row, :count, 0].detach().float().cpu()
+                    packed_cpu[row, :count, 2]
                 )
                 slots.output_p_win[request.slot_id, :count].copy_(
-                    output.p_win[row, :count, 0].detach().float().cpu()
+                    packed_cpu[row, :count, 3]
                 )
                 slots.output_score[request.slot_id, :count].copy_(
-                    output.score_mean[row, :count, 0].detach().float().cpu()
+                    packed_cpu[row, :count, 4]
                 )
                 self._async_coordinator.complete(request.slot_id)
                 if request.submitted_ns > 0:

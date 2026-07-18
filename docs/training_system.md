@@ -139,7 +139,16 @@ metadata. Actors make epsilon decisions with their local RNG and never own a
 CUDA tensor. The main process owns an independent inference model and learner
 model in one CUDA context, groups requests by immutable policy snapshot,
 action-count bucket and role, and publishes a complete inference state only at
-a quiescent boundary.
+a quiescent boundary. Compact replay selects eligible action buckets by
+occupancy, preserving transition-level sampling probability while reducing
+padding. Async replay drain uses incremental batched insertion and O(1)
+bucket eviction rather than rebuilding every bucket for each transition.
+
+Each inference group packs win, conditional-score, probability, and expected
+score outputs into one contiguous `[B, A, 5]` tensor and performs one blocking
+group-level device-to-host copy. CUDA events measure inference work without a
+hot-path global device synchronization; shared-slot writes then slice the
+single CPU staging tensor.
 
 | Combination | `single_process` | `async_single_gpu` |
 |---|---:|---:|
@@ -316,6 +325,20 @@ python benchmarks/bench_training_system.py --rounds 10
 
 It writes JSON and Markdown under `artifacts/benchmark/` and separately times
 actor environment steps, observation encoding, queue wait, learner
-forward/backward, weight publication, and legacy/factorized/V2 forward paths.
+forward/backward, weight publication, compact replay ingestion near capacity,
+and legacy/factorized/V2 forward paths.
 Unavailable CUDA AMP and DDP paths are recorded as `not_run`, never estimated.
 The first compile is intentionally not mixed into steady-state forward timing.
+
+On a CUDA host, run the bounded async topology smoke before benchmarking:
+
+```bash
+python -m pytest -q \
+  tests/test_v2_throughput.py::test_async_single_gpu_end_to_end_checkpoint_resume_and_shutdown
+```
+
+The smoke starts two spawned actors, collects games through centralized CUDA
+inference, performs optimizer steps, checks parameter updates and quiescence,
+saves and resumes a topology-bound checkpoint, and verifies worker shutdown.
+Passing CPU CI does not substitute for this CUDA execution or for the matched
+`single_process` versus `async_single_gpu` A/B benchmark.

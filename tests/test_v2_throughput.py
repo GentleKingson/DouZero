@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import random
 
@@ -21,6 +22,7 @@ from douzero.training.async_single_gpu import AsyncRequestCoordinator, SlotState
 from douzero.training.long_running import LongRunningTrainer
 from douzero.training.v2_buffer import (
     CompactTensorTransition,
+    CompactTensorReplayBuffer,
     Transition,
     action_count_bucket,
 )
@@ -79,6 +81,25 @@ def _scalar(model, obs):
         bundle.history_tokens, bundle.history_key_padding_mask,
         bundle.action_features, bundle.action_mask, bundle.acting_role,
     )
+
+
+def _compact_with_action_count(obs, action_count: int, policy_step: int):
+    transition = Transition(
+        obs=obs,
+        action_index=0,
+        position=obs.public.acting_role,
+        target_win=1.0,
+        target_score=1.0,
+        target_log_score=0.0,
+        policy_step=policy_step,
+    )
+    record = CompactTensorTransition.from_transition(transition)
+    bundle = copy.deepcopy(record.model_inputs)
+    row = bundle.action_features[:1]
+    bundle.action_features = row.repeat(action_count, 1)
+    bundle.action_mask = torch.ones(action_count, dtype=torch.bool)
+    record.model_inputs = bundle
+    return record
 
 
 def test_scalar_and_batched_forward_padding_and_gather_parity():
@@ -143,6 +164,40 @@ def test_compact_replay_round_trip_preserves_labels_and_provenance():
     assert torch.equal(
         restored.model_inputs.action_features, compact.model_inputs.action_features
     )
+
+
+def test_compact_replay_bucket_selection_is_weighted_by_occupancy():
+    obs = _observations(1)[0]
+    small = _compact_with_action_count(obs, 8, 1)
+    large = _compact_with_action_count(obs, 9, 2)
+    replay = CompactTensorReplayBuffer(capacity_transitions=4160)
+    replay.add_many([small] * 64 + [large] * 4096)
+    rng = random.Random(20260718)
+    small_bucket_samples = 0
+    rounds = 2000
+    for _ in range(rounds):
+        batch = replay.sample_minibatch(64, rng)
+        assert batch is not None and batch.model_inputs is not None
+        small_bucket_samples += int(
+            batch.model_inputs[0].action_features.shape[0] == 8
+        )
+    # Occupancy weighting predicts about 31 selections. Equal bucket weighting
+    # would produce about 1000 and is rejected with a deliberately wide bound.
+    assert 1 <= small_bucket_samples < 100
+
+
+def test_compact_replay_add_many_updates_and_evicts_buckets_incrementally():
+    obs = _observations(1)[0]
+    small = _compact_with_action_count(obs, 8, 1)
+    large = _compact_with_action_count(obs, 9, 2)
+    replay = CompactTensorReplayBuffer(capacity_transitions=128)
+    replay.add_many([small] * 96 + [large] * 32)
+    assert replay.bucket_occupancy()[8] == 96
+    assert replay.bucket_occupancy()[16] == 32
+    replay.add_many([large] * 64)
+    assert len(replay) == 128
+    assert replay.bucket_occupancy()[8] == 32
+    assert replay.bucket_occupancy()[16] == 96
 
 
 def test_shared_request_protocol_quiescence_timeout_and_shutdown():
@@ -246,4 +301,57 @@ def test_cross_topology_resume_is_rejected_before_restore(tmp_path):
     assert all(
         torch.equal(before[name], value)
         for name, value in trainer.model.state_dict().items()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA host")
+def test_async_single_gpu_end_to_end_checkpoint_resume_and_shutdown(tmp_path):
+    schema = build_v2_schema()
+    model_config = ModelV2Config(hidden_size=16, history_layers=1, history_heads=1)
+    trainer_config = TrainerConfig(
+        max_episodes=2,
+        optimizer_steps=1,
+        batch_size=1,
+        buffer_capacity=256,
+        exp_epsilon=0.1,
+        device="cuda",
+        v2_training_mode="async_single_gpu",
+        num_actors=2,
+    )
+    trainer = V2Trainer(ModelV2(schema, model_config), config=trainer_config)
+    checkpoint = tmp_path / "async.pt"
+    workers = []
+    try:
+        trainer.collect_episodes(2)
+        boundary = trainer.quiesce_cycle_boundary()
+        assert boundary["in_flight_slots"] == 0
+        before = {
+            name: value.detach().clone()
+            for name, value in trainer.model.state_dict().items()
+        }
+        assert trainer.step() is not None
+        assert any(
+            not torch.equal(before[name], value)
+            for name, value in trainer.model.state_dict().items()
+        )
+        trainer.save_training_checkpoint(str(checkpoint))
+        workers = list(trainer._async_workers)
+    finally:
+        trainer.shutdown()
+    assert workers and all(not process.is_alive() for process in workers)
+
+    resumed = V2Trainer(ModelV2(schema, model_config), config=trainer_config)
+    resumed_workers = []
+    try:
+        resumed.load_training_checkpoint(str(checkpoint))
+        assert resumed.stats.optimizer_steps == 1
+        resumed.collect_episodes(2)
+        assert resumed.step() is not None
+        boundary = resumed.quiesce_cycle_boundary()
+        assert boundary["active_slots"] == 0
+        resumed_workers = list(resumed._async_workers)
+    finally:
+        resumed.shutdown()
+    assert resumed_workers and all(
+        not process.is_alive() for process in resumed_workers
     )
