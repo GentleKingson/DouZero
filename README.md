@@ -226,6 +226,9 @@ The current async support scope is deliberately narrow: base legacy-ruleset
 V2 card play only. Standard bidding, league, curriculum, RL+BC, style,
 strategy features/auxiliaries, and belief fusion fail before workers start.
 `single_process` remains the default and retains all existing combinations.
+Compact replay records are schema-, tensor-, action-, label-, and provenance-
+validated before shared slots are released and before replay insertion. Actor
+failure and shutdown use spawn-shared signals so blocked peers exit promptly.
 
 V2 single GPU with checkpoint and metrics output (PowerShell):
 
@@ -378,5 +381,4 @@ operations, checkpoint/resume commands, and error-specific guidance.
 ## Acknowlegements
 *   The demo is largely based on [RLCard-Showdown](https://github.com/datamllab/rlcard-showdown)
 *   Code implementation is inspired by [TorchBeast](https://github.com/facebookresearch/torchbeast)
-
 

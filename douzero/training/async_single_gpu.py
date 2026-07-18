@@ -27,7 +27,7 @@ from douzero.observation.schema import (
     history_token_width,
     state_width,
 )
-from douzero.training.v2_buffer import action_count_bucket
+from douzero.training.v2_buffer import action_count_bucket, compact_model_input_shapes
 
 
 def _shared_tensor(shape, dtype=torch.float32):
@@ -204,6 +204,7 @@ class SharedReplaySlots:
     def __init__(self, schema, num_slots: int, max_actions: int = 256) -> None:
         self.context = mp.get_context("spawn")
         self.observations = SharedObservationSlots(schema, num_slots, max_actions)
+        self._validation_shapes = compact_model_input_shapes(schema)
         self._shared_owners = []
         self._shared_specs = []
         self.labels, owner = _shared_tensor((num_slots, len(self.TARGET_NAMES)))
@@ -244,12 +245,20 @@ class SharedReplaySlots:
 
     def write_transition(
         self, transition, bundle: ModelInputBundle, policy_step: int,
-        timeout_seconds: float,
+        timeout_seconds: float, abort_event=None,
     ) -> None:
-        try:
-            slot_id = int(self.free_queue.get(timeout=timeout_seconds))
-        except queue.Empty as exc:
-            raise TimeoutError("timed out waiting for a shared replay slot") from exc
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            if abort_event is not None and abort_event.is_set():
+                raise RuntimeError("async runtime aborted while waiting for replay slot")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for a shared replay slot")
+            try:
+                slot_id = int(self.free_queue.get(timeout=min(0.05, remaining)))
+                break
+            except queue.Empty:
+                continue
         self.observations.write(slot_id, bundle)
         self.action_indices[slot_id] = transition.action_index
         self.trace_indices[slot_id] = transition.trace_index
@@ -299,6 +308,10 @@ class SharedReplaySlots:
                 policy_step=int(self.policy_steps[slot_id]),
                 schema_version=COMPACT_REPLAY_SCHEMA_VERSION,
             ))
+            records[-1].validate(
+                feature_schema_hash,
+                expected_tensor_shapes=self._validation_shapes,
+            )
             self.free_queue.put(slot_id)
         return records
 
@@ -350,8 +363,9 @@ class AsyncRequestCoordinator:
             self.free_queue.put(slot_id)
         self.request_timeout_seconds = float(request_timeout_seconds)
         self._submitted_at: dict[int, float] = {}
-        self._failure: str = ""
-        self._shutdown = False
+        self.abort_event = self.context.Event()
+        self.shutdown_event = self.context.Event()
+        self.failure_message = self.context.Array(ctypes.c_char, 1024, lock=True)
         self.active_games = 0
         self.completed_episodes_pending = 0
 
@@ -373,18 +387,29 @@ class AsyncRequestCoordinator:
             setattr(self, name, _restore_shared_tensor(owner, shape, dtype))
 
     def _raise_if_failed(self) -> None:
-        if self._failure:
-            raise RuntimeError(f"async actor runtime failed: {self._failure}")
-        if self._shutdown:
+        if self.abort_event.is_set():
+            with self.failure_message.get_lock():
+                reason = bytes(self.failure_message.value).decode("utf-8", "replace")
+            raise RuntimeError(
+                f"async actor runtime failed: {reason or 'unknown worker failure'}"
+            )
+        if self.shutdown_event.is_set():
             raise RuntimeError("async actor runtime is shut down")
 
     def acquire(self, actor_id: int, timeout: float | None = None) -> int:
         self._raise_if_failed()
         timeout = self.request_timeout_seconds if timeout is None else timeout
-        try:
-            slot_id = int(self.free_queue.get(timeout=timeout))
-        except queue.Empty as exc:
-            raise TimeoutError("timed out waiting for a free inference slot") from exc
+        deadline = time.monotonic() + timeout
+        while True:
+            self._raise_if_failed()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for a free inference slot")
+            try:
+                slot_id = int(self.free_queue.get(timeout=min(0.05, remaining)))
+                break
+            except queue.Empty:
+                continue
         if int(self.states[slot_id]) != SlotState.FREE:
             raise RuntimeError("free queue returned a non-FREE slot")
         self.states[slot_id] = int(SlotState.WRITING)
@@ -464,7 +489,11 @@ class AsyncRequestCoordinator:
         self.free_queue.put(slot_id)
 
     def fail(self, reason: str) -> None:
-        self._failure = str(reason) or "unknown worker failure"
+        message = (str(reason) or "unknown worker failure").encode("utf-8")[:1023]
+        with self.failure_message.get_lock():
+            if not self.failure_message.value:
+                self.failure_message.value = message
+        self.abort_event.set()
         for slot_id in range(len(self.states)):
             if int(self.states[slot_id]) not in {
                 SlotState.FREE, SlotState.DONE, SlotState.SHUTDOWN
@@ -484,9 +513,9 @@ class AsyncRequestCoordinator:
         return counts
 
     def shutdown(self) -> None:
-        if self._shutdown:
+        if self.shutdown_event.is_set():
             return
-        self._shutdown = True
+        self.shutdown_event.set()
         for slot_id in range(len(self.states)):
             self.states[slot_id] = int(SlotState.SHUTDOWN)
         self.ready_queue.close()
@@ -525,7 +554,11 @@ def async_actor_main(
     request_id = actor_id << 48
     try:
         while True:
-            task = task_queue.get()
+            coordinator._raise_if_failed()
+            try:
+                task = task_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
             if task is None:
                 return
             episode_id = int(task)
@@ -606,6 +639,7 @@ def async_actor_main(
                     observation_to_model_inputs(transition.obs),
                     snapshot,
                     coordinator.request_timeout_seconds,
+                    coordinator.abort_event,
                 )
             team = episode.terminal_result.get("winner_team", "landlord")
             event_queue.put((
@@ -614,6 +648,7 @@ def async_actor_main(
                 len(episode.action_trace),
             ))
     except BaseException as exc:
-        coordinator.fail(f"actor {actor_id}: {type(exc).__name__}: {exc}")
-        event_queue.put(("failed", actor_id, type(exc).__name__))
+        message = f"actor {actor_id}: {type(exc).__name__}: {exc}"
+        coordinator.fail(message)
+        event_queue.put(("failed", actor_id, message))
         raise

@@ -604,9 +604,16 @@ class V2Trainer:
             eps=self.config.rmsprop_epsilon,
         )
         if self.async_mode:
-            from douzero.training.v2_buffer import CompactTensorReplayBuffer
+            from douzero.training.v2_buffer import (
+                CompactTensorReplayBuffer,
+                compact_model_input_shapes,
+            )
 
-            self.buffer = CompactTensorReplayBuffer(self.config.buffer_capacity)
+            self.buffer = CompactTensorReplayBuffer(
+                self.config.buffer_capacity,
+                expected_schema_hash=self.model.schema.stable_hash(),
+                expected_tensor_shapes=compact_model_input_shapes(self.model.schema),
+            )
         else:
             self.buffer = V2ReplayBuffer(capacity_transitions=self.config.buffer_capacity)
         self.bidding_buffer = BiddingReplayBuffer(self.config.buffer_capacity)
@@ -765,10 +772,16 @@ class V2Trainer:
         self._async_inference_seconds = 0.0
 
     def _drain_async_replay(self) -> int:
-        records = self._async_replay_slots.read_ready(
-            self.model.schema.stable_hash(), self.policy_version
-        )
-        self.buffer.add_many(records)
+        try:
+            records = self._async_replay_slots.read_ready(
+                self.model.schema.stable_hash(), self.policy_version
+            )
+            self.buffer.add_many(records)
+        except BaseException as exc:
+            self._async_coordinator.fail(
+                f"shared replay validation failed: {type(exc).__name__}: {exc}"
+            )
+            raise
         return len(records)
 
     def _service_async_requests(self, wait_seconds: float = 0.001) -> int:

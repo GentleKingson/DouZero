@@ -147,6 +147,13 @@ without starving rare decisions. Async replay drain uses incremental batched
 insertion and O(1) bucket eviction rather than rebuilding every bucket for each
 transition.
 
+Every compact transition is validated twice at the async trust boundary:
+before its shared replay slot is returned to an actor, and again before
+batched insertion. Validation binds the feature-schema hash and compact schema
+version, checks every tensor's CPU device, dtype and structural shape, verifies
+the acting role and selected legal action, and rejects non-finite, partial, or
+out-of-domain labels and malformed policy provenance.
+
 Each inference group packs win, conditional-score, probability, and expected
 score outputs into one contiguous `[B, A, 5]` tensor and performs one blocking
 group-level device-to-host copy. CUDA events measure inference work without a
@@ -170,7 +177,12 @@ synchronization in the inference and learner hot paths.
 
 Async startup requires CUDA and never silently falls back. Request timeout,
 worker exit, invalid state transition, and bounded shutdown all fail the run
-instead of waiting indefinitely. Cycle quiescence requires no active games,
+instead of waiting indefinitely. Abort and shutdown are spawn-shared events,
+not process-local flags; slot acquisition, response waits, replay-slot waits,
+actor task loops, and the coordinator service all observe the same state. The
+first failure reason is stored in shared memory so a failure in one actor wakes
+other actors blocked on slots without waiting for their request timeout. Cycle
+quiescence requires no active games,
 no WRITING/READY/RUNNING slots, and no completed episode waiting to enter
 compact replay. Replay is then cleared through the trainer lifecycle API,
 preserving the existing P0 cycle-boundary rule.

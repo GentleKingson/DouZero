@@ -20,7 +20,11 @@ from douzero.models_v2 import (
 )
 from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.observation.encode_v2 import LegalActionBatch
-from douzero.training.async_single_gpu import AsyncRequestCoordinator, SlotState
+from douzero.training.async_single_gpu import (
+    AsyncRequestCoordinator,
+    SharedReplaySlots,
+    SlotState,
+)
 from douzero.training.long_running import LongRunningTrainer
 from douzero.training.v2_buffer import (
     CompactTensorTransition,
@@ -29,12 +33,26 @@ from douzero.training.v2_buffer import (
     Episode,
     V2ReplayBuffer,
     action_count_bucket,
+    compact_model_input_shapes,
 )
 from douzero.training.v2_trainer import TrainerConfig, V2Trainer
 
 
 def _spawn_protocol_probe(coordinator, output_queue):
     output_queue.put((coordinator.context.get_start_method(), int(coordinator.states[0])))
+
+
+def _blocked_acquire_probe(coordinator, output_queue):
+    started = __import__("time").monotonic()
+    try:
+        coordinator.acquire(actor_id=9, timeout=10.0)
+    except BaseException as exc:
+        output_queue.put((type(exc).__name__, str(exc), __import__("time").monotonic() - started))
+
+
+def _failing_actor_probe(coordinator):
+    __import__("time").sleep(0.1)
+    coordinator.fail("actor 4: injected replay write failure")
 
 
 class _LocalDDPContext:
@@ -184,6 +202,72 @@ def test_compact_replay_round_trip_preserves_labels_and_provenance():
     )
 
 
+def test_compact_replay_validates_schema_tensors_actions_and_labels_at_entry():
+    obs = _observations(1)[0]
+    valid = _compact_with_action_count(obs, 8, 3)
+    expected_hash = valid.model_inputs.feature_schema_hash
+    replay = CompactTensorReplayBuffer(
+        capacity_transitions=8,
+        expected_schema_hash=expected_hash,
+        expected_tensor_shapes=compact_model_input_shapes(build_v2_schema()),
+    )
+
+    bad_hash = copy.deepcopy(valid)
+    bad_hash.model_inputs.feature_schema_hash = "wrong-schema"
+    with pytest.raises(ValueError, match="schema hash"):
+        replay.add(bad_hash)
+
+    bad_dtype = copy.deepcopy(valid)
+    bad_dtype.model_inputs.action_features = bad_dtype.model_inputs.action_features.float()
+    with pytest.raises(TypeError, match="action_features must have dtype"):
+        replay.add(bad_dtype)
+
+    bad_shape = copy.deepcopy(valid)
+    bad_shape.model_inputs.history_tokens = bad_shape.model_inputs.history_tokens[:-1]
+    with pytest.raises(ValueError, match="history.*shape"):
+        replay.add(bad_shape)
+
+    masked = copy.deepcopy(valid)
+    masked.model_inputs.action_mask[masked.action_index] = False
+    with pytest.raises(ValueError, match="chosen action is masked"):
+        replay.add(masked)
+
+    partial_aux = copy.deepcopy(valid)
+    partial_aux.targets["target_min_turns_after"] = 1.0
+    with pytest.raises(ValueError, match="partially populated"):
+        replay.add(partial_aux)
+    assert len(replay) == 0
+
+
+def test_shared_replay_validates_before_returning_slot_to_writer():
+    schema = build_v2_schema()
+    obs = _observations(1)[0]
+    transition = Transition(
+        obs=obs,
+        action_index=0,
+        position=obs.public.acting_role,
+        target_win=1.0,
+        target_score=1.0,
+        target_log_score=0.0,
+    )
+    slots = SharedReplaySlots(schema, num_slots=1)
+    try:
+        slots.write_transition(
+            transition, observation_to_model_inputs(obs), 0, timeout_seconds=1.0
+        )
+        slots.action_indices[0] = len(obs.actions.legal_actions)
+        __import__("time").sleep(0.05)
+        with pytest.raises(ValueError, match="action_index is outside"):
+            slots.read_ready(schema.stable_hash(), "snapshot")
+        with pytest.raises(TimeoutError, match="shared replay slot"):
+            slots.write_transition(
+                transition, observation_to_model_inputs(obs), 0,
+                timeout_seconds=0.01,
+            )
+    finally:
+        slots.close()
+
+
 def test_compact_replay_global_sampling_includes_sub_batch_bucket_and_is_uniform():
     obs = _observations(1)[0]
     small = _compact_with_action_count(obs, 8, 1)
@@ -284,6 +368,40 @@ def test_shared_request_protocol_is_spawn_picklable():
     assert output.get(timeout=1) == ("spawn", int(SlotState.FREE))
     output.close()
     coordinator.shutdown()
+
+
+def test_actor_failure_aborts_another_process_blocked_on_inference_slot():
+    coordinator = AsyncRequestCoordinator(
+        build_v2_schema(), num_slots=1, request_timeout_seconds=10.0
+    )
+    held_slot = coordinator.acquire(actor_id=1)
+    output = coordinator.context.Queue()
+    blocked = coordinator.context.Process(
+        target=_blocked_acquire_probe, args=(coordinator, output)
+    )
+    failing = coordinator.context.Process(
+        target=_failing_actor_probe, args=(coordinator,)
+    )
+    try:
+        blocked.start()
+        failing.start()
+        failing.join(2.0)
+        blocked.join(2.0)
+        assert failing.exitcode == 0
+        assert blocked.exitcode == 0
+        error_type, message, elapsed = output.get(timeout=1.0)
+        assert error_type == "RuntimeError"
+        assert "injected replay write failure" in message
+        assert elapsed < 1.0
+        assert coordinator.abort_event.is_set()
+        assert SlotState(int(coordinator.states[held_slot])) == SlotState.FAILED
+    finally:
+        for process in (blocked, failing):
+            if process.is_alive():
+                process.terminate()
+                process.join(1.0)
+        output.close()
+        coordinator.shutdown()
 
 
 def test_long_running_controller_has_no_concrete_buffer_access():

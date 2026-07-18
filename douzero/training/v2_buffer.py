@@ -37,6 +37,12 @@ from typing import Iterable
 import torch
 
 from douzero.observation.encode_v2 import ObservationV2
+from douzero.observation.schema import (
+    action_width,
+    context_width,
+    history_token_width,
+    state_width,
+)
 from douzero.models_v2.batch import ModelInputBundle, observation_to_model_inputs
 
 COMPACT_REPLAY_SCHEMA_VERSION = 1
@@ -58,6 +64,20 @@ def action_count_bucket(action_count: int) -> int | str:
 _VALID_POSITIONS: frozenset[str] = frozenset(
     {"landlord", "landlord_up", "landlord_down"}
 )
+
+
+def compact_model_input_shapes(schema) -> dict[str, tuple[int, ...] | int]:
+    """Return exact fixed tensor dimensions bound by a feature schema."""
+    card_dim = schema.card_vector_dim
+    return {
+        "state_card_vector": (card_dim,),
+        "state_context_flat": (state_width(schema) - 6 * card_dim,),
+        "context_card_vector": (card_dim,),
+        "context_flat": (context_width(schema) - 2 * card_dim,),
+        "history_tokens": (schema.max_history_len, history_token_width(schema)),
+        "history_key_padding_mask": (schema.max_history_len,),
+        "action_width": action_width(schema),
+    }
 
 
 @dataclass
@@ -226,6 +246,148 @@ class CompactTensorTransition:
     policy_step: int
     schema_version: int = COMPACT_REPLAY_SCHEMA_VERSION
 
+    _TARGET_NAMES = (
+        "target_win", "target_score", "target_log_score",
+        "target_min_turns_after", "target_min_turns_exact_mask",
+        "target_regain_initiative", "target_teammate_finish",
+        "target_teammate_finish_mask", "target_spring_probability",
+        "target_structure_cost",
+    )
+
+    def validate(
+        self,
+        expected_schema_hash: str,
+        *,
+        expected_tensor_shapes: dict[str, tuple[int, ...] | int] | None = None,
+    ) -> None:
+        """Fail closed on compact records before they enter replay."""
+        if self.schema_version != COMPACT_REPLAY_SCHEMA_VERSION:
+            raise ValueError("unknown compact replay schema version")
+        if not isinstance(expected_schema_hash, str) or not expected_schema_hash:
+            raise ValueError("expected compact replay schema hash must be non-empty")
+        bundle = self.model_inputs
+        if bundle.feature_schema_hash != expected_schema_hash:
+            raise ValueError("compact replay feature schema hash mismatch")
+        if bundle.acting_role not in _VALID_POSITIONS:
+            raise ValueError("compact replay has unsupported acting role")
+        if self.position != bundle.acting_role:
+            raise ValueError("compact replay position does not match acting role")
+
+        def tensor(name: str, value: torch.Tensor, dtype: torch.dtype, ndim: int) -> None:
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"compact replay {name} must be a tensor")
+            if value.device.type != "cpu":
+                raise ValueError(f"compact replay {name} must be on CPU")
+            if value.dtype != dtype:
+                raise TypeError(
+                    f"compact replay {name} must have dtype {dtype}, got {value.dtype}"
+                )
+            if value.ndim != ndim:
+                raise ValueError(
+                    f"compact replay {name} must have rank {ndim}, got {value.ndim}"
+                )
+
+        if len(bundle.state_card_vectors) != 6 or len(bundle.context_card_vectors) != 2:
+            raise ValueError("compact replay card-vector field count is invalid")
+        for index, value in enumerate(bundle.state_card_vectors):
+            tensor(f"state_card_vectors[{index}]", value, torch.int8, 1)
+        tensor("state_context_flat", bundle.state_context_flat, torch.int8, 1)
+        for index, value in enumerate(bundle.context_card_vectors):
+            tensor(f"context_card_vectors[{index}]", value, torch.int8, 1)
+        tensor("context_flat", bundle.context_flat, torch.int32, 1)
+        tensor("history_tokens", bundle.history_tokens, torch.int8, 2)
+        tensor("history_key_padding_mask", bundle.history_key_padding_mask, torch.bool, 1)
+        if bundle.history_tokens.shape[0] != bundle.history_key_padding_mask.shape[0]:
+            raise ValueError("compact replay history mask shape is invalid")
+        tensor("action_features", bundle.action_features, torch.int8, 2)
+        tensor("action_mask", bundle.action_mask, torch.bool, 1)
+        if bundle.action_features.shape[0] != bundle.action_mask.shape[0]:
+            raise ValueError("compact replay action mask shape is invalid")
+        if bundle.action_features.shape[0] < 1 or bundle.action_features.shape[1] < 1:
+            raise ValueError("compact replay must contain action features")
+        if expected_tensor_shapes is not None:
+            exact = (
+                ("state_context_flat", bundle.state_context_flat),
+                ("context_flat", bundle.context_flat),
+                ("history_tokens", bundle.history_tokens),
+                ("history_key_padding_mask", bundle.history_key_padding_mask),
+            )
+            for name, value in exact:
+                if tuple(value.shape) != tuple(expected_tensor_shapes[name]):
+                    raise ValueError(f"compact replay {name} shape is invalid")
+            if any(
+                tuple(value.shape) != tuple(expected_tensor_shapes["state_card_vector"])
+                for value in bundle.state_card_vectors
+            ):
+                raise ValueError("compact replay state card-vector shape is invalid")
+            if any(
+                tuple(value.shape) != tuple(expected_tensor_shapes["context_card_vector"])
+                for value in bundle.context_card_vectors
+            ):
+                raise ValueError("compact replay context card-vector shape is invalid")
+            if bundle.action_features.shape[1] != expected_tensor_shapes["action_width"]:
+                raise ValueError("compact replay action feature width is invalid")
+        if not bool(bundle.action_mask.any()):
+            raise ValueError("compact replay has zero legal actions")
+        if isinstance(self.action_index, bool) or not isinstance(self.action_index, int):
+            raise TypeError("compact replay action_index must be an int")
+        if not 0 <= self.action_index < self.action_count:
+            raise ValueError("compact replay action_index is outside the action range")
+        if not bool(bundle.action_mask[self.action_index]):
+            raise ValueError("compact replay chosen action is masked")
+
+        for name, value in (
+            ("strategy_features", bundle.strategy_features),
+            ("style_features", bundle.style_features),
+        ):
+            if value is not None:
+                tensor(name, value, torch.float32, 2 if name == "strategy_features" else 1)
+        if (
+            bundle.strategy_features is not None
+            and bundle.strategy_features.shape[0] != self.action_count
+        ):
+            raise ValueError("compact replay strategy feature shape is invalid")
+
+        if set(self.targets) != set(self._TARGET_NAMES):
+            raise ValueError("compact replay target fields do not match the schema")
+        for name in ("target_win", "target_score", "target_log_score"):
+            if not math.isfinite(self.targets[name]):
+                raise ValueError(f"compact replay {name} must be finite")
+        if self.targets["target_win"] not in (0.0, 1.0):
+            raise ValueError("compact replay target_win must be binary")
+        auxiliary = [self.targets[name] for name in self._TARGET_NAMES[3:]]
+        if not (all(math.isnan(value) for value in auxiliary) or all(
+            math.isfinite(value) for value in auxiliary
+        )):
+            raise ValueError("compact replay auxiliary labels are partially populated")
+        if all(math.isfinite(value) for value in auxiliary):
+            for name in (
+                "target_min_turns_exact_mask", "target_regain_initiative",
+                "target_teammate_finish", "target_teammate_finish_mask",
+                "target_spring_probability",
+            ):
+                if self.targets[name] not in (0.0, 1.0):
+                    raise ValueError(f"compact replay {name} must be binary")
+            if (
+                self.targets["target_min_turns_after"] < 0
+                or self.targets["target_structure_cost"] < 0
+            ):
+                raise ValueError("compact replay regression labels must be non-negative")
+        if isinstance(self.trace_index, bool) or not isinstance(self.trace_index, int):
+            raise TypeError("compact replay trace_index must be an int")
+        if self.trace_index < -1:
+            raise ValueError("compact replay trace_index must be -1 or non-negative")
+        if not isinstance(self.policy_id, str) or not isinstance(self.policy_version, str):
+            raise TypeError("compact replay policy provenance must be strings")
+        if self.teammate_policy_id is not None and not isinstance(
+            self.teammate_policy_id, str
+        ):
+            raise TypeError("compact replay teammate_policy_id must be a string or None")
+        if isinstance(self.policy_step, bool) or not isinstance(self.policy_step, int):
+            raise TypeError("compact replay policy_step must be an int")
+        if self.policy_step < -1:
+            raise ValueError("compact replay policy_step must be -1 or non-negative")
+
     @classmethod
     def from_transition(
         cls,
@@ -276,7 +438,7 @@ class CompactTensorTransition:
             "target_teammate_finish_mask", "target_spring_probability",
             "target_structure_cost",
         )
-        return cls(
+        record = cls(
             model_inputs=bundle,
             action_index=transition.action_index,
             position=transition.position,
@@ -287,6 +449,8 @@ class CompactTensorTransition:
             policy_version=transition.policy_version,
             policy_step=transition.policy_step,
         )
+        record.validate(bundle.feature_schema_hash)
+        return record
 
     @property
     def action_count(self) -> int:
@@ -344,7 +508,7 @@ class CompactTensorTransition:
             strategy_features=values.get("strategy_features"),
             style_features=values.get("style_features"),
         )
-        return cls(
+        record = cls(
             model_inputs=bundle,
             action_index=int(raw["action_index"]),
             position=str(raw["position"]),
@@ -355,6 +519,8 @@ class CompactTensorTransition:
             policy_version=str(raw["policy_version"]),
             policy_step=int(raw["policy_step"]),
         )
+        record.validate(bundle.feature_schema_hash)
+        return record
 
 
 @dataclass
@@ -682,10 +848,18 @@ class V2ReplayBuffer:
 class CompactTensorReplayBuffer:
     """Bounded bucketed replay containing no environment Python objects."""
 
-    def __init__(self, capacity_transitions: int = 4096) -> None:
+    def __init__(
+        self,
+        capacity_transitions: int = 4096,
+        *,
+        expected_schema_hash: str | None = None,
+        expected_tensor_shapes: dict[str, tuple[int, ...] | int] | None = None,
+    ) -> None:
         if capacity_transitions < 1:
             raise ValueError("capacity_transitions must be positive")
         self._capacity = int(capacity_transitions)
+        self._expected_schema_hash = expected_schema_hash
+        self._expected_tensor_shapes = expected_tensor_shapes
         self._records: deque[CompactTensorTransition] = deque()
         self._buckets: dict[int | str, deque[CompactTensorTransition]] = {
             **{limit: deque() for limit in ACTION_BUCKET_LIMITS},
@@ -710,9 +884,16 @@ class CompactTensorReplayBuffer:
     def add_many(self, records: Iterable[CompactTensorTransition]) -> None:
         """Append compact records while maintaining buckets incrementally."""
         incoming = list(records)
+        expected_hash = self._expected_schema_hash or (
+            incoming[0].model_inputs.feature_schema_hash if incoming else None
+        )
         for record in incoming:
-            if record.schema_version != COMPACT_REPLAY_SCHEMA_VERSION:
-                raise ValueError("unknown compact replay schema version")
+            record.validate(
+                expected_hash,
+                expected_tensor_shapes=self._expected_tensor_shapes,
+            )
+        if incoming and self._expected_schema_hash is None:
+            self._expected_schema_hash = expected_hash
         for record in incoming:
             self._records.append(record)
             self._buckets[record.bucket].append(record)
