@@ -28,6 +28,7 @@ baselines/*/
 .venv/
 
 # Editor / agent tooling directories.
+AGENTS.md
 .zcode/
 .vscode/
 .idea/

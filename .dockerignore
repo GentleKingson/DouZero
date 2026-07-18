@@ -1,22 +1,33 @@
-# Exclude everything that the CPU test image does not need.
-# Keeps build context small and avoids copying local weights / artifacts.
+# Keep the build context small and exclude local metadata, environments,
+# checkpoints, logs, and generated artifacts.
 .git
-.github
-imgs
-artifacts
-.zcode
 .vscode
 .idea
+.zcode
+
 .venv
-douzero_checkpoints
-most_recent_model
-baselines
+venv
 **/__pycache__
+**/*.pyc
+**/*.pyo
 **/.pytest_cache
 **/.mypy_cache
 **/.ruff_cache
-**/*.pyc
+.coverage
+htmlcov
+
+artifacts
+douzero_checkpoints
+checkpoints
+most_recent_model
+baselines
+logs
+*.log
+*.pt
+*.pth
 **/*.ckpt
 **/*.tar
 eval_data.pkl
+
+imgs
 .DS_Store
