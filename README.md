@@ -226,6 +226,9 @@ The current async support scope is deliberately narrow: base legacy-ruleset
 V2 card play only. Standard bidding, league, curriculum, RL+BC, style,
 strategy features/auxiliaries, and belief fusion fail before workers start.
 `single_process` remains the default and retains all existing combinations.
+The prior-based `pure_prior` and `uncertainty_gated_prior` decision modes also
+fail before CUDA checks or worker startup because the async response protocol
+does not publish `prior_logit`.
 Compact replay records are schema-, tensor-, action-, label-, and provenance-
 validated before shared slots are released and before replay insertion. Actor
 or main inference failure and shutdown use spawn-shared signals so blocked

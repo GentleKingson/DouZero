@@ -260,7 +260,7 @@ def model_input_bundles_to_batch(
     actions = bundles[0].action_features.new_zeros(
         (len(bundles), max_actions, action_width)
     )
-    action_mask = torch.zeros((len(bundles), max_actions), dtype=torch.bool)
+    action_mask = bundles[0].action_mask.new_zeros((len(bundles), max_actions))
     strategy = None
     if bundles[0].strategy_features is not None:
         strategy_width = int(bundles[0].strategy_features.shape[1])
@@ -278,21 +278,33 @@ def model_input_bundles_to_batch(
 
     chosen = None
     if chosen_action_indices is not None:
-        chosen = torch.as_tensor(chosen_action_indices, dtype=torch.long)
+        chosen = torch.as_tensor(
+            chosen_action_indices,
+            dtype=torch.long,
+            device=bundles[0].action_features.device,
+        )
         if chosen.shape != (len(bundles),):
             raise ValueError(
                 f"chosen_action_indices must have shape ({len(bundles)},), "
                 f"got {tuple(chosen.shape)}"
             )
-        for row, count in enumerate(counts):
-            value = int(chosen[row].item())
-            if value < 0 or value >= count:
-                raise ValueError(
-                    f"chosen action {value} is outside row {row}'s legal range [0, {count})"
-                )
+        if chosen.device.type == "cuda":
+            action_counts = chosen.new_tensor(counts)
+            torch._assert_async(
+                ((chosen >= 0) & (chosen < action_counts)).all(),
+                "chosen action is outside its row's legal range",
+            )
+        else:
+            for row, count in enumerate(counts):
+                value = int(chosen[row].item())
+                if value < 0 or value >= count:
+                    raise ValueError(
+                        f"chosen action {value} is outside row {row}'s legal range "
+                        f"[0, {count})"
+                    )
 
     try:
-        role_indices = torch.tensor(
+        role_indices = bundles[0].action_features.new_tensor(
             [SUPPORTED_ROLE_TO_INDEX[bundle.acting_role] for bundle in bundles],
             dtype=torch.long,
         )

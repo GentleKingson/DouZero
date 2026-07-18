@@ -175,10 +175,17 @@ synchronization in the inference and learner hot paths.
 | RL+BC / human prior | yes | fail closed |
 | Style / strategy | yes | fail closed |
 | Frozen/joint/alternating belief | yes | fail closed |
+| Value-based decision modes | yes | yes |
+| `pure_prior` / `uncertainty_gated_prior` | yes | fail closed before CUDA/worker startup |
 | DDP | existing scoped support | rejected |
 
-Async startup requires CUDA and never silently falls back. Request timeout,
-worker exit, invalid state transition, and bounded shutdown all fail the run
+Async startup requires CUDA and never silently falls back. Prior-based
+decision modes are rejected before the CUDA availability check
+because the current five-field shared response protocol intentionally does not
+publish `prior_logit`.
+
+Request timeout, worker exit, invalid state transition, and bounded shutdown
+all fail the run
 instead of waiting indefinitely. Abort and shutdown are spawn-shared events,
 not process-local flags; slot acquisition, response waits, replay-slot waits,
 actor task loops, and the coordinator service all observe the same state. The

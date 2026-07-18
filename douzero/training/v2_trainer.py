@@ -94,6 +94,9 @@ _TRAINER_CHECKPOINT_VERSION = 4
 _COMPATIBLE_TRAINER_CHECKPOINT_VERSIONS = frozenset({3, 4})
 _SINGLE_PROCESS_TOPOLOGY = "single_process"
 _ASYNC_SINGLE_GPU_TOPOLOGY = "async_single_gpu"
+_ASYNC_UNSUPPORTED_DECISION_MODES = frozenset({
+    "pure_prior", "uncertainty_gated_prior",
+})
 _POLICY_STEP_SEMANTICS = "absolute_v1"
 _SNAPSHOT_PUBLICATION_SEMANTICS = "cycle_quiescent_atomic_copy_v1"
 _REQUEST_ORDERING_SEMANTICS = "policy_bucket_role_fifo_microbatch_v1"
@@ -469,6 +472,12 @@ class V2Trainer:
         self.distributed = distributed_context or DistributedContext(enabled=False)
         self.async_mode = self.config.v2_training_mode == _ASYNC_SINGLE_GPU_TOPOLOGY
         if self.async_mode:
+            if self.decision_config.mode in _ASYNC_UNSUPPORTED_DECISION_MODES:
+                raise NotImplementedError(
+                    "async_single_gpu does not publish prior_logit and rejects "
+                    f"decision mode {self.decision_config.mode!r}; use a value-based "
+                    "decision mode or single_process"
+                )
             if self.device.type != "cuda" or not torch.cuda.is_available():
                 raise RuntimeError(
                     "async_single_gpu requires an available CUDA device and never falls back"

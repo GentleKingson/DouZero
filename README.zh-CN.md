@@ -211,6 +211,8 @@ python train_v2.py --v2_training_mode async_single_gpu --device cuda \
 当前异步支持范围刻意限定为 legacy ruleset 的基础 V2 出牌训练。standard
 bidding、league、curriculum、RL+BC、style、strategy 和 belief 组合都会在
 worker 启动前 fail closed。默认仍是 `single_process`，原有组合保持不变。
+由于异步响应协议尚未发布 `prior_logit`，`pure_prior` 和
+`uncertainty_gated_prior` 也会在 CUDA 检查及 worker 启动前 fail closed。
 compact replay 会在共享槽归还前和写入 replay 前分别校验 schema、Tensor、
 动作、标签及 provenance。Actor 故障与 shutdown 使用 spawn 进程共享信号，
 主进程推理故障也会发布同一 abort 信号，使正在等待槽位的其他 worker 能

@@ -15,6 +15,7 @@ from douzero.env.env import Env
 from douzero.models_v2 import (
     ModelV2,
     ModelV2Config,
+    model_input_bundles_to_batch,
     observation_batch_to_model_inputs,
     observation_to_model_inputs,
 )
@@ -26,6 +27,7 @@ from douzero.training.async_single_gpu import (
     SlotState,
 )
 from douzero.training.long_running import LongRunningTrainer
+from douzero.training.decision_policy import DecisionConfig
 from douzero.training.v2_buffer import (
     CompactTensorTransition,
     CompactTensorReplayBuffer,
@@ -637,6 +639,36 @@ def test_async_mode_without_cuda_fails_before_startup(monkeypatch):
                 device="cuda",
             ),
         )
+
+
+@pytest.mark.parametrize("mode", ["pure_prior", "uncertainty_gated_prior"])
+def test_async_prior_decision_modes_fail_before_cuda_or_worker_start(mode):
+    model = ModelV2(
+        build_v2_schema(),
+        ModelV2Config(hidden_size=16, history_layers=1, history_heads=1),
+    )
+    with pytest.raises(NotImplementedError, match="does not publish prior_logit"):
+        V2Trainer(
+            model,
+            config=TrainerConfig(
+                max_episodes=0,
+                optimizer_steps=0,
+                v2_training_mode="async_single_gpu",
+                num_actors=2,
+                device="cuda",
+            ),
+            decision_config=DecisionConfig(mode=mode),
+        )
+
+
+def test_bundle_batch_control_tensors_preserve_input_device():
+    bundle = observation_to_model_inputs(_observations(1)[0])
+    batch = model_input_bundles_to_batch([bundle], [0])
+    expected = bundle.action_features.device
+    assert batch.action_features.device == expected
+    assert batch.action_mask.device == expected
+    assert batch.chosen_action_index.device == expected
+    assert batch.acting_role.device == expected
 
 
 def test_cross_topology_resume_is_rejected_before_restore(tmp_path):
