@@ -42,8 +42,9 @@ def _spawn_protocol_probe(coordinator, output_queue):
     output_queue.put((coordinator.context.get_start_method(), int(coordinator.states[0])))
 
 
-def _blocked_acquire_probe(coordinator, output_queue):
+def _blocked_acquire_probe(coordinator, output_queue, ready_event):
     started = __import__("time").monotonic()
+    ready_event.set()
     try:
         coordinator.acquire(actor_id=9, timeout=10.0)
     except BaseException as exc:
@@ -376,23 +377,28 @@ def test_actor_failure_aborts_another_process_blocked_on_inference_slot():
     )
     held_slot = coordinator.acquire(actor_id=1)
     output = coordinator.context.Queue()
+    blocked_ready = coordinator.context.Event()
     blocked = coordinator.context.Process(
-        target=_blocked_acquire_probe, args=(coordinator, output)
+        target=_blocked_acquire_probe, args=(coordinator, output, blocked_ready)
     )
     failing = coordinator.context.Process(
         target=_failing_actor_probe, args=(coordinator,)
     )
     try:
         blocked.start()
+        assert blocked_ready.wait(10.0)
         failing.start()
-        failing.join(2.0)
-        blocked.join(2.0)
-        assert failing.exitcode == 0
+        assert coordinator.abort_event.wait(10.0)
+        abort_observed = __import__("time").monotonic()
+        blocked.join(1.0)
         assert blocked.exitcode == 0
+        assert __import__("time").monotonic() - abort_observed < 1.0
+        failing.join(5.0)
+        assert failing.exitcode == 0
         error_type, message, elapsed = output.get(timeout=1.0)
         assert error_type == "RuntimeError"
         assert "injected replay write failure" in message
-        assert elapsed < 1.0
+        assert elapsed < 11.0
         assert coordinator.abort_event.is_set()
         assert SlotState(int(coordinator.states[held_slot])) == SlotState.FAILED
     finally:
