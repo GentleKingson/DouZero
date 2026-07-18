@@ -165,7 +165,7 @@ Long-running `single_process` checkpoints remain format 3 and load through the
 existing strict identity path. Format 4 is reserved for `async_single_gpu` and
 adds `num_actors`, compact replay schema version,
 `cycle_quiescent_atomic_copy_v1` snapshot publication, and
-`policy_bucket_role_fifo_microbatch_v1` request semantics. It also binds Actor
+`policy_bucket_fifo_post_first_window_v2` request semantics. It also binds Actor
 resume behavior to `restart_from_configured_seeds_v1`: environment and action
 RNG streams restart from `seed + actor_id` and `rng_seed + actor_id` because
 process-local Actor RNG states are not serialized. A v3 checkpoint is

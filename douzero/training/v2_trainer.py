@@ -99,7 +99,7 @@ _ASYNC_UNSUPPORTED_DECISION_MODES = frozenset({
 })
 _POLICY_STEP_SEMANTICS = "absolute_v1"
 _SNAPSHOT_PUBLICATION_SEMANTICS = "cycle_quiescent_atomic_copy_v1"
-_REQUEST_ORDERING_SEMANTICS = "policy_bucket_role_fifo_microbatch_v1"
+_REQUEST_ORDERING_SEMANTICS = "policy_bucket_fifo_post_first_window_v2"
 _ACTOR_RNG_RESUME_SEMANTICS = "restart_from_configured_seeds_v1"
 
 

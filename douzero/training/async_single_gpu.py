@@ -75,11 +75,10 @@ class RequestMetadata:
     submitted_ns: int
 
     @property
-    def grouping_key(self) -> tuple[int, int | str, int]:
+    def grouping_key(self) -> tuple[int, int | str]:
         return (
             self.policy_snapshot,
             action_count_bucket(self.action_count),
-            self.acting_role,
         )
 
 
@@ -448,11 +447,26 @@ class AsyncRequestCoordinator:
         if max_items < 1:
             raise ValueError("max_items must be positive")
         slot_ids: list[int] = []
-        deadline = time.monotonic() + max(0.0, wait_seconds)
+        wait_seconds = max(0.0, wait_seconds)
+        # Wait for the first request, then give its peers a complete
+        # coalescing window.  Starting the deadline before the first request
+        # arrives leaves almost no batching opportunity when the queue was
+        # initially empty.
+        try:
+            if wait_seconds:
+                slot_ids.append(int(self.ready_queue.get(timeout=wait_seconds)))
+            else:
+                slot_ids.append(int(self.ready_queue.get_nowait()))
+        except queue.Empty:
+            return []
+        deadline = time.monotonic() + wait_seconds
         while len(slot_ids) < max_items:
             timeout = max(0.0, deadline - time.monotonic()) if wait_seconds else 0.0
             try:
-                slot_ids.append(int(self.ready_queue.get(timeout=timeout)))
+                if wait_seconds:
+                    slot_ids.append(int(self.ready_queue.get(timeout=timeout)))
+                else:
+                    slot_ids.append(int(self.ready_queue.get_nowait()))
             except queue.Empty:
                 break
         metadata = []

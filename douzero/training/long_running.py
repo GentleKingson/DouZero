@@ -86,7 +86,7 @@ class LongRunningConfig:
     num_actors: int = 1
     replay_schema_version: int = 1
     snapshot_publication_semantics: str = "cycle_quiescent_atomic_copy_v1"
-    request_ordering_semantics: str = "policy_bucket_role_fifo_microbatch_v1"
+    request_ordering_semantics: str = "policy_bucket_fifo_post_first_window_v2"
     actor_rng_resume_semantics: str = "restart_from_configured_seeds_v1"
 
     def __post_init__(self) -> None:

@@ -137,9 +137,12 @@ unknown topology, and cross-topology resume are rejected.
 observation/replay slots, and queues containing only slot IDs plus small
 metadata. Actors make epsilon decisions with their local RNG and never own a
 CUDA tensor. The main process owns an independent inference model and learner
-model in one CUDA context, groups requests by immutable policy snapshot,
-action-count bucket and role, and publishes a complete inference state only at
-a quiescent boundary. Both replay implementations sample uniformly across all
+model in one CUDA context, and groups requests by immutable policy snapshot
+and action-count bucket. Acting roles remain a vectorized model input instead
+of splitting otherwise compatible microbatches. The coalescing deadline starts
+after the first request arrives, so an initially empty queue cannot consume
+the entire batching window. A complete inference state is published only at a
+quiescent boundary. Both replay implementations sample uniformly across all
 resident transitions first, including action buckets smaller than the learner
 batch size. The learner then partitions the sampled records by action-count
 bucket and forwards each homogeneous sub-batch separately, reducing padding

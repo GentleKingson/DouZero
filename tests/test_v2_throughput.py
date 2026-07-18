@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import inspect
 import random
+import threading
+import time
 from dataclasses import replace
 
 import numpy as np
@@ -23,6 +25,7 @@ from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.observation.encode_v2 import LegalActionBatch
 from douzero.training.async_single_gpu import (
     AsyncRequestCoordinator,
+    RequestMetadata,
     SharedReplaySlots,
     SlotState,
 )
@@ -223,6 +226,39 @@ def test_scalar_and_batched_forward_padding_and_gather_parity():
 )
 def test_action_bucket_boundaries(count, expected):
     assert action_count_bucket(count) == expected
+
+
+def test_async_request_grouping_keeps_roles_in_one_bucket_batch():
+    landlord = RequestMetadata(0, 0, 1, 7, 12, 0, 1)
+    farmer = RequestMetadata(1, 1, 2, 7, 15, 2, 2)
+    assert landlord.grouping_key == farmer.grouping_key
+
+
+def test_claim_ready_coalescing_window_starts_after_first_request():
+    coordinator = AsyncRequestCoordinator(build_v2_schema(), num_slots=2)
+    slot_ids = [coordinator.acquire(actor_id=index) for index in range(2)]
+    for slot_id in slot_ids:
+        coordinator.slots.action_counts[slot_id] = 1
+        coordinator.slots.action_mask[slot_id, 0] = True
+
+    def submit_delayed():
+        time.sleep(0.15)
+        coordinator.submit(slot_ids[0], request_id=1, policy_snapshot=7)
+        time.sleep(0.10)
+        coordinator.submit(slot_ids[1], request_id=2, policy_snapshot=7)
+
+    producer = threading.Thread(target=submit_delayed)
+    producer.start()
+    try:
+        claimed = coordinator.claim_ready(max_items=2, wait_seconds=0.20)
+        producer.join(timeout=1.0)
+        assert not producer.is_alive()
+        assert [request.request_id for request in claimed] == [1, 2]
+        for request in claimed:
+            coordinator.complete(request.slot_id)
+            coordinator.release(request.slot_id)
+    finally:
+        coordinator.shutdown()
 
 
 def test_compact_replay_round_trip_preserves_labels_and_provenance():
@@ -870,7 +906,7 @@ def test_cross_topology_resume_is_rejected_before_restore(tmp_path):
         "num_actors": 2,
         "replay_schema_version": 1,
         "snapshot_publication_semantics": "cycle_quiescent_atomic_copy_v1",
-        "request_ordering_semantics": "policy_bucket_role_fifo_microbatch_v1",
+        "request_ordering_semantics": "policy_bucket_fifo_post_first_window_v2",
     })
     async_path = tmp_path / "async.pt"
     torch.save(payload, async_path)
