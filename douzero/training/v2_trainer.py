@@ -1984,12 +1984,17 @@ class V2Trainer:
             np.random.RandomState().set_state(probe_numpy)
             probe_torch_rng = torch.Generator(device="cpu")
             probe_torch_rng.set_state(rng["torch"].cpu())
+            cuda_rng_state = rng["cuda"]
             if self.device.type == "cuda":
-                if not isinstance(rng["cuda"], torch.Tensor):
+                if not isinstance(cuda_rng_state, torch.Tensor):
                     raise ValueError("CUDA trainer resume requires CUDA RNG state")
+                # ``map_location=self.device`` also moves serialized RNG state.
+                # PyTorch generators require their opaque state as a CPU
+                # ByteTensor even when the generator itself targets CUDA.
+                cuda_rng_state = cuda_rng_state.cpu()
                 probe_cuda_rng = torch.Generator(device=self.device)
-                probe_cuda_rng.set_state(rng["cuda"])
-            elif rng["cuda"] is not None:
+                probe_cuda_rng.set_state(cuda_rng_state)
+            elif cuda_rng_state is not None:
                 raise ValueError("CPU trainer checkpoint must not carry CUDA RNG state")
             policy_step = bundle["policy_step"]
             if (
@@ -2056,8 +2061,8 @@ class V2Trainer:
         random.setstate(rng["python"])
         np.random.set_state(self._decode_numpy_rng_state(rng["numpy"]))
         torch.random.set_rng_state(rng["torch"].cpu())
-        if rng["cuda"] is not None:
-            torch.cuda.set_rng_state(rng["cuda"], self.device)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, self.device)
         self.model.eval()
         if self.belief_model is not None:
             self.belief_model.eval()

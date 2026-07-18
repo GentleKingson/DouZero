@@ -916,6 +916,10 @@ def test_async_single_gpu_end_to_end_checkpoint_resume_and_shutdown(tmp_path):
             for name, value in trainer.model.state_dict().items()
         )
         trainer.save_training_checkpoint(str(checkpoint))
+        mapped_checkpoint = torch.load(
+            checkpoint, map_location="cuda", weights_only=True
+        )
+        assert mapped_checkpoint["rng"]["cuda"].device.type == "cuda"
         workers = list(trainer._async_workers)
     finally:
         trainer.shutdown()
