@@ -164,7 +164,62 @@ class CheckpointSeries:
         self.suffix = suffix
         self.latest_manifest = self.base.with_name(f"{self.prefix}-latest.json")
         self.pending_manifest = self.base.with_name(f".{self.prefix}-pending.json")
+        self.lock_path = self.base.with_name(f".{self.prefix}.lock")
         self.last_rotation_error = ""
+        self._lock_token = ""
+
+    def acquire(self, run_id: str) -> None:
+        """Atomically own this series until ``release`` is called."""
+        if self._lock_token:
+            raise RuntimeError("checkpoint series lock is already held")
+        self.base.parent.mkdir(parents=True, exist_ok=True)
+        token = uuid.uuid4().hex
+        payload = {
+            "schema_version": "v2-checkpoint-series-lock-v1",
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "started_at_unix": time.time(),
+            "token": token,
+        }
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            descriptor = os.open(self.lock_path, flags, 0o600)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"checkpoint series is locked: {self.lock_path}; verify the owner "
+                "has stopped before explicitly removing a stale lock"
+            ) from exc
+        try:
+            encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+            remaining = memoryview(encoded)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written == 0:
+                    raise OSError("checkpoint series lock write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            self.lock_path.unlink(missing_ok=True)
+            raise
+        os.close(descriptor)
+        self._lock_token = token
+
+    def release(self) -> None:
+        """Release this process's lock without deleting another owner's lock."""
+        if not self._lock_token:
+            return
+        try:
+            payload = json.loads(self.lock_path.read_text(encoding="utf-8"))
+            if payload.get("token") != self._lock_token:
+                raise RuntimeError("checkpoint series lock ownership changed")
+            self.lock_path.unlink()
+        finally:
+            self._lock_token = ""
+
+    def _require_lock(self) -> None:
+        if not self._lock_token:
+            raise RuntimeError("checkpoint series operation requires ownership lock")
 
     @classmethod
     def from_checkpoint(cls, checkpoint: str | Path, state: LongRunningState,
@@ -256,6 +311,7 @@ class CheckpointSeries:
 
     def bind_resume(self, state: LongRunningState, checkpoint: str | Path) -> None:
         """Bind resume to this series and reconcile one committed orphan."""
+        self._require_lock()
         source = Path(checkpoint)
         expected = self.cycle_path(
             state.run_id,
@@ -356,6 +412,7 @@ class CheckpointSeries:
 
     def ensure_available(self, state: LongRunningState) -> None:
         """Fail closed when a fresh run would reuse an existing series."""
+        self._require_lock()
         if state.checkpoint_sequence:
             source = state.resume_source
             if not source and self.latest_manifest.exists():
@@ -394,6 +451,7 @@ class CheckpointSeries:
         return int(match.group(1))
 
     def publish(self, trainer, state: LongRunningState) -> Path:
+        self._require_lock()
         self.last_rotation_error = ""
         sequence = state.checkpoint_sequence + 1
         destination = self.cycle_path(
@@ -420,6 +478,7 @@ class CheckpointSeries:
         self, state: LongRunningState, checkpoint: str | Path
     ) -> None:
         """Atomically persist boundary work accounted after model publication."""
+        self._require_lock()
         path = Path(checkpoint)
         expected = self.cycle_path(
             state.run_id,
@@ -463,28 +522,88 @@ class CheckpointSeries:
 class RunMetricsWriter:
     """Append cycle records once and atomically maintain a constant-size summary."""
 
+    _SUMMARY_FIELDS = {
+        "schema_version", "run_id", "status", "stop_reason", "error",
+        "cycles_path", "state", "latest_cycle",
+    }
+
+    @staticmethod
+    def output_paths(summary_path: str | Path) -> tuple[Path, Path]:
+        summary = Path(summary_path)
+        suffix = summary.suffix or ".json"
+        stem = (
+            summary.name[:-len(suffix)]
+            if summary.name.endswith(suffix) else summary.name
+        )
+        return summary, summary.with_name(f"{stem}-cycles.jsonl")
+
+    @classmethod
+    def validate_checkpoint_paths(
+        cls, summary_path: str | Path, series: CheckpointSeries
+    ) -> None:
+        """Reject metrics paths inside the checkpoint series namespace."""
+        summary, cycles = cls.output_paths(summary_path)
+        outputs = {summary.resolve(), cycles.resolve()}
+        protected = {
+            series.base.resolve(),
+            series.latest_manifest.resolve(),
+            series.pending_manifest.resolve(),
+            series.lock_path.resolve(),
+        }
+        if outputs & protected:
+            raise ValueError("metrics output conflicts with checkpoint series paths")
+        cycle_pattern = re.compile(
+            rf"{re.escape(series.prefix)}-run-.+-seq-\d+-cycle-\d+-step-\d+"
+            rf"{re.escape(series.suffix)}"
+        )
+        if any(
+            path.parent == series.base.resolve().parent
+            and cycle_pattern.fullmatch(path.name)
+            for path in outputs
+        ):
+            raise ValueError(
+                "metrics output conflicts with checkpoint cycle namespace"
+            )
+
     def __init__(self, summary_path: str, *, run_id: str, resume: bool) -> None:
-        self.summary_path = Path(summary_path)
+        self.summary_path, self.cycles_path = self.output_paths(summary_path)
         self.run_id = run_id
         self._latest_cycle: dict | None = None
-        suffix = self.summary_path.suffix or ".json"
-        stem = (
-            self.summary_path.name[:-len(suffix)]
-            if self.summary_path.name.endswith(suffix)
-            else self.summary_path.name
-        )
-        self.cycles_path = self.summary_path.with_name(f"{stem}-cycles.jsonl")
         self.summary_path.parent.mkdir(parents=True, exist_ok=True)
         if not resume and (self.summary_path.exists() or self.cycles_path.exists()):
             raise FileExistsError(
                 f"metrics output already exists for {self.summary_path}; resume "
                 "the run or choose a new --metrics_path"
             )
+        if resume and not self.summary_path.exists() and self.cycles_path.exists():
+            raise ValueError(
+                "metrics cycle history exists without its run summary"
+            )
         if resume and self.summary_path.exists():
             payload = json.loads(self.summary_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or set(payload) != self._SUMMARY_FIELDS:
+                raise ValueError("metrics summary has an invalid field set")
+            if payload.get("schema_version") != "v2-long-running-run-v2":
+                raise ValueError("metrics summary has an unsupported schema_version")
             if payload.get("run_id") != run_id:
                 raise ValueError(
                     "metrics run_id does not match the resumed checkpoint"
+                )
+            if payload.get("cycles_path") != self.cycles_path.name:
+                raise ValueError("metrics summary cycles_path does not match output")
+            if not all(
+                isinstance(payload[name], str)
+                for name in ("status", "stop_reason", "error")
+            ):
+                raise ValueError("metrics summary status fields must be text")
+            if payload["state"] is not None and not isinstance(payload["state"], dict):
+                raise ValueError("metrics summary state must be an object or null")
+            if (
+                payload["latest_cycle"] is not None
+                and not isinstance(payload["latest_cycle"], dict)
+            ):
+                raise ValueError(
+                    "metrics summary latest_cycle must be an object or null"
                 )
             latest_cycle = payload.get("latest_cycle")
             if isinstance(latest_cycle, dict):
@@ -596,7 +715,12 @@ class LongRunningTrainer:
             )
         self._validate_totals()
         self._validate_reachable_limits()
-        self.checkpoints.ensure_available(self.state)
+        self.checkpoints.acquire(self.state.run_id)
+        try:
+            self.checkpoints.ensure_available(self.state)
+        except BaseException:
+            self.checkpoints.release()
+            raise
 
     def _validate_reachable_limits(self) -> None:
         cfg = self.config
@@ -927,11 +1051,17 @@ class LongRunningTrainer:
                     break
         finally:
             self.stop.restore()
+            self.checkpoints.release()
         return self.state, reason, records
 
 
 def command_evaluator(
-    command: str, *, windows: bool | None = None
+    command: str,
+    *,
+    windows: bool | None = None,
+    stop_controller: StopController | None = None,
+    poll_seconds: float = 0.1,
+    terminate_timeout_seconds: float = 5.0,
 ) -> Callable[[Path, int], None]:
     """Build a no-shell callback for an existing evaluation CLI command."""
     import shlex
@@ -956,12 +1086,62 @@ def command_evaluator(
             ]
     if not argv:
         raise ValueError("eval_command must not be empty")
+    if poll_seconds <= 0 or terminate_timeout_seconds < 0:
+        raise ValueError("evaluator polling and termination timeouts are invalid")
+
+    def stop_process(process: subprocess.Popen) -> None:
+        if os.name == "nt":
+            try:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            except (AttributeError, OSError):
+                try:
+                    process.terminate()
+                except OSError:
+                    process.wait()
+                    return
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                process.wait()
+                return
+        try:
+            process.wait(timeout=terminate_timeout_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        if os.name == "nt":
+            process.kill()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                process.wait()
+                return
+        process.wait()
 
     def evaluate(checkpoint: Path, cycle: int) -> None:
         expanded = [
             part.replace("{checkpoint}", str(checkpoint)).replace("{cycle}", str(cycle))
             for part in argv
         ]
-        subprocess.run(expanded, check=True)
+        if stop_controller is not None and stop_controller.event.is_set():
+            raise RuntimeError("periodic evaluation interrupted by stop request")
+        popen_kwargs = (
+            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+            if os.name == "nt" else {"start_new_session": True}
+        )
+        process = subprocess.Popen(expanded, **popen_kwargs)
+        while True:
+            if stop_controller is not None and stop_controller.event.is_set():
+                stop_process(process)
+                raise RuntimeError("periodic evaluation interrupted by stop request")
+            try:
+                return_code = process.wait(timeout=poll_seconds)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if return_code:
+            raise subprocess.CalledProcessError(return_code, expanded)
 
     return evaluate

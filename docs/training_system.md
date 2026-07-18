@@ -157,6 +157,11 @@ Checkpoints are immutable sequence files written to a temporary file and
 published with `os.replace`. Only after that succeeds is `*-latest.json`
 atomically replaced. Rotation retains the newest `--keep_last_checkpoints`
 files. A failed save never removes or repoints the previous valid checkpoint.
+Before fresh-run checks or resume reconciliation, the controller atomically
+creates a per-series ownership lock and holds it until training exits. A second
+fresh or resumed process fails closed. Locks are never stolen automatically;
+after a crash, an operator must verify the recorded PID is gone before
+explicitly removing the stale lock.
 Each series has a persistent run ID in its state and filenames. Starting a
 fresh run against an existing manifest or matching files fails closed; resume
 through the manifest, or choose a new `--checkpoint_path`, rather than
@@ -215,7 +220,10 @@ implement rules or another evaluator. The command is tokenized without a shell;
 recorded and fail fast by default; `--no-eval_fail_fast` explicitly records and
 continues. If the evaluation subprocess exits because the controller received
 `SIGINT` or `SIGTERM`, it is recorded as interrupted and the run follows normal
-safe-boundary signal shutdown instead of treating it as a fail-fast error.
+safe-boundary signal shutdown instead of treating it as a fail-fast error. The
+evaluator runs in a separate process group; the controller polls its stop event,
+requests group termination, and escalates to a kill after a bounded grace
+period rather than waiting indefinitely for evaluation to return.
 
 ```bash
 python train_v2.py --long_running --episodes_per_cycle 32 \
@@ -233,7 +241,11 @@ summary with an error type. Metrics retain only checkpoint basenames and error
 classes, never absolute checkpoint/resume paths or exception messages. Cycle
 records are streamed rather than retained by the production controller, so
 metrics memory remains bounded. The summary retains its most recent cycle
-record after finalization, including failure finalization. These semantics are
+record after finalization, including failure finalization. Metrics summary and
+JSONL paths are resolved and rejected before any series write if they overlap
+the checkpoint base, latest/pending manifests, lock, or cycle namespace.
+Resume validates the complete metrics summary schema, run ID, and JSONL name;
+an orphan JSONL without its summary fails closed. These semantics are
 CPU-tested; CUDA soak and
 long-duration GPU stability are not validated here.
 

@@ -209,7 +209,9 @@ the same checkpoint series and rejects a conflicting `--checkpoint_path`.
 Direct cycle-file resume is reconciled against the same manifest, so it cannot
 ignore a newer committed orphan or duplicate a sequence. Wall-time limits are
 cumulative across resumes and include checkpoint, evaluation, and metrics
-boundary work. See
+boundary work. A per-series process lock prevents concurrent fresh or resumed
+writers, and metrics paths are rejected if they overlap checkpoint artifacts.
+See
 [the V2 long-running state machine](docs/training_system.md#long-running-v2-state-machine).
 
 V2 single GPU with checkpoint and metrics output (PowerShell):
@@ -363,7 +365,6 @@ operations, checkpoint/resume commands, and error-specific guidance.
 ## Acknowlegements
 *   The demo is largely based on [RLCard-Showdown](https://github.com/datamllab/rlcard-showdown)
 *   Code implementation is inspired by [TorchBeast](https://github.com/facebookresearch/torchbeast)
-
 
 
 

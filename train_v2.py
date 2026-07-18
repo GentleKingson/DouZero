@@ -1286,6 +1286,7 @@ def main() -> None:
                 LongRunningState,
                 LongRunningTrainer,
                 RunMetricsWriter,
+                StopController,
                 command_evaluator,
             )
 
@@ -1317,7 +1318,6 @@ def main() -> None:
             eval_command = getattr(args, "eval_command", "")
             if long_cfg.eval_every_cycles and not eval_command:
                 raise ValueError("--eval_every_cycles requires --eval_command")
-            evaluator = command_evaluator(eval_command) if eval_command else None
             state = None
             if resume_checkpoint:
                 state_payload = resume_identity.get("long_running_state")
@@ -1344,7 +1344,37 @@ def main() -> None:
                     )
                 output_checkpoint = str(derived_series.base)
 
-            metrics_writer = None
+            if state is None:
+                state = LongRunningState(
+                    total_episodes=int(trainer.stats.episodes_completed),
+                    total_transitions=int(trainer.stats.transitions_collected),
+                    total_optimizer_steps=int(trainer.stats.optimizer_steps),
+                    policy_version=str(trainer.policy_version),
+                    policy_step=int(trainer.policy_step),
+                    cycle_identity=long_cfg.resume_identity(),
+                )
+            checkpoint_series = CheckpointSeries(
+                output_checkpoint, long_cfg.keep_last_checkpoints
+            )
+            if metrics_path and distributed.is_rank_zero:
+                RunMetricsWriter.validate_checkpoint_paths(
+                    metrics_path, checkpoint_series
+                )
+            metrics_writer = (
+                RunMetricsWriter(
+                    metrics_path,
+                    run_id=state.run_id,
+                    resume=bool(resume_checkpoint),
+                )
+                if metrics_path and distributed.is_rank_zero else None
+            )
+            stop_controller = StopController()
+            evaluator = (
+                command_evaluator(
+                    eval_command, stop_controller=stop_controller
+                )
+                if eval_command else None
+            )
 
             def emit_cycle(record: dict) -> None:
                 if distributed.is_rank_zero:
@@ -1359,18 +1389,13 @@ def main() -> None:
             runner = LongRunningTrainer(
                 trainer,
                 long_cfg,
-                CheckpointSeries(output_checkpoint, long_cfg.keep_last_checkpoints),
+                checkpoint_series,
                 state=state,
+                stop_controller=stop_controller,
                 evaluator=evaluator,
                 metric_sink=emit_cycle,
                 peak_memory=peak_memory,
             )
-            if metrics_path and distributed.is_rank_zero:
-                metrics_writer = RunMetricsWriter(
-                    metrics_path,
-                    run_id=runner.state.run_id,
-                    resume=bool(resume_checkpoint),
-                )
             try:
                 final_state, stop_reason, _records = runner.run()
             except BaseException as exc:

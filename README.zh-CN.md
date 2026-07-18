@@ -195,6 +195,8 @@ python train_v2.py --long_running --device cpu --seed 17 \
 checkpoint 系列，并拒绝冲突的 `--checkpoint_path`；墙钟上限会跨恢复累计。
 直接指定 cycle checkpoint 时也会与同一 manifest 对账，不能跳过更新的
 orphan 或生成重复 sequence。累计墙钟包含 checkpoint、评测和指标边界工作。
+每个 checkpoint 系列使用跨进程独占锁，阻止并发启动；metrics 路径与任何
+checkpoint artifact 冲突时会在写入前失败。
 细节见
 [V2 长期训练状态机](docs/training_system.md#long-running-v2-state-machine)。
 

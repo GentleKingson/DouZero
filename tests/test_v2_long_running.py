@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import copy
 import json
+import multiprocessing
 import os
 import random
+import signal
+import subprocess
+import sys
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from threading import Event
@@ -105,6 +111,14 @@ class _DeterministicTrainer:
         self.policy_version = payload["policy_version"]
         self.policy_step = payload["policy_step"]
         return payload["long_running_state"]
+
+
+def _hold_checkpoint_series_lock(base_path, run_id, ready, release):
+    series = CheckpointSeries(base_path, 1)
+    series.acquire(run_id)
+    ready.set()
+    release.wait(10)
+    series.release()
 
 
 def _run(tmp_path, trainer, *, cycles, state=None, stop=None, keep=3):
@@ -802,20 +816,24 @@ def test_sequence_ordering_crosses_one_million_numerically(tmp_path):
         cycle_identity={"episodes_per_cycle": 1, "optimizer_steps_per_cycle": 0},
     )
     series = CheckpointSeries(str(tmp_path / "large.pt"), 2)
-    first = series.publish(trainer, state)
-    assert "seq-999999" in first.name
+    series.acquire(state.run_id)
+    try:
+        first = series.publish(trainer, state)
+        assert "seq-999999" in first.name
 
-    state.cycle += 1
-    original_write = series._write_json_atomic
+        state.cycle += 1
+        original_write = series._write_json_atomic
 
-    def fail_manifest(path, payload):
-        if path == series.latest_manifest:
-            raise OSError("injected manifest failure")
-        original_write(path, payload)
+        def fail_manifest(path, payload):
+            if path == series.latest_manifest:
+                raise OSError("injected manifest failure")
+            original_write(path, payload)
 
-    series._write_json_atomic = fail_manifest
-    with pytest.raises(OSError, match="manifest failure"):
-        series.publish(trainer, state)
+        series._write_json_atomic = fail_manifest
+        with pytest.raises(OSError, match="manifest failure"):
+            series.publish(trainer, state)
+    finally:
+        series.release()
     orphan = next(tmp_path.glob("large-run-*-seq-1000000-*.pt"))
     assert series.checkpoint_sequence(orphan, run_id=state.run_id) == 1_000_000
 
@@ -1040,6 +1058,62 @@ def test_resumed_metrics_writer_rejects_a_different_run(tmp_path):
         RunMetricsWriter(str(summary), run_id="run-2", resume=True)
 
 
+def test_metrics_paths_cannot_overlap_checkpoint_namespace(tmp_path):
+    series = CheckpointSeries(str(tmp_path / "train.pt"), 2)
+    protected = [
+        series.base,
+        series.latest_manifest,
+        series.pending_manifest,
+        series.lock_path,
+        series.cycle_path("run", 1, 1, 1),
+    ]
+    for path in protected:
+        with pytest.raises(ValueError, match="conflicts"):
+            RunMetricsWriter.validate_checkpoint_paths(path, series)
+    assert not any(tmp_path.iterdir())
+
+
+def test_metrics_resume_requires_strict_summary_schema(tmp_path):
+    summary = tmp_path / "metrics.json"
+    summary.write_text(json.dumps({"run_id": "run-1"}))
+    with pytest.raises(ValueError, match="field set"):
+        RunMetricsWriter(str(summary), run_id="run-1", resume=True)
+
+
+def test_metrics_resume_rejects_history_without_summary(tmp_path):
+    (tmp_path / "metrics-cycles.jsonl").write_text("{}\n")
+    with pytest.raises(ValueError, match="without its run summary"):
+        RunMetricsWriter(
+            str(tmp_path / "metrics.json"), run_id="run-1", resume=True
+        )
+
+
+@pytest.mark.parametrize("run_id", ["fresh-owner", "resumed-owner"])
+def test_checkpoint_series_lock_is_exclusive_across_processes(tmp_path, run_id):
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    base = str(tmp_path / f"{run_id}.pt")
+    process = context.Process(
+        target=_hold_checkpoint_series_lock,
+        args=(base, run_id, ready, release),
+    )
+    process.start()
+    try:
+        assert ready.wait(10)
+        contender = CheckpointSeries(base, 1)
+        with pytest.raises(FileExistsError, match="is locked"):
+            contender.acquire(run_id)
+    finally:
+        release.set()
+        process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join()
+    assert process.exitcode == 0
+    assert not CheckpointSeries(base, 1).lock_path.exists()
+
+
 def test_production_loop_streams_metrics_without_retaining_history(tmp_path):
     trainer = _DeterministicTrainer()
     streamed = 0
@@ -1083,9 +1157,19 @@ def test_cycle_metrics_do_not_expose_absolute_paths(tmp_path):
 
 def test_windows_evaluator_preserves_backslashes_and_quoted_paths(monkeypatch):
     calls = []
+
+    class CompletedProcess:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return CompletedProcess()
+
     monkeypatch.setattr(
-        "douzero.training.long_running.subprocess.run",
-        lambda argv, check: calls.append((argv, check)),
+        "douzero.training.long_running.subprocess.Popen", popen
     )
     evaluator = command_evaluator(
         '"C:\\Program Files\\Python\\python.exe" '
@@ -1093,21 +1177,61 @@ def test_windows_evaluator_preserves_backslashes_and_quoted_paths(monkeypatch):
         windows=True,
     )
     evaluator(Path("candidate.pt"), 3)
-    argv, check = calls[0]
+    argv, kwargs = calls[0]
     assert argv[0] == "C:\\Program Files\\Python\\python.exe"
     assert argv[2] == "C:\\models\\baseline.pt"
     assert argv[-1] == "candidate.pt"
-    assert check is True
+    if os.name == "nt":
+        assert kwargs.get("creationflags") == subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        assert kwargs.get("start_new_session") is True
 
 
 def test_evaluator_accepts_json_argv(monkeypatch):
     calls = []
+
+    class CompletedProcess:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return 0
+
     monkeypatch.setattr(
-        "douzero.training.long_running.subprocess.run",
-        lambda argv, check: calls.append(argv),
+        "douzero.training.long_running.subprocess.Popen",
+        lambda argv, **_kwargs: (calls.append(argv) or CompletedProcess()),
     )
     evaluator = command_evaluator(
         '["python", "evaluate.py", "--candidate", "{checkpoint}"]'
     )
     evaluator(Path("candidate.pt"), 1)
     assert calls == [["python", "evaluate.py", "--candidate", "candidate.pt"]]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal/process-group test")
+def test_evaluator_terminates_process_group_on_parent_sigterm():
+    stop = StopController(Event())
+    stop.install()
+
+    def request_sigterm():
+        time.sleep(0.2)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    sender = threading.Thread(target=request_sigterm)
+    sender.start()
+    started = time.monotonic()
+    try:
+        evaluator = command_evaluator(
+            json.dumps(
+                [sys.executable, "-c", "import time; time.sleep(30)"]
+            ),
+            stop_controller=stop,
+            poll_seconds=0.02,
+            terminate_timeout_seconds=1.0,
+        )
+        with pytest.raises(RuntimeError, match="interrupted"):
+            evaluator(Path("unused.pt"), 1)
+    finally:
+        sender.join()
+        stop.restore()
+    assert stop.reason == "sigterm"
+    assert time.monotonic() - started < 5.0
