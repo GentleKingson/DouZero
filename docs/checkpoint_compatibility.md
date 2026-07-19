@@ -161,20 +161,24 @@ pseudo-gate that provided no real protection; it has been deleted.
 
 ## Resumable V2 trainer topology
 
-Long-running `single_process` checkpoints remain format 3 and load through the
-existing strict identity path. Format 4 is reserved for `async_single_gpu` and
-adds `num_actors`, `games_per_actor`, compact replay schema version,
-`cycle_quiescent_atomic_copy_v1` snapshot publication, and
-`policy_inference_bucket_interleaved_games_v3` request semantics. It also binds Actor
-resume behavior to `restart_from_configured_seeds_v1`: environment and action
-RNG streams restart from `seed + actor_id` and `rng_seed + actor_id` because
-process-local Actor RNG states are not serialized. A v3 checkpoint is
-accepted only by `single_process`; v3 to async, v4 async to single-process,
-unknown versions, and unknown topology fail before model or optimizer state is
-mutated. Async resume is a safe empty cycle boundary, not a claim of bitwise
-N+M determinism. Resume is rejected after Actor startup: callers must load into
-a fresh `V2Trainer`, then start Actors, so the declared restart-from-seeds RNG
-semantics cannot diverge from already-running process-local streams.
+New resumable trainer checkpoints use format 6 for both `single_process` and
+`async_single_gpu`. Format 6 records identity version 2 and the complete
+`TrainerConfig`, including independent bidding batch size and update cadence.
+Formats 3, 4, and 5 remain same-source-shape compatibility paths only: the
+runtime still requires the checkpoint's full `source_git_sha` to equal the
+running build. They are not a cross-commit migration promise. Missing M1
+bidding controls are accepted only when `bidding_batch_size == batch_size` and
+`bidding_update_interval == 1`; otherwise resume fails before model or optimizer
+state is mutated.
+
+Format 4 introduced the async actor/replay identity and format 5 added protocol,
+task, and commit semantics. A v3 checkpoint is accepted only by
+`single_process`; cross-topology and unknown-version resume fail closed. Async
+resume is a safe empty cycle boundary, not a claim of bitwise N+M determinism.
+Resume is rejected after Actor startup so process-local Actor RNG semantics
+cannot diverge from already-running workers. Cross-commit reuse must export and
+load a weights-only model artifact or use a future explicit offline migration
+tool, never the resumable trainer loader.
 
 ## Round-trip and tests
 

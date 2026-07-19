@@ -380,7 +380,8 @@ def test_joint_trainer_checkpoint_resume_restores_both_and_continues(tmp_path):
     saved_belief = {name: tensor.detach().clone() for name, tensor in belief.state_dict().items()}
     path = str(tmp_path / "trainer_joint.pt")
     identity = trainer.save_training_checkpoint(path)
-    assert identity["checkpoint_version"] == 3
+    assert identity["checkpoint_version"] == 6
+    assert identity["trainer_config_identity_version"] == 2
     assert identity["training_topology"] == "single_process"
     assert identity["training_world_size"] == 1
     assert identity["belief_training_mode"] == "joint"

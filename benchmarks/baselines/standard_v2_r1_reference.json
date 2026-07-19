@@ -1,6 +1,6 @@
 {
-  "benchmark_workload_hash": "1387b3ca047cfe001cbca412955605775040a7b86944217cee9f8edfec13915a",
-  "config_hash": "abcb2050b79649309b0e7ec3563f64d56c9e1e18943ce409fd25d813f3b7dcbe",
+  "benchmark_workload_hash": "b8ce1193e5b810d6e0d9582071b6b54d85b97c611b96f805e2a254ffb6f69f4d",
+  "config_hash": "fa704d56c7affca5889cf60af3c9efcb6a8fa152ef4a43ebf9097206dc2fa1ef",
   "contract_version": "standard-v2-r1-contract-v2",
   "coverage": {
     "all_pass": true,
@@ -16,7 +16,7 @@
     "redeal": true,
     "spring": true
   },
-  "reference_digest": "bfcefc9ab6f26f3f259c144bdf7adb7d5f1677b5e7c1a20b5024ab56dd05af18",
+  "reference_digest": "a177bc8a30e0f9d88072a3373e178d89ff4eddf2eb74334029f4bf1e0213a3bb",
   "scenarios": [
     {
       "bidding_attempts": [
@@ -1903,7 +1903,7 @@
     }
   ],
   "schema_version": "standard-v2-r1-reference-v1",
-  "training_semantics_hash": "6e52575d1e3ae0745b462862b39407f53a0886d5ab1f4322e2cd1a9d5a27b82a",
+  "training_semantics_hash": "717f608dbd96091d578869bef967ab5a57a55efb1aa465a5beb3e3bcfe3dd1cf",
   "version_contract": {
     "contract_version": "standard-v2-r1-contract-v2",
     "current_base_async": {

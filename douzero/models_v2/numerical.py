@@ -37,6 +37,33 @@ class NumericalError(RuntimeError):
     """
 
 
+def assert_tensor_true(
+    condition: torch.Tensor,
+    message: str,
+    *,
+    error_type: type[Exception] = ValueError,
+) -> None:
+    """Validate one device condition without relying on private Torch APIs.
+
+    CUDA uses Torch's optional device-side assertion when the runtime provides
+    it and otherwise falls back to one synchronized scalar read. Keeping that
+    private capability lookup here avoids hard-coding it throughout public
+    model and loss contracts, while older or future runtimes remain functional.
+    """
+
+    if not isinstance(condition, torch.Tensor) or condition.numel() != 1:
+        raise TypeError("tensor condition must contain exactly one value")
+    if condition.dtype != torch.bool:
+        raise TypeError("tensor condition must have bool dtype")
+    if condition.device.type == "cuda":
+        async_assert = getattr(torch, "_assert_async", None)
+        if callable(async_assert):
+            async_assert(condition, message)
+            return
+    if not bool(condition.detach()):
+        raise error_type(message)
+
+
 def assert_finite(tensor: torch.Tensor, name: str) -> None:
     """Raise :class:`NumericalError` if ``tensor`` contains any NaN or Inf.
 

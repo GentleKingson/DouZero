@@ -1,6 +1,6 @@
 {
-  "benchmark_workload_hash": "1387b3ca047cfe001cbca412955605775040a7b86944217cee9f8edfec13915a",
-  "config_hash": "abcb2050b79649309b0e7ec3563f64d56c9e1e18943ce409fd25d813f3b7dcbe",
+  "benchmark_workload_hash": "b8ce1193e5b810d6e0d9582071b6b54d85b97c611b96f805e2a254ffb6f69f4d",
+  "config_hash": "fa704d56c7affca5889cf60af3c9efcb6a8fa152ef4a43ebf9097206dc2fa1ef",
   "contract_version": "standard-v2-r1-contract-v2",
   "coverage": {
     "all_pass": true,
@@ -19,19 +19,19 @@
   "performance": {
     "counts": {
       "abandoned_bidding_transitions": 0,
-      "bid_transitions": 45,
-      "bidding_decisions": 45,
-      "cardplay_decisions": 1473,
+      "bid_transitions": 44,
+      "bidding_decisions": 44,
+      "cardplay_decisions": 1105,
       "games": 16,
       "learner_bidding_samples": 32,
       "learner_cardplay_samples": 32,
       "learner_samples": 64,
       "learner_steps": 1,
-      "play_transitions": 646
+      "play_transitions": 768
     },
     "gpu_seconds": {
       "inference": null,
-      "learner": 0.25119395446777343
+      "learner": 0.24305197143554688
     },
     "measurement": {
       "amp": {
@@ -55,32 +55,32 @@
       },
       "parameter_update_observed": true,
       "phase_wall_seconds": {
-        "collection": 1.871441,
-        "optimization": 0.252054,
-        "total": 2.123969
+        "collection": 2.026131,
+        "optimization": 0.243909,
+        "total": 2.270417
       },
       "source_schema_version": "p17-gpu-run-v1",
-      "training_wall_seconds": 2.123969
+      "training_wall_seconds": 2.270417
     },
-    "peak_vram_mib": 271.103,
+    "peak_vram_mib": 266.845,
     "queue_latency_ms": {
       "p50": null,
       "p95": null
     },
     "rates": {
-      "bid_transitions_per_second": 24.045642,
-      "bidding_decisions_per_second": 24.045642,
-      "cardplay_decisions_per_second": 787.094009,
-      "games_per_second": 8.549562,
-      "learner_samples_per_second": 253.913844,
-      "learner_steps_per_second": 3.967404,
-      "play_transitions_per_second": 345.188547
+      "bid_transitions_per_second": 21.716266,
+      "bidding_decisions_per_second": 21.716266,
+      "cardplay_decisions_per_second": 545.374411,
+      "games_per_second": 7.896824,
+      "learner_samples_per_second": 262.392942,
+      "learner_steps_per_second": 4.09989,
+      "play_transitions_per_second": 379.047554
     },
     "staging_seconds": null,
     "status": "measured"
   },
   "privacy": "sanitized_no_host_or_device_identifiers",
-  "reference_digest": "bfcefc9ab6f26f3f259c144bdf7adb7d5f1677b5e7c1a20b5024ab56dd05af18",
+  "reference_digest": "a177bc8a30e0f9d88072a3373e178d89ff4eddf2eb74334029f4bf1e0213a3bb",
   "schema_version": "standard-v2-r1-benchmark-v1",
-  "training_semantics_hash": "6e52575d1e3ae0745b462862b39407f53a0886d5ab1f4322e2cd1a9d5a27b82a"
+  "training_semantics_hash": "717f608dbd96091d578869bef967ab5a57a55efb1aa465a5beb3e3bcfe3dd1cf"
 }

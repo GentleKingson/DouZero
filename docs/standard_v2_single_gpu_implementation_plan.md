@@ -107,7 +107,7 @@ flowchart LR
 
 - 冻结配置与版本注册表：`douzero/training/standard_v2_contract.py`。
 - 固定 corpus 与参考执行器：`benchmarks/standard_v2_reference.py`。
-- Golden reference：`benchmarks/baselines/standard_v2_r1_reference.json`；M1 增加独立 bidding batch 语义后 contract 显式升级为 v2，当前 digest 为 `bfcefc9ab6f26f3f259c144bdf7adb7d5f1677b5e7c1a20b5024ab56dd05af18`。
+- Golden reference：`benchmarks/baselines/standard_v2_r1_reference.json`；M1 contract v2 与固定非零 R1 seed 的当前 digest 为 `a177bc8a30e0f9d88072a3373e178d89ff4eddf2eb74334029f4bf1e0213a3bb`。
 - R1 身份拆分为训练语义 hash 与 benchmark workload hash；后者绑定完整 `TrainerConfig`、设备、world size 和执行拓扑，组合 config hash 同时覆盖两者。
 - 统一基准入口：`python -m benchmarks.bench_standard_v2`。
 - 单 GPU 实测基线：`benchmarks/baselines/standard_v2_r1_single_gpu.json`。
@@ -115,7 +115,7 @@ flowchart LR
 
 当前 base async 身份固定为 protocol `1`、bidding replay schema `0`、task semantics `actor_local_task_queue_v1`、commit semantics `cardplay_count_reconciled_v1`。目标 Standard async 身份预留为 protocol `2`、bidding replay schema `1`、task semantics `global_episode_domain_rng_v2`、commit semantics `atomic_bid_play_terminal_v2`、snapshot semantics `cycle_quiescent_atomic_standard_bundle_v2`。
 
-Async checkpoint format 已升级到 `5` 并写入上述当前协议字段；format `4` 通过显式旧 identity 兼容，未知 protocol/schema/semantics 失败关闭。Single-process checkpoint 继续使用 format `3`，没有伪装成跨拓扑 exact resume。
+新 checkpoint 统一升级为 format `6`，使用 trainer identity v2 绑定完整 `TrainerConfig`；format 3/4/5 仅作为同 source SHA 下的旧字段形状兼容，不承诺跨提交恢复。缺少 M1 字段的 checkpoint 只允许默认等价的 bidding batch/cadence，未知 protocol/schema/semantics 和跨拓扑恢复均失败关闭。
 
 本次 16 局 FP32 Standard V2 单 GPU 短基准完成 1 次参数更新：6.459 games/s、368.990 play transitions/s、12.919 bid transitions/s、241.305 learner samples/s，peak allocated VRAM 269.424 MiB。采样吞吐使用 collection wall time，learner 吞吐使用 optimization wall time。单进程路径没有推理队列和 staging 阶段，对应字段明确记录为 `null`，由 M2/M5 的 async 基准填充。
 
@@ -125,9 +125,9 @@ Async checkpoint format 已升级到 `5` 并写入上述当前协议字段；for
 
 - [x] **SV2-101** 新增 `BatchedBiddingInput`，包含 `[B, input_width]` features 和 `[B, 4]` legal mask。
 - [x] **SV2-102** 新增 `BatchedBiddingOutput`，包含 `[B, 4]` logits、landlord win、expected score 和 optional uncertainty。
-- [x] **SV2-103** 实现 `ModelV2.forward_bidding_batched()`；标量 `forward_bidding()` 改为 B=1 兼容包装。
+- [x] **SV2-103** 实现 `ModelV2.forward_bidding_batched()`；标量 `forward_bidding()` 保留轻量路径并共享 bidding head 运算。
 - [x] **SV2-104** 重写 `bidding_loss()`，直接消费批量输出和批量 targets，不再 stack Python output objects。
-- [x] **SV2-105** 移除 bidding output/mask 上逐样本的 CUDA host sync，CUDA 合法性检查使用异步断言或一次性批量检查。
+- [x] **SV2-105** 移除 bidding output/mask 上逐样本检查；批量合同使用一次聚合检查且不依赖 PyTorch 私有 API。
 - [x] **SV2-106** 增加独立的 `bidding_batch_size`，默认保持与旧 `batch_size` 相同以兼容旧配置。
 - [x] **SV2-107** 增加 `bidding_update_interval`，使 play/bid 数据率不再强制一一同步。
 - [x] **SV2-108** 增加标量/批量 output、loss、gradient、illegal-mask 和 mixed-source-policy 对照测试。
@@ -140,11 +140,13 @@ Async checkpoint format 已升级到 `5` 并写入上述当前协议字段；for
 #### M1 实施结果（2026-07-19）
 
 - 新增 dense bidding tensor contract 与单次批量 forward；训练热路径不再逐样本构造 `BiddingModelOutput` 或 stack Python outputs。
-- `bidding_loss()` 直接消费 `BatchedBiddingOutput` 和 `BatchedBiddingTargets`；CUDA mask/action 合法性使用批量异步断言，零 credit batch 保持有限零梯度。
+- `bidding_loss()` 直接消费 `BatchedBiddingOutput` 和 `BatchedBiddingTargets`，并保留旧 scalar-list API wrapper；mask/action 合法性使用公开 Torch 运算的一次批量检查，零 credit batch 保持有限零梯度。
 - `bidding_batch_size` 默认继承 play `batch_size`，`bidding_update_interval` 默认 1；两个字段进入 CLI、YAML、TrainerConfig、checkpoint trainer identity 和 R1 evidence identity。
-- bidding 模型参数和 `state_dict` key 未改变；旧 format 3/4 以及默认等价的 pre-M1 format 5 trainer identity 通过显式兼容路径加载，非默认新语义失败关闭。
-- RTX 5070、PyTorch 2.12.1+cu132、FP32、100 次采样的 forward+backward microbenchmark：B=1/32/64/128 平均分别为 0.957/0.964/0.976/0.964 ms；B=32 p95 为 1.072 ms。
-- 16 局冻结 workload 的单 GPU实测更新为 8.550 games/s、345.189 play transitions/s、24.046 bid transitions/s、253.914 learner samples/s，peak allocated VRAM 271.103 MiB。
+- bidding 模型参数和 `state_dict` key 未改变；新 format 6 完整绑定 TrainerConfig，旧 format 3/4/5 只在同 source SHA 和默认等价的新字段下加载。
+- 基准脚本同时报告 head forward/backward、包含 observation tensorization、targets、实际 loss、optimizer 和 diagnostics 的 learner wall time，以及 scalar fast path 对 batched wrapper 的延迟对照。
+- R1 seed 固定为非零值 `20260719`。旧的 16 局随机 workload 数字不再作为 M0/M1 可比证据；更新后的 CUDA artifact 必须绑定精确 head、镜像、环境、命令和完整 JSON。
+- 固定 seed 的 16 局 FP32 baseline 为 7.897 games/s、379.048 play transitions/s、21.716 bid transitions/s、262.393 learner samples/s，peak allocated VRAM 266.845 MiB；后续 M1 对照复用相同 seed 和 workload。
+- 手动 `Standard V2 M1 GPU Evidence` workflow 在 self-hosted NVIDIA runner 上以 Docker 重建精确 head，上传 CUDA pytest、完整 benchmark JSON、环境、镜像 ID 和 SHA-256 清单。
 
 ### M2：Async Standard Protocol v2
 

@@ -1,4 +1,4 @@
-"""Microbenchmark the vectorized Standard V2 bidding forward/backward path."""
+"""Benchmark the bidding head, scalar inference, and full learner hot path."""
 
 from __future__ import annotations
 
@@ -11,8 +11,13 @@ from pathlib import Path
 import torch
 
 from douzero._version import git_sha
+from douzero.coach.records import CANONICAL_DECK
+from douzero.env.rules import RuleSet
 from douzero.models_v2 import BatchedBiddingInput, ModelV2, ModelV2Config
+from douzero.models_v2.batch import bidding_observations_to_model_input
+from douzero.observation.bidding import get_bidding_obs_v2
 from douzero.observation.schema import build_v2_schema
+from douzero.training.bidding import BiddingMinibatch, BiddingTransition, bidding_loss
 
 
 def _elapsed_ms(device: torch.device, operation) -> float:
@@ -27,6 +32,80 @@ def _elapsed_ms(device: torch.device, operation) -> float:
     started = time.perf_counter()
     operation()
     return (time.perf_counter() - started) * 1000.0
+
+
+def _wall_elapsed_ms(device: torch.device, operation) -> float:
+    """Measure host-visible latency, including tensorization, copies, and syncs."""
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    operation()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return (time.perf_counter() - started) * 1000.0
+
+
+def _summary(samples: list[float], iterations: int) -> dict:
+    ordered = sorted(samples)
+    return {
+        "mean_ms": statistics.fmean(samples),
+        "p50_ms": statistics.median(samples),
+        "p95_ms": ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))],
+        "iterations": iterations,
+    }
+
+
+def _bidding_observations_and_minibatch(batch_size: int):
+    ruleset = RuleSet.standard()
+    histories = ((), (("0", 1),), (("0", 1), ("1", 2)))
+    observations = []
+    transitions = []
+    sources = ("rule", "learned", "epsilon_random")
+    for index in range(batch_size):
+        history = histories[index % len(histories)]
+        order = ("0", "1", "2")
+        highest = max((bid for _, bid in history), default=0)
+        raw = {
+            "phase": "bidding",
+            "position": order[len(history)],
+            "my_handcards": list(CANONICAL_DECK[:17]),
+            "current_highest_bid": highest,
+            "bidding_history": list(history),
+            "bidding_order": list(order),
+            "first_bidder": order[0],
+            "legal_bids": [
+                bid for bid in ruleset.bid_values if bid == 0 or bid > highest
+            ],
+        }
+        observation = get_bidding_obs_v2(raw, ruleset=ruleset)
+        action = min(bid for bid in observation.legal_bids if bid > highest)
+        transition = BiddingTransition(
+            obs=observation,
+            bid_action=action,
+            policy_version="benchmark",
+            source_policy=sources[index % len(sources)],
+        )
+        others = [seat for seat in order if seat != observation.current_seat]
+        transition.assign_actor_role(
+            {
+                observation.current_seat: "landlord",
+                others[0]: "landlord_down",
+                others[1]: "landlord_up",
+            }
+        )
+        transition.label_from_terminal(
+            {
+                "team_targets": {
+                    "landlord": {"target_win": 1.0, "target_score": 2.0},
+                    "landlord_down": {"target_win": 0.0, "target_score": -1.0},
+                    "landlord_up": {"target_win": 0.0, "target_score": -1.0},
+                }
+            }
+        )
+        observations.append(observation)
+        transitions.append(transition)
+    return observations, BiddingMinibatch(transitions)
 
 
 def run_benchmark(
@@ -70,7 +149,7 @@ def run_benchmark(
             feature_schema_hash=schema_hash,
         )
 
-        def forward_backward() -> None:
+        def head_forward_backward() -> None:
             model.zero_grad(set_to_none=True)
             output = model.forward_bidding_batched(inputs)
             loss = (
@@ -81,20 +160,75 @@ def run_benchmark(
             loss.backward()
 
         for _ in range(warmup):
-            forward_backward()
+            head_forward_backward()
         if target.type == "cuda":
             torch.cuda.synchronize(target)
-        samples = [
-            _elapsed_ms(target, forward_backward) for _ in range(iterations)
+        head_samples = [
+            _elapsed_ms(target, head_forward_backward) for _ in range(iterations)
         ]
-        ordered = sorted(samples)
+
+        observations, minibatch = _bidding_observations_and_minibatch(batch_size)
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=1e-4)
+
+        def learner_step() -> None:
+            optimizer.zero_grad(set_to_none=True)
+            learner_inputs = bidding_observations_to_model_input(observations)
+            learner_output = model.forward_bidding_batched(learner_inputs)
+            learner_targets = minibatch.to_targets(
+                learner_output.bid_logits.device,
+                dtype=learner_output.bid_logits.dtype,
+            )
+            components = bidding_loss(
+                learner_output,
+                learner_targets,
+                lambda_policy=1.0,
+                lambda_landlord_win=0.5,
+                lambda_landlord_score=0.25,
+            )
+            components.total.backward()
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), 40.0, error_if_nonfinite=True
+            )
+            optimizer.step()
+            components.as_log_dict()
+
+        for _ in range(warmup):
+            learner_step()
+        learner_samples = [
+            _wall_elapsed_ms(target, learner_step) for _ in range(iterations)
+        ]
         results.append({
             "batch_size": batch_size,
-            "mean_ms": statistics.fmean(samples),
-            "p50_ms": statistics.median(samples),
-            "p95_ms": ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))],
-            "iterations": iterations,
+            "head_forward_backward": _summary(head_samples, iterations),
+            "learner_step_wall": _summary(learner_samples, iterations),
         })
+
+    scalar_observation = _bidding_observations_and_minibatch(1)[0][0]
+
+    def scalar_fast() -> None:
+        model.forward_bidding(scalar_observation)
+
+    def scalar_batched_reference() -> None:
+        model.forward_bidding_batched(
+            bidding_observations_to_model_input((scalar_observation,))
+        ).select(0)
+
+    for _ in range(warmup):
+        scalar_fast()
+        scalar_batched_reference()
+    scalar_inference = {
+        "fast_path_wall": _summary(
+            [_wall_elapsed_ms(target, scalar_fast) for _ in range(iterations)],
+            iterations,
+        ),
+        "batched_wrapper_wall": _summary(
+            [
+                _wall_elapsed_ms(target, scalar_batched_reference)
+                for _ in range(iterations)
+            ],
+            iterations,
+        ),
+    }
 
     device_metadata = None
     if target.type == "cuda":
@@ -105,7 +239,7 @@ def run_benchmark(
             "compute_capability": f"{properties.major}.{properties.minor}",
         }
     return {
-        "schema_version": "standard-v2-bidding-microbenchmark-v1",
+        "schema_version": "standard-v2-bidding-microbenchmark-v2",
         "source_git_sha": git_sha(),
         "device": str(target),
         "device_metadata": device_metadata,
@@ -113,6 +247,7 @@ def run_benchmark(
         "cuda_version": torch.version.cuda,
         "batch_sizes": list(batch_sizes),
         "results": results,
+        "scalar_inference": scalar_inference,
     }
 
 

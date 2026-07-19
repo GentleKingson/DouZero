@@ -1,0 +1,75 @@
+# Manual, commit-bound target-hardware evidence for the Standard V2 M1 gate.
+name: Standard V2 M1 GPU Evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: standard-v2-m1-gpu-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: [self-hosted, linux, gpu, nvidia]
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Build exact-source test image
+        run: |
+          docker build --progress=plain \
+            --build-arg DOUZERO_GIT_SHA="${GITHUB_SHA}" \
+            -t douzero-test:latest .
+          mkdir -p artifacts/standard-v2-m1-gpu
+          docker image inspect douzero-test:latest --format '{{.Id}}' \
+            > artifacts/standard-v2-m1-gpu/docker-image-id.txt
+
+      - name: Run CUDA acceptance tests
+        run: |
+          docker run --rm --gpus all \
+            --mount type=bind,src="${PWD}/.git",dst=/workspace/DouZero/.git,readonly \
+            douzero-test:latest python -m pytest -q \
+              tests/test_p17_bidding.py \
+              tests/test_standard_v2_contract.py \
+              tests/test_v2_throughput.py::test_async_single_gpu_end_to_end_checkpoint_resume_and_shutdown \
+            2>&1 | tee artifacts/standard-v2-m1-gpu/cuda-pytest.log
+
+      - name: Measure head, learner, and scalar latency
+        run: |
+          docker run --rm --gpus all \
+            --mount type=bind,src="${PWD}/.git",dst=/workspace/DouZero/.git,readonly \
+            --mount type=bind,src="${PWD}/artifacts/standard-v2-m1-gpu",dst=/artifacts \
+            douzero-test:latest python -m benchmarks.bench_bidding_batch \
+              --device cuda --batch-sizes 1 32 64 128 \
+              --warmup 20 --iterations 100 \
+              --output /artifacts/bidding-benchmark.json
+
+      - name: Record commit-bound environment and digests
+        run: |
+          docker run --rm --gpus all \
+            --mount type=bind,src="${PWD}/artifacts/standard-v2-m1-gpu",dst=/artifacts \
+            douzero-test:latest python tools/gpu_validation_probe.py \
+              --output /artifacts/environment.json
+          printf '%s\n' \
+            "source_git_sha=${GITHUB_SHA}" \
+            "docker_image=$(cat artifacts/standard-v2-m1-gpu/docker-image-id.txt)" \
+            "workflow=${GITHUB_WORKFLOW}" \
+            "run_id=${GITHUB_RUN_ID}" \
+            > artifacts/standard-v2-m1-gpu/metadata.txt
+          cd artifacts/standard-v2-m1-gpu
+          sha256sum bidding-benchmark.json cuda-pytest.log environment.json \
+            docker-image-id.txt metadata.txt > SHA256SUMS
+
+      - name: Upload exact-head evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: standard-v2-m1-gpu-${{ github.sha }}
+          path: artifacts/standard-v2-m1-gpu/
+          if-no-files-found: error
+          retention-days: 30

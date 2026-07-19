@@ -12,7 +12,8 @@ feature_version: v2
 ruleset: standard
 model_version: v2
 
-seed: 0
+# Non-zero so benchmark deals and model initialization are reproducible.
+seed: 20260719
 deterministic: false
 batch_size: 32
 bidding_batch_size: 32

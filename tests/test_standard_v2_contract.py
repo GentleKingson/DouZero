@@ -603,7 +603,7 @@ def test_historical_v3_stats_are_marked_as_partial_metrics_history():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_async_checkpoint_v5_binds_protocol_and_loads_v4(tmp_path):
+def test_async_checkpoint_v6_binds_protocol_and_loads_v4(tmp_path):
     config = TrainerConfig(
         max_episodes=0,
         optimizer_steps=0,
@@ -615,14 +615,17 @@ def test_async_checkpoint_v5_binds_protocol_and_loads_v4(tmp_path):
         device="cuda",
     )
     trainer = V2Trainer(_tiny_model(), config=config)
-    checkpoint = tmp_path / "async-v5.pt"
+    checkpoint = tmp_path / "async-v6.pt"
     identity = trainer.save_training_checkpoint(str(checkpoint))
-    assert identity["checkpoint_version"] == 5
+    assert identity["checkpoint_version"] == 6
+    assert identity["trainer_config_identity_version"] == 2
     assert identity["async_protocol_version"] == BASE_ASYNC_PROTOCOL_VERSION
     assert identity["compact_bidding_replay_schema_version"] == 0
 
     bundle = torch.load(checkpoint, map_location="cuda", weights_only=True)
     pre_m1 = copy.deepcopy(bundle)
+    pre_m1["checkpoint_version"] = 5
+    pre_m1.pop("trainer_config_identity_version")
     pre_m1_config, pre_m1_hash = trainer._pre_m1_v5_trainer_config_identity()
     pre_m1["trainer_config"] = pre_m1_config
     pre_m1["trainer_config_hash"] = pre_m1_hash
@@ -642,6 +645,7 @@ def test_async_checkpoint_v5_binds_protocol_and_loads_v4(tmp_path):
 
     v4_config, v4_hash = trainer._v4_trainer_config_identity()
     bundle["checkpoint_version"] = 4
+    bundle.pop("trainer_config_identity_version")
     bundle["trainer_config"] = v4_config
     bundle["trainer_config_hash"] = v4_hash
     bundle["stats"].update({
@@ -678,9 +682,9 @@ def test_async_checkpoint_v5_binds_protocol_and_loads_v4(tmp_path):
     assert restored.stats.metrics_history_complete is True
     assert restored.stats.metrics_history_source == "migrated_v4_exact"
 
-    v5_bundle = torch.load(checkpoint, map_location="cuda", weights_only=True)
-    v5_bundle["async_protocol_version"] = 999
+    v6_bundle = torch.load(checkpoint, map_location="cuda", weights_only=True)
+    v6_bundle["async_protocol_version"] = 999
     bad_path = tmp_path / "async-bad-protocol.pt"
-    torch.save(v5_bundle, bad_path)
+    torch.save(v6_bundle, bad_path)
     with pytest.raises(CheckpointCompatibilityError, match="async_protocol_version"):
         restored.load_training_checkpoint(str(bad_path))

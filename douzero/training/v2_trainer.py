@@ -94,11 +94,13 @@ from douzero.training.standard_v2_contract import (
 )
 
 
-# Format 3 is the single-process topology contract, format 4 introduced the
-# base async topology, and format 5 binds async protocol/task/commit identities.
-# Formats 1/2 predated explicit topology and remain intentionally rejected.
-_TRAINER_CHECKPOINT_VERSION = 5
-_COMPATIBLE_TRAINER_CHECKPOINT_VERSIONS = frozenset({3, 4, 5})
+# Format 3 is the legacy single-process topology contract, format 4 introduced
+# the base async topology, format 5 binds async protocol/task/commit identities,
+# and format 6 gives both topologies one complete TrainerConfig identity. Formats
+# 1/2 predated explicit topology and remain intentionally rejected.
+_TRAINER_CHECKPOINT_VERSION = 6
+_TRAINER_CONFIG_IDENTITY_VERSION = 2
+_COMPATIBLE_TRAINER_CHECKPOINT_VERSIONS = frozenset({3, 4, 5, 6})
 _SINGLE_PROCESS_TOPOLOGY = "single_process"
 _ASYNC_SINGLE_GPU_TOPOLOGY = "async_single_gpu"
 _ASYNC_UNSUPPORTED_DECISION_MODES = frozenset({
@@ -1923,7 +1925,7 @@ class V2Trainer:
             raise ValueError(
                 "checkpoint stats contain a partial benchmark counter set"
             )
-        if checkpoint_version in {4, 5}:
+        if checkpoint_version in {4, 5, 6}:
             required = field_names - new_counters - history_fields
             missing = required - set(payload)
             if missing:
@@ -1931,8 +1933,10 @@ class V2Trainer:
                     "checkpoint stats are missing required fields: "
                     + ", ".join(sorted(missing))
                 )
-        if checkpoint_version == 5 and not present_new:
-            raise ValueError("format 5 checkpoint is missing benchmark counters")
+        if checkpoint_version in {5, 6} and not present_new:
+            raise ValueError(
+                f"format {checkpoint_version} checkpoint is missing benchmark counters"
+            )
 
         migrated = asdict(TrainerStats())
         migrated.update(payload)
@@ -2038,14 +2042,8 @@ class V2Trainer:
                 "resumable trainer checkpoints require a full source Git SHA; "
                 "build from a Git checkout or set DOUZERO_GIT_SHA"
             )
-        checkpoint_version = (
-            3 if self.config.v2_training_mode == _SINGLE_PROCESS_TOPOLOGY
-            else _TRAINER_CHECKPOINT_VERSION
-        )
-        if checkpoint_version == 3:
-            trainer_config, trainer_config_hash = self._v3_trainer_config_identity()
-        else:
-            trainer_config, trainer_config_hash = self._trainer_config_identity()
+        checkpoint_version = _TRAINER_CHECKPOINT_VERSION
+        trainer_config, trainer_config_hash = self._trainer_config_identity()
         bundle = {
             "checkpoint_version": checkpoint_version,
             "training_topology": self.config.v2_training_mode,
@@ -2076,6 +2074,7 @@ class V2Trainer:
             "belief_state_dict_hash": belief_state_hash,
             "trainer_config": trainer_config,
             "trainer_config_hash": trainer_config_hash,
+            "trainer_config_identity_version": _TRAINER_CONFIG_IDENTITY_VERSION,
             "loss_config": self.loss_fn.config.to_dict(),
             "bidding_policy_config": (
                 asdict(self.bidding_policy_config)
@@ -2154,6 +2153,7 @@ class V2Trainer:
             "bidding_head_version", "bidding_action_schema",
             "bidding_feature_schema_hash", "belief_config_hash",
             "belief_state_dict_hash", "trainer_config", "trainer_config_hash",
+            "trainer_config_identity_version",
             "replay_resume_policy",
             "loss_config", "bidding_policy_config",
         ]
@@ -2252,8 +2252,24 @@ class V2Trainer:
         }
         trainer_config, trainer_config_hash = self._trainer_config_identity()
         if checkpoint_version == 3:
+            if (
+                self.config.bidding_batch_size != self.config.batch_size
+                or self.config.bidding_update_interval != 1
+            ):
+                raise CheckpointCompatibilityError(
+                    "legacy format 3 checkpoint requires bidding_batch_size "
+                    "to inherit batch_size and bidding_update_interval=1"
+                )
             trainer_config, trainer_config_hash = self._v3_trainer_config_identity()
         elif checkpoint_version == 4:
+            if (
+                self.config.bidding_batch_size != self.config.batch_size
+                or self.config.bidding_update_interval != 1
+            ):
+                raise CheckpointCompatibilityError(
+                    "legacy format 4 checkpoint requires bidding_batch_size "
+                    "to inherit batch_size and bidding_update_interval=1"
+                )
             trainer_config, trainer_config_hash = self._v4_trainer_config_identity()
         elif (
             checkpoint_version == 5
@@ -2274,6 +2290,10 @@ class V2Trainer:
             )
         expected["trainer_config"] = trainer_config
         expected["trainer_config_hash"] = trainer_config_hash
+        if checkpoint_version >= 6:
+            expected["trainer_config_identity_version"] = (
+                _TRAINER_CONFIG_IDENTITY_VERSION
+            )
         if checkpoint_version >= 4:
             expected.update({
                 "num_actors": self.config.num_actors,

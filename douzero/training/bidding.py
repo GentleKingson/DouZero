@@ -11,7 +11,7 @@ from typing import Callable, Iterable, Mapping
 import torch
 import torch.nn.functional as F
 
-from douzero.models_v2.output import BatchedBiddingOutput
+from douzero.models_v2.output import BatchedBiddingOutput, BiddingModelOutput
 from douzero.observation.bidding import BIDDING_ACTIONS, BiddingObservationV2
 
 _CONFIGURABLE_POLICIES = frozenset({"random", "rule", "max", "pass", "learned"})
@@ -260,6 +260,22 @@ class BatchedBiddingTargets:
         )
         if not same_device:
             raise ValueError("all bidding target tensors must share one device")
+        value_targets = (self.actor_win, self.landlord_win, self.landlord_score)
+        if any(not tensor.is_floating_point() for tensor in value_targets):
+            raise ValueError("bidding value targets must have floating dtype")
+        from douzero.models_v2.numerical import assert_tensor_true
+
+        assert_tensor_true(
+            torch.stack([torch.isfinite(tensor).all() for tensor in value_targets]).all(),
+            "bidding value targets must contain only finite values",
+        )
+        assert_tensor_true(
+            (
+                ((self.actor_win == 0) | (self.actor_win == 1)).all()
+                & ((self.landlord_win == 0) | (self.landlord_win == 1)).all()
+            ),
+            "bidding win targets must be binary",
+        )
 
 
 class BiddingReplayBuffer:
@@ -314,8 +330,8 @@ class BiddingLossComponents:
 
 
 def bidding_loss(
-    output: BatchedBiddingOutput,
-    targets: BatchedBiddingTargets,
+    output: BatchedBiddingOutput | list[BiddingModelOutput],
+    targets: BatchedBiddingTargets | BiddingMinibatch,
     *,
     lambda_policy: float,
     lambda_landlord_win: float,
@@ -332,10 +348,53 @@ def bidding_loss(
     actor-win target instead of being treated as an always-correct class label.
     """
 
-    if not isinstance(output, BatchedBiddingOutput):
-        raise TypeError("bidding_loss requires BatchedBiddingOutput")
+    if isinstance(output, list):
+        if not output or any(
+            not isinstance(item, BiddingModelOutput) for item in output
+        ):
+            raise TypeError(
+                "legacy bidding_loss outputs must be a non-empty list of "
+                "BiddingModelOutput"
+            )
+        if not isinstance(targets, BiddingMinibatch):
+            raise TypeError(
+                "legacy bidding_loss outputs require a BiddingMinibatch"
+            )
+        uncertainty = (
+            None
+            if all(item.uncertainty is None for item in output)
+            else torch.stack(
+                [
+                    item.uncertainty
+                    for item in output
+                    if item.uncertainty is not None
+                ]
+            )
+        )
+        if uncertainty is not None and uncertainty.shape[0] != len(output):
+            raise ValueError("legacy bidding outputs must agree on uncertainty")
+        output = BatchedBiddingOutput(
+            bid_logits=torch.stack([item.bid_logits for item in output]),
+            bid_action_mask=torch.stack([item.bid_action_mask for item in output]),
+            landlord_win_logit=torch.stack(
+                [item.landlord_win_logit.reshape(()) for item in output]
+            ),
+            expected_landlord_score=torch.stack(
+                [item.expected_landlord_score.reshape(()) for item in output]
+            ),
+            uncertainty=uncertainty,
+        )
+        targets = targets.to_targets(
+            output.bid_logits.device, dtype=output.bid_logits.dtype
+        )
+    elif not isinstance(output, BatchedBiddingOutput):
+        raise TypeError(
+            "bidding_loss requires BatchedBiddingOutput or legacy scalar outputs"
+        )
     if not isinstance(targets, BatchedBiddingTargets):
-        raise TypeError("bidding_loss requires BatchedBiddingTargets")
+        raise TypeError(
+            "batched bidding_loss output requires BatchedBiddingTargets"
+        )
     if output.batch_size != targets.actions.shape[0]:
         raise ValueError("bidding output and targets must have equal batch size")
     if output.bid_logits.device != targets.actions.device:
@@ -350,21 +409,16 @@ def bidding_loss(
     actions = targets.actions
     rows = torch.arange(output.batch_size, device=logits.device)
     actions_in_range = ((actions >= 0) & (actions < logits.shape[1])).all()
-    if logits.device.type == "cuda":
-        torch._assert_async(
-            actions_in_range, "bidding policy label is outside the action schema"
-        )
-        safe_actions = actions.clamp(0, logits.shape[1] - 1)
-        torch._assert_async(
-            masks[rows, safe_actions].all(),
-            "bidding policy label points to an illegal action",
-        )
-    else:
-        if not bool(actions_in_range):
-            raise ValueError("bidding policy label is outside the action schema")
-        safe_actions = actions
-        if not bool(masks[rows, safe_actions].all()):
-            raise ValueError("bidding policy label points to an illegal action")
+    from douzero.models_v2.numerical import assert_tensor_true
+
+    assert_tensor_true(
+        actions_in_range, "bidding policy label is outside the action schema"
+    )
+    safe_actions = actions.clamp(0, logits.shape[1] - 1)
+    assert_tensor_true(
+        masks[rows, safe_actions].all(),
+        "bidding policy label points to an illegal action",
+    )
     masked_logits = logits.masked_fill(~masks, torch.finfo(logits.dtype).min)
     selected_logits = logits.gather(1, safe_actions[:, None]).squeeze(1)
     imitation_terms = F.cross_entropy(

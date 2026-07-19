@@ -215,17 +215,22 @@ class BatchedBiddingInput:
             raise ValueError("batched bidding legal_mask must have shape (B, 4)")
         if self.legal_mask.dtype != torch.bool:
             raise ValueError("batched bidding legal_mask must have bool dtype")
+        if not self.features.is_floating_point():
+            raise ValueError("batched bidding features must have floating dtype")
+        if self.features.device != self.legal_mask.device:
+            raise ValueError("batched bidding features and legal_mask must share one device")
         if not self.feature_schema_hash:
             raise ValueError("batched bidding input requires a feature schema hash")
-        legal_rows = self.legal_mask.any(dim=1).all()
-        if self.legal_mask.device.type == "cuda":
-            torch._assert_async(
-                legal_rows, "every batched bidding input must contain a legal action"
-            )
-        elif not bool(legal_rows):
-            raise ValueError(
-                "every batched bidding input must contain a legal action"
-            )
+        from .numerical import assert_tensor_true
+
+        assert_tensor_true(
+            self.legal_mask.any(dim=1).all(),
+            "every batched bidding input must contain a legal action",
+        )
+        assert_tensor_true(
+            torch.isfinite(self.features).all(),
+            "batched bidding features must contain only finite values",
+        )
 
     @property
     def batch_size(self) -> int:
@@ -331,13 +336,11 @@ def model_input_bundles_to_batch(
             raise ValueError(
                 f"bundle {index} action_mask must be bool with shape ({count},)"
             )
-        if bundle.action_mask.device.type == "cuda":
-            torch._assert_async(
-                bundle.action_mask.any(),
-                f"bundle {index} must contain a legal action",
-            )
-        elif not bool(bundle.action_mask.any()):
-            raise ValueError(f"bundle {index} must contain a legal action")
+        from .numerical import assert_tensor_true
+
+        assert_tensor_true(
+            bundle.action_mask.any(), f"bundle {index} must contain a legal action"
+        )
     max_actions = max(counts)
     if pad_to_actions is not None:
         if pad_to_actions < max_actions:
@@ -378,20 +381,11 @@ def model_input_bundles_to_batch(
                 f"chosen_action_indices must have shape ({len(bundles)},), "
                 f"got {tuple(chosen.shape)}"
             )
-        if chosen.device.type == "cuda":
-            action_counts = chosen.new_tensor(counts)
-            torch._assert_async(
-                ((chosen >= 0) & (chosen < action_counts)).all(),
-                "chosen action is outside its row's legal range",
-            )
-        else:
-            for row, count in enumerate(counts):
-                value = int(chosen[row].item())
-                if value < 0 or value >= count:
-                    raise ValueError(
-                        f"chosen action {value} is outside row {row}'s legal range "
-                        f"[0, {count})"
-                    )
+        action_counts = chosen.new_tensor(counts)
+        assert_tensor_true(
+            ((chosen >= 0) & (chosen < action_counts)).all(),
+            "chosen action is outside its row's legal range",
+        )
 
     try:
         role_indices = bundles[0].action_features.new_tensor(

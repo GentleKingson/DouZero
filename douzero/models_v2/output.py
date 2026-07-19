@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .numerical import assert_tensor_true
+
 
 @dataclass(frozen=True)
 class BiddingModelOutput:
@@ -40,13 +42,9 @@ class BiddingModelOutput:
             )
         if self.bid_action_mask.shape != (4,) or self.bid_action_mask.dtype != torch.bool:
             raise ValueError("bid_action_mask must be bool with shape (4,)")
-        has_legal_action = self.bid_action_mask.any()
-        if self.bid_action_mask.device.type == "cuda":
-            torch._assert_async(
-                has_legal_action, "bidding output must contain a legal action"
-            )
-        elif not bool(has_legal_action):
-            raise ValueError("bidding output must contain a legal action")
+        assert_tensor_true(
+            self.bid_action_mask.any(), "bidding output must contain a legal action"
+        )
         for name in ("landlord_win_logit", "expected_landlord_score"):
             if getattr(self, name).numel() != 1:
                 raise ValueError(f"{name} must be scalar")
@@ -88,15 +86,26 @@ class BatchedBiddingOutput:
                 raise ValueError(f"{name} must have shape (B,)")
         if self.uncertainty is not None and self.uncertainty.shape != (batch_size,):
             raise ValueError("batched uncertainty must have shape (B,) when present")
-        legal_rows = self.bid_action_mask.any(dim=1).all()
-        if self.bid_action_mask.device.type == "cuda":
-            torch._assert_async(
-                legal_rows, "every batched bidding decision must contain a legal action"
-            )
-        elif not bool(legal_rows):
-            raise ValueError(
-                "every batched bidding decision must contain a legal action"
-            )
+        tensors = (
+            self.bid_action_mask,
+            self.landlord_win_logit,
+            self.expected_landlord_score,
+        ) + (() if self.uncertainty is None else (self.uncertainty,))
+        if any(tensor.device != self.bid_logits.device for tensor in tensors):
+            raise ValueError("all batched bidding outputs must share one device")
+        if any(
+            not tensor.is_floating_point()
+            for tensor in (
+                self.bid_logits,
+                self.landlord_win_logit,
+                self.expected_landlord_score,
+            ) + (() if self.uncertainty is None else (self.uncertainty,))
+        ):
+            raise ValueError("batched bidding values must have floating dtype")
+        assert_tensor_true(
+            self.bid_action_mask.any(dim=1).all(),
+            "every batched bidding decision must contain a legal action",
+        )
 
     @property
     def batch_size(self) -> int:
@@ -288,13 +297,10 @@ class BatchedModelOutput:
         batch_actions = self.win_logit.shape[:2]
         if self.action_mask.shape != batch_actions or self.action_mask.dtype != torch.bool:
             raise ValueError("batched action_mask must be bool with shape (B, A)")
-        legal_rows = self.action_mask.any(dim=1).all()
-        if self.action_mask.device.type == "cuda":
-            torch._assert_async(
-                legal_rows, "every batched decision must contain a legal action"
-            )
-        elif not bool(legal_rows):
-            raise ValueError("every batched decision must contain a legal action")
+        assert_tensor_true(
+            self.action_mask.any(dim=1).all(),
+            "every batched decision must contain a legal action",
+        )
         names = ("score_if_win", "score_if_loss", "p_win", "score_mean")
         for name in names:
             if getattr(self, name).shape != self.win_logit.shape:
@@ -314,20 +320,14 @@ class BatchedModelOutput:
             raise ValueError("chosen indices must be long with shape (B,)")
         rows = torch.arange(indices.shape[0], device=indices.device)
         in_range = ((indices >= 0) & (indices < self.action_mask.shape[1])).all()
-        if indices.device.type == "cuda":
-            torch._assert_async(
-                in_range, "chosen action index is outside the padded action range"
-            )
-            indices = indices.clamp(0, self.action_mask.shape[1] - 1)
-            torch._assert_async(
-                self.action_mask[rows, indices].all(),
-                "chosen action index points at padding",
-            )
-        else:
-            if not bool(in_range):
-                raise ValueError("chosen action index is outside the padded action range")
-            if not bool(self.action_mask[rows, indices].all()):
-                raise ValueError("chosen action index points at padding")
+        assert_tensor_true(
+            in_range, "chosen action index is outside the padded action range"
+        )
+        indices = indices.clamp(0, self.action_mask.shape[1] - 1)
+        assert_tensor_true(
+            self.action_mask[rows, indices].all(),
+            "chosen action index points at padding",
+        )
 
         def gather(value):
             return None if value is None else value[rows, indices]

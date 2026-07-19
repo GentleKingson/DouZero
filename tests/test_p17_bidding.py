@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from benchmarks.bench_bidding_batch import run_benchmark
 from douzero.checkpoint import (
     CheckpointCompatibilityError,
     load_v2_checkpoint,
@@ -372,10 +373,9 @@ def test_batched_bidding_loss_and_gradients_match_b1_compatibility_path():
         scalar_model.forward_bidding(observation)
         for observation in observations
     ]
-    scalar_output = _batch_bidding_outputs(scalar_outputs)
     scalar_components = bidding_loss(
-        scalar_output,
-        minibatch.to_targets(scalar_output.bid_logits.device),
+        scalar_outputs,
+        minibatch,
         lambda_policy=1.0,
         lambda_landlord_win=0.5,
         lambda_landlord_score=0.25,
@@ -439,6 +439,18 @@ def test_batched_bidding_cuda_mixed_source_forward_loss_backward():
 
 def test_batched_bidding_contract_rejects_empty_and_illegal_rows():
     schema_hash = build_v2_schema().stable_hash()
+    with pytest.raises(ValueError, match="floating dtype"):
+        BatchedBiddingInput(
+            features=torch.ones(1, 8, dtype=torch.long),
+            legal_mask=torch.ones(1, 4, dtype=torch.bool),
+            feature_schema_hash=schema_hash,
+        )
+    with pytest.raises(ValueError, match="finite values"):
+        BatchedBiddingInput(
+            features=torch.tensor([[float("nan")]]),
+            legal_mask=torch.ones(1, 4, dtype=torch.bool),
+            feature_schema_hash=schema_hash,
+        )
     with pytest.raises(ValueError, match="legal action"):
         BatchedBiddingInput(
             features=torch.zeros(2, 8),
@@ -453,6 +465,11 @@ def test_batched_bidding_contract_rejects_empty_and_illegal_rows():
     )
     transition = _labelled_bidding_transition(obs, 3)
     minibatch = BiddingMinibatch([transition])
+    valid_targets = minibatch.to_targets("cpu")
+    with pytest.raises(ValueError, match="floating dtype"):
+        replace(valid_targets, actor_win=torch.ones(1, dtype=torch.long))
+    with pytest.raises(ValueError, match="binary"):
+        replace(valid_targets, landlord_win=torch.tensor([0.5]))
     output = BatchedBiddingOutput(
         bid_logits=torch.zeros(1, 4),
         bid_action_mask=torch.tensor([[True, False, True, False]]),
@@ -484,6 +501,23 @@ def test_bidding_batch_controls_inherit_and_validate_independently():
         TrainerConfig(bidding_batch_size=0)
     with pytest.raises(ValueError, match="bidding_update_interval"):
         TrainerConfig(bidding_update_interval=0)
+
+
+def test_bidding_benchmark_covers_head_learner_and_scalar_paths():
+    report = run_benchmark(
+        device="cpu", batch_sizes=(1,), warmup=0, iterations=1
+    )
+    assert report["schema_version"] == "standard-v2-bidding-microbenchmark-v2"
+    assert set(report["results"][0]) == {
+        "batch_size",
+        "head_forward_backward",
+        "learner_step_wall",
+    }
+    assert set(report["scalar_inference"]) == {
+        "fast_path_wall",
+        "batched_wrapper_wall",
+    }
+    assert report["results"][0]["learner_step_wall"]["mean_ms"] > 0
 
 
 def test_masked_bid_loss_uses_actor_return_and_landlord_value_gradients():
@@ -897,7 +931,8 @@ def test_standard_training_step_and_strict_resume(tmp_path):
 
     checkpoint = tmp_path / "standard-resume.pt"
     identity = trainer.save_training_checkpoint(str(checkpoint))
-    assert identity["checkpoint_version"] == 3
+    assert identity["checkpoint_version"] == 6
+    assert identity["trainer_config_identity_version"] == 2
     assert identity["training_topology"] == "single_process"
     assert identity["training_world_size"] == 1
     assert identity["bidding_head_version"]
@@ -937,6 +972,142 @@ def test_standard_training_step_and_strict_resume(tmp_path):
         CheckpointCompatibilityError, match="training_world_size mismatch"
     ):
         restored.load_training_checkpoint(str(topology_checkpoint))
+
+    changed_bidding_config = replace(
+        trainer_cfg, bidding_batch_size=1, bidding_update_interval=2
+    )
+    with pytest.raises(CheckpointCompatibilityError, match="trainer_config mismatch"):
+        V2Trainer(
+            ModelV2(build_v2_schema(), cfg),
+            ruleset=RuleSet.standard(),
+            loss_config=loss,
+            bidding_policy_config=BiddingPolicyConfig(policy="max"),
+            config=changed_bidding_config,
+        ).load_training_checkpoint(str(checkpoint))
+
+
+def test_single_process_legacy_format3_requires_default_m1_controls(tmp_path):
+    cfg = _tiny_config()
+    loss = LossConfig(lambda_bid_policy=1.0)
+    default_config = TrainerConfig(
+        max_episodes=0,
+        optimizer_steps=0,
+        batch_size=2,
+        buffer_capacity=4,
+    )
+    trainer = V2Trainer(
+        ModelV2(build_v2_schema(), cfg),
+        ruleset=RuleSet.standard(),
+        loss_config=loss,
+        bidding_policy_config=BiddingPolicyConfig(policy="max"),
+        config=default_config,
+    )
+    current_path = tmp_path / "single-v6.pt"
+    trainer.save_training_checkpoint(str(current_path))
+    legacy = torch.load(current_path, weights_only=True)
+    legacy["checkpoint_version"] = 3
+    legacy_config, legacy_hash = trainer._v3_trainer_config_identity()
+    legacy["trainer_config"] = legacy_config
+    legacy["trainer_config_hash"] = legacy_hash
+    legacy.pop("trainer_config_identity_version")
+    for name in (
+        "num_actors",
+        "games_per_actor",
+        "replay_schema_version",
+        "snapshot_publication_semantics",
+        "request_ordering_semantics",
+        "actor_rng_resume_semantics",
+        "async_protocol_version",
+        "compact_bidding_replay_schema_version",
+        "episode_task_semantics",
+        "episode_commit_semantics",
+    ):
+        legacy.pop(name, None)
+    legacy_path = tmp_path / "single-v3.pt"
+    torch.save(legacy, legacy_path)
+
+    restored = V2Trainer(
+        ModelV2(build_v2_schema(), cfg),
+        ruleset=RuleSet.standard(),
+        loss_config=loss,
+        bidding_policy_config=BiddingPolicyConfig(policy="max"),
+        config=default_config,
+    )
+    assert restored.load_training_checkpoint(str(legacy_path))[
+        "checkpoint_version"
+    ] == 3
+
+    cross_commit = copy.deepcopy(legacy)
+    current_sha = cross_commit["source_git_sha"]
+    cross_commit["source_git_sha"] = (
+        ("f" if current_sha[0] != "f" else "e") * len(current_sha)
+    )
+    cross_commit_path = tmp_path / "single-v3-other-source.pt"
+    torch.save(cross_commit, cross_commit_path)
+    with pytest.raises(CheckpointCompatibilityError, match="source_git_sha mismatch"):
+        restored.load_training_checkpoint(str(cross_commit_path))
+
+    for incompatible in (
+        replace(default_config, bidding_batch_size=1),
+        replace(default_config, bidding_update_interval=2),
+    ):
+        with pytest.raises(
+            CheckpointCompatibilityError, match="legacy format 3 checkpoint"
+        ):
+            V2Trainer(
+                ModelV2(build_v2_schema(), cfg),
+                ruleset=RuleSet.standard(),
+                loss_config=loss,
+                bidding_policy_config=BiddingPolicyConfig(policy="max"),
+                config=incompatible,
+            ).load_training_checkpoint(str(legacy_path))
+
+
+def test_bidding_update_interval_cadence_survives_checkpoint_resume(tmp_path):
+    cfg = _tiny_config()
+    loss = LossConfig(lambda_bid_policy=1.0)
+    trainer_config = TrainerConfig(
+        max_episodes=0,
+        optimizer_steps=0,
+        batch_size=1,
+        bidding_batch_size=1,
+        bidding_update_interval=2,
+        buffer_capacity=64,
+        exp_epsilon=1.0,
+        max_steps_per_episode=500,
+        rng_seed=23,
+    )
+
+    def make_trainer():
+        return V2Trainer(
+            ModelV2(build_v2_schema(), cfg),
+            ruleset=RuleSet.standard(),
+            loss_config=loss,
+            bidding_policy_config=BiddingPolicyConfig(policy="max"),
+            config=trainer_config,
+        )
+
+    trainer = make_trainer()
+    trainer.collect_episodes(2)
+    assert trainer.step() is not None
+    assert trainer.stats.optimizer_steps == 1
+    assert trainer.stats.learner_bidding_samples == 1
+
+    checkpoint = tmp_path / "interval-resume.pt"
+    trainer.save_training_checkpoint(str(checkpoint))
+    restored = make_trainer()
+    restored.load_training_checkpoint(str(checkpoint))
+    restored.collect_episodes(2)
+
+    assert restored.step() is not None
+    assert restored.stats.optimizer_steps == 2
+    assert restored.stats.learner_bidding_samples == 1
+    assert "loss_bid_policy" not in restored.stats.last_loss
+
+    assert restored.step() is not None
+    assert restored.stats.optimizer_steps == 3
+    assert restored.stats.learner_bidding_samples == 2
+    assert "loss_bid_policy" in restored.stats.last_loss
 
 
 def test_v2_checkpoint_carries_and_validates_explicit_bidding_identity(tmp_path):

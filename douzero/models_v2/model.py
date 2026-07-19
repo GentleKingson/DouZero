@@ -69,7 +69,7 @@ from .config import HISTORY_ENCODER_TRANSFORMER, ModelV2Config, SUPPORTED_ROLES
 from .fusion import StateActionFusion
 from .heads import BiddingHeads, PriorHead, StrategyAuxiliaryHeads, ValueHeads
 from .history_encoder import build_history_encoder
-from .batch import BatchedBiddingInput, bidding_observations_to_model_input
+from .batch import BatchedBiddingInput
 from .output import (
     BatchedBiddingOutput,
     BatchedModelOutput,
@@ -274,13 +274,55 @@ class ModelV2(nn.Module):
             ) from exc
 
     def forward_bidding(self, observation) -> BiddingModelOutput:
-        """B=1 compatibility wrapper around :meth:`forward_bidding_batched`."""
+        """Run the scalar bidding path without batch construction overhead."""
         from douzero.observation.bidding import BiddingObservationV2
 
+        if self.bidding_heads is None or self.bidding_schema is None:
+            raise RuntimeError(
+                "forward_bidding requires ModelV2Config(bidding_enabled=True)"
+            )
         if not isinstance(observation, BiddingObservationV2):
             raise TypeError("forward_bidding requires a public BiddingObservationV2")
-        batch = bidding_observations_to_model_input((observation,))
-        return self.forward_bidding_batched(batch).select(0)
+        expected_hash = self.bidding_schema.stable_hash()
+        if observation.feature_schema_hash != expected_hash:
+            raise ValueError(
+                "bidding feature schema mismatch: observation was encoded under "
+                f"{observation.feature_schema_hash}, model expects {expected_hash}"
+            )
+        parameter = next(self.bidding_heads.parameters())
+        features = observation.to_tensor(parameter.device).to(parameter.dtype)
+        head_out = self._forward_bidding_head(features)
+        mask = torch.from_numpy(observation.bid_action_mask.copy()).to(
+            device=parameter.device, dtype=torch.bool
+        )
+        return BiddingModelOutput(
+            bid_logits=head_out["bid_logits"],
+            bid_action_mask=mask,
+            landlord_win_logit=head_out["landlord_win_logit"],
+            expected_landlord_score=head_out["expected_landlord_score"],
+            uncertainty=head_out["uncertainty"],
+        )
+
+    def _forward_bidding_head(self, features: torch.Tensor) -> dict[str, torch.Tensor | None]:
+        if self.bidding_heads is None:
+            raise RuntimeError("bidding heads are disabled")
+        head_out = self.bidding_heads(features)
+        if self.config.nan_guard:
+            from .numerical import NumericalError, assert_tensor_true
+
+            values = [
+                head_out["bid_logits"],
+                head_out["landlord_win_logit"],
+                head_out["expected_landlord_score"],
+            ]
+            if head_out["uncertainty"] is not None:
+                values.append(head_out["uncertainty"])
+            assert_tensor_true(
+                torch.stack([torch.isfinite(value).all() for value in values]).all(),
+                "batched bidding output contains NaN or Inf",
+                error_type=NumericalError,
+            )
+        return head_out
 
     def forward_bidding_batched(
         self, inputs: BatchedBiddingInput
@@ -307,39 +349,9 @@ class ModelV2(nn.Module):
                 f"{self.bidding_schema.input_width}"
             )
         parameter = next(self.bidding_heads.parameters())
-        features = inputs.features.to(
-            device=parameter.device, dtype=parameter.dtype, non_blocking=True
-        )
-        mask = inputs.legal_mask.to(
-            device=parameter.device, dtype=torch.bool, non_blocking=True
-        )
-        head_out = self.bidding_heads(features)
-        if self.config.nan_guard:
-            from .numerical import assert_finite
-
-            finite_names = (
-                "bid_logits", "landlord_win_logit", "expected_landlord_score"
-            )
-            if parameter.device.type == "cuda":
-                finite = torch.stack(
-                    [torch.isfinite(head_out[name]).all() for name in finite_names]
-                    + (
-                        [torch.isfinite(head_out["uncertainty"]).all()]
-                        if head_out["uncertainty"] is not None
-                        else []
-                    )
-                ).all()
-                torch._assert_async(
-                    finite, "batched bidding output contains NaN or Inf"
-                )
-            else:
-                for name in finite_names:
-                    assert_finite(head_out[name], name)
-            if head_out["uncertainty"] is not None:
-                if parameter.device.type != "cuda":
-                    assert_finite(
-                        head_out["uncertainty"], "bidding_uncertainty"
-                    )
+        features = inputs.features.to(device=parameter.device, dtype=parameter.dtype)
+        mask = inputs.legal_mask.to(device=parameter.device, dtype=torch.bool)
+        head_out = self._forward_bidding_head(features)
         return BatchedBiddingOutput(
             bid_logits=head_out["bid_logits"],
             bid_action_mask=mask,
@@ -649,13 +661,12 @@ class ModelV2(nn.Module):
             raise ValueError("ModelV2.forward_batched requires a non-empty batch")
         if action_mask.shape != (batch, actions) or action_mask.dtype != torch.bool:
             raise ValueError("action_mask must be bool with shape (B, A)")
-        legal_rows = action_mask.any(dim=1).all()
-        if action_mask.device.type == "cuda":
-            torch._assert_async(
-                legal_rows, "every batched decision must contain a legal action"
-            )
-        elif not bool(legal_rows):
-            raise ValueError("every batched decision must contain a legal action")
+        from .numerical import assert_tensor_true
+
+        assert_tensor_true(
+            action_mask.any(dim=1).all(),
+            "every batched decision must contain a legal action",
+        )
         if acting_role.shape != (batch,) or acting_role.dtype != torch.long:
             raise ValueError("acting_role must be long with shape (B,)")
 
