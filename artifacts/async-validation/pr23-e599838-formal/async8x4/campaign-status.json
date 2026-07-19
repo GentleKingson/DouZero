@@ -1,0 +1,15 @@
+{
+  "schema_version": "pr23-commit-bound-soak-v1",
+  "status": "completed",
+  "source_head": "e59983869ad88370af661d5238f6e50d4841b39e",
+  "image_id": "sha256:8c994b0b0ab8998f433d71ec92c25640d5beb16f5e45ba2fc496272e9c76b282",
+  "topology": "async8x4",
+  "actors": 8,
+  "games_per_actor": 4,
+  "phase_duration_seconds": 1800,
+  "source_mount": false,
+  "git_metadata_mount": "/opt/DouZero/.git:/workspace/DouZero/.git:readonly",
+  "evidence_mount": "/tmp/douzero-pr23-e599838-formal/async8x4:/evidence",
+  "phase1_exit_code": 0,
+  "phase2_exit_code": 0
+}
