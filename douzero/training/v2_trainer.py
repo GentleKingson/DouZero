@@ -85,13 +85,19 @@ from douzero.training.bidding import (
     bidding_loss,
     select_bidding_action,
 )
+from douzero.training.standard_v2_contract import (
+    BASE_ASYNC_PROTOCOL_VERSION,
+    BASE_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION,
+    BASE_EPISODE_COMMIT_SEMANTICS,
+    BASE_EPISODE_TASK_SEMANTICS,
+)
 
 
-# Format 3 makes the resume topology explicit. Formats 1/2 predated this
-# contract and are intentionally rejected rather than guessed to be safe for a
-# different process topology.
-_TRAINER_CHECKPOINT_VERSION = 4
-_COMPATIBLE_TRAINER_CHECKPOINT_VERSIONS = frozenset({3, 4})
+# Format 3 is the single-process topology contract, format 4 introduced the
+# base async topology, and format 5 binds async protocol/task/commit identities.
+# Formats 1/2 predated explicit topology and remain intentionally rejected.
+_TRAINER_CHECKPOINT_VERSION = 5
+_COMPATIBLE_TRAINER_CHECKPOINT_VERSIONS = frozenset({3, 4, 5})
 _SINGLE_PROCESS_TOPOLOGY = "single_process"
 _ASYNC_SINGLE_GPU_TOPOLOGY = "async_single_gpu"
 _ASYNC_UNSUPPORTED_DECISION_MODES = frozenset({
@@ -153,6 +159,12 @@ class TrainerConfig:
     replay_schema_version: int = 1
     snapshot_publication_semantics: str = _SNAPSHOT_PUBLICATION_SEMANTICS
     request_ordering_semantics: str = _REQUEST_ORDERING_SEMANTICS
+    async_protocol_version: int = BASE_ASYNC_PROTOCOL_VERSION
+    compact_bidding_replay_schema_version: int = (
+        BASE_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION
+    )
+    episode_task_semantics: str = BASE_EPISODE_TASK_SEMANTICS
+    episode_commit_semantics: str = BASE_EPISODE_COMMIT_SEMANTICS
 
     def __post_init__(self) -> None:
         """Validate ranges so a malformed config fails fast (P06 r2).
@@ -234,6 +246,17 @@ class TrainerConfig:
             raise ValueError("unknown snapshot publication semantics")
         if self.request_ordering_semantics != _REQUEST_ORDERING_SEMANTICS:
             raise ValueError("unknown request ordering semantics")
+        if self.async_protocol_version != BASE_ASYNC_PROTOCOL_VERSION:
+            raise ValueError("unknown async protocol version")
+        if (
+            self.compact_bidding_replay_schema_version
+            != BASE_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION
+        ):
+            raise ValueError("unknown compact bidding replay schema version")
+        if self.episode_task_semantics != BASE_EPISODE_TASK_SEMANTICS:
+            raise ValueError("unknown episode task semantics")
+        if self.episode_commit_semantics != BASE_EPISODE_COMMIT_SEMANTICS:
+            raise ValueError("unknown episode commit semantics")
 
 
 @dataclass
@@ -241,6 +264,7 @@ class TrainerStats:
     """Per-step / per-episode statistics surfaced by the trainer."""
 
     episodes_completed: int = 0
+    games_collected: int = 0
     episodes_per_team: dict[str, int] = field(default_factory=dict)
     transitions_collected: int = 0
     decisions_collected: int = 0
@@ -254,6 +278,10 @@ class TrainerStats:
     opening_predicted_win_mean: float = float("nan")
     amp_fallbacks: int = 0
     bidding_transitions_collected: int = 0
+    bidding_decisions_collected: int = 0
+    abandoned_bidding_transitions: int = 0
+    learner_cardplay_samples: int = 0
+    learner_bidding_samples: int = 0
     redeals: int = 0
     max_redeals_exceeded: int = 0
     belief_phase: str = "frozen"
@@ -558,6 +586,8 @@ class V2Trainer:
             fallback_on_nonfinite=self.config.amp_fallback_on_nonfinite,
         )
         self._learner_gpu_seconds = 0.0
+        self._last_collection_seconds = 0.0
+        self._last_optimization_seconds = 0.0
         # P06 r4: reject a "valid but trains nothing" configuration.
         # (a) optimizer_steps > 0 with all loss weights at 0 produces a
         #     zero-gradient step that silently changes nothing.
@@ -1043,6 +1073,7 @@ class V2Trainer:
                 count = int(event[3])
                 decision_count = int(event[6])
                 expected_transitions += count
+                self.stats.games_collected += 1
                 self.stats.episodes_completed += 1
                 self.stats.transitions_collected += count
                 self.stats.decisions_collected += decision_count
@@ -1067,7 +1098,15 @@ class V2Trainer:
             return
         for _ in range(target):
             episode = self._run_one_episode()
+            self.stats.games_collected += 1
             self.stats.decisions_collected += len(episode.action_trace)
+            self.stats.bidding_decisions_collected += (
+                len(episode.bidding_transitions)
+                + episode.abandoned_bidding_transitions
+            )
+            self.stats.abandoned_bidding_transitions += (
+                episode.abandoned_bidding_transitions
+            )
             self.stats.redeals += episode.redeal_count
             self.stats.max_redeals_exceeded += int(
                 episode.max_redeals_exceeded
@@ -1123,6 +1162,12 @@ class V2Trainer:
                     "inference_queue_p95_ms": 0.0,
                     "inference_gpu_seconds": 0.0,
                     "learner_gpu_seconds": learner_gpu_seconds,
+                    "collection_seconds": getattr(
+                        self, "_last_collection_seconds", 0.0
+                    ),
+                    "optimization_seconds": getattr(
+                        self, "_last_optimization_seconds", 0.0
+                    ),
                     "policy_lag": 0,
                     "games_per_actor": self.config.games_per_actor,
                     "claimed_requests": 0,
@@ -1165,6 +1210,12 @@ class V2Trainer:
                 "inference_queue_p95_ms": percentile(0.95),
                 "inference_gpu_seconds": self._async_inference_seconds,
                 "learner_gpu_seconds": learner_gpu_seconds,
+                "collection_seconds": getattr(
+                    self, "_last_collection_seconds", 0.0
+                ),
+                "optimization_seconds": getattr(
+                    self, "_last_optimization_seconds", 0.0
+                ),
                 "policy_lag": self.policy_step - self._async_snapshot,
                 "games_per_actor": getattr(
                     getattr(self, "config", None), "games_per_actor", 4
@@ -1202,6 +1253,12 @@ class V2Trainer:
             "bidding_replay_occupancy": len(self.bidding_buffer),
             "quiesce_seconds": 0.0,
             "learner_gpu_seconds": learner_gpu_seconds,
+            "collection_seconds": getattr(
+                self, "_last_collection_seconds", 0.0
+            ),
+            "optimization_seconds": getattr(
+                self, "_last_optimization_seconds", 0.0
+            ),
         }
         if consume_interval_metrics:
             self._reset_cycle_interval_metrics()
@@ -1210,6 +1267,10 @@ class V2Trainer:
     def quiesce_cycle_boundary(self) -> dict[str, object]:
         """Establish a checkpoint-safe boundary and consume cycle metrics."""
         return self._quiesce_cycle_boundary(consume_interval_metrics=True)
+
+    def runtime_metrics_snapshot(self) -> dict[str, object]:
+        """Return quiescent interval diagnostics without resetting counters."""
+        return self._quiesce_cycle_boundary(consume_interval_metrics=False)
 
     def clear_replay(self) -> None:
         """Clear card-play and bidding replay at an explicit cycle boundary."""
@@ -1765,8 +1826,20 @@ class V2Trainer:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
-    def _v3_trainer_config_identity(self) -> tuple[dict, str]:
+    def _v4_trainer_config_identity(self) -> tuple[dict, str]:
         payload = asdict(self.config)
+        for name in (
+            "async_protocol_version",
+            "compact_bidding_replay_schema_version",
+            "episode_task_semantics",
+            "episode_commit_semantics",
+        ):
+            payload.pop(name, None)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _v3_trainer_config_identity(self) -> tuple[dict, str]:
+        payload, _ = self._v4_trainer_config_identity()
         for name in (
             "v2_training_mode", "num_actors", "games_per_actor",
             "replay_schema_version",
@@ -1899,6 +1972,15 @@ class V2Trainer:
                 "request_ordering_semantics": self.config.request_ordering_semantics,
                 "actor_rng_resume_semantics": _ACTOR_RNG_RESUME_SEMANTICS,
             })
+        if checkpoint_version >= 5:
+            bundle.update({
+                "async_protocol_version": self.config.async_protocol_version,
+                "compact_bidding_replay_schema_version": (
+                    self.config.compact_bidding_replay_schema_version
+                ),
+                "episode_task_semantics": self.config.episode_task_semantics,
+                "episode_commit_semantics": self.config.episode_commit_semantics,
+            })
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(
@@ -1939,6 +2021,13 @@ class V2Trainer:
                 "num_actors", "games_per_actor", "replay_schema_version",
                 "snapshot_publication_semantics", "request_ordering_semantics",
                 "actor_rng_resume_semantics",
+            ])
+        if checkpoint_version >= 5:
+            identity_keys.extend([
+                "async_protocol_version",
+                "compact_bidding_replay_schema_version",
+                "episode_task_semantics",
+                "episode_commit_semantics",
             ])
         identity = {
             key: bundle[key]
@@ -2017,6 +2106,8 @@ class V2Trainer:
         trainer_config, trainer_config_hash = self._trainer_config_identity()
         if checkpoint_version == 3:
             trainer_config, trainer_config_hash = self._v3_trainer_config_identity()
+        elif checkpoint_version == 4:
+            trainer_config, trainer_config_hash = self._v4_trainer_config_identity()
         expected["trainer_config"] = trainer_config
         expected["trainer_config_hash"] = trainer_config_hash
         if checkpoint_version >= 4:
@@ -2027,6 +2118,15 @@ class V2Trainer:
                 "snapshot_publication_semantics": self.config.snapshot_publication_semantics,
                 "request_ordering_semantics": self.config.request_ordering_semantics,
                 "actor_rng_resume_semantics": _ACTOR_RNG_RESUME_SEMANTICS,
+            })
+        if checkpoint_version >= 5:
+            expected.update({
+                "async_protocol_version": self.config.async_protocol_version,
+                "compact_bidding_replay_schema_version": (
+                    self.config.compact_bidding_replay_schema_version
+                ),
+                "episode_task_semantics": self.config.episode_task_semantics,
+                "episode_commit_semantics": self.config.episode_commit_semantics,
             })
         if self.belief_training_mode != "frozen":
             expected.update({
@@ -2490,6 +2590,9 @@ class V2Trainer:
             grad_norm = step_result.grad_norm
             self.stats.amp_fallbacks = self.mixed_precision.fallback_count
             self.stats.optimizer_steps += 1
+            self.stats.learner_cardplay_samples += batch.batch_size
+            if bidding_batch is not None:
+                self.stats.learner_bidding_samples += bidding_batch.batch_size
             self.policy_step += 1
             if self.async_mode:
                 self._publish_async_snapshot()
@@ -2552,12 +2655,18 @@ class V2Trainer:
         if self.belief_model is not None and self.belief_training_mode != "frozen":
             watched.append(next(self.belief_model.parameters()))
         before = [parameter.detach().clone() for parameter in watched]
+        collection_started = time.perf_counter()
         self.collect_episodes()
+        self._last_collection_seconds = time.perf_counter() - collection_started
+        optimization_started = time.perf_counter()
         steps_taken = 0
         for _ in range(self.config.optimizer_steps):
             result = self.step()
             if result is not None:
                 steps_taken += 1
+        self._last_optimization_seconds = (
+            time.perf_counter() - optimization_started
+        )
         self.stats_last_run_changed = any(
             not torch.equal(snapshot, parameter.detach())
             for snapshot, parameter in zip(before, watched)

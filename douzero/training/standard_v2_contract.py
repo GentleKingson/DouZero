@@ -1,0 +1,258 @@
+"""Frozen Standard V2 R1 semantics and version names.
+
+This module is deliberately dependency-light.  It gives benchmarks,
+checkpoint code, and future async protocol implementations one place to
+import the names that define the R1 mathematical boundary.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any, Mapping
+
+
+STANDARD_V2_R1_CONTRACT_VERSION = "standard-v2-r1-contract-v1"
+STANDARD_V2_REFERENCE_SCHEMA_VERSION = "standard-v2-r1-reference-v1"
+STANDARD_V2_BENCHMARK_SCHEMA_VERSION = "standard-v2-r1-benchmark-v1"
+
+# The currently implemented base async path.  These values are written into
+# async checkpoints so protocol changes cannot be mistaken for exact resume.
+BASE_ASYNC_PROTOCOL_VERSION = 1
+BASE_ASYNC_PROTOCOL_SEMANTICS = "base_play_only_async_v1"
+BASE_EPISODE_TASK_SEMANTICS = "actor_local_task_queue_v1"
+BASE_EPISODE_COMMIT_SEMANTICS = "cardplay_count_reconciled_v1"
+BASE_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION = 0
+
+# Reserved names for the M2-M4 Standard async implementation.  Defining them
+# now prevents individual components from inventing incompatible identities.
+STANDARD_ASYNC_PROTOCOL_VERSION = 2
+STANDARD_ASYNC_PROTOCOL_SEMANTICS = "standard_bid_play_async_v2"
+STANDARD_EPISODE_TASK_SEMANTICS = "global_episode_domain_rng_v2"
+STANDARD_EPISODE_COMMIT_SEMANTICS = "atomic_bid_play_terminal_v2"
+STANDARD_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION = 1
+STANDARD_SNAPSHOT_PUBLICATION_SEMANTICS = (
+    "cycle_quiescent_atomic_standard_bundle_v2"
+)
+
+
+def _canonical_json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
+def stable_identity_hash(payload: Mapping[str, Any]) -> str:
+    """Return the canonical SHA-256 used by R1 contract artifacts."""
+
+    return hashlib.sha256(_canonical_json(payload).encode("ascii")).hexdigest()
+
+
+def standard_v2_r1_config_identity(config: Any) -> dict[str, Any]:
+    """Extract only production-relevant R1 semantics from ``TrainingConfig``."""
+
+    return {
+        "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
+        "runtime": {
+            "ruleset": config.ruleset,
+            "feature_version": config.feature_version,
+            "model_version": config.model_version,
+            "seed": config.seed,
+            "deterministic": config.deterministic,
+            "batch_size": config.batch_size,
+            "exp_epsilon": config.exp_epsilon,
+            "max_grad_norm": config.max_grad_norm,
+            "amp_enabled": config.amp_enabled,
+            "amp_dtype": config.amp_dtype,
+            "amp_fallback_on_nonfinite": config.amp_fallback_on_nonfinite,
+            "ddp_enabled": config.ddp_enabled,
+            "ddp_backend": config.ddp_backend,
+            "compile_model": config.compile_model,
+            "first_bidder_mode": config.first_bidder_mode,
+        },
+        "optimizer": {
+            "learning_rate": config.optimizer.learning_rate,
+            "alpha": config.optimizer.alpha,
+            "momentum": config.optimizer.momentum,
+            "epsilon": config.optimizer.epsilon,
+        },
+        "model": {
+            "version": config.model.version,
+            "hidden_size": config.model.hidden_size,
+            "history_encoder": config.model.history_encoder,
+            "history_layers": config.model.history_layers,
+            "history_heads": config.model.history_heads,
+            "role_embedding_dim": config.model.role_embedding_dim,
+            "belief_enabled": config.model.belief_enabled,
+            "human_prior_enabled": config.model.human_prior_enabled,
+            "style_enabled": config.model.style_enabled,
+            "strategy_features_enabled": config.model.strategy_features_enabled,
+            "strategy_aux_enabled": config.model.strategy_aux_enabled,
+            "bidding_enabled": config.model.bidding_enabled,
+            "bidding_hidden_size": config.model.bidding_hidden_size,
+            "bidding_uncertainty_enabled": (
+                config.model.bidding_uncertainty_enabled
+            ),
+        },
+        "loss": {
+            name: getattr(config.loss, name)
+            for name in (
+                "lambda_win",
+                "lambda_score",
+                "lambda_uncertainty",
+                "lambda_bc",
+                "lambda_min_turns",
+                "lambda_regain_initiative",
+                "lambda_teammate_finish",
+                "lambda_spring",
+                "lambda_structure",
+                "lambda_bid_policy",
+                "lambda_bid_win",
+                "lambda_bid_score",
+                "lambda_bid_regret",
+                "score_delta",
+                "score_target_transform",
+                "score_clamp",
+            )
+        },
+        "decision_policy": {
+            name: getattr(config.decision_policy, name)
+            for name in (
+                "mode",
+                "abs_tol",
+                "rel_tol",
+                "risk_penalty",
+                "prior_alpha",
+            )
+        },
+        "bidding": {
+            "enabled": config.bidding.enabled,
+            "policy": config.bidding.policy,
+            "warm_start_policy": config.bidding.warm_start_policy,
+            "learned_probability": config.bidding.learned_probability,
+        },
+    }
+
+
+STANDARD_V2_R1_EXPECTED_CONFIG: dict[str, Any] = {
+    "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
+    "runtime": {
+        "ruleset": "standard",
+        "feature_version": "v2",
+        "model_version": "v2",
+        "seed": 0,
+        "deterministic": False,
+        "batch_size": 32,
+        "exp_epsilon": 0.05,
+        "max_grad_norm": 40.0,
+        "amp_enabled": False,
+        "amp_dtype": "float16",
+        "amp_fallback_on_nonfinite": True,
+        "ddp_enabled": False,
+        "ddp_backend": "auto",
+        "compile_model": False,
+        "first_bidder_mode": "rotate",
+    },
+    "optimizer": {
+        "learning_rate": 0.0001,
+        "alpha": 0.99,
+        "momentum": 0.0,
+        "epsilon": 0.00001,
+    },
+    "model": {
+        "version": "v2",
+        "hidden_size": 256,
+        "history_encoder": "transformer",
+        "history_layers": 4,
+        "history_heads": 8,
+        "role_embedding_dim": 32,
+        "belief_enabled": False,
+        "human_prior_enabled": False,
+        "style_enabled": False,
+        "strategy_features_enabled": False,
+        "strategy_aux_enabled": False,
+        "bidding_enabled": True,
+        "bidding_hidden_size": 128,
+        "bidding_uncertainty_enabled": False,
+    },
+    "loss": {
+        "lambda_win": 1.0,
+        "lambda_score": 0.5,
+        "lambda_uncertainty": 0.0,
+        "lambda_bc": 0.0,
+        "lambda_min_turns": 0.0,
+        "lambda_regain_initiative": 0.0,
+        "lambda_teammate_finish": 0.0,
+        "lambda_spring": 0.0,
+        "lambda_structure": 0.0,
+        "lambda_bid_policy": 1.0,
+        "lambda_bid_win": 0.5,
+        "lambda_bid_score": 0.25,
+        "lambda_bid_regret": 0.0,
+        "score_delta": 1.0,
+        "score_target_transform": "raw",
+        "score_clamp": 32.0,
+    },
+    "decision_policy": {
+        "mode": "pure_win",
+        "abs_tol": 0.0,
+        "rel_tol": 0.0,
+        "risk_penalty": 0.0,
+        "prior_alpha": 0.0,
+    },
+    "bidding": {
+        "enabled": True,
+        "policy": "learned",
+        "warm_start_policy": "rule",
+        "learned_probability": 0.1,
+    },
+}
+STANDARD_V2_R1_CONFIG_HASH = stable_identity_hash(
+    STANDARD_V2_R1_EXPECTED_CONFIG
+)
+
+
+def validate_standard_v2_r1_config(config: Any) -> dict[str, Any]:
+    """Fail closed when the production YAML drifts from the frozen matrix."""
+
+    identity = standard_v2_r1_config_identity(config)
+    if identity != STANDARD_V2_R1_EXPECTED_CONFIG:
+        raise ValueError(
+            "Standard V2 R1 config drifted from its frozen contract: "
+            f"actual={stable_identity_hash(identity)}, "
+            f"expected={STANDARD_V2_R1_CONFIG_HASH}"
+        )
+    return identity
+
+
+def standard_v2_version_contract() -> dict[str, Any]:
+    """Return the complete current/reserved async version registry."""
+
+    return {
+        "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
+        "current_base_async": {
+            "protocol_version": BASE_ASYNC_PROTOCOL_VERSION,
+            "protocol_semantics": BASE_ASYNC_PROTOCOL_SEMANTICS,
+            "compact_bidding_replay_schema_version": (
+                BASE_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION
+            ),
+            "episode_task_semantics": BASE_EPISODE_TASK_SEMANTICS,
+            "episode_commit_semantics": BASE_EPISODE_COMMIT_SEMANTICS,
+        },
+        "reserved_standard_async": {
+            "protocol_version": STANDARD_ASYNC_PROTOCOL_VERSION,
+            "protocol_semantics": STANDARD_ASYNC_PROTOCOL_SEMANTICS,
+            "compact_bidding_replay_schema_version": (
+                STANDARD_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION
+            ),
+            "episode_task_semantics": STANDARD_EPISODE_TASK_SEMANTICS,
+            "episode_commit_semantics": STANDARD_EPISODE_COMMIT_SEMANTICS,
+            "snapshot_publication_semantics": (
+                STANDARD_SNAPSHOT_PUBLICATION_SEMANTICS
+            ),
+        },
+    }

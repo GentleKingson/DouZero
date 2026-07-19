@@ -1,0 +1,1923 @@
+{
+  "config_hash": "6f906d869160b538ef1516ceeb462ff02196c7eb58cf813dcecc5690d0d277c2",
+  "contract_version": "standard-v2-r1-contract-v1",
+  "coverage": {
+    "all_pass": true,
+    "anti_spring": true,
+    "bomb_or_rocket": true,
+    "first_bidders": [
+      "0",
+      "1",
+      "2"
+    ],
+    "max_redeal_guard": true,
+    "normal_auction": true,
+    "redeal": true,
+    "spring": true
+  },
+  "reference_digest": "097cd1c4c91604b925134fe4477e81ada29629efa31a122c4f432eee8389e258",
+  "scenarios": [
+    {
+      "bidding_attempts": [
+        [
+          {
+            "bid": 3,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "0",
+            "source_policy": "learned"
+          }
+        ]
+      ],
+      "cardplay_policy": "rocket_then_bomb_then_longest_v1",
+      "cardplay_trace": [
+        {
+          "action": [
+            3,
+            3,
+            3,
+            4,
+            4,
+            4,
+            5,
+            5,
+            5,
+            6,
+            6,
+            6,
+            7,
+            7,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12
+          ],
+          "legal_action_count": 1023,
+          "position": "landlord"
+        }
+      ],
+      "counts": {
+        "abandoned_bidding_transitions": 0,
+        "bid_transitions": 1,
+        "bidding_decisions": 1,
+        "cardplay_actions": 1,
+        "cardplay_decisions": 1,
+        "max_redeals_exceeded": 0,
+        "play_transitions": 1,
+        "redeals": 0
+      },
+      "excluded_from_training": false,
+      "exclusion_reason": "",
+      "numpy_seed": 101,
+      "opening": {
+        "bidding_order": [
+          "0",
+          "1",
+          "2"
+        ],
+        "bids": [],
+        "deck": [
+          3,
+          3,
+          3,
+          4,
+          4,
+          4,
+          5,
+          5,
+          5,
+          6,
+          6,
+          6,
+          7,
+          7,
+          7,
+          8,
+          9,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          8,
+          8,
+          9,
+          9,
+          9,
+          10,
+          10,
+          10,
+          11,
+          11,
+          11,
+          12,
+          12,
+          12,
+          13,
+          13,
+          13,
+          13,
+          14,
+          14,
+          14,
+          14,
+          17,
+          17,
+          17,
+          17,
+          20,
+          30,
+          10,
+          11,
+          12
+        ],
+        "landlord_candidate": "0",
+        "opening_id": "13cf08b2432632a8baf63b1a581f6ebf7eabe4c58ecc2dded7e5c092264a6494",
+        "public_features": {
+          "first_bidder": "0",
+          "ruleset_hash": "05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f"
+        },
+        "ruleset": {
+          "all_pass_redeal": true,
+          "allow_double": false,
+          "allow_rob": false,
+          "anti_spring_multiplier": 2,
+          "base_score": 1,
+          "bid_multiplier": true,
+          "bid_values": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "bidding_mode": "score_0_1_2_3",
+          "bomb_multiplier": 2,
+          "max_multiplier": null,
+          "max_redeals": 10,
+          "rocket_multiplier": 2,
+          "ruleset_id": "standard",
+          "ruleset_version": "standard-v1",
+          "spring_multiplier": 2
+        },
+        "schema_version": 1
+      },
+      "scenario_id": "first_bidder_0_spring",
+      "seat_to_role": {
+        "0": "landlord",
+        "1": "landlord_down",
+        "2": "landlord_up"
+      },
+      "terminal": {
+        "anti_spring": false,
+        "bid_value": 3,
+        "bomb_count": 0,
+        "farmer_score": -6,
+        "landlord_score": 12,
+        "multiplier_breakdown": {
+          "bid": 3,
+          "event_multiplier": 2,
+          "spring": 2,
+          "total_multiplier": 6,
+          "uncapped_total_multiplier": 6
+        },
+        "rocket_count": 0,
+        "ruleset_hash": "05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f",
+        "ruleset_id": "standard",
+        "ruleset_version": "standard-v1",
+        "spring": true,
+        "team_targets": {
+          "landlord": {
+            "target_log_score": 2.5649493574615367,
+            "target_score": 12.0,
+            "target_win": 1.0
+          },
+          "landlord_down": {
+            "target_log_score": -1.9459101490553132,
+            "target_score": -6.0,
+            "target_win": 0.0
+          },
+          "landlord_up": {
+            "target_log_score": -1.9459101490553132,
+            "target_score": -6.0,
+            "target_win": 0.0
+          }
+        },
+        "terminal_result": {
+          "farmer_score": -6,
+          "landlord_score": 12,
+          "winner_team": "landlord"
+        },
+        "total_multiplier": 6,
+        "winner_position": "landlord",
+        "winner_team": "landlord"
+      }
+    },
+    {
+      "bidding_attempts": [
+        [
+          {
+            "bid": 1,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "1",
+            "source_policy": "rule"
+          },
+          {
+            "bid": 2,
+            "legal_bids": [
+              0,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "2",
+            "source_policy": "learned"
+          },
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "0",
+            "source_policy": "epsilon_random"
+          }
+        ]
+      ],
+      "cardplay_policy": "rocket_then_bomb_then_longest_v1",
+      "cardplay_trace": [
+        {
+          "action": [
+            20,
+            30
+          ],
+          "legal_action_count": 641,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [
+            6,
+            6,
+            6,
+            6
+          ],
+          "legal_action_count": 376,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            10,
+            10,
+            10,
+            10
+          ],
+          "legal_action_count": 4,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            14,
+            14,
+            14,
+            14
+          ],
+          "legal_action_count": 4,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            13,
+            13,
+            13,
+            13
+          ],
+          "legal_action_count": 67,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            12,
+            12,
+            12,
+            12
+          ],
+          "legal_action_count": 21,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            11,
+            11,
+            17,
+            17,
+            17
+          ],
+          "legal_action_count": 7,
+          "position": "landlord_up"
+        }
+      ],
+      "counts": {
+        "abandoned_bidding_transitions": 0,
+        "bid_transitions": 3,
+        "bidding_decisions": 3,
+        "cardplay_actions": 15,
+        "cardplay_decisions": 7,
+        "max_redeals_exceeded": 0,
+        "play_transitions": 7,
+        "redeals": 0
+      },
+      "excluded_from_training": false,
+      "exclusion_reason": "",
+      "numpy_seed": 202,
+      "opening": {
+        "bidding_order": [
+          "1",
+          "2",
+          "0"
+        ],
+        "bids": [],
+        "deck": [
+          7,
+          7,
+          7,
+          8,
+          8,
+          8,
+          8,
+          9,
+          9,
+          9,
+          9,
+          10,
+          10,
+          10,
+          10,
+          11,
+          11,
+          11,
+          11,
+          12,
+          12,
+          12,
+          12,
+          13,
+          13,
+          13,
+          13,
+          14,
+          14,
+          14,
+          14,
+          17,
+          17,
+          17,
+          17,
+          20,
+          30,
+          3,
+          3,
+          3,
+          3,
+          4,
+          4,
+          4,
+          4,
+          5,
+          5,
+          5,
+          5,
+          6,
+          6,
+          6,
+          6,
+          7
+        ],
+        "landlord_candidate": "1",
+        "opening_id": "0f37db536fb3567ab0bbc37756fe80dab8b5af713378bb264459a41b3af8ed00",
+        "public_features": {
+          "first_bidder": "1",
+          "ruleset_hash": "05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f"
+        },
+        "ruleset": {
+          "all_pass_redeal": true,
+          "allow_double": false,
+          "allow_rob": false,
+          "anti_spring_multiplier": 2,
+          "base_score": 1,
+          "bid_multiplier": true,
+          "bid_values": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "bidding_mode": "score_0_1_2_3",
+          "bomb_multiplier": 2,
+          "max_multiplier": null,
+          "max_redeals": 10,
+          "rocket_multiplier": 2,
+          "ruleset_id": "standard",
+          "ruleset_version": "standard-v1",
+          "spring_multiplier": 2
+        },
+        "schema_version": 1
+      },
+      "scenario_id": "first_bidder_1_normal",
+      "seat_to_role": {
+        "0": "landlord_down",
+        "1": "landlord_up",
+        "2": "landlord"
+      },
+      "terminal": {
+        "anti_spring": false,
+        "bid_value": 2,
+        "bomb_count": 5,
+        "farmer_score": 128,
+        "landlord_score": -256,
+        "multiplier_breakdown": {
+          "bid": 2,
+          "bomb": 32,
+          "event_multiplier": 64,
+          "rocket": 2,
+          "total_multiplier": 128,
+          "uncapped_total_multiplier": 128
+        },
+        "rocket_count": 1,
+        "ruleset_hash": "05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f",
+        "ruleset_id": "standard",
+        "ruleset_version": "standard-v1",
+        "spring": false,
+        "team_targets": {
+          "landlord": {
+            "target_log_score": -5.54907608489522,
+            "target_score": -256.0,
+            "target_win": 0.0
+          },
+          "landlord_down": {
+            "target_log_score": 4.859812404361672,
+            "target_score": 128.0,
+            "target_win": 1.0
+          },
+          "landlord_up": {
+            "target_log_score": 4.859812404361672,
+            "target_score": 128.0,
+            "target_win": 1.0
+          }
+        },
+        "terminal_result": {
+          "farmer_score": 128,
+          "landlord_score": -256,
+          "winner_team": "farmer"
+        },
+        "total_multiplier": 128,
+        "winner_position": "landlord_up",
+        "winner_team": "farmer"
+      }
+    },
+    {
+      "bidding_attempts": [
+        [
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "2",
+            "source_policy": "epsilon_random"
+          },
+          {
+            "bid": 1,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "0",
+            "source_policy": "rule"
+          },
+          {
+            "bid": 2,
+            "legal_bids": [
+              0,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "1",
+            "source_policy": "learned"
+          }
+        ]
+      ],
+      "cardplay_policy": "rocket_then_bomb_then_longest_v1",
+      "cardplay_trace": [
+        {
+          "action": [
+            11,
+            11,
+            11,
+            11
+          ],
+          "legal_action_count": 439,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            20,
+            30
+          ],
+          "legal_action_count": 5,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            17,
+            17,
+            17,
+            17
+          ],
+          "legal_action_count": 112,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            14,
+            14,
+            14,
+            14
+          ],
+          "legal_action_count": 41,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            13,
+            13,
+            13,
+            13
+          ],
+          "legal_action_count": 13,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            12,
+            12,
+            12
+          ],
+          "legal_action_count": 3,
+          "position": "landlord_up"
+        }
+      ],
+      "counts": {
+        "abandoned_bidding_transitions": 0,
+        "bid_transitions": 3,
+        "bidding_decisions": 3,
+        "cardplay_actions": 15,
+        "cardplay_decisions": 6,
+        "max_redeals_exceeded": 0,
+        "play_transitions": 6,
+        "redeals": 0
+      },
+      "excluded_from_training": false,
+      "exclusion_reason": "",
+      "numpy_seed": 303,
+      "opening": {
+        "bidding_order": [
+          "2",
+          "0",
+          "1"
+        ],
+        "bids": [],
+        "deck": [
+          30,
+          20,
+          17,
+          17,
+          17,
+          17,
+          14,
+          14,
+          14,
+          14,
+          13,
+          13,
+          13,
+          13,
+          12,
+          12,
+          12,
+          12,
+          11,
+          11,
+          11,
+          11,
+          10,
+          10,
+          10,
+          10,
+          9,
+          9,
+          9,
+          9,
+          8,
+          8,
+          8,
+          8,
+          7,
+          7,
+          7,
+          7,
+          6,
+          6,
+          6,
+          6,
+          5,
+          5,
+          5,
+          5,
+          4,
+          4,
+          4,
+          4,
+          3,
+          3,
+          3,
+          3
+        ],
+        "landlord_candidate": "2",
+        "opening_id": "645af09e0a085d072515e021c7b0e694b6f16b0763eed0a1148043b37aca8980",
+        "public_features": {
+          "first_bidder": "2",
+          "ruleset_hash": "05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f"
+        },
+        "ruleset": {
+          "all_pass_redeal": true,
+          "allow_double": false,
+          "allow_rob": false,
+          "anti_spring_multiplier": 2,
+          "base_score": 1,
+          "bid_multiplier": true,
+          "bid_values": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "bidding_mode": "score_0_1_2_3",
+          "bomb_multiplier": 2,
+          "max_multiplier": null,
+          "max_redeals": 10,
+          "rocket_multiplier": 2,
+          "ruleset_id": "standard",
+          "ruleset_version": "standard-v1",
+          "spring_multiplier": 2
+        },
+        "schema_version": 1
+      },
+      "scenario_id": "first_bidder_2_normal",
+      "seat_to_role": {
+        "0": "landlord_up",
+        "1": "landlord",
+        "2": "landlord_down"
+      },
+      "terminal": {
+        "anti_spring": true,
+        "bid_value": 2,
+        "bomb_count": 4,
+        "farmer_score": 128,
+        "landlord_score": -256,
+        "multiplier_breakdown": {
+          "anti_spring": 2,
+          "bid": 2,
+          "bomb": 16,
+          "event_multiplier": 64,
+          "rocket": 2,
+          "total_multiplier": 128,
+          "uncapped_total_multiplier": 128
+        },
+        "rocket_count": 1,
+        "ruleset_hash": "05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f",
+        "ruleset_id": "standard",
+        "ruleset_version": "standard-v1",
+        "spring": false,
+        "team_targets": {
+          "landlord": {
+            "target_log_score": -5.54907608489522,
+            "target_score": -256.0,
+            "target_win": 0.0
+          },
+          "landlord_down": {
+            "target_log_score": 4.859812404361672,
+            "target_score": 128.0,
+            "target_win": 1.0
+          },
+          "landlord_up": {
+            "target_log_score": 4.859812404361672,
+            "target_score": 128.0,
+            "target_win": 1.0
+          }
+        },
+        "terminal_result": {
+          "farmer_score": 128,
+          "landlord_score": -256,
+          "winner_team": "farmer"
+        },
+        "total_multiplier": 128,
+        "winner_position": "landlord_up",
+        "winner_team": "farmer"
+      }
+    },
+    {
+      "bidding_attempts": [
+        [
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "0",
+            "source_policy": "epsilon_random"
+          },
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "1",
+            "source_policy": "epsilon_random"
+          },
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "2",
+            "source_policy": "epsilon_random"
+          }
+        ],
+        [
+          {
+            "bid": 3,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 1,
+            "seat": "0",
+            "source_policy": "learned"
+          }
+        ]
+      ],
+      "cardplay_policy": "rocket_then_bomb_then_longest_v1",
+      "cardplay_trace": [
+        {
+          "action": [
+            12,
+            12,
+            12,
+            13,
+            13,
+            13,
+            14,
+            14,
+            17,
+            17
+          ],
+          "legal_action_count": 127,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [
+            6,
+            6,
+            10,
+            10,
+            10
+          ],
+          "legal_action_count": 17,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [
+            3,
+            3
+          ],
+          "legal_action_count": 5,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            11,
+            11
+          ],
+          "legal_action_count": 4,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10
+          ],
+          "legal_action_count": 33,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            7,
+            7
+          ],
+          "legal_action_count": 8,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            11,
+            11
+          ],
+          "legal_action_count": 4,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            3,
+            3,
+            4,
+            4,
+            5,
+            5
+          ],
+          "legal_action_count": 28,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            9,
+            9
+          ],
+          "legal_action_count": 9,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            8,
+            8
+          ],
+          "legal_action_count": 7,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            30
+          ],
+          "legal_action_count": 5,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            17
+          ],
+          "legal_action_count": 4,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            20
+          ],
+          "legal_action_count": 2,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            17
+          ],
+          "legal_action_count": 5,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            14
+          ],
+          "legal_action_count": 4,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            13
+          ],
+          "legal_action_count": 3,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            14
+          ],
+          "legal_action_count": 2,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            7
+          ],
+          "legal_action_count": 2,
+          "position": "landlord_up"
+        },
+        {
+          "action": [
+            9
+          ],
+          "legal_action_count": 3,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            12
+          ],
+          "legal_action_count": 2,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            6
+          ],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        }
+      ],
+      "counts": {
+        "abandoned_bidding_transitions": 3,
+        "bid_transitions": 1,
+        "bidding_decisions": 4,
+        "cardplay_actions": 50,
+        "cardplay_decisions": 20,
+        "max_redeals_exceeded": 0,
+        "play_transitions": 20,
+        "redeals": 1
+      },
+      "excluded_from_training": false,
+      "exclusion_reason": "",
+      "numpy_seed": 404,
+      "opening": {
+        "bidding_order": [
+          "0",
+          "1",
+          "2"
+        ],
+        "bids": [],
+        "deck": [
+          10,
+          11,
+          11,
+          11,
+          11,
+          12,
+          12,
+          12,
+          12,
+          13,
+          13,
+          13,
+          13,
+          14,
+          14,
+          14,
+          14,
+          17,
+          17,
+          17,
+          17,
+          20,
+          30,
+          3,
+          3,
+          3,
+          3,
+          4,
+          4,
+          4,
+          4,
+          5,
+          5,
+          5,
+          5,
+          6,
+          6,
+          6,
+          6,
+          7,
+          7,
+          7,
+          7,
+          8,
+          8,
+          8,
+          8,
+          9,
+          9,
+          9,
+          9,
+          10,
+          10,
+          10
+        ],
+        "landlord_candidate": "0",
+        "opening_id": "d2bb7de460ba016f1561d0bf209e967b8ca26804793c656aa6ac33993275b4e3",
+        "public_features": {
+          "first_bidder": "0",
+          "ruleset_hash": "05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f"
+        },
+        "ruleset": {
+          "all_pass_redeal": true,
+          "allow_double": false,
+          "allow_rob": false,
+          "anti_spring_multiplier": 2,
+          "base_score": 1,
+          "bid_multiplier": true,
+          "bid_values": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "bidding_mode": "score_0_1_2_3",
+          "bomb_multiplier": 2,
+          "max_multiplier": null,
+          "max_redeals": 10,
+          "rocket_multiplier": 2,
+          "ruleset_id": "standard",
+          "ruleset_version": "standard-v1",
+          "spring_multiplier": 2
+        },
+        "schema_version": 1
+      },
+      "scenario_id": "one_redeal_then_max_bid",
+      "seat_to_role": {
+        "0": "landlord",
+        "1": "landlord_down",
+        "2": "landlord_up"
+      },
+      "terminal": {
+        "anti_spring": false,
+        "bid_value": 3,
+        "bomb_count": 0,
+        "farmer_score": 3,
+        "landlord_score": -6,
+        "multiplier_breakdown": {
+          "bid": 3,
+          "event_multiplier": 1,
+          "total_multiplier": 3,
+          "uncapped_total_multiplier": 3
+        },
+        "rocket_count": 0,
+        "ruleset_hash": "05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f",
+        "ruleset_id": "standard",
+        "ruleset_version": "standard-v1",
+        "spring": false,
+        "team_targets": {
+          "landlord": {
+            "target_log_score": -1.9459101490553132,
+            "target_score": -6.0,
+            "target_win": 0.0
+          },
+          "landlord_down": {
+            "target_log_score": 1.3862943611198906,
+            "target_score": 3.0,
+            "target_win": 1.0
+          },
+          "landlord_up": {
+            "target_log_score": 1.3862943611198906,
+            "target_score": 3.0,
+            "target_win": 1.0
+          }
+        },
+        "terminal_result": {
+          "farmer_score": 3,
+          "landlord_score": -6,
+          "winner_team": "farmer"
+        },
+        "total_multiplier": 3,
+        "winner_position": "landlord_down",
+        "winner_team": "farmer"
+      }
+    },
+    {
+      "bidding_attempts": [
+        [
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "1",
+            "source_policy": "epsilon_random"
+          },
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "2",
+            "source_policy": "epsilon_random"
+          },
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 0,
+            "seat": "0",
+            "source_policy": "epsilon_random"
+          }
+        ],
+        [
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 1,
+            "seat": "1",
+            "source_policy": "epsilon_random"
+          },
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 1,
+            "seat": "2",
+            "source_policy": "epsilon_random"
+          },
+          {
+            "bid": 0,
+            "legal_bids": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "redeal_count": 1,
+            "seat": "0",
+            "source_policy": "epsilon_random"
+          }
+        ]
+      ],
+      "cardplay_policy": "rocket_then_bomb_then_longest_v1",
+      "cardplay_trace": [
+        {
+          "action": [
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14
+          ],
+          "legal_action_count": 159,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [
+            11,
+            11
+          ],
+          "legal_action_count": 9,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            17,
+            17
+          ],
+          "legal_action_count": 3,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14
+          ],
+          "legal_action_count": 33,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            4,
+            4,
+            4,
+            30
+          ],
+          "legal_action_count": 13,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            6,
+            6,
+            6,
+            17
+          ],
+          "legal_action_count": 10,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            3,
+            3,
+            3,
+            13,
+            13
+          ],
+          "legal_action_count": 23,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            7,
+            7
+          ],
+          "legal_action_count": 8,
+          "position": "landlord_up"
+        },
+        {
+          "action": [
+            10,
+            10
+          ],
+          "legal_action_count": 2,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [
+            20
+          ],
+          "legal_action_count": 5,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [
+            12
+          ],
+          "legal_action_count": 4,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            17
+          ],
+          "legal_action_count": 3,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            14
+          ],
+          "legal_action_count": 3,
+          "position": "landlord_down"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [
+            9
+          ],
+          "legal_action_count": 2,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            14
+          ],
+          "legal_action_count": 3,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            5,
+            5
+          ],
+          "legal_action_count": 5,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            12
+          ],
+          "legal_action_count": 3,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            9
+          ],
+          "legal_action_count": 2,
+          "position": "landlord_up"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord"
+        },
+        {
+          "action": [],
+          "legal_action_count": 1,
+          "position": "landlord_down"
+        },
+        {
+          "action": [
+            8
+          ],
+          "legal_action_count": 1,
+          "position": "landlord_up"
+        }
+      ],
+      "counts": {
+        "abandoned_bidding_transitions": 6,
+        "bid_transitions": 0,
+        "bidding_decisions": 6,
+        "cardplay_actions": 45,
+        "cardplay_decisions": 18,
+        "max_redeals_exceeded": 1,
+        "play_transitions": 0,
+        "redeals": 2
+      },
+      "excluded_from_training": true,
+      "exclusion_reason": "redeal_cap_guard",
+      "numpy_seed": 505,
+      "opening": {
+        "bidding_order": [
+          "1",
+          "2",
+          "0"
+        ],
+        "bids": [],
+        "deck": [
+          14,
+          13,
+          13,
+          13,
+          13,
+          12,
+          12,
+          12,
+          12,
+          11,
+          11,
+          11,
+          11,
+          10,
+          10,
+          10,
+          10,
+          9,
+          9,
+          9,
+          9,
+          8,
+          8,
+          8,
+          8,
+          7,
+          7,
+          7,
+          7,
+          6,
+          6,
+          6,
+          6,
+          5,
+          5,
+          5,
+          5,
+          4,
+          4,
+          4,
+          4,
+          3,
+          3,
+          3,
+          3,
+          30,
+          20,
+          17,
+          17,
+          17,
+          17,
+          14,
+          14,
+          14
+        ],
+        "landlord_candidate": "1",
+        "opening_id": "49bd6484a3e13602ef0d40029475c82c56bed8e75e34d953f5cc825061bf300e",
+        "public_features": {
+          "first_bidder": "1",
+          "ruleset_hash": "ebb651e6e2abefec406b3897b5a753c440ffbcb544cd3ec15575a4885d61bab7"
+        },
+        "ruleset": {
+          "all_pass_redeal": true,
+          "allow_double": false,
+          "allow_rob": false,
+          "anti_spring_multiplier": 2,
+          "base_score": 1,
+          "bid_multiplier": true,
+          "bid_values": [
+            0,
+            1,
+            2,
+            3
+          ],
+          "bidding_mode": "score_0_1_2_3",
+          "bomb_multiplier": 2,
+          "max_multiplier": null,
+          "max_redeals": 1,
+          "rocket_multiplier": 2,
+          "ruleset_id": "standard",
+          "ruleset_version": "standard-v1",
+          "spring_multiplier": 2
+        },
+        "schema_version": 1
+      },
+      "scenario_id": "max_redeal_guard",
+      "seat_to_role": {
+        "0": "landlord_up",
+        "1": "landlord",
+        "2": "landlord_down"
+      },
+      "terminal": {
+        "anti_spring": false,
+        "bid_value": 1,
+        "bomb_count": 0,
+        "farmer_score": 1,
+        "landlord_score": -2,
+        "multiplier_breakdown": {
+          "bid": 1,
+          "event_multiplier": 1,
+          "total_multiplier": 1,
+          "uncapped_total_multiplier": 1
+        },
+        "rocket_count": 0,
+        "ruleset_hash": "ebb651e6e2abefec406b3897b5a753c440ffbcb544cd3ec15575a4885d61bab7",
+        "ruleset_id": "standard",
+        "ruleset_version": "standard-v1",
+        "spring": false,
+        "team_targets": {
+          "landlord": {
+            "target_log_score": -1.0986122886681096,
+            "target_score": -2.0,
+            "target_win": 0.0
+          },
+          "landlord_down": {
+            "target_log_score": 0.6931471805599453,
+            "target_score": 1.0,
+            "target_win": 1.0
+          },
+          "landlord_up": {
+            "target_log_score": 0.6931471805599453,
+            "target_score": 1.0,
+            "target_win": 1.0
+          }
+        },
+        "terminal_result": {
+          "farmer_score": 1,
+          "landlord_score": -2,
+          "winner_team": "farmer"
+        },
+        "total_multiplier": 1,
+        "winner_position": "landlord_up",
+        "winner_team": "farmer"
+      }
+    }
+  ],
+  "schema_version": "standard-v2-r1-reference-v1",
+  "version_contract": {
+    "contract_version": "standard-v2-r1-contract-v1",
+    "current_base_async": {
+      "compact_bidding_replay_schema_version": 0,
+      "episode_commit_semantics": "cardplay_count_reconciled_v1",
+      "episode_task_semantics": "actor_local_task_queue_v1",
+      "protocol_semantics": "base_play_only_async_v1",
+      "protocol_version": 1
+    },
+    "reserved_standard_async": {
+      "compact_bidding_replay_schema_version": 1,
+      "episode_commit_semantics": "atomic_bid_play_terminal_v2",
+      "episode_task_semantics": "global_episode_domain_rng_v2",
+      "protocol_semantics": "standard_bid_play_async_v2",
+      "protocol_version": 2,
+      "snapshot_publication_semantics": "cycle_quiescent_atomic_standard_bundle_v2"
+    }
+  }
+}

@@ -49,6 +49,11 @@ from pathlib import Path
 from douzero.config import load_config
 from douzero.runtime import maybe_set_global_deterministic, set_global_seed
 from douzero.runtime.cleanup import run_cleanup_steps
+from douzero.training.standard_v2_contract import (
+    STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
+    STANDARD_V2_R1_CONFIG_HASH,
+    STANDARD_V2_R1_CONTRACT_VERSION,
+)
 
 
 def _cleanup_training_runtime(
@@ -616,15 +621,51 @@ def _build_training_metrics(
     ddp_enabled: bool,
     world_size: int,
     parameters_changed: bool | None,
+    runtime_metrics: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build finite, sanitized P17 throughput and memory diagnostics."""
     elapsed = max(float(training_wall_seconds), 1.0e-12)
     cardplay = int(stats.transitions_collected)
     bidding = int(stats.bidding_transitions_collected)
     decisions = cardplay + bidding
+    games = int(getattr(stats, "games_collected", stats.episodes_completed))
+    cardplay_decisions = int(getattr(stats, "decisions_collected", cardplay))
+    bidding_decisions = int(getattr(
+        stats, "bidding_decisions_collected", bidding
+    ))
+    abandoned_bids = int(getattr(
+        stats, "abandoned_bidding_transitions", 0
+    ))
+    learner_cardplay_samples = int(getattr(
+        stats, "learner_cardplay_samples", cardplay
+    ))
+    learner_bidding_samples = int(getattr(
+        stats, "learner_bidding_samples", bidding
+    ))
+    learner_samples = learner_cardplay_samples + learner_bidding_samples
+    runtime = runtime_metrics or {}
+    collection_seconds = runtime.get("collection_seconds")
+    optimization_seconds = runtime.get("optimization_seconds")
+    collection_elapsed = max(
+        float(collection_seconds) if collection_seconds is not None else elapsed,
+        1.0e-12,
+    )
+    optimization_elapsed = max(
+        float(optimization_seconds) if optimization_seconds is not None else elapsed,
+        1.0e-12,
+    )
+    staging_seconds = runtime.get("staging_seconds")
+    if staging_seconds is None and any(
+        f"{name}_seconds" in runtime
+        for name in ("slot_read", "collate", "h2d", "d2h", "publish", "replay_drain")
+    ):
+        staging_seconds = round(sum(
+            float(runtime.get(f"{name}_seconds", 0.0))
+            for name in ("slot_read", "collate", "h2d", "d2h", "publish", "replay_drain")
+        ), 6)
 
-    def per_second(count: int) -> float:
-        return round(float(count) / elapsed, 6)
+    def per_second(count: int, denominator: float = elapsed) -> float:
+        return round(float(count) / denominator, 6)
 
     def mib(value: int | None) -> float | None:
         if value is None:
@@ -655,6 +696,59 @@ def _build_training_metrics(
             "samples_per_second": per_second(decisions),
             "decisions_per_second": per_second(decisions),
             "learner_steps_per_second": per_second(int(stats.optimizer_steps)),
+        },
+        "standard_v2": {
+            "schema_version": STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
+            "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
+            "config_hash": STANDARD_V2_R1_CONFIG_HASH,
+            "wall_seconds": {
+                "total": round(elapsed, 6),
+                "collection": round(collection_elapsed, 6),
+                "optimization": round(optimization_elapsed, 6),
+            },
+            "counts": {
+                "games": games,
+                "cardplay_decisions": cardplay_decisions,
+                "bidding_decisions": bidding_decisions,
+                "play_transitions": cardplay,
+                "bid_transitions": bidding,
+                "abandoned_bidding_transitions": abandoned_bids,
+                "learner_cardplay_samples": learner_cardplay_samples,
+                "learner_bidding_samples": learner_bidding_samples,
+                "learner_samples": learner_samples,
+                "learner_steps": int(stats.optimizer_steps),
+            },
+            "rates": {
+                "games_per_second": per_second(games, collection_elapsed),
+                "cardplay_decisions_per_second": per_second(
+                    cardplay_decisions, collection_elapsed
+                ),
+                "bidding_decisions_per_second": per_second(
+                    bidding_decisions, collection_elapsed
+                ),
+                "play_transitions_per_second": per_second(
+                    cardplay, collection_elapsed
+                ),
+                "bid_transitions_per_second": per_second(
+                    bidding, collection_elapsed
+                ),
+                "learner_samples_per_second": per_second(
+                    learner_samples, optimization_elapsed
+                ),
+                "learner_steps_per_second": per_second(
+                    int(stats.optimizer_steps), optimization_elapsed
+                ),
+            },
+            "queue_latency_ms": {
+                "p50": runtime.get("inference_queue_p50_ms"),
+                "p95": runtime.get("inference_queue_p95_ms"),
+            },
+            "gpu_seconds": {
+                "inference": runtime.get("inference_gpu_seconds"),
+                "learner": runtime.get("learner_gpu_seconds"),
+            },
+            "staging_seconds": staging_seconds,
+            "peak_vram_mib": mib(peak_memory_bytes),
         },
         "amp": {
             "enabled": bool(amp_enabled),
@@ -1405,6 +1499,12 @@ def main() -> None:
                     trainer_cfg.snapshot_publication_semantics
                 ),
                 request_ordering_semantics=trainer_cfg.request_ordering_semantics,
+                async_protocol_version=trainer_cfg.async_protocol_version,
+                compact_bidding_replay_schema_version=(
+                    trainer_cfg.compact_bidding_replay_schema_version
+                ),
+                episode_task_semantics=trainer_cfg.episode_task_semantics,
+                episode_commit_semantics=trainer_cfg.episode_commit_semantics,
             )
             eval_command = getattr(args, "eval_command", "")
             if long_cfg.eval_every_cycles and not eval_command:
@@ -1532,6 +1632,7 @@ def main() -> None:
             changed = getattr(trainer, "stats_last_run_changed", None)
             if not isinstance(changed, bool):
                 changed = None
+            runtime_metrics = trainer.runtime_metrics_snapshot()
             _write_metrics_atomic(
                 metrics_path,
                 _build_training_metrics(
@@ -1549,6 +1650,7 @@ def main() -> None:
                     ddp_enabled=distributed.enabled,
                     world_size=distributed.world_size,
                     parameters_changed=changed,
+                    runtime_metrics=runtime_metrics,
                 ),
             )
     finally:

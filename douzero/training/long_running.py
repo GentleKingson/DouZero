@@ -24,6 +24,12 @@ from threading import Event, current_thread, main_thread
 from typing import Callable
 
 from douzero.runtime.cleanup import run_cleanup_steps
+from douzero.training.standard_v2_contract import (
+    BASE_ASYNC_PROTOCOL_VERSION,
+    BASE_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION,
+    BASE_EPISODE_COMMIT_SEMANTICS,
+    BASE_EPISODE_TASK_SEMANTICS,
+)
 
 
 _RUN_STATE_VERSION = 3
@@ -90,6 +96,12 @@ class LongRunningConfig:
     snapshot_publication_semantics: str = "cycle_quiescent_atomic_copy_v1"
     request_ordering_semantics: str = "policy_inference_bucket_interleaved_games_v3"
     actor_rng_resume_semantics: str = "restart_from_configured_seeds_v1"
+    async_protocol_version: int = BASE_ASYNC_PROTOCOL_VERSION
+    compact_bidding_replay_schema_version: int = (
+        BASE_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION
+    )
+    episode_task_semantics: str = BASE_EPISODE_TASK_SEMANTICS
+    episode_commit_semantics: str = BASE_EPISODE_COMMIT_SEMANTICS
 
     def __post_init__(self) -> None:
         integer_nonnegative = (
@@ -111,6 +123,17 @@ class LongRunningConfig:
             raise ValueError("keep_last_checkpoints must be >= 1")
         if self.num_actors < 1 or self.games_per_actor < 1:
             raise ValueError("num_actors and games_per_actor must be >= 1")
+        if self.async_protocol_version != BASE_ASYNC_PROTOCOL_VERSION:
+            raise ValueError("unknown async protocol version")
+        if (
+            self.compact_bidding_replay_schema_version
+            != BASE_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION
+        ):
+            raise ValueError("unknown compact bidding replay schema version")
+        if self.episode_task_semantics != BASE_EPISODE_TASK_SEMANTICS:
+            raise ValueError("unknown episode task semantics")
+        if self.episode_commit_semantics != BASE_EPISODE_COMMIT_SEMANTICS:
+            raise ValueError("unknown episode commit semantics")
 
     def resume_identity(self) -> dict[str, int | str]:
         """Return fields that affect the mathematical N+M trajectory."""
@@ -124,6 +147,12 @@ class LongRunningConfig:
             "snapshot_publication_semantics": self.snapshot_publication_semantics,
             "request_ordering_semantics": self.request_ordering_semantics,
             "actor_rng_resume_semantics": self.actor_rng_resume_semantics,
+            "async_protocol_version": self.async_protocol_version,
+            "compact_bidding_replay_schema_version": (
+                self.compact_bidding_replay_schema_version
+            ),
+            "episode_task_semantics": self.episode_task_semantics,
+            "episode_commit_semantics": self.episode_commit_semantics,
         }
 
 
@@ -771,12 +800,30 @@ class LongRunningTrainer:
             "episodes_per_cycle": config.episodes_per_cycle,
             "optimizer_steps_per_cycle": config.optimizer_steps_per_cycle,
         }
-        pre_interleaved_identity = config.resume_identity()
+        desired_identity = config.resume_identity()
+        pre_protocol_identity = dict(desired_identity)
+        for name in (
+            "async_protocol_version",
+            "compact_bidding_replay_schema_version",
+            "episode_task_semantics",
+            "episode_commit_semantics",
+        ):
+            pre_protocol_identity.pop(name)
+        pre_interleaved_identity = dict(desired_identity)
         pre_interleaved_identity.pop("games_per_actor")
         pre_interleaved_identity["request_ordering_semantics"] = (
             _PRE_INTERLEAVED_REQUEST_ORDERING
         )
-        if (
+        pre_interleaved_pre_protocol_identity = dict(pre_protocol_identity)
+        pre_interleaved_pre_protocol_identity.pop("games_per_actor")
+        pre_interleaved_pre_protocol_identity["request_ordering_semantics"] = (
+            _PRE_INTERLEAVED_REQUEST_ORDERING
+        )
+        if self.state.cycle_identity == pre_protocol_identity:
+            # The added fields describe the already-implemented base protocol;
+            # accepting an old identity is therefore an exact migration.
+            self.state.cycle_identity = desired_identity
+        elif (
             config.v2_training_mode == "single_process"
             and (
                 (
@@ -784,17 +831,20 @@ class LongRunningTrainer:
                     and config.num_actors == 1
                     and config.replay_schema_version == 1
                 )
-                or self.state.cycle_identity == pre_interleaved_identity
+                or self.state.cycle_identity in (
+                    pre_interleaved_identity,
+                    pre_interleaved_pre_protocol_identity,
+                )
             )
         ):
             # These fields are inert in single-process mode. Preserve both the
             # original two-field v3 migration and checkpoints written before
             # interleaved async games became part of the topology identity.
-            self.state.cycle_identity = config.resume_identity()
-        if self.state.cycle_identity != config.resume_identity():
+            self.state.cycle_identity = desired_identity
+        if self.state.cycle_identity != desired_identity:
             raise ValueError(
                 "long-running resume identity mismatch: checkpoint has "
-                f"{self.state.cycle_identity!r}, runtime expects {config.resume_identity()!r}"
+                f"{self.state.cycle_identity!r}, runtime expects {desired_identity!r}"
             )
         self._validate_totals()
         self._validate_reachable_limits()
@@ -968,6 +1018,28 @@ class LongRunningTrainer:
                     "decisions_collected",
                     transitions_before,
                 ))
+                games_before = int(getattr(
+                    self.trainer.stats,
+                    "games_collected",
+                    self.trainer.stats.episodes_completed,
+                ))
+                bidding_decisions_before = int(getattr(
+                    self.trainer.stats,
+                    "bidding_decisions_collected",
+                    getattr(self.trainer.stats, "bidding_transitions_collected", 0),
+                ))
+                bidding_transitions_before = int(getattr(
+                    self.trainer.stats, "bidding_transitions_collected", 0
+                ))
+                abandoned_bids_before = int(getattr(
+                    self.trainer.stats, "abandoned_bidding_transitions", 0
+                ))
+                learner_cardplay_before = int(getattr(
+                    self.trainer.stats, "learner_cardplay_samples", 0
+                ))
+                learner_bidding_before = int(getattr(
+                    self.trainer.stats, "learner_bidding_samples", 0
+                ))
                 collection_started = self.clock()
                 self.trainer.collect_episodes(episodes)
                 collection_seconds = self.clock() - collection_started
@@ -1084,6 +1156,43 @@ class LongRunningTrainer:
                     boundary_reason = post_service_reason
                     self.last_stop_reason = boundary_reason
 
+                cycle_games = int(getattr(
+                    self.trainer.stats,
+                    "games_collected",
+                    self.trainer.stats.episodes_completed,
+                )) - games_before
+                cycle_cardplay_decisions = int(getattr(
+                    self.trainer.stats,
+                    "decisions_collected",
+                    self.state.total_transitions,
+                )) - decisions_before
+                cycle_bidding_decisions = int(getattr(
+                    self.trainer.stats,
+                    "bidding_decisions_collected",
+                    getattr(self.trainer.stats, "bidding_transitions_collected", 0),
+                )) - bidding_decisions_before
+                cycle_play_transitions = (
+                    self.state.total_transitions - transitions_before
+                )
+                cycle_bid_transitions = int(getattr(
+                    self.trainer.stats, "bidding_transitions_collected", 0
+                )) - bidding_transitions_before
+                cycle_abandoned_bids = int(getattr(
+                    self.trainer.stats, "abandoned_bidding_transitions", 0
+                )) - abandoned_bids_before
+                cycle_learner_cardplay_samples = int(getattr(
+                    self.trainer.stats, "learner_cardplay_samples", 0
+                )) - learner_cardplay_before
+                cycle_learner_bidding_samples = int(getattr(
+                    self.trainer.stats, "learner_bidding_samples", 0
+                )) - learner_bidding_before
+                cycle_learner_samples = (
+                    cycle_learner_cardplay_samples
+                    + cycle_learner_bidding_samples
+                )
+                collection_denominator = max(collection_seconds, 1e-12)
+                optimization_denominator = max(optimization_seconds, 1e-12)
+
                 record = {
                     "schema_version": "v2-long-running-cycle-v1",
                     "event": "cycle",
@@ -1093,6 +1202,17 @@ class LongRunningTrainer:
                     "total_optimizer_steps": self.state.total_optimizer_steps,
                     "policy_version": self.state.policy_version,
                     "policy_step": self.state.policy_step,
+                    "cycle_games": cycle_games,
+                    "cycle_cardplay_decisions": cycle_cardplay_decisions,
+                    "cycle_bidding_decisions": cycle_bidding_decisions,
+                    "cycle_play_transitions": cycle_play_transitions,
+                    "cycle_bid_transitions": cycle_bid_transitions,
+                    "cycle_abandoned_bidding_transitions": cycle_abandoned_bids,
+                    "cycle_learner_cardplay_samples": (
+                        cycle_learner_cardplay_samples
+                    ),
+                    "cycle_learner_bidding_samples": cycle_learner_bidding_samples,
+                    "cycle_learner_samples": cycle_learner_samples,
                     "cycle_wall_seconds": round(self.clock() - cycle_started, 6),
                     "collection_seconds": round(collection_seconds, 6),
                     "optimization_seconds": round(optimization_seconds, 6),
@@ -1101,26 +1221,31 @@ class LongRunningTrainer:
                     "active_slots": int(boundary_status.get("active_slots", 0)),
                     "in_flight_slots": int(boundary_status.get("in_flight_slots", 0)),
                     "transitions_per_second": round(
-                        (self.state.total_transitions - transitions_before)
-                        / max(collection_seconds, 1e-12), 6
+                        cycle_play_transitions / collection_denominator, 6
                     ),
                     "decisions_per_second": round(
-                        (
-                            int(getattr(
-                                self.trainer.stats,
-                                "decisions_collected",
-                                self.state.total_transitions,
-                            ))
-                            - decisions_before
-                        )
-                        / max(collection_seconds, 1e-12), 6
+                        cycle_cardplay_decisions / collection_denominator, 6
                     ),
                     "trainable_decisions_per_second": round(
-                        (self.state.total_transitions - transitions_before)
-                        / max(collection_seconds, 1e-12), 6
+                        cycle_play_transitions / collection_denominator, 6
+                    ),
+                    "games_per_second": round(
+                        cycle_games / collection_denominator, 6
+                    ),
+                    "cardplay_decisions_per_second": round(
+                        cycle_cardplay_decisions / collection_denominator, 6
+                    ),
+                    "bidding_decisions_per_second": round(
+                        cycle_bidding_decisions / collection_denominator, 6
+                    ),
+                    "bid_transitions_per_second": round(
+                        cycle_bid_transitions / collection_denominator, 6
+                    ),
+                    "learner_samples_per_second": round(
+                        cycle_learner_samples / optimization_denominator, 6
                     ),
                     "learner_steps_per_second": round(
-                        steps_taken / max(optimization_seconds, 1e-12), 6
+                        steps_taken / optimization_denominator, 6
                     ),
                     "requests_per_microbatch": round(
                         float(boundary_status.get("requests_per_microbatch", 0.0)), 6
@@ -1182,6 +1307,20 @@ class LongRunningTrainer:
                     ),
                     "replay_drain_seconds": round(
                         float(boundary_status.get("replay_drain_seconds", 0.0)), 6
+                    ),
+                    "staging_seconds": round(
+                        sum(
+                            float(boundary_status.get(f"{name}_seconds", 0.0))
+                            for name in (
+                                "slot_read",
+                                "collate",
+                                "h2d",
+                                "d2h",
+                                "publish",
+                                "replay_drain",
+                            )
+                        ),
+                        6,
                     ),
                     "amp_fallback": int(self.trainer.stats.amp_fallbacks) - amp_before,
                     "checkpoint_path": checkpoint_path.name if checkpoint_path else "",
