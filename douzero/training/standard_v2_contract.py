@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import asdict, is_dataclass
 from typing import Any, Mapping
 
 
@@ -16,7 +17,7 @@ STANDARD_V2_R1_CONTRACT_VERSION = "standard-v2-r1-contract-v1"
 STANDARD_V2_REFERENCE_SCHEMA_VERSION = "standard-v2-r1-reference-v1"
 STANDARD_V2_BENCHMARK_SCHEMA_VERSION = "standard-v2-r1-benchmark-v1"
 STANDARD_V2_R1_REFERENCE_DIGEST = (
-    "097cd1c4c91604b925134fe4477e81ada29629efa31a122c4f432eee8389e258"
+    "8817274e665ad6296e688044326e4c2ad1a682d6e78b6124e61081bf0f3e014e"
 )
 
 # The currently implemented base async path.  These values are written into
@@ -154,13 +155,14 @@ def resolved_standard_v2_config_identity(
     deterministic: bool,
     ddp_enabled: bool,
     ddp_backend: str,
+    world_size: int,
     compile_model: bool,
     bidding_enabled: bool,
 ) -> dict[str, Any]:
-    """Build the R1 identity shape from the values the trainer will use."""
+    """Bind mathematical semantics and the complete benchmark workload."""
 
     bidding_policy = bidding_config
-    return {
+    training_semantics = {
         "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
         "runtime": {
             "ruleset": str(ruleset),
@@ -255,9 +257,27 @@ def resolved_standard_v2_config_identity(
             ),
         },
     }
+    if not is_dataclass(trainer_config):
+        raise TypeError("trainer_config must be a dataclass instance")
+    benchmark_workload = {
+        # TrainerConfig deliberately contains no paths or logging destinations,
+        # so every field is workload- or trajectory-relevant and is bound.
+        "trainer_config": asdict(trainer_config),
+        "execution": {
+            "ddp_enabled": bool(ddp_enabled),
+            "ddp_backend": str(ddp_backend),
+            "world_size": int(world_size),
+            "compile_model": bool(compile_model),
+        },
+    }
+    return {
+        "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
+        "training_semantics": training_semantics,
+        "benchmark_workload": benchmark_workload,
+    }
 
 
-STANDARD_V2_R1_EXPECTED_CONFIG: dict[str, Any] = {
+STANDARD_V2_R1_EXPECTED_TRAINING_SEMANTICS: dict[str, Any] = {
     "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
     "runtime": {
         "ruleset": "standard",
@@ -330,6 +350,67 @@ STANDARD_V2_R1_EXPECTED_CONFIG: dict[str, Any] = {
         "learned_probability": 0.1,
     },
 }
+
+STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD: dict[str, Any] = {
+    "trainer_config": {
+        "seed": 0,
+        "max_episodes": 16,
+        "max_steps_per_episode": 600,
+        "exp_epsilon": 0.05,
+        "batch_size": 32,
+        "learning_rate": 0.0001,
+        "rmsprop_alpha": 0.99,
+        "rmsprop_momentum": 0.0,
+        "rmsprop_epsilon": 0.00001,
+        "max_grad_norm": 40.0,
+        "optimizer_steps": 1,
+        "buffer_capacity": 4096,
+        "rng_seed": 0,
+        "device": "cuda",
+        "amp_enabled": False,
+        "amp_dtype": "float16",
+        "amp_fallback_on_nonfinite": True,
+        "belief_training_mode": "frozen",
+        "belief_supervised_weight": 0.0,
+        "belief_alternating_interval": 1,
+        "belief_supervised_batch_size": 16,
+        "first_bidder_mode": "rotate",
+        "v2_training_mode": "single_process",
+        "num_actors": 1,
+        "games_per_actor": 4,
+        "replay_schema_version": 1,
+        "snapshot_publication_semantics": (
+            "cycle_quiescent_atomic_copy_v1"
+        ),
+        "request_ordering_semantics": (
+            "policy_inference_bucket_interleaved_games_v3"
+        ),
+        "async_protocol_version": BASE_ASYNC_PROTOCOL_VERSION,
+        "compact_bidding_replay_schema_version": (
+            BASE_COMPACT_BIDDING_REPLAY_SCHEMA_VERSION
+        ),
+        "episode_task_semantics": BASE_EPISODE_TASK_SEMANTICS,
+        "episode_commit_semantics": BASE_EPISODE_COMMIT_SEMANTICS,
+    },
+    "execution": {
+        "ddp_enabled": False,
+        "ddp_backend": "auto",
+        "world_size": 1,
+        "compile_model": False,
+    },
+}
+
+STANDARD_V2_R1_EXPECTED_CONFIG: dict[str, Any] = {
+    "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
+    "training_semantics": STANDARD_V2_R1_EXPECTED_TRAINING_SEMANTICS,
+    "benchmark_workload": STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD,
+}
+STANDARD_V2_R1_TRAINING_SEMANTICS_HASH = stable_identity_hash(
+    STANDARD_V2_R1_EXPECTED_TRAINING_SEMANTICS
+)
+STANDARD_V2_R1_BENCHMARK_WORKLOAD_HASH = stable_identity_hash(
+    STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD
+)
 STANDARD_V2_R1_CONFIG_HASH = stable_identity_hash(
     STANDARD_V2_R1_EXPECTED_CONFIG
 )
@@ -339,11 +420,11 @@ def validate_standard_v2_r1_config(config: Any) -> dict[str, Any]:
     """Fail closed when the production YAML drifts from the frozen matrix."""
 
     identity = standard_v2_r1_config_identity(config)
-    if identity != STANDARD_V2_R1_EXPECTED_CONFIG:
+    if identity != STANDARD_V2_R1_EXPECTED_TRAINING_SEMANTICS:
         raise ValueError(
-            "Standard V2 R1 config drifted from its frozen contract: "
+            "Standard V2 R1 training semantics drifted from the frozen contract: "
             f"actual={stable_identity_hash(identity)}, "
-            f"expected={STANDARD_V2_R1_CONFIG_HASH}"
+            f"expected={STANDARD_V2_R1_TRAINING_SEMANTICS_HASH}"
         )
     return identity
 
@@ -355,10 +436,24 @@ def standard_v2_benchmark_identity(
 
     actual_hash = stable_identity_hash(config_identity)
     is_r1 = dict(config_identity) == STANDARD_V2_R1_EXPECTED_CONFIG
+    semantics = config_identity.get("training_semantics")
+    workload = config_identity.get("benchmark_workload")
+    semantics_hash = (
+        stable_identity_hash(semantics)
+        if isinstance(semantics, Mapping)
+        else None
+    )
+    workload_hash = (
+        stable_identity_hash(workload)
+        if isinstance(workload, Mapping)
+        else None
+    )
     return {
         "schema_version": STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
         "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
         "config_hash": actual_hash,
+        "training_semantics_hash": semantics_hash,
+        "benchmark_workload_hash": workload_hash,
         "reference_digest": (
             STANDARD_V2_R1_REFERENCE_DIGEST if is_r1 else None
         ),

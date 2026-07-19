@@ -11,9 +11,11 @@ from douzero.coach.records import CANONICAL_DECK, OpeningRecord
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.training.standard_v2_contract import (
+    STANDARD_V2_R1_BENCHMARK_WORKLOAD_HASH,
     STANDARD_V2_R1_CONFIG_HASH,
     STANDARD_V2_R1_CONTRACT_VERSION,
     STANDARD_V2_R1_REFERENCE_DIGEST,
+    STANDARD_V2_R1_TRAINING_SEMANTICS_HASH,
     STANDARD_V2_REFERENCE_SCHEMA_VERSION,
     stable_identity_hash,
     standard_v2_version_contract,
@@ -322,6 +324,8 @@ def build_standard_v2_reference() -> dict[str, Any]:
         "schema_version": STANDARD_V2_REFERENCE_SCHEMA_VERSION,
         "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
         "config_hash": STANDARD_V2_R1_CONFIG_HASH,
+        "training_semantics_hash": STANDARD_V2_R1_TRAINING_SEMANTICS_HASH,
+        "benchmark_workload_hash": STANDARD_V2_R1_BENCHMARK_WORKLOAD_HASH,
         "version_contract": standard_v2_version_contract(),
         "coverage": coverage,
         "scenarios": scenarios,

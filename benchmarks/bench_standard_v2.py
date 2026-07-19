@@ -12,9 +12,12 @@ from typing import Any, Mapping
 from benchmarks.standard_v2_reference import build_standard_v2_reference
 from douzero.training.standard_v2_contract import (
     STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
+    STANDARD_V2_R1_BENCHMARK_WORKLOAD_HASH,
     STANDARD_V2_R1_CONFIG_HASH,
     STANDARD_V2_R1_CONTRACT_VERSION,
+    STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD,
     STANDARD_V2_R1_REFERENCE_DIGEST,
+    STANDARD_V2_R1_TRAINING_SEMANTICS_HASH,
 )
 
 
@@ -24,6 +27,8 @@ _IDENTITY_FIELDS = frozenset({
     "schema_version",
     "contract_version",
     "config_hash",
+    "training_semantics_hash",
+    "benchmark_workload_hash",
     "reference_digest",
     "qualification",
 })
@@ -134,6 +139,8 @@ def _validate_identity(value: object, name: str) -> dict[str, Any]:
         "schema_version": STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
         "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
         "config_hash": STANDARD_V2_R1_CONFIG_HASH,
+        "training_semantics_hash": STANDARD_V2_R1_TRAINING_SEMANTICS_HASH,
+        "benchmark_workload_hash": STANDARD_V2_R1_BENCHMARK_WORKLOAD_HASH,
         "reference_digest": STANDARD_V2_R1_REFERENCE_DIGEST,
         "qualification": "r1",
     }
@@ -176,12 +183,40 @@ def _validate_counts(value: object, name: str) -> dict[str, int]:
     return counts
 
 
-def _validate_rates(value: object, name: str) -> dict[str, float]:
+def _validate_rates(
+    value: object,
+    name: str,
+    *,
+    expected: Mapping[str, tuple[int, float]],
+) -> dict[str, float]:
     raw = _require_mapping(value, name, fields=set(_RATE_FIELDS))
-    return {
-        field: _require_number(raw[field], f"{name}.{field}")
-        for field in _RATE_FIELDS
-    }
+    rates: dict[str, float] = {}
+    for field in _RATE_FIELDS:
+        reported = _require_number(raw[field], f"{name}.{field}")
+        count, seconds = expected[field]
+        recomputed = float(count) / seconds
+        canonical = round(recomputed, 6)
+        if reported != canonical:
+            raise ValueError(
+                f"{name}.{field} disagrees with its count and wall time"
+            )
+        rates[field] = canonical
+    return rates
+
+
+def _validate_phase_wall(
+    wall: Mapping[str, float],
+    name: str,
+    *,
+    bound_overhead: bool,
+) -> None:
+    total = wall["total"]
+    phase_sum = wall["collection"] + wall["optimization"]
+    tolerance = max(2.0e-6, total * 1.0e-6)
+    if phase_sum > total + tolerance:
+        raise ValueError(f"{name} phases exceed total wall time")
+    if bound_overhead and total > phase_sum * 1.05 + 0.1:
+        raise ValueError(f"{name} total wall time has implausible overhead")
 
 
 def _validate_amp(
@@ -332,9 +367,13 @@ def _validate_training_metrics(payload: object) -> dict[str, Any]:
     counts = _validate_counts(
         standard["counts"], "training_metrics.standard_v2.counts"
     )
-    rates = _validate_rates(
-        standard["rates"], "training_metrics.standard_v2.rates"
-    )
+    frozen_trainer = STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD[
+        "trainer_config"
+    ]
+    if counts["games"] != frozen_trainer["max_episodes"]:
+        raise ValueError("game count disagrees with the frozen R1 workload")
+    if counts["learner_steps"] != frozen_trainer["optimizer_steps"]:
+        raise ValueError("learner steps disagree with the frozen R1 workload")
     wall = _require_mapping(
         standard["wall_seconds"],
         "training_metrics.standard_v2.wall_seconds",
@@ -350,6 +389,42 @@ def _validate_training_metrics(payload: object) -> dict[str, Any]:
     }
     if not math.isclose(wall["total"], training_wall, abs_tol=1.0e-6):
         raise ValueError("training wall time disagrees with Standard V2 metrics")
+    _validate_phase_wall(
+        wall,
+        "training_metrics.standard_v2.wall_seconds",
+        bound_overhead=True,
+    )
+    rates = _validate_rates(
+        standard["rates"],
+        "training_metrics.standard_v2.rates",
+        expected={
+            "games_per_second": (counts["games"], wall["collection"]),
+            "cardplay_decisions_per_second": (
+                counts["cardplay_decisions"],
+                wall["collection"],
+            ),
+            "bidding_decisions_per_second": (
+                counts["bidding_decisions"],
+                wall["collection"],
+            ),
+            "play_transitions_per_second": (
+                counts["play_transitions"],
+                wall["collection"],
+            ),
+            "bid_transitions_per_second": (
+                counts["bid_transitions"],
+                wall["collection"],
+            ),
+            "learner_samples_per_second": (
+                counts["learner_samples"],
+                wall["optimization"],
+            ),
+            "learner_steps_per_second": (
+                counts["learner_steps"],
+                wall["optimization"],
+            ),
+        },
+    )
     queue, gpu_seconds, staging = _validate_optional_sections(
         queue=standard["queue_latency_ms"],
         gpu_seconds=standard["gpu_seconds"],
@@ -374,18 +449,21 @@ def _validate_training_metrics(payload: object) -> dict[str, Any]:
             "learner_steps_per_second",
         },
     )
-    for name, value in top_metrics.items():
-        _require_number(value, f"training_metrics.metrics.{name}")
-    if float(top_metrics["peak_memory_mib"]) != peak_vram:
-        raise ValueError("peak VRAM disagrees with top-level training metrics")
     top_counts = _require_mapping(
         training["counts"],
         "training_metrics.counts",
         fields={
             "episodes",
+            "games",
+            "cardplay_decisions",
             "cardplay_transitions",
             "bidding_decisions",
+            "bidding_transitions",
+            "abandoned_bidding_transitions",
             "total_decisions",
+            "learner_cardplay_samples",
+            "learner_bidding_samples",
+            "learner_samples",
             "learner_steps",
             "redeals",
             "max_redeals_exceeded",
@@ -394,8 +472,72 @@ def _validate_training_metrics(payload: object) -> dict[str, Any]:
     )
     for name, value in top_counts.items():
         _require_count(value, f"training_metrics.counts.{name}")
-    if top_counts["learner_steps"] != counts["learner_steps"]:
-        raise ValueError("learner step counters disagree")
+    if top_counts["episodes"] != top_counts["games"]:
+        raise ValueError("completed episodes disagree with collected games")
+    repeated_counts = {
+        "games": "games",
+        "cardplay_decisions": "cardplay_decisions",
+        "bidding_decisions": "bidding_decisions",
+        "cardplay_transitions": "play_transitions",
+        "bidding_transitions": "bid_transitions",
+        "abandoned_bidding_transitions": "abandoned_bidding_transitions",
+        "learner_cardplay_samples": "learner_cardplay_samples",
+        "learner_bidding_samples": "learner_bidding_samples",
+        "learner_samples": "learner_samples",
+        "learner_steps": "learner_steps",
+    }
+    for top_name, standard_name in repeated_counts.items():
+        if top_counts[top_name] != counts[standard_name]:
+            raise ValueError(f"{top_name} counters disagree")
+    if top_counts["total_decisions"] != (
+        top_counts["cardplay_decisions"]
+        + top_counts["bidding_decisions"]
+    ):
+        raise ValueError("total decision counter does not reconcile")
+
+    peak_memory = _require_number(
+        top_metrics["peak_memory_mib"],
+        "training_metrics.metrics.peak_memory_mib",
+        positive=True,
+    )
+    peak_reserved = _require_number(
+        top_metrics["peak_reserved_memory_mib"],
+        "training_metrics.metrics.peak_reserved_memory_mib",
+        positive=True,
+    )
+    if peak_memory != peak_vram:
+        raise ValueError("peak VRAM disagrees with top-level training metrics")
+    if peak_reserved < peak_memory:
+        raise ValueError("reserved VRAM cannot be below allocated VRAM")
+    top_rate_expectations = {
+        "cardplay_transitions_per_second": (
+            top_counts["cardplay_transitions"] / training_wall
+        ),
+        "bidding_decisions_per_second": (
+            top_counts["bidding_decisions"] / training_wall
+        ),
+        "samples_per_second": (
+            (
+                top_counts["cardplay_transitions"]
+                + top_counts["bidding_transitions"]
+            )
+            / training_wall
+        ),
+        "decisions_per_second": (
+            top_counts["total_decisions"] / training_wall
+        ),
+        "learner_steps_per_second": (
+            top_counts["learner_steps"] / training_wall
+        ),
+    }
+    for name, expected_rate in top_rate_expectations.items():
+        reported_rate = _require_number(
+            top_metrics[name], f"training_metrics.metrics.{name}"
+        )
+        if reported_rate != round(expected_rate, 6):
+            raise ValueError(
+                f"training_metrics.metrics.{name} disagrees with counts and wall time"
+            )
 
     return {
         "identity": identity,
@@ -431,6 +573,9 @@ def _validate_cycle_metrics(payload: object) -> dict[str, Any]:
         "compile",
         "distributed",
         "parameter_update_observed",
+        "total_episodes",
+        "total_transitions",
+        "total_optimizer_steps",
         "cycle_games",
         "cycle_cardplay_decisions",
         "cycle_bidding_decisions",
@@ -504,20 +649,27 @@ def _validate_cycle_metrics(payload: object) -> dict[str, Any]:
         "learner_steps": cycle["cycle_learner_steps"],
     }
     counts = _validate_counts(count_source, "cycle_metrics.counts")
-    rate_source = {
-        "games_per_second": cycle["games_per_second"],
-        "cardplay_decisions_per_second": cycle[
-            "cardplay_decisions_per_second"
-        ],
-        "bidding_decisions_per_second": cycle[
-            "bidding_decisions_per_second"
-        ],
-        "play_transitions_per_second": cycle["transitions_per_second"],
-        "bid_transitions_per_second": cycle["bid_transitions_per_second"],
-        "learner_samples_per_second": cycle["learner_samples_per_second"],
-        "learner_steps_per_second": cycle["learner_steps_per_second"],
+    frozen_trainer = STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD[
+        "trainer_config"
+    ]
+    if counts["games"] != frozen_trainer["max_episodes"]:
+        raise ValueError("cycle games disagree with the frozen R1 workload")
+    if counts["learner_steps"] != frozen_trainer["optimizer_steps"]:
+        raise ValueError("cycle learner steps disagree with the frozen R1 workload")
+    totals = {
+        name: _require_count(cycle[name], f"cycle_metrics.{name}")
+        for name in (
+            "total_episodes",
+            "total_transitions",
+            "total_optimizer_steps",
+        )
     }
-    rates = _validate_rates(rate_source, "cycle_metrics.rates")
+    if totals["total_episodes"] < counts["games"]:
+        raise ValueError("cycle games exceed cumulative episodes")
+    if totals["total_transitions"] < counts["play_transitions"]:
+        raise ValueError("cycle transitions exceed cumulative transitions")
+    if totals["total_optimizer_steps"] < counts["learner_steps"]:
+        raise ValueError("cycle learner steps exceed cumulative learner steps")
     wall = {
         "total": _require_number(
             cycle["cycle_wall_seconds"],
@@ -535,6 +687,51 @@ def _validate_cycle_metrics(payload: object) -> dict[str, Any]:
             positive=True,
         ),
     }
+    _validate_phase_wall(wall, "cycle_metrics wall time", bound_overhead=False)
+    rate_source = {
+        "games_per_second": cycle["games_per_second"],
+        "cardplay_decisions_per_second": cycle[
+            "cardplay_decisions_per_second"
+        ],
+        "bidding_decisions_per_second": cycle[
+            "bidding_decisions_per_second"
+        ],
+        "play_transitions_per_second": cycle["transitions_per_second"],
+        "bid_transitions_per_second": cycle["bid_transitions_per_second"],
+        "learner_samples_per_second": cycle["learner_samples_per_second"],
+        "learner_steps_per_second": cycle["learner_steps_per_second"],
+    }
+    rates = _validate_rates(
+        rate_source,
+        "cycle_metrics.rates",
+        expected={
+            "games_per_second": (counts["games"], wall["collection"]),
+            "cardplay_decisions_per_second": (
+                counts["cardplay_decisions"],
+                wall["collection"],
+            ),
+            "bidding_decisions_per_second": (
+                counts["bidding_decisions"],
+                wall["collection"],
+            ),
+            "play_transitions_per_second": (
+                counts["play_transitions"],
+                wall["collection"],
+            ),
+            "bid_transitions_per_second": (
+                counts["bid_transitions"],
+                wall["collection"],
+            ),
+            "learner_samples_per_second": (
+                counts["learner_samples"],
+                wall["optimization"],
+            ),
+            "learner_steps_per_second": (
+                counts["learner_steps"],
+                wall["optimization"],
+            ),
+        },
+    )
     queue, gpu_seconds, staging = _validate_optional_sections(
         queue={
             "p50": cycle["inference_queue_p50_ms"],
@@ -611,6 +808,8 @@ def build_unified_benchmark(
         "schema_version": STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
         "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
         "config_hash": STANDARD_V2_R1_CONFIG_HASH,
+        "training_semantics_hash": STANDARD_V2_R1_TRAINING_SEMANTICS_HASH,
+        "benchmark_workload_hash": STANDARD_V2_R1_BENCHMARK_WORKLOAD_HASH,
         "reference_digest": reference["reference_digest"],
         "coverage": reference["coverage"],
         "performance": {

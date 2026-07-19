@@ -107,7 +107,8 @@ flowchart LR
 
 - 冻结配置与版本注册表：`douzero/training/standard_v2_contract.py`。
 - 固定 corpus 与参考执行器：`benchmarks/standard_v2_reference.py`。
-- Golden reference：`benchmarks/baselines/standard_v2_r1_reference.json`，digest 为 `097cd1c4c91604b925134fe4477e81ada29629efa31a122c4f432eee8389e258`。
+- Golden reference：`benchmarks/baselines/standard_v2_r1_reference.json`，digest 为 `8817274e665ad6296e688044326e4c2ad1a682d6e78b6124e61081bf0f3e014e`。
+- R1 身份拆分为训练语义 hash 与 benchmark workload hash；后者绑定完整 `TrainerConfig`、设备、world size 和执行拓扑，组合 config hash 同时覆盖两者。
 - 统一基准入口：`python -m benchmarks.bench_standard_v2`。
 - 单 GPU 实测基线：`benchmarks/baselines/standard_v2_r1_single_gpu.json`。
 - 回归门槛：`tests/test_standard_v2_contract.py`。
@@ -116,7 +117,7 @@ flowchart LR
 
 Async checkpoint format 已升级到 `5` 并写入上述当前协议字段；format `4` 通过显式旧 identity 兼容，未知 protocol/schema/semantics 失败关闭。Single-process checkpoint 继续使用 format `3`，没有伪装成跨拓扑 exact resume。
 
-本次 16 局 FP32 Standard V2 单 GPU 短基准完成 1 次参数更新：8.827 games/s、341.483 play transitions/s、22.618 bid transitions/s、238.290 learner samples/s，peak allocated VRAM 276.272 MiB。采样吞吐使用 collection wall time，learner 吞吐使用 optimization wall time。单进程路径没有推理队列和 staging 阶段，对应字段明确记录为 `null`，由 M2/M5 的 async 基准填充。
+本次 16 局 FP32 Standard V2 单 GPU 短基准完成 1 次参数更新：6.459 games/s、368.990 play transitions/s、12.919 bid transitions/s、241.305 learner samples/s，peak allocated VRAM 269.424 MiB。采样吞吐使用 collection wall time，learner 吞吐使用 optimization wall time。单进程路径没有推理队列和 staging 阶段，对应字段明确记录为 `null`，由 M2/M5 的 async 基准填充。
 
 ### M1：向量化 Bidding Learner
 

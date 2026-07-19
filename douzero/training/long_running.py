@@ -1233,8 +1233,14 @@ class LongRunningTrainer:
                     cycle_learner_cardplay_samples
                     + cycle_learner_bidding_samples
                 )
-                collection_denominator = max(collection_seconds, 1e-12)
-                optimization_denominator = max(optimization_seconds, 1e-12)
+                collection_wall_seconds = max(
+                    round(collection_seconds, 6), 1.0e-6
+                )
+                optimization_wall_seconds = max(
+                    round(optimization_seconds, 6), 1.0e-6
+                )
+                collection_denominator = collection_wall_seconds
+                optimization_denominator = optimization_wall_seconds
 
                 record = {
                     "schema_version": _CYCLE_METRICS_SCHEMA_VERSION,
@@ -1272,8 +1278,8 @@ class LongRunningTrainer:
                     "cycle_learner_samples": cycle_learner_samples,
                     "cycle_learner_steps": steps_taken,
                     "cycle_wall_seconds": round(self.clock() - cycle_started, 6),
-                    "collection_seconds": round(collection_seconds, 6),
-                    "optimization_seconds": round(optimization_seconds, 6),
+                    "collection_seconds": collection_wall_seconds,
+                    "optimization_seconds": optimization_wall_seconds,
                     "cycle_quiesce_seconds": round(quiesce_seconds, 6),
                     "replay_occupancy": int(boundary_status.get("replay_occupancy", 0)),
                     "active_slots": int(boundary_status.get("active_slots", 0)),

@@ -623,10 +623,13 @@ def _build_training_metrics(
 ) -> dict[str, object]:
     """Build finite, sanitized P17 throughput and memory diagnostics."""
     benchmark_identity = standard_v2_benchmark_identity(config_identity)
-    runtime_identity = config_identity.get("runtime")
+    training_semantics = config_identity.get("training_semantics")
+    if not isinstance(training_semantics, Mapping):
+        raise ValueError("resolved config identity is missing training semantics")
+    runtime_identity = training_semantics.get("runtime")
     if not isinstance(runtime_identity, Mapping):
         raise ValueError("resolved config identity is missing runtime fields")
-    elapsed = max(float(training_wall_seconds), 1.0e-12)
+    elapsed = max(round(float(training_wall_seconds), 6), 1.0e-6)
     cardplay = int(stats.transitions_collected)
     bidding = int(stats.bidding_transitions_collected)
     games = int(getattr(stats, "games_collected", stats.episodes_completed))
@@ -650,12 +653,22 @@ def _build_training_metrics(
     collection_seconds = runtime.get("collection_seconds")
     optimization_seconds = runtime.get("optimization_seconds")
     collection_elapsed = max(
-        float(collection_seconds) if collection_seconds is not None else elapsed,
-        1.0e-12,
+        round(
+            float(collection_seconds)
+            if collection_seconds is not None
+            else elapsed,
+            6,
+        ),
+        1.0e-6,
     )
     optimization_elapsed = max(
-        float(optimization_seconds) if optimization_seconds is not None else elapsed,
-        1.0e-12,
+        round(
+            float(optimization_seconds)
+            if optimization_seconds is not None
+            else elapsed,
+            6,
+        ),
+        1.0e-6,
     )
     staging_seconds = runtime.get("staging_seconds")
     if staging_seconds is None and any(
@@ -686,9 +699,16 @@ def _build_training_metrics(
         "training_wall_seconds": round(elapsed, 6),
         "counts": {
             "episodes": int(stats.episodes_completed),
+            "games": games,
+            "cardplay_decisions": cardplay_decisions,
             "cardplay_transitions": cardplay,
             "bidding_decisions": bidding_decisions,
+            "bidding_transitions": bidding,
+            "abandoned_bidding_transitions": abandoned_bids,
             "total_decisions": decisions,
+            "learner_cardplay_samples": learner_cardplay_samples,
+            "learner_bidding_samples": learner_bidding_samples,
+            "learner_samples": learner_samples,
             "learner_steps": int(stats.optimizer_steps),
             "redeals": int(stats.redeals),
             "max_redeals_exceeded": int(stats.max_redeals_exceeded),
@@ -728,6 +748,12 @@ def _build_training_metrics(
             "schema_version": STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
             "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
             "config_hash": benchmark_identity["config_hash"],
+            "training_semantics_hash": benchmark_identity[
+                "training_semantics_hash"
+            ],
+            "benchmark_workload_hash": benchmark_identity[
+                "benchmark_workload_hash"
+            ],
             "reference_digest": benchmark_identity["reference_digest"],
             "qualification": "r1",
             "wall_seconds": {
@@ -1250,6 +1276,7 @@ def main() -> None:
         deterministic=deterministic,
         ddp_enabled=distributed.enabled,
         ddp_backend=ddp_backend,
+        world_size=distributed.world_size,
         compile_model=compile_enabled,
         bidding_enabled=bool(
             yaml_cfg.bidding.enabled if yaml_cfg is not None else False

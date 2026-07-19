@@ -2,6 +2,9 @@
 # Run a short CPU closure with:
 #   python train_v2.py --config configs/standard_v2.yaml \
 #     --episodes 2 --optimizer_steps 1 --batch_size 1
+# Run the frozen R1 single-GPU benchmark workload with:
+#   python train_v2.py --config configs/standard_v2.yaml \
+#     --episodes 16 --optimizer_steps 1 --device cuda
 
 xpid: douzero_standard_v2
 objective: adp
@@ -21,6 +24,9 @@ amp_fallback_on_nonfinite: true
 ddp_enabled: false
 ddp_backend: auto
 compile_model: false
+v2_training_mode: single_process
+num_actors: 1
+games_per_actor: 4
 
 optimizer:
   learning_rate: 0.0001

@@ -584,7 +584,10 @@ def test_training_metrics_are_measured_and_amp_fallback_is_exercised():
         amp_fallbacks = 1
 
     config_identity = copy.deepcopy(STANDARD_V2_R1_EXPECTED_CONFIG)
-    config_identity["runtime"]["amp_enabled"] = True
+    config_identity["training_semantics"]["runtime"]["amp_enabled"] = True
+    config_identity["benchmark_workload"]["trainer_config"][
+        "amp_enabled"
+    ] = True
     report = _build_training_metrics(
         Stats(),
         config_identity=config_identity,
