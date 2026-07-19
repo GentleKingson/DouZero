@@ -68,6 +68,12 @@ def standard_v2_r1_config_identity(config: Any) -> dict[str, Any]:
             "seed": config.seed,
             "deterministic": config.deterministic,
             "batch_size": config.batch_size,
+            "bidding_batch_size": (
+                config.batch_size
+                if config.bidding_batch_size is None
+                else config.bidding_batch_size
+            ),
+            "bidding_update_interval": config.bidding_update_interval,
             "exp_epsilon": config.exp_epsilon,
             "max_grad_norm": config.max_grad_norm,
             "amp_enabled": config.amp_enabled,
@@ -171,6 +177,10 @@ def resolved_standard_v2_config_identity(
             "seed": int(trainer_config.seed),
             "deterministic": bool(deterministic),
             "batch_size": int(trainer_config.batch_size),
+            "bidding_batch_size": int(trainer_config.bidding_batch_size),
+            "bidding_update_interval": int(
+                trainer_config.bidding_update_interval
+            ),
             "exp_epsilon": float(trainer_config.exp_epsilon),
             "max_grad_norm": float(trainer_config.max_grad_norm),
             "amp_enabled": bool(trainer_config.amp_enabled),
@@ -286,6 +296,8 @@ STANDARD_V2_R1_EXPECTED_TRAINING_SEMANTICS: dict[str, Any] = {
         "seed": 0,
         "deterministic": False,
         "batch_size": 32,
+        "bidding_batch_size": 32,
+        "bidding_update_interval": 1,
         "exp_epsilon": 0.05,
         "max_grad_norm": 40.0,
         "amp_enabled": False,
@@ -358,6 +370,8 @@ STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD: dict[str, Any] = {
         "max_steps_per_episode": 600,
         "exp_epsilon": 0.05,
         "batch_size": 32,
+        "bidding_batch_size": 32,
+        "bidding_update_interval": 1,
         "learning_rate": 0.0001,
         "rmsprop_alpha": 0.99,
         "rmsprop_momentum": 0.0,

@@ -92,6 +92,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episodes", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--optimizer_steps", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--batch_size", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--bidding_batch_size", type=int, default=argparse.SUPPRESS,
+        help="Independent learned-bidding minibatch size (defaults to batch_size).",
+    )
+    parser.add_argument(
+        "--bidding_update_interval", type=int, default=argparse.SUPPRESS,
+        help="Apply bidding loss every N optimizer steps (default: 1).",
+    )
     parser.add_argument("--buffer_capacity", type=int, default=argparse.SUPPRESS)
     parser.add_argument(
         "--v2_training_mode",
@@ -1151,6 +1159,12 @@ def main() -> None:
 
     from douzero.training import V2Trainer
 
+    resolved_batch_size = resolve(
+        "batch_size", yaml_cfg.batch_size if yaml_cfg else None, defaults.batch_size
+    )
+    yaml_bidding_batch_size = (
+        yaml_cfg.bidding_batch_size if yaml_cfg else None
+    )
     trainer_cfg = TrainerConfig(
         seed=rank_seed,
         rng_seed=rank_seed,
@@ -1158,7 +1172,17 @@ def main() -> None:
         # has no episodes field; it comes from CLI or the TrainerConfig default).
         max_episodes=resolve("episodes", None, defaults.max_episodes),
         optimizer_steps=resolve("optimizer_steps", None, defaults.optimizer_steps),
-        batch_size=resolve("batch_size", yaml_cfg.batch_size if yaml_cfg else None, defaults.batch_size),
+        batch_size=resolved_batch_size,
+        bidding_batch_size=resolve(
+            "bidding_batch_size",
+            yaml_bidding_batch_size,
+            resolved_batch_size,
+        ),
+        bidding_update_interval=resolve(
+            "bidding_update_interval",
+            yaml_cfg.bidding_update_interval if yaml_cfg else None,
+            defaults.bidding_update_interval,
+        ),
         # buffer_capacity / max_steps_per_episode are TrainerConfig-only
         # (TrainingConfig has no such field), so they come from CLI or the
         # TrainerConfig default only.
@@ -1501,6 +1525,8 @@ def main() -> None:
         f"loss_cfg={loss_cfg.to_dict()} "
         f"decision={decision_cfg.to_dict()} "
         f"trainer=batch_size={trainer_cfg.batch_size} "
+        f"bidding_batch_size={trainer_cfg.bidding_batch_size} "
+        f"bidding_update_interval={trainer_cfg.bidding_update_interval} "
         f"lr={trainer_cfg.learning_rate} "
         f"epsilon={trainer_cfg.exp_epsilon} "
         f"amp={trainer_cfg.amp_enabled}:{trainer_cfg.amp_dtype} "

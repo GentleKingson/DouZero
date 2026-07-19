@@ -37,8 +37,10 @@ from __future__ import annotations
 
 from douzero.models_v2.action_encoder import ActionEncoder
 from douzero.models_v2.batch import (
+    BatchedBiddingInput,
     BatchedModelInputBundle,
     ModelInputBundle,
+    bidding_observations_to_model_input,
     model_input_bundles_to_batch,
     observation_batch_to_model_inputs,
     observation_to_model_inputs,
@@ -59,7 +61,11 @@ from douzero.models_v2.history_encoder import (
 )
 from douzero.models_v2.model import ModelV2
 from douzero.models_v2.numerical import NumericalError, assert_finite
-from douzero.models_v2.output import BiddingModelOutput, ModelOutput
+from douzero.models_v2.output import (
+    BatchedBiddingOutput,
+    BiddingModelOutput,
+    ModelOutput,
+)
 from douzero.models_v2.state_encoder import StateEncoder
 
 __all__ = [
@@ -68,12 +74,15 @@ __all__ = [
     "ModelV2Config",
     "ModelOutput",
     "BiddingModelOutput",
+    "BatchedBiddingOutput",
     "SUPPORTED_ROLES",
     "HISTORY_ENCODER_TRANSFORMER",
     "HISTORY_ENCODER_LSTM",
     # batch bridge
     "ModelInputBundle",
+    "BatchedBiddingInput",
     "BatchedModelInputBundle",
+    "bidding_observations_to_model_input",
     "observation_batch_to_model_inputs",
     "model_input_bundles_to_batch",
     "observation_to_model_inputs",

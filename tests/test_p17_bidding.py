@@ -31,7 +31,11 @@ from douzero.league import (
 )
 from douzero.models_v2.config import ModelV2Config
 from douzero.models_v2.model import ModelV2
-from douzero.models_v2.output import BiddingModelOutput
+from douzero.models_v2.batch import (
+    BatchedBiddingInput,
+    bidding_observations_to_model_input,
+)
+from douzero.models_v2.output import BatchedBiddingOutput, BiddingModelOutput
 from douzero.observation.bidding import get_bidding_obs_v2
 from douzero.observation.schema import build_v2_schema
 from douzero.training import (
@@ -54,6 +58,29 @@ def _tiny_config() -> ModelV2Config:
         history_heads=1,
         bidding_enabled=True,
         bidding_hidden_size=12,
+    )
+
+
+def _batch_bidding_outputs(
+    outputs: list[BiddingModelOutput],
+) -> BatchedBiddingOutput:
+    uncertainty = (
+        None
+        if outputs[0].uncertainty is None
+        else torch.stack([output.uncertainty for output in outputs])
+    )
+    return BatchedBiddingOutput(
+        bid_logits=torch.stack([output.bid_logits for output in outputs]),
+        bid_action_mask=torch.stack(
+            [output.bid_action_mask for output in outputs]
+        ),
+        landlord_win_logit=torch.stack(
+            [output.landlord_win_logit for output in outputs]
+        ),
+        expected_landlord_score=torch.stack(
+            [output.expected_landlord_score for output in outputs]
+        ),
+        uncertainty=uncertainty,
     )
 
 
@@ -275,6 +302,152 @@ def test_bidding_head_is_separate_from_card_action_encoder_and_masks_illegal():
     assert output.argmax_bid() in obs.legal_bids
 
 
+def test_batched_bidding_output_matches_scalar_wrapper_for_mixed_masks():
+    ruleset = RuleSet.standard()
+    observations = [
+        get_bidding_obs_v2(_raw_bidding_obs(history=history), ruleset=ruleset)
+        for history in (
+            (),
+            (("0", 1),),
+            (("0", 1), ("1", 2)),
+        )
+    ]
+    model = ModelV2(build_v2_schema(), _tiny_config()).eval()
+    state_keys = tuple(model.state_dict())
+    batched = model.forward_bidding_batched(
+        bidding_observations_to_model_input(observations)
+    )
+    scalars = [model.forward_bidding(obs) for obs in observations]
+    assert batched.bid_logits.shape == (3, 4)
+    assert torch.equal(
+        batched.bid_action_mask,
+        torch.stack([output.bid_action_mask for output in scalars]),
+    )
+    for index, scalar in enumerate(scalars):
+        assert torch.allclose(batched.bid_logits[index], scalar.bid_logits)
+        assert torch.allclose(
+            batched.landlord_win_logit[index], scalar.landlord_win_logit
+        )
+        assert torch.allclose(
+            batched.expected_landlord_score[index],
+            scalar.expected_landlord_score,
+        )
+    assert tuple(model.state_dict()) == state_keys
+
+
+def test_batched_bidding_loss_and_gradients_match_b1_compatibility_path():
+    ruleset = RuleSet.standard()
+    observations = [
+        get_bidding_obs_v2(_raw_bidding_obs(history=history), ruleset=ruleset)
+        for history in ((), (("0", 1),), (("0", 1), ("1", 2)))
+    ]
+    transitions = [
+        _labelled_bidding_transition(
+            observations[0], 1, source_policy="rule"
+        ),
+        _labelled_bidding_transition(
+            observations[1], 2, source_policy="learned"
+        ),
+        _labelled_bidding_transition(
+            observations[2], 3, source_policy="epsilon_random"
+        ),
+    ]
+    minibatch = BiddingMinibatch(transitions)
+    batched_model = ModelV2(build_v2_schema(), _tiny_config())
+    scalar_model = copy.deepcopy(batched_model)
+
+    batched_output = batched_model.forward_bidding_batched(
+        bidding_observations_to_model_input(observations)
+    )
+    batched_components = bidding_loss(
+        batched_output,
+        minibatch.to_targets(batched_output.bid_logits.device),
+        lambda_policy=1.0,
+        lambda_landlord_win=0.5,
+        lambda_landlord_score=0.25,
+    )
+    batched_components.total.backward()
+
+    scalar_outputs = [
+        scalar_model.forward_bidding(observation)
+        for observation in observations
+    ]
+    scalar_output = _batch_bidding_outputs(scalar_outputs)
+    scalar_components = bidding_loss(
+        scalar_output,
+        minibatch.to_targets(scalar_output.bid_logits.device),
+        lambda_policy=1.0,
+        lambda_landlord_win=0.5,
+        lambda_landlord_score=0.25,
+    )
+    scalar_components.total.backward()
+
+    assert torch.allclose(
+        batched_components.total, scalar_components.total, atol=1e-6, rtol=1e-6
+    )
+    for batched_parameter, scalar_parameter in zip(
+        batched_model.bidding_heads.parameters(),
+        scalar_model.bidding_heads.parameters(),
+    ):
+        assert batched_parameter.grad is not None
+        assert scalar_parameter.grad is not None
+        assert torch.allclose(
+            batched_parameter.grad,
+            scalar_parameter.grad,
+            atol=2e-6,
+            rtol=2e-5,
+        )
+
+
+def test_batched_bidding_contract_rejects_empty_and_illegal_rows():
+    schema_hash = build_v2_schema().stable_hash()
+    with pytest.raises(ValueError, match="legal action"):
+        BatchedBiddingInput(
+            features=torch.zeros(2, 8),
+            legal_mask=torch.tensor(
+                [[True, False, False, False], [False, False, False, False]]
+            ),
+            feature_schema_hash=schema_hash,
+        )
+
+    obs = get_bidding_obs_v2(
+        _raw_bidding_obs(history=(("0", 1),)), ruleset=RuleSet.standard()
+    )
+    transition = _labelled_bidding_transition(obs, 3)
+    minibatch = BiddingMinibatch([transition])
+    output = BatchedBiddingOutput(
+        bid_logits=torch.zeros(1, 4),
+        bid_action_mask=torch.tensor([[True, False, True, False]]),
+        landlord_win_logit=torch.zeros(1),
+        expected_landlord_score=torch.zeros(1),
+    )
+    with pytest.raises(ValueError, match="illegal action"):
+        bidding_loss(
+            output,
+            minibatch.to_targets(output.bid_logits.device),
+            lambda_policy=1.0,
+            lambda_landlord_win=0.0,
+            lambda_landlord_score=0.0,
+        )
+
+
+def test_bidding_batch_controls_inherit_and_validate_independently():
+    inherited = TrainerConfig(batch_size=7, optimizer_steps=0)
+    assert inherited.bidding_batch_size == 7
+    explicit = TrainerConfig(
+        batch_size=7,
+        bidding_batch_size=3,
+        bidding_update_interval=2,
+        optimizer_steps=0,
+    )
+    assert explicit.bidding_batch_size == 3
+    assert explicit.bidding_update_interval == 2
+    with pytest.raises(ValueError, match="bidding_batch_size"):
+        TrainerConfig(bidding_batch_size=0)
+    with pytest.raises(ValueError, match="bidding_update_interval"):
+        TrainerConfig(bidding_update_interval=0)
+
+
 def test_masked_bid_loss_uses_actor_return_and_landlord_value_gradients():
     ruleset = RuleSet.standard()
     obs = get_bidding_obs_v2(
@@ -304,9 +477,10 @@ def test_masked_bid_loss_uses_actor_return_and_landlord_value_gradients():
         win,
         score,
     )
+    minibatch = BiddingMinibatch([transition])
     components = bidding_loss(
-        [output],
-        BiddingMinibatch([transition]),
+        _batch_bidding_outputs([output]),
+        minibatch.to_targets(logits.device),
         lambda_policy=1.0,
         lambda_landlord_win=0.5,
         lambda_landlord_score=0.25,
@@ -354,9 +528,10 @@ def test_all_disabled_bid_credit_is_finite_with_illegal_actions_and_zero_gradien
         )
         for row, obs in zip(logits, observations)
     ]
+    minibatch = BiddingMinibatch(transitions)
     components = bidding_loss(
-        outputs,
-        BiddingMinibatch(transitions),
+        _batch_bidding_outputs(outputs),
+        minibatch.to_targets(logits[0].device),
         lambda_policy=1.0,
         lambda_landlord_win=0.0,
         lambda_landlord_score=0.0,
@@ -381,9 +556,10 @@ def test_bid_regret_fails_closed_without_a_separate_action_value_head():
         torch.tensor(0.0),
     )
     with pytest.raises(ValueError, match="lambda_bid_regret is unsupported"):
+        minibatch = BiddingMinibatch([transition])
         bidding_loss(
-            [output],
-            BiddingMinibatch([transition]),
+            _batch_bidding_outputs([output]),
+            minibatch.to_targets(output.bid_logits.device),
             lambda_policy=1.0,
             lambda_landlord_win=0.0,
             lambda_landlord_score=0.0,
@@ -648,6 +824,7 @@ def test_standard_training_step_and_strict_resume(tmp_path):
         max_episodes=1,
         optimizer_steps=1,
         batch_size=1,
+        bidding_batch_size=2,
         exp_epsilon=1.0,
         max_steps_per_episode=500,
         rng_seed=17,
@@ -662,6 +839,8 @@ def test_standard_training_step_and_strict_resume(tmp_path):
     before = trainer.model.bidding_heads.policy.weight.detach().clone()
     stats = trainer.train()
     assert stats.optimizer_steps == 1
+    assert stats.learner_cardplay_samples == 1
+    assert stats.learner_bidding_samples == 2
     assert stats.bidding_transitions_collected >= 1
     assert all(
         transition.obs.current_seat == "0" and transition.actor_role == "landlord"

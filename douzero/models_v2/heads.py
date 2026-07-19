@@ -143,9 +143,10 @@ class BiddingHeads(nn.Module):
         )
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor | None]:
-        if features.ndim != 1 or features.shape[0] != self.input_width:
+        if features.ndim not in (1, 2) or features.shape[-1] != self.input_width:
             raise ValueError(
-                f"bidding features must have shape ({self.input_width},), "
+                "bidding features must have shape "
+                f"({self.input_width},) or (B, {self.input_width}), "
                 f"got {tuple(features.shape)}"
             )
         hidden = self.trunk(features)
@@ -154,13 +155,13 @@ class BiddingHeads(nn.Module):
             uncertainty = torch.nn.functional.softplus(self.uncertainty(hidden))
         return {
             "bid_logits": self.policy(hidden),
-            "landlord_win_logit": self.landlord_win(hidden).reshape(()),
+            "landlord_win_logit": self.landlord_win(hidden).squeeze(-1),
             "expected_landlord_score": torch.clamp(
-                self.landlord_score(hidden).reshape(()),
+                self.landlord_score(hidden).squeeze(-1),
                 -self.score_clamp,
                 self.score_clamp,
             ),
-            "uncertainty": uncertainty.reshape(()) if uncertainty is not None else None,
+            "uncertainty": uncertainty.squeeze(-1) if uncertainty is not None else None,
         }
 
 

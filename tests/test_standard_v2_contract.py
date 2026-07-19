@@ -72,6 +72,12 @@ def _resolved_r1_config_identity(
         max_episodes=16,
         max_steps_per_episode=600,
         batch_size=config.batch_size,
+        bidding_batch_size=(
+            config.batch_size
+            if config.bidding_batch_size is None
+            else config.bidding_batch_size
+        ),
+        bidding_update_interval=config.bidding_update_interval,
         exp_epsilon=config.exp_epsilon,
         learning_rate=config.optimizer.learning_rate,
         rmsprop_alpha=config.optimizer.alpha,
@@ -352,6 +358,8 @@ def test_non_r1_resolved_config_cannot_emit_r1_metrics(identity_overrides):
     ("cli_args", "loss_override"),
     [
         (["--batch_size", "1"], None),
+        (["--bidding_batch_size", "16"], None),
+        (["--bidding_update_interval", "2"], None),
         (["--exp_epsilon", "0.2"], None),
         (["--amp_enabled", "--amp_dtype", "bfloat16"], None),
         (["--bidding_policy", "rule"], None),
@@ -360,6 +368,8 @@ def test_non_r1_resolved_config_cannot_emit_r1_metrics(identity_overrides):
     ],
     ids=(
         "batch-size-cli",
+        "bidding-batch-size-cli",
+        "bidding-update-interval-cli",
         "epsilon-cli",
         "amp-cli",
         "bidding-policy-cli",

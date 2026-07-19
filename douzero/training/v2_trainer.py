@@ -63,6 +63,7 @@ from douzero.runtime import DistributedContext, SafeMixedPrecision
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.models_v2.batch import (
+    bidding_observations_to_model_input,
     observation_batch_to_model_inputs,
     observation_to_model_inputs,
 )
@@ -131,6 +132,10 @@ class TrainerConfig:
     exp_epsilon: float = 0.3
     # Minibatch / optimization.
     batch_size: int = 16
+    # ``None`` inherits ``batch_size`` so existing configs retain their exact
+    # play/bid sample ratio until they opt into independent tuning.
+    bidding_batch_size: int | None = None
+    bidding_update_interval: int = 1
     learning_rate: float = 1e-4
     rmsprop_alpha: float = 0.99
     rmsprop_momentum: float = 0.0
@@ -178,6 +183,23 @@ class TrainerConfig:
 
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
+        if self.bidding_batch_size is None:
+            self.bidding_batch_size = self.batch_size
+        if (
+            isinstance(self.bidding_batch_size, bool)
+            or not isinstance(self.bidding_batch_size, int)
+            or self.bidding_batch_size < 1
+        ):
+            raise ValueError(
+                "bidding_batch_size must be >= 1, got "
+                f"{self.bidding_batch_size}"
+            )
+        if (
+            isinstance(self.bidding_update_interval, bool)
+            or not isinstance(self.bidding_update_interval, int)
+            or self.bidding_update_interval < 1
+        ):
+            raise ValueError("bidding_update_interval must be >= 1")
         if self.optimizer_steps < 0:
             raise ValueError(f"optimizer_steps must be >= 0, got {self.optimizer_steps}")
         if not (0.0 <= self.exp_epsilon <= 1.0):
@@ -633,6 +655,16 @@ class V2Trainer:
                 f"buffer_capacity ({self.config.buffer_capacity}) must be >= "
                 f"batch_size ({self.config.batch_size}) when optimizer_steps > 0; "
                 f"otherwise step() can never sample a minibatch."
+            )
+        if (
+            self.config.optimizer_steps > 0
+            and self.bidding_loss_weight > 0
+            and self.config.buffer_capacity < self.config.bidding_batch_size
+        ):
+            raise ValueError(
+                f"buffer_capacity ({self.config.buffer_capacity}) must be >= "
+                f"bidding_batch_size ({self.config.bidding_batch_size}) when "
+                "bidding optimization is enabled"
             )
         self._value_parameters = list(self.model.parameters())
         self._belief_parameters = (
@@ -1831,12 +1863,23 @@ class V2Trainer:
     def _v4_trainer_config_identity(self) -> tuple[dict, str]:
         payload = asdict(self.config)
         for name in (
+            "bidding_batch_size",
+            "bidding_update_interval",
             "async_protocol_version",
             "compact_bidding_replay_schema_version",
             "episode_task_semantics",
             "episode_commit_semantics",
         ):
             payload.pop(name, None)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _pre_m1_v5_trainer_config_identity(self) -> tuple[dict, str]:
+        """Identity used by format-5 checkpoints before M1 batch controls."""
+
+        payload = asdict(self.config)
+        payload.pop("bidding_batch_size", None)
+        payload.pop("bidding_update_interval", None)
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -2212,6 +2255,23 @@ class V2Trainer:
             trainer_config, trainer_config_hash = self._v3_trainer_config_identity()
         elif checkpoint_version == 4:
             trainer_config, trainer_config_hash = self._v4_trainer_config_identity()
+        elif (
+            checkpoint_version == 5
+            and isinstance(bundle.get("trainer_config"), dict)
+            and "bidding_batch_size" not in bundle["trainer_config"]
+            and "bidding_update_interval" not in bundle["trainer_config"]
+        ):
+            if (
+                self.config.bidding_batch_size != self.config.batch_size
+                or self.config.bidding_update_interval != 1
+            ):
+                raise CheckpointCompatibilityError(
+                    "pre-M1 format 5 checkpoint requires bidding_batch_size "
+                    "to inherit batch_size and bidding_update_interval=1"
+                )
+            trainer_config, trainer_config_hash = (
+                self._pre_m1_v5_trainer_config_identity()
+            )
         expected["trainer_config"] = trainer_config
         expected["trainer_config_hash"] = trainer_config_hash
         if checkpoint_version >= 4:
@@ -2422,10 +2482,14 @@ class V2Trainer:
         :class:`FloatingPointError`.
         """
         local_batch_ready = len(self.buffer) >= self.config.batch_size
-        if self.bidding_loss_weight > 0:
+        bidding_update_due = (
+            self.bidding_loss_weight > 0
+            and self.stats.optimizer_steps % self.config.bidding_update_interval == 0
+        )
+        if bidding_update_due:
             local_batch_ready = (
                 local_batch_ready
-                and len(self.bidding_buffer) >= self.config.batch_size
+                and len(self.bidding_buffer) >= self.config.bidding_batch_size
             )
         if not self.distributed.all_true(local_batch_ready):
             return None
@@ -2433,9 +2497,9 @@ class V2Trainer:
         if batch is None:
             raise RuntimeError("replay buffer reported ready but returned no minibatch")
         bidding_batch = None
-        if self.bidding_loss_weight > 0:
+        if bidding_update_due:
             bidding_batch = self.bidding_buffer.sample(
-                self.config.batch_size, self.rng
+                self.config.bidding_batch_size, self.rng
             )
             if bidding_batch is None:
                 raise RuntimeError(
@@ -2617,16 +2681,19 @@ class V2Trainer:
                     aux_diag = aux_components.as_log_dict()
                 bid_diag = {}
                 if bidding_batch is not None:
-                    bid_outputs = []
-                    for transition in bidding_batch.transitions:
-                        with self.mixed_precision.autocast():
-                            bid_outputs.append(
-                                self.model.forward_bidding(transition.obs)
-                            )
+                    bid_inputs = bidding_observations_to_model_input(
+                        [transition.obs for transition in bidding_batch.transitions]
+                    )
+                    with self.mixed_precision.autocast():
+                        bid_output = self.model.forward_bidding_batched(bid_inputs)
+                    bid_targets = bidding_batch.to_targets(
+                        bid_output.bid_logits.device,
+                        dtype=bid_output.bid_logits.dtype,
+                    )
                     cfg = self.loss_fn.config
                     bid_components = bidding_loss(
-                        bid_outputs,
-                        bidding_batch,
+                        bid_output,
+                        bid_targets,
                         lambda_policy=cfg.lambda_bid_policy,
                         lambda_landlord_win=cfg.lambda_bid_win,
                         lambda_landlord_score=cfg.lambda_bid_score,

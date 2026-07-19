@@ -69,7 +69,13 @@ from .config import HISTORY_ENCODER_TRANSFORMER, ModelV2Config, SUPPORTED_ROLES
 from .fusion import StateActionFusion
 from .heads import BiddingHeads, PriorHead, StrategyAuxiliaryHeads, ValueHeads
 from .history_encoder import build_history_encoder
-from .output import BatchedModelOutput, BiddingModelOutput, ModelOutput
+from .batch import BatchedBiddingInput, bidding_observations_to_model_input
+from .output import (
+    BatchedBiddingOutput,
+    BatchedModelOutput,
+    BiddingModelOutput,
+    ModelOutput,
+)
 from .state_encoder import StateEncoder
 
 #: The number of card-set sub-blocks the state encoder consumes from the state
@@ -268,37 +274,73 @@ class ModelV2(nn.Module):
             ) from exc
 
     def forward_bidding(self, observation) -> BiddingModelOutput:
-        """Run the public bidding path without encoding card-play actions."""
+        """B=1 compatibility wrapper around :meth:`forward_bidding_batched`."""
         from douzero.observation.bidding import BiddingObservationV2
+
+        if not isinstance(observation, BiddingObservationV2):
+            raise TypeError("forward_bidding requires a public BiddingObservationV2")
+        batch = bidding_observations_to_model_input((observation,))
+        return self.forward_bidding_batched(batch).select(0)
+
+    def forward_bidding_batched(
+        self, inputs: BatchedBiddingInput
+    ) -> BatchedBiddingOutput:
+        """Run one dense bidding forward for every row in ``inputs``."""
 
         if self.bidding_heads is None or self.bidding_schema is None:
             raise RuntimeError(
-                "forward_bidding requires ModelV2Config(bidding_enabled=True)"
+                "forward_bidding_batched requires "
+                "ModelV2Config(bidding_enabled=True)"
             )
-        if not isinstance(observation, BiddingObservationV2):
-            raise TypeError("forward_bidding requires a public BiddingObservationV2")
+        if not isinstance(inputs, BatchedBiddingInput):
+            raise TypeError("forward_bidding_batched requires BatchedBiddingInput")
         expected_hash = self.bidding_schema.stable_hash()
-        if observation.feature_schema_hash != expected_hash:
+        if inputs.feature_schema_hash != expected_hash:
             raise ValueError(
-                "bidding feature schema mismatch: observation was encoded under "
-                f"{observation.feature_schema_hash}, model expects {expected_hash}"
+                "bidding feature schema mismatch: input was encoded under "
+                f"{inputs.feature_schema_hash}, model expects {expected_hash}"
+            )
+        if inputs.features.shape[1] != self.bidding_schema.input_width:
+            raise ValueError(
+                "bidding input width mismatch: input has "
+                f"{inputs.features.shape[1]}, model expects "
+                f"{self.bidding_schema.input_width}"
             )
         parameter = next(self.bidding_heads.parameters())
-        features = observation.to_tensor(parameter.device).to(parameter.dtype)
-        head_out = self.bidding_heads(features)
-        mask = torch.from_numpy(observation.bid_action_mask.copy()).to(
-            device=parameter.device, dtype=torch.bool
+        features = inputs.features.to(
+            device=parameter.device, dtype=parameter.dtype, non_blocking=True
         )
+        mask = inputs.legal_mask.to(
+            device=parameter.device, dtype=torch.bool, non_blocking=True
+        )
+        head_out = self.bidding_heads(features)
         if self.config.nan_guard:
             from .numerical import assert_finite
 
-            for name in (
+            finite_names = (
                 "bid_logits", "landlord_win_logit", "expected_landlord_score"
-            ):
-                assert_finite(head_out[name], name)
+            )
+            if parameter.device.type == "cuda":
+                finite = torch.stack(
+                    [torch.isfinite(head_out[name]).all() for name in finite_names]
+                    + (
+                        [torch.isfinite(head_out["uncertainty"]).all()]
+                        if head_out["uncertainty"] is not None
+                        else []
+                    )
+                ).all()
+                torch._assert_async(
+                    finite, "batched bidding output contains NaN or Inf"
+                )
+            else:
+                for name in finite_names:
+                    assert_finite(head_out[name], name)
             if head_out["uncertainty"] is not None:
-                assert_finite(head_out["uncertainty"], "bidding_uncertainty")
-        return BiddingModelOutput(
+                if parameter.device.type != "cuda":
+                    assert_finite(
+                        head_out["uncertainty"], "bidding_uncertainty"
+                    )
+        return BatchedBiddingOutput(
             bid_logits=head_out["bid_logits"],
             bid_action_mask=mask,
             landlord_win_logit=head_out["landlord_win_logit"],

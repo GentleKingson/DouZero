@@ -11,7 +11,7 @@ from typing import Callable, Iterable, Mapping
 import torch
 import torch.nn.functional as F
 
-from douzero.models_v2.output import BiddingModelOutput
+from douzero.models_v2.output import BatchedBiddingOutput
 from douzero.observation.bidding import BIDDING_ACTIONS, BiddingObservationV2
 
 _CONFIGURABLE_POLICIES = frozenset({"random", "rule", "max", "pass", "learned"})
@@ -169,6 +169,98 @@ class BiddingMinibatch:
     def batch_size(self) -> int:
         return len(self.transitions)
 
+    def to_targets(
+        self, device: torch.device | str, *, dtype: torch.dtype = torch.float32
+    ) -> "BatchedBiddingTargets":
+        """Validate once on CPU and materialize dense learner targets."""
+
+        if not self.transitions:
+            raise ValueError("bidding minibatch must not be empty")
+        for transition in self.transitions:
+            transition.validate()
+        return BatchedBiddingTargets(
+            actions=torch.tensor(
+                [transition.bid_action for transition in self.transitions],
+                device=device,
+                dtype=torch.long,
+            ),
+            policy_credit_mask=torch.tensor(
+                [transition.policy_credit_valid for transition in self.transitions],
+                device=device,
+                dtype=torch.bool,
+            ),
+            imitation_mask=torch.tensor(
+                [
+                    transition.source_policy in _IMITATION_POLICIES
+                    for transition in self.transitions
+                ],
+                device=device,
+                dtype=torch.bool,
+            ),
+            actor_win=torch.tensor(
+                [transition.target_actor_win for transition in self.transitions],
+                device=device,
+                dtype=dtype,
+            ),
+            landlord_win=torch.tensor(
+                [transition.target_landlord_win for transition in self.transitions],
+                device=device,
+                dtype=dtype,
+            ),
+            landlord_score=torch.tensor(
+                [transition.target_landlord_score for transition in self.transitions],
+                device=device,
+                dtype=dtype,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class BatchedBiddingTargets:
+    """Dense bidding labels aligned with :class:`BatchedBiddingOutput`."""
+
+    actions: torch.Tensor
+    policy_credit_mask: torch.Tensor
+    imitation_mask: torch.Tensor
+    actor_win: torch.Tensor
+    landlord_win: torch.Tensor
+    landlord_score: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if self.actions.ndim != 1 or self.actions.dtype != torch.long:
+            raise ValueError("bidding actions must be long with shape (B,)")
+        batch_size = self.actions.shape[0]
+        if batch_size < 1:
+            raise ValueError("batched bidding targets must not be empty")
+        if any(
+            tensor.shape != (batch_size,)
+            for tensor in (
+                self.policy_credit_mask,
+                self.imitation_mask,
+                self.actor_win,
+                self.landlord_win,
+                self.landlord_score,
+            )
+        ):
+            raise ValueError("every bidding target tensor must have shape (B,)")
+        if (
+            self.policy_credit_mask.dtype != torch.bool
+            or self.imitation_mask.dtype != torch.bool
+        ):
+            raise ValueError("bidding target masks must have bool dtype")
+        same_device = all(
+            tensor.device == self.actions.device
+            for tensor in (
+                self.policy_credit_mask,
+                self.imitation_mask,
+                self.actor_win,
+                self.landlord_win,
+                self.landlord_score,
+            )
+        )
+        if not same_device:
+            raise ValueError("all bidding target tensors must share one device")
+
 
 class BiddingReplayBuffer:
     """Bounded transition buffer; abandoned all-pass deals are never added."""
@@ -222,8 +314,8 @@ class BiddingLossComponents:
 
 
 def bidding_loss(
-    outputs: list[BiddingModelOutput],
-    batch: BiddingMinibatch,
+    output: BatchedBiddingOutput,
+    targets: BatchedBiddingTargets,
     *,
     lambda_policy: float,
     lambda_landlord_win: float,
@@ -240,81 +332,71 @@ def bidding_loss(
     actor-win target instead of being treated as an always-correct class label.
     """
 
-    if len(outputs) != batch.batch_size or not outputs:
-        raise ValueError("bidding outputs and minibatch must have equal non-zero size")
+    if not isinstance(output, BatchedBiddingOutput):
+        raise TypeError("bidding_loss requires BatchedBiddingOutput")
+    if not isinstance(targets, BatchedBiddingTargets):
+        raise TypeError("bidding_loss requires BatchedBiddingTargets")
+    if output.batch_size != targets.actions.shape[0]:
+        raise ValueError("bidding output and targets must have equal batch size")
+    if output.bid_logits.device != targets.actions.device:
+        raise ValueError("bidding output and targets must share one device")
     if float(lambda_regret) != 0.0:
         raise ValueError(
             "lambda_bid_regret is unsupported by bid-policy-value-v2; "
             "per-bid regret requires a separate action-value head"
         )
-    for transition in batch.transitions:
-        transition.validate()
-    logits = torch.stack([out.bid_logits.float() for out in outputs])
-    masks = torch.stack([out.bid_action_mask for out in outputs])
-    actions = torch.tensor(
-        [transition.bid_action for transition in batch.transitions],
-        device=logits.device,
-        dtype=torch.long,
-    )
-    if not bool(masks[torch.arange(len(outputs), device=logits.device), actions].all()):
-        raise ValueError("bidding policy label points to an illegal action")
+    logits = output.bid_logits.float()
+    masks = output.bid_action_mask
+    actions = targets.actions
+    rows = torch.arange(output.batch_size, device=logits.device)
+    actions_in_range = ((actions >= 0) & (actions < logits.shape[1])).all()
+    if logits.device.type == "cuda":
+        torch._assert_async(
+            actions_in_range, "bidding policy label is outside the action schema"
+        )
+        safe_actions = actions.clamp(0, logits.shape[1] - 1)
+        torch._assert_async(
+            masks[rows, safe_actions].all(),
+            "bidding policy label points to an illegal action",
+        )
+    else:
+        if not bool(actions_in_range):
+            raise ValueError("bidding policy label is outside the action schema")
+        safe_actions = actions
+        if not bool(masks[rows, safe_actions].all()):
+            raise ValueError("bidding policy label points to an illegal action")
     masked_logits = logits.masked_fill(~masks, torch.finfo(logits.dtype).min)
-    selected_logits = logits.gather(1, actions[:, None]).squeeze(1)
-    credit_mask = torch.tensor(
-        [transition.policy_credit_valid for transition in batch.transitions],
-        device=logits.device,
-        dtype=torch.bool,
+    selected_logits = logits.gather(1, safe_actions[:, None]).squeeze(1)
+    imitation_terms = F.cross_entropy(
+        masked_logits, safe_actions, reduction="none"
     )
-    imitation_mask = torch.tensor(
-        [
-            transition.source_policy in _IMITATION_POLICIES
-            for transition in batch.transitions
-        ],
-        device=logits.device,
-        dtype=torch.bool,
-    )
-    actor_win_targets = torch.tensor(
-        [transition.target_actor_win for transition in batch.transitions],
-        device=logits.device,
-        dtype=logits.dtype,
-    )
-    imitation_terms = F.cross_entropy(masked_logits, actions, reduction="none")
     behavior_terms = F.binary_cross_entropy_with_logits(
-        selected_logits, actor_win_targets, reduction="none"
+        selected_logits, targets.actor_win.float(), reduction="none"
     )
     policy_terms = torch.where(
-        imitation_mask,
+        targets.imitation_mask,
         imitation_terms,
         behavior_terms,
     )
+    credit = targets.policy_credit_mask.to(dtype=policy_terms.dtype)
     policy = (
-        policy_terms[credit_mask].mean()
-        if bool(credit_mask.any())
-        else logits.sum() * 0.0
+        (policy_terms * credit).sum() / credit.sum().clamp_min(1.0)
     )
-    win_logits = torch.stack([out.landlord_win_logit.float() for out in outputs])
-    target_win = torch.tensor(
-        [transition.target_landlord_win for transition in batch.transitions],
-        device=logits.device,
-        dtype=torch.float32,
-    )
-    win = F.binary_cross_entropy_with_logits(win_logits.reshape(-1), target_win)
-    score_predictions = torch.stack(
-        [out.expected_landlord_score.float() for out in outputs]
-    ).reshape(-1)
-    raw_target_score = torch.tensor(
-        [transition.target_landlord_score for transition in batch.transitions],
-        device=logits.device,
-        dtype=torch.float32,
+    win = F.binary_cross_entropy_with_logits(
+        output.landlord_win_logit.float(), targets.landlord_win.float()
     )
     from douzero.training.losses import resolve_score_target
 
     target_score = resolve_score_target(
-        raw_target_score,
+        targets.landlord_score.float(),
         score_target_transform=score_target_transform,
         score_clamp=score_clamp,
     )
-    score = F.huber_loss(score_predictions, target_score, delta=score_delta)
+    score = F.huber_loss(
+        output.expected_landlord_score.float(),
+        target_score,
+        delta=score_delta,
+    )
     regret = logits.new_zeros(())
     total = (
         float(lambda_policy) * policy

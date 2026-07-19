@@ -40,7 +40,12 @@ class BiddingModelOutput:
             )
         if self.bid_action_mask.shape != (4,) or self.bid_action_mask.dtype != torch.bool:
             raise ValueError("bid_action_mask must be bool with shape (4,)")
-        if not bool(self.bid_action_mask.any()):
+        has_legal_action = self.bid_action_mask.any()
+        if self.bid_action_mask.device.type == "cuda":
+            torch._assert_async(
+                has_legal_action, "bidding output must contain a legal action"
+            )
+        elif not bool(has_legal_action):
             raise ValueError("bidding output must contain a legal action")
         for name in ("landlord_win_logit", "expected_landlord_score"):
             if getattr(self, name).numel() != 1:
@@ -55,6 +60,72 @@ class BiddingModelOutput:
 
     def argmax_bid(self) -> int:
         return int(torch.argmax(self.masked_bid_logits()).item())
+
+
+@dataclass(frozen=True)
+class BatchedBiddingOutput:
+    """Batched learned-bidding values with a leading decision dimension."""
+
+    bid_logits: torch.Tensor
+    bid_action_mask: torch.Tensor
+    landlord_win_logit: torch.Tensor
+    expected_landlord_score: torch.Tensor
+    uncertainty: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.bid_logits.ndim != 2 or self.bid_logits.shape[1] != 4:
+            raise ValueError("batched bid_logits must have shape (B, 4)")
+        batch_size = self.bid_logits.shape[0]
+        if batch_size < 1:
+            raise ValueError("batched bidding output must not be empty")
+        if (
+            self.bid_action_mask.shape != self.bid_logits.shape
+            or self.bid_action_mask.dtype != torch.bool
+        ):
+            raise ValueError("batched bid_action_mask must be bool with shape (B, 4)")
+        for name in ("landlord_win_logit", "expected_landlord_score"):
+            if getattr(self, name).shape != (batch_size,):
+                raise ValueError(f"{name} must have shape (B,)")
+        if self.uncertainty is not None and self.uncertainty.shape != (batch_size,):
+            raise ValueError("batched uncertainty must have shape (B,) when present")
+        legal_rows = self.bid_action_mask.any(dim=1).all()
+        if self.bid_action_mask.device.type == "cuda":
+            torch._assert_async(
+                legal_rows, "every batched bidding decision must contain a legal action"
+            )
+        elif not bool(legal_rows):
+            raise ValueError(
+                "every batched bidding decision must contain a legal action"
+            )
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.bid_logits.shape[0])
+
+    def masked_bid_logits(self) -> torch.Tensor:
+        return self.bid_logits.masked_fill(~self.bid_action_mask, float("-inf"))
+
+    def argmax_bids(self) -> torch.Tensor:
+        """Return one legal bid index per row without synchronizing CUDA."""
+
+        return torch.argmax(self.masked_bid_logits(), dim=1)
+
+    def select(self, index: int) -> BiddingModelOutput:
+        """Expose one row through the legacy scalar inference contract."""
+
+        if isinstance(index, bool) or not isinstance(index, int):
+            raise TypeError("bidding output index must be an int")
+        if not 0 <= index < self.batch_size:
+            raise IndexError("bidding output index is outside the batch")
+        return BiddingModelOutput(
+            bid_logits=self.bid_logits[index],
+            bid_action_mask=self.bid_action_mask[index],
+            landlord_win_logit=self.landlord_win_logit[index],
+            expected_landlord_score=self.expected_landlord_score[index],
+            uncertainty=(
+                None if self.uncertainty is None else self.uncertainty[index]
+            ),
+        )
 
 
 @dataclass(frozen=True)

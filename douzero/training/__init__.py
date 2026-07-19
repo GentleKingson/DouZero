@@ -48,6 +48,7 @@ from douzero.training.losses import (
     uncertainty_nll,
 )
 from douzero.training.bidding import (
+    BatchedBiddingTargets,
     BiddingLossComponents,
     BiddingMinibatch,
     BiddingPolicyConfig,
@@ -110,6 +111,7 @@ __all__ = [
     "resolve_score_target",
     "uncertainty_nll",
     "BiddingLossComponents",
+    "BatchedBiddingTargets",
     "BiddingMinibatch",
     "BiddingPolicyConfig",
     "BiddingReplayBuffer",

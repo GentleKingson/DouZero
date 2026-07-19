@@ -40,6 +40,7 @@ import numpy as np
 import torch
 
 from douzero.observation.encode_v2 import ObservationV2
+from douzero.observation.bidding import BiddingObservationV2
 from douzero.models_v2.config import SUPPORTED_ROLES
 
 SUPPORTED_ROLE_TO_INDEX = {role: index for index, role in enumerate(SUPPORTED_ROLES)}
@@ -195,6 +196,92 @@ class BatchedModelInputBundle:
         if self.style_features is not None:
             self.style_features = move(self.style_features)
         return self
+
+
+@dataclass(frozen=True)
+class BatchedBiddingInput:
+    """Dense bidding inputs shared by inference and the vectorized learner."""
+
+    features: torch.Tensor
+    legal_mask: torch.Tensor
+    feature_schema_hash: str
+
+    def __post_init__(self) -> None:
+        if self.features.ndim != 2:
+            raise ValueError("batched bidding features must have shape (B, W)")
+        if self.features.shape[0] < 1 or self.features.shape[1] < 1:
+            raise ValueError("batched bidding features must not be empty")
+        if self.legal_mask.shape != (self.features.shape[0], 4):
+            raise ValueError("batched bidding legal_mask must have shape (B, 4)")
+        if self.legal_mask.dtype != torch.bool:
+            raise ValueError("batched bidding legal_mask must have bool dtype")
+        if not self.feature_schema_hash:
+            raise ValueError("batched bidding input requires a feature schema hash")
+        legal_rows = self.legal_mask.any(dim=1).all()
+        if self.legal_mask.device.type == "cuda":
+            torch._assert_async(
+                legal_rows, "every batched bidding input must contain a legal action"
+            )
+        elif not bool(legal_rows):
+            raise ValueError(
+                "every batched bidding input must contain a legal action"
+            )
+
+    @property
+    def batch_size(self) -> int:
+        return int(self.features.shape[0])
+
+    def to(
+        self,
+        device,
+        *,
+        dtype: torch.dtype | None = None,
+        non_blocking: bool = False,
+    ) -> "BatchedBiddingInput":
+        return BatchedBiddingInput(
+            features=self.features.to(
+                device=device, dtype=dtype, non_blocking=non_blocking
+            ),
+            legal_mask=self.legal_mask.to(
+                device=device, dtype=torch.bool, non_blocking=non_blocking
+            ),
+            feature_schema_hash=self.feature_schema_hash,
+        )
+
+
+def bidding_observations_to_model_input(
+    observations: list[BiddingObservationV2]
+    | tuple[BiddingObservationV2, ...],
+) -> BatchedBiddingInput:
+    """Stack public bidding observations into one dense tensor contract."""
+
+    if not observations:
+        raise ValueError("bidding observation batch must not be empty")
+    if any(not isinstance(obs, BiddingObservationV2) for obs in observations):
+        raise TypeError(
+            "bidding observation batch requires public BiddingObservationV2 values"
+        )
+    hashes = {obs.feature_schema_hash for obs in observations}
+    if len(hashes) != 1:
+        raise ValueError("all bidding observations in a batch must share one schema")
+    widths = {int(obs.features.shape[0]) for obs in observations}
+    if len(widths) != 1:
+        raise ValueError("all bidding observations in a batch must share one width")
+    features = torch.from_numpy(
+        np.stack([np.asarray(obs.features) for obs in observations]).astype(
+            np.float32, copy=False
+        )
+    )
+    legal_mask = torch.from_numpy(
+        np.stack([np.asarray(obs.bid_action_mask) for obs in observations]).astype(
+            np.bool_, copy=False
+        )
+    )
+    return BatchedBiddingInput(
+        features=features,
+        legal_mask=legal_mask,
+        feature_schema_hash=next(iter(hashes)),
+    )
 
 
 def observation_batch_to_model_inputs(
