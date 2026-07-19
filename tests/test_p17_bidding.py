@@ -9,7 +9,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
+from benchmarks.bench_bidding_batch import _summary, run_benchmark
 from douzero.checkpoint import (
     CheckpointCompatibilityError,
     load_v2_checkpoint,
@@ -31,19 +33,29 @@ from douzero.league import (
 )
 from douzero.models_v2.config import ModelV2Config
 from douzero.models_v2.model import ModelV2
-from douzero.models_v2.output import BiddingModelOutput
+from douzero.models_v2.batch import (
+    BatchedBiddingInput,
+    bidding_observations_to_model_input,
+)
+from douzero.models_v2.output import BatchedBiddingOutput, BiddingModelOutput
+from douzero.models_v2.numerical import NumericalError
 from douzero.observation.bidding import get_bidding_obs_v2
 from douzero.observation.schema import build_v2_schema
 from douzero.training import (
+    BatchedBiddingTargets,
     BiddingMinibatch,
     BiddingPolicyConfig,
     BiddingTransition,
     LossConfig,
+    LongRunningConfig,
     TrainerConfig,
     V2Trainer,
     bidding_loss,
     select_bidding_action,
 )
+from douzero.runtime import SafeMixedPrecision
+from douzero.training.bc_loss import BCSchedule
+from douzero.training.v2_trainer import has_guaranteed_non_bidding_objective
 
 
 def _tiny_config() -> ModelV2Config:
@@ -54,6 +66,29 @@ def _tiny_config() -> ModelV2Config:
         history_heads=1,
         bidding_enabled=True,
         bidding_hidden_size=12,
+    )
+
+
+def _batch_bidding_outputs(
+    outputs: list[BiddingModelOutput],
+) -> BatchedBiddingOutput:
+    uncertainty = (
+        None
+        if outputs[0].uncertainty is None
+        else torch.stack([output.uncertainty for output in outputs])
+    )
+    return BatchedBiddingOutput(
+        bid_logits=torch.stack([output.bid_logits for output in outputs]),
+        bid_action_mask=torch.stack(
+            [output.bid_action_mask for output in outputs]
+        ),
+        landlord_win_logit=torch.stack(
+            [output.landlord_win_logit for output in outputs]
+        ),
+        expected_landlord_score=torch.stack(
+            [output.expected_landlord_score for output in outputs]
+        ),
+        uncertainty=uncertainty,
     )
 
 
@@ -275,6 +310,446 @@ def test_bidding_head_is_separate_from_card_action_encoder_and_masks_illegal():
     assert output.argmax_bid() in obs.legal_bids
 
 
+def test_batched_bidding_output_matches_scalar_wrapper_for_mixed_masks():
+    ruleset = RuleSet.standard()
+    observations = [
+        get_bidding_obs_v2(_raw_bidding_obs(history=history), ruleset=ruleset)
+        for history in (
+            (),
+            (("0", 1),),
+            (("0", 1), ("1", 2)),
+        )
+    ]
+    model = ModelV2(build_v2_schema(), _tiny_config()).eval()
+    state_keys = tuple(model.state_dict())
+    batched = model.forward_bidding_batched(
+        bidding_observations_to_model_input(observations)
+    )
+    scalars = [model.forward_bidding(obs) for obs in observations]
+    assert batched.bid_logits.shape == (3, 4)
+    assert torch.equal(
+        batched.bid_action_mask,
+        torch.stack([output.bid_action_mask for output in scalars]),
+    )
+    for index, scalar in enumerate(scalars):
+        torch.testing.assert_close(
+            batched.bid_logits[index], scalar.bid_logits, atol=1e-6, rtol=1e-6
+        )
+        torch.testing.assert_close(
+            batched.landlord_win_logit[index],
+            scalar.landlord_win_logit,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        torch.testing.assert_close(
+            batched.expected_landlord_score[index],
+            scalar.expected_landlord_score,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+    assert tuple(model.state_dict()) == state_keys
+
+
+def test_batched_bidding_loss_and_gradients_match_b1_compatibility_path():
+    ruleset = RuleSet.standard()
+    observations = [
+        get_bidding_obs_v2(_raw_bidding_obs(history=history), ruleset=ruleset)
+        for history in ((), (("0", 1),), (("0", 1), ("1", 2)))
+    ]
+    transitions = [
+        _labelled_bidding_transition(
+            observations[0], 1, source_policy="rule"
+        ),
+        _labelled_bidding_transition(
+            observations[1], 2, source_policy="learned"
+        ),
+        _labelled_bidding_transition(
+            observations[2], 3, source_policy="epsilon_random"
+        ),
+    ]
+    minibatch = BiddingMinibatch(transitions)
+    batched_model = ModelV2(build_v2_schema(), _tiny_config())
+    scalar_model = copy.deepcopy(batched_model)
+
+    batched_output = batched_model.forward_bidding_batched(
+        bidding_observations_to_model_input(observations)
+    )
+    batched_components = bidding_loss(
+        batched_output,
+        minibatch.to_targets(batched_output.bid_logits.device),
+        lambda_policy=1.0,
+        lambda_landlord_win=0.5,
+        lambda_landlord_score=0.25,
+    )
+    batched_components.total.backward()
+
+    scalar_outputs = [
+        scalar_model.forward_bidding(observation)
+        for observation in observations
+    ]
+    scalar_components = bidding_loss(
+        scalar_outputs,
+        minibatch,
+        lambda_policy=1.0,
+        lambda_landlord_win=0.5,
+        lambda_landlord_score=0.25,
+    )
+    scalar_components.total.backward()
+
+    assert torch.allclose(
+        batched_components.total, scalar_components.total, atol=1e-6, rtol=1e-6
+    )
+    for batched_parameter, scalar_parameter in zip(
+        batched_model.bidding_heads.parameters(),
+        scalar_model.bidding_heads.parameters(),
+    ):
+        assert batched_parameter.grad is not None
+        assert scalar_parameter.grad is not None
+        assert torch.allclose(
+            batched_parameter.grad,
+            scalar_parameter.grad,
+            atol=2e-6,
+            rtol=2e-5,
+        )
+
+
+def test_batched_bidding_loss_and_gradients_match_independent_tensor_oracle():
+    logits = torch.tensor(
+        [[0.2, 0.8, -0.4, 0.1], [0.5, -0.3, 1.2, 0.7]],
+        requires_grad=True,
+    )
+    win_logits = torch.tensor([-0.2, 0.9], requires_grad=True)
+    scores = torch.tensor([1.5, -0.5], requires_grad=True)
+    legal = torch.tensor(
+        [[True, True, False, False], [True, False, True, True]]
+    )
+    targets = BatchedBiddingTargets(
+        actions=torch.tensor([1, 2]),
+        policy_credit_mask=torch.tensor([True, True]),
+        imitation_mask=torch.tensor([True, False]),
+        actor_win=torch.tensor([1.0, 0.0]),
+        landlord_win=torch.tensor([1.0, 0.0]),
+        landlord_score=torch.tensor([2.0, -1.0]),
+    )
+    output = BatchedBiddingOutput(
+        bid_logits=logits,
+        bid_action_mask=legal,
+        landlord_win_logit=win_logits,
+        expected_landlord_score=scores,
+    )
+    actual = bidding_loss(
+        output,
+        targets,
+        lambda_policy=1.25,
+        lambda_landlord_win=0.5,
+        lambda_landlord_score=0.75,
+    )
+    actual.total.backward()
+    actual_grads = tuple(
+        tensor.grad.detach().clone() for tensor in (logits, win_logits, scores)
+    )
+
+    ref_logits = logits.detach().clone().requires_grad_()
+    ref_win_logits = win_logits.detach().clone().requires_grad_()
+    ref_scores = scores.detach().clone().requires_grad_()
+    masked = ref_logits.masked_fill(~legal, torch.finfo(torch.float32).min)
+    imitation = F.cross_entropy(masked, targets.actions, reduction="none")
+    selected = ref_logits.gather(1, targets.actions[:, None]).squeeze(1)
+    behavior = F.binary_cross_entropy_with_logits(
+        selected, targets.actor_win, reduction="none"
+    )
+    reference_policy = torch.where(
+        targets.imitation_mask, imitation, behavior
+    ).mean()
+    reference_win = F.binary_cross_entropy_with_logits(
+        ref_win_logits, targets.landlord_win
+    )
+    reference_score = F.huber_loss(ref_scores, targets.landlord_score, delta=1.0)
+    reference_total = (
+        1.25 * reference_policy + 0.5 * reference_win + 0.75 * reference_score
+    )
+    reference_total.backward()
+
+    torch.testing.assert_close(actual.total, reference_total)
+    for actual_grad, reference_tensor in zip(
+        actual_grads, (ref_logits, ref_win_logits, ref_scores)
+    ):
+        torch.testing.assert_close(actual_grad, reference_tensor.grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_batched_bidding_cuda_mixed_source_forward_loss_backward():
+    ruleset = RuleSet.standard()
+    observations = [
+        get_bidding_obs_v2(_raw_bidding_obs(history=history), ruleset=ruleset)
+        for history in ((), (("0", 1),), (("0", 1), ("1", 2)))
+    ]
+    transitions = [
+        _labelled_bidding_transition(observations[0], 1, source_policy="rule"),
+        _labelled_bidding_transition(
+            observations[1], 2, source_policy="learned"
+        ),
+        _labelled_bidding_transition(
+            observations[2], 3, source_policy="epsilon_random"
+        ),
+    ]
+    model = ModelV2(build_v2_schema(), _tiny_config()).cuda().train()
+    output = model.forward_bidding_batched(
+        bidding_observations_to_model_input(observations)
+    )
+    assert output.bid_logits.device.type == "cuda"
+    assert output.argmax_bids().shape == (3,)
+    minibatch = BiddingMinibatch(transitions)
+    components = bidding_loss(
+        output,
+        minibatch.to_targets(output.bid_logits.device),
+        lambda_policy=1.0,
+        lambda_landlord_win=0.5,
+        lambda_landlord_score=0.25,
+    )
+    components.total.backward()
+    assert torch.isfinite(components.total)
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.bidding_heads.parameters()
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_bidding_validation_raises_python_errors_without_poisoning_context():
+    device = torch.device("cuda")
+    model = ModelV2(build_v2_schema(), _tiny_config()).to(device).train()
+    width = model.bidding_schema.input_width
+    schema_hash = model.bidding_schema.stable_hash()
+
+    with pytest.raises(ValueError, match="legal action"):
+        BatchedBiddingInput(
+            features=torch.zeros(1, width, device=device),
+            legal_mask=torch.zeros(1, 4, dtype=torch.bool, device=device),
+            feature_schema_hash=schema_hash,
+        )
+    with pytest.raises(ValueError, match="finite values"):
+        BatchedBiddingInput(
+            features=torch.full((1, width), float("nan"), device=device),
+            legal_mask=torch.ones(1, 4, dtype=torch.bool, device=device),
+            feature_schema_hash=schema_hash,
+        )
+
+    valid_inputs = BatchedBiddingInput(
+        features=torch.zeros(1, width, device=device),
+        legal_mask=torch.tensor([[True, False, True, True]], device=device),
+        feature_schema_hash=schema_hash,
+    )
+    output = model.forward_bidding_batched(valid_inputs)
+    invalid_targets = BatchedBiddingTargets(
+        actions=torch.tensor([1], device=device),
+        policy_credit_mask=torch.tensor([True], device=device),
+        imitation_mask=torch.tensor([True], device=device),
+        actor_win=torch.tensor([1.0], device=device),
+        landlord_win=torch.tensor([1.0], device=device),
+        landlord_score=torch.tensor([1.0], device=device),
+    )
+    amp = SafeMixedPrecision(device, enabled=True, fallback_on_nonfinite=True)
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=1e-4)
+    with pytest.raises(ValueError, match="illegal action"):
+        amp.step(
+            lambda: bidding_loss(
+                output,
+                invalid_targets,
+                lambda_policy=1.0,
+                lambda_landlord_win=0.5,
+                lambda_landlord_score=0.25,
+            ).total,
+            optimizer,
+            model.parameters(),
+            max_grad_norm=40.0,
+        )
+    assert amp.fallback_count == 0
+
+    poisoned_model = ModelV2(build_v2_schema(), _tiny_config()).to(device)
+    with torch.no_grad():
+        poisoned_model.bidding_heads.landlord_win.weight.fill_(float("nan"))
+    with pytest.raises(NumericalError, match="bidding output contains NaN"):
+        poisoned_model.forward_bidding_batched(valid_inputs)
+
+    # Every rejected input above is recoverable; subsequent CUDA work succeeds.
+    assert torch.ones(4, device=device).sum().item() == 4.0
+
+
+def test_batched_bidding_contract_rejects_empty_and_illegal_rows():
+    schema_hash = build_v2_schema().stable_hash()
+    with pytest.raises(ValueError, match="floating dtype"):
+        BatchedBiddingInput(
+            features=torch.ones(1, 8, dtype=torch.long),
+            legal_mask=torch.ones(1, 4, dtype=torch.bool),
+            feature_schema_hash=schema_hash,
+        )
+    with pytest.raises(ValueError, match="finite values"):
+        BatchedBiddingInput(
+            features=torch.tensor([[float("nan")]]),
+            legal_mask=torch.ones(1, 4, dtype=torch.bool),
+            feature_schema_hash=schema_hash,
+        )
+    with pytest.raises(ValueError, match="legal action"):
+        BatchedBiddingInput(
+            features=torch.zeros(2, 8),
+            legal_mask=torch.tensor(
+                [[True, False, False, False], [False, False, False, False]]
+            ),
+            feature_schema_hash=schema_hash,
+        )
+
+    obs = get_bidding_obs_v2(
+        _raw_bidding_obs(history=(("0", 1),)), ruleset=RuleSet.standard()
+    )
+    transition = _labelled_bidding_transition(obs, 3)
+    minibatch = BiddingMinibatch([transition])
+    valid_targets = minibatch.to_targets("cpu")
+    with pytest.raises(ValueError, match="floating dtype"):
+        replace(valid_targets, actor_win=torch.ones(1, dtype=torch.long))
+    with pytest.raises(ValueError, match="binary"):
+        replace(valid_targets, landlord_win=torch.tensor([0.5]))
+    output = BatchedBiddingOutput(
+        bid_logits=torch.zeros(1, 4),
+        bid_action_mask=torch.tensor([[True, False, True, False]]),
+        landlord_win_logit=torch.zeros(1),
+        expected_landlord_score=torch.zeros(1),
+    )
+    with pytest.raises(ValueError, match="illegal action"):
+        bidding_loss(
+            output,
+            minibatch.to_targets(output.bid_logits.device),
+            lambda_policy=1.0,
+            lambda_landlord_win=0.0,
+            lambda_landlord_score=0.0,
+        )
+
+
+def test_bidding_batch_controls_inherit_and_validate_independently():
+    inherited = TrainerConfig(batch_size=7, optimizer_steps=0)
+    assert inherited.bidding_batch_size is None
+    assert inherited.resolved_bidding_batch_size == 7
+    resized = replace(inherited, batch_size=11)
+    assert resized.bidding_batch_size is None
+    assert resized.resolved_bidding_batch_size == 11
+    explicit = TrainerConfig(
+        batch_size=7,
+        bidding_batch_size=3,
+        bidding_update_interval=2,
+        optimizer_steps=0,
+    )
+    assert explicit.bidding_batch_size == 3
+    assert explicit.resolved_bidding_batch_size == 3
+    assert explicit.bidding_update_interval == 2
+    with pytest.raises(ValueError, match="bidding_batch_size"):
+        TrainerConfig(bidding_batch_size=0)
+    with pytest.raises(ValueError, match="bidding_update_interval"):
+        TrainerConfig(bidding_update_interval=0)
+
+
+def test_pure_bidding_loss_rejects_long_running_interval_gap_before_side_effects(
+    tmp_path,
+):
+    long_running = LongRunningConfig(
+        episodes_per_cycle=1,
+        optimizer_steps_per_cycle=2,
+    )
+    assert long_running.optimizer_steps_per_cycle == 2
+    model = ModelV2(build_v2_schema(), _tiny_config())
+    before = {
+        name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+    }
+    with pytest.raises(
+        ValueError, match="requires at least one non-bidding"
+    ):
+        V2Trainer(
+            model,
+            ruleset=RuleSet.standard(),
+            loss_config=LossConfig(
+                lambda_win=0.0,
+                lambda_score=0.0,
+                lambda_uncertainty=0.0,
+                lambda_bid_policy=1.0,
+            ),
+            bidding_policy_config=BiddingPolicyConfig(policy="max"),
+            config=TrainerConfig(
+                max_episodes=0,
+                optimizer_steps=0,
+                batch_size=1,
+                bidding_update_interval=2,
+            ),
+        )
+    assert not list(tmp_path.iterdir())
+    assert all(
+        torch.equal(tensor, model.state_dict()[name])
+        for name, tensor in before.items()
+    )
+
+
+def test_non_bidding_objective_detection_includes_guaranteed_bc_and_joint_belief():
+    loss = LossConfig(
+        lambda_win=0.0,
+        lambda_score=0.0,
+        lambda_uncertainty=0.0,
+        lambda_bid_policy=1.0,
+    )
+    common = {"loss_config": loss, "strategy_aux_weight": 0.0}
+    assert has_guaranteed_non_bidding_objective(
+        **common,
+        bc_schedule=BCSchedule(base_lambda=0.5),
+        belief_training_mode="frozen",
+        belief_supervised_weight=0.0,
+    )
+    assert not has_guaranteed_non_bidding_objective(
+        **common,
+        bc_schedule=BCSchedule(
+            base_lambda=0.5,
+            schedule="linear_decay",
+            schedule_steps=10,
+            schedule_floor=0.0,
+        ),
+        belief_training_mode="frozen",
+        belief_supervised_weight=0.0,
+    )
+    assert has_guaranteed_non_bidding_objective(
+        **common,
+        bc_schedule=BCSchedule(),
+        belief_training_mode="joint",
+        belief_supervised_weight=0.5,
+    )
+    assert not has_guaranteed_non_bidding_objective(
+        **common,
+        bc_schedule=BCSchedule(),
+        belief_training_mode="alternating",
+        belief_supervised_weight=0.5,
+    )
+
+
+def test_bidding_benchmark_covers_head_learner_and_scalar_paths():
+    report = run_benchmark(
+        device="cpu", batch_sizes=(1,), warmup=0, iterations=1
+    )
+    assert report["schema_version"] == "standard-v2-bidding-microbenchmark-v3"
+    assert set(report["results"][0]) == {
+        "batch_size",
+        "head_forward_backward",
+        "learner_step_wall",
+    }
+    assert set(report["scalar_inference"]) == {
+        "fast_forward_wall",
+        "fast_decision_wall",
+        "batched_wrapper_forward_wall",
+        "batched_wrapper_decision_wall",
+    }
+    assert report["inference_mode"] == "eval_inference_mode_fp32"
+    assert report["results"][0]["learner_step_wall"]["mean_ms"] > 0
+
+
+def test_bidding_benchmark_p95_uses_nearest_rank():
+    summary = _summary([float(value) for value in range(1, 101)], 100)
+    assert summary["p95_ms"] == 95.0
+
+
 def test_masked_bid_loss_uses_actor_return_and_landlord_value_gradients():
     ruleset = RuleSet.standard()
     obs = get_bidding_obs_v2(
@@ -304,9 +779,10 @@ def test_masked_bid_loss_uses_actor_return_and_landlord_value_gradients():
         win,
         score,
     )
+    minibatch = BiddingMinibatch([transition])
     components = bidding_loss(
-        [output],
-        BiddingMinibatch([transition]),
+        _batch_bidding_outputs([output]),
+        minibatch.to_targets(logits.device),
         lambda_policy=1.0,
         lambda_landlord_win=0.5,
         lambda_landlord_score=0.25,
@@ -354,9 +830,10 @@ def test_all_disabled_bid_credit_is_finite_with_illegal_actions_and_zero_gradien
         )
         for row, obs in zip(logits, observations)
     ]
+    minibatch = BiddingMinibatch(transitions)
     components = bidding_loss(
-        outputs,
-        BiddingMinibatch(transitions),
+        _batch_bidding_outputs(outputs),
+        minibatch.to_targets(logits[0].device),
         lambda_policy=1.0,
         lambda_landlord_win=0.0,
         lambda_landlord_score=0.0,
@@ -381,9 +858,10 @@ def test_bid_regret_fails_closed_without_a_separate_action_value_head():
         torch.tensor(0.0),
     )
     with pytest.raises(ValueError, match="lambda_bid_regret is unsupported"):
+        minibatch = BiddingMinibatch([transition])
         bidding_loss(
-            [output],
-            BiddingMinibatch([transition]),
+            _batch_bidding_outputs([output]),
+            minibatch.to_targets(output.bid_logits.device),
             lambda_policy=1.0,
             lambda_landlord_win=0.0,
             lambda_landlord_score=0.0,
@@ -645,9 +1123,10 @@ def test_standard_training_step_and_strict_resume(tmp_path):
         lambda_bid_score=0.25,
     )
     trainer_cfg = TrainerConfig(
-        max_episodes=1,
+        max_episodes=2,
         optimizer_steps=1,
         batch_size=1,
+        bidding_batch_size=2,
         exp_epsilon=1.0,
         max_steps_per_episode=500,
         rng_seed=17,
@@ -662,9 +1141,15 @@ def test_standard_training_step_and_strict_resume(tmp_path):
     before = trainer.model.bidding_heads.policy.weight.detach().clone()
     stats = trainer.train()
     assert stats.optimizer_steps == 1
+    assert stats.learner_cardplay_samples == 1
+    assert stats.learner_bidding_samples == 2
     assert stats.bidding_transitions_collected >= 1
+    assert {
+        transition.obs.current_seat
+        for transition in trainer.bidding_buffer._transitions
+    } == {"0", "1"}
     assert all(
-        transition.obs.current_seat == "0" and transition.actor_role == "landlord"
+        transition.actor_role == "landlord"
         for transition in trainer.bidding_buffer._transitions
     )
     assert all(
@@ -676,7 +1161,8 @@ def test_standard_training_step_and_strict_resume(tmp_path):
 
     checkpoint = tmp_path / "standard-resume.pt"
     identity = trainer.save_training_checkpoint(str(checkpoint))
-    assert identity["checkpoint_version"] == 3
+    assert identity["checkpoint_version"] == 7
+    assert identity["trainer_config_identity_version"] == 2
     assert identity["training_topology"] == "single_process"
     assert identity["training_world_size"] == 1
     assert identity["bidding_head_version"]
@@ -694,7 +1180,7 @@ def test_standard_training_step_and_strict_resume(tmp_path):
         torch.equal(value, restored.model.state_dict()[name])
         for name, value in trainer.model.state_dict().items()
     )
-    restored.collect_episodes(1)
+    restored.collect_episodes(2)
     assert restored.step() is not None
     assert restored.stats.optimizer_steps == 2
 
@@ -716,6 +1202,143 @@ def test_standard_training_step_and_strict_resume(tmp_path):
         CheckpointCompatibilityError, match="training_world_size mismatch"
     ):
         restored.load_training_checkpoint(str(topology_checkpoint))
+
+    changed_bidding_config = replace(
+        trainer_cfg, bidding_batch_size=1, bidding_update_interval=2
+    )
+    with pytest.raises(CheckpointCompatibilityError, match="trainer_config mismatch"):
+        V2Trainer(
+            ModelV2(build_v2_schema(), cfg),
+            ruleset=RuleSet.standard(),
+            loss_config=loss,
+            bidding_policy_config=BiddingPolicyConfig(policy="max"),
+            config=changed_bidding_config,
+        ).load_training_checkpoint(str(checkpoint))
+
+
+def test_single_process_legacy_format3_requires_default_m1_controls(tmp_path):
+    cfg = _tiny_config()
+    loss = LossConfig(lambda_bid_policy=1.0)
+    default_config = TrainerConfig(
+        max_episodes=0,
+        optimizer_steps=0,
+        batch_size=2,
+        buffer_capacity=4,
+    )
+    trainer = V2Trainer(
+        ModelV2(build_v2_schema(), cfg),
+        ruleset=RuleSet.standard(),
+        loss_config=loss,
+        bidding_policy_config=BiddingPolicyConfig(policy="max"),
+        config=default_config,
+    )
+    current_path = tmp_path / "single-v7.pt"
+    trainer.save_training_checkpoint(str(current_path))
+    legacy = torch.load(current_path, weights_only=True)
+    legacy["checkpoint_version"] = 3
+    legacy_config, legacy_hash = trainer._v3_trainer_config_identity()
+    legacy["trainer_config"] = legacy_config
+    legacy["trainer_config_hash"] = legacy_hash
+    legacy.pop("trainer_config_identity_version")
+    legacy["stats"].pop("bidding_eligible_steps")
+    for name in (
+        "num_actors",
+        "games_per_actor",
+        "replay_schema_version",
+        "snapshot_publication_semantics",
+        "request_ordering_semantics",
+        "actor_rng_resume_semantics",
+        "async_protocol_version",
+        "compact_bidding_replay_schema_version",
+        "episode_task_semantics",
+        "episode_commit_semantics",
+    ):
+        legacy.pop(name, None)
+    legacy_path = tmp_path / "single-v3.pt"
+    torch.save(legacy, legacy_path)
+
+    restored = V2Trainer(
+        ModelV2(build_v2_schema(), cfg),
+        ruleset=RuleSet.standard(),
+        loss_config=loss,
+        bidding_policy_config=BiddingPolicyConfig(policy="max"),
+        config=default_config,
+    )
+    assert restored.load_training_checkpoint(str(legacy_path))[
+        "checkpoint_version"
+    ] == 3
+
+    cross_commit = copy.deepcopy(legacy)
+    current_sha = cross_commit["source_git_sha"]
+    cross_commit["source_git_sha"] = (
+        ("f" if current_sha[0] != "f" else "e") * len(current_sha)
+    )
+    cross_commit_path = tmp_path / "single-v3-other-source.pt"
+    torch.save(cross_commit, cross_commit_path)
+    with pytest.raises(CheckpointCompatibilityError, match="source_git_sha mismatch"):
+        restored.load_training_checkpoint(str(cross_commit_path))
+
+    for incompatible in (
+        replace(default_config, bidding_batch_size=1),
+        replace(default_config, bidding_update_interval=2),
+    ):
+        with pytest.raises(
+            CheckpointCompatibilityError, match="legacy format 3 checkpoint"
+        ):
+            V2Trainer(
+                ModelV2(build_v2_schema(), cfg),
+                ruleset=RuleSet.standard(),
+                loss_config=loss,
+                bidding_policy_config=BiddingPolicyConfig(policy="max"),
+                config=incompatible,
+            ).load_training_checkpoint(str(legacy_path))
+
+
+def test_bidding_update_interval_cadence_survives_checkpoint_resume(tmp_path):
+    cfg = _tiny_config()
+    loss = LossConfig(lambda_bid_policy=1.0)
+    trainer_config = TrainerConfig(
+        max_episodes=0,
+        optimizer_steps=0,
+        batch_size=1,
+        bidding_batch_size=1,
+        bidding_update_interval=2,
+        buffer_capacity=64,
+        exp_epsilon=1.0,
+        max_steps_per_episode=500,
+        rng_seed=23,
+    )
+
+    def make_trainer():
+        return V2Trainer(
+            ModelV2(build_v2_schema(), cfg),
+            ruleset=RuleSet.standard(),
+            loss_config=loss,
+            bidding_policy_config=BiddingPolicyConfig(policy="max"),
+            config=trainer_config,
+        )
+
+    trainer = make_trainer()
+    trainer.collect_episodes(2)
+    assert trainer.step() is not None
+    assert trainer.stats.optimizer_steps == 1
+    assert trainer.stats.learner_bidding_samples == 1
+
+    checkpoint = tmp_path / "interval-resume.pt"
+    trainer.save_training_checkpoint(str(checkpoint))
+    restored = make_trainer()
+    restored.load_training_checkpoint(str(checkpoint))
+    restored.collect_episodes(2)
+
+    assert restored.step() is not None
+    assert restored.stats.optimizer_steps == 2
+    assert restored.stats.learner_bidding_samples == 1
+    assert "loss_bid_policy" not in restored.stats.last_loss
+
+    assert restored.step() is not None
+    assert restored.stats.optimizer_steps == 3
+    assert restored.stats.learner_bidding_samples == 2
+    assert "loss_bid_policy" in restored.stats.last_loss
 
 
 def test_v2_checkpoint_carries_and_validates_explicit_bidding_identity(tmp_path):

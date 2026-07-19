@@ -13,11 +13,11 @@ from dataclasses import asdict, is_dataclass
 from typing import Any, Mapping
 
 
-STANDARD_V2_R1_CONTRACT_VERSION = "standard-v2-r1-contract-v1"
+STANDARD_V2_R1_CONTRACT_VERSION = "standard-v2-r1-contract-v2"
 STANDARD_V2_REFERENCE_SCHEMA_VERSION = "standard-v2-r1-reference-v1"
 STANDARD_V2_BENCHMARK_SCHEMA_VERSION = "standard-v2-r1-benchmark-v1"
 STANDARD_V2_R1_REFERENCE_DIGEST = (
-    "8817274e665ad6296e688044326e4c2ad1a682d6e78b6124e61081bf0f3e014e"
+    "a177bc8a30e0f9d88072a3373e178d89ff4eddf2eb74334029f4bf1e0213a3bb"
 )
 
 # The currently implemented base async path.  These values are written into
@@ -68,6 +68,12 @@ def standard_v2_r1_config_identity(config: Any) -> dict[str, Any]:
             "seed": config.seed,
             "deterministic": config.deterministic,
             "batch_size": config.batch_size,
+            "bidding_batch_size": (
+                config.batch_size
+                if config.bidding_batch_size is None
+                else config.bidding_batch_size
+            ),
+            "bidding_update_interval": config.bidding_update_interval,
             "exp_epsilon": config.exp_epsilon,
             "max_grad_norm": config.max_grad_norm,
             "amp_enabled": config.amp_enabled,
@@ -171,6 +177,12 @@ def resolved_standard_v2_config_identity(
             "seed": int(trainer_config.seed),
             "deterministic": bool(deterministic),
             "batch_size": int(trainer_config.batch_size),
+            "bidding_batch_size": int(
+                trainer_config.resolved_bidding_batch_size
+            ),
+            "bidding_update_interval": int(
+                trainer_config.bidding_update_interval
+            ),
             "exp_epsilon": float(trainer_config.exp_epsilon),
             "max_grad_norm": float(trainer_config.max_grad_norm),
             "amp_enabled": bool(trainer_config.amp_enabled),
@@ -283,9 +295,11 @@ STANDARD_V2_R1_EXPECTED_TRAINING_SEMANTICS: dict[str, Any] = {
         "ruleset": "standard",
         "feature_version": "v2",
         "model_version": "v2",
-        "seed": 0,
+        "seed": 20260719,
         "deterministic": False,
         "batch_size": 32,
+        "bidding_batch_size": 32,
+        "bidding_update_interval": 1,
         "exp_epsilon": 0.05,
         "max_grad_norm": 40.0,
         "amp_enabled": False,
@@ -353,11 +367,13 @@ STANDARD_V2_R1_EXPECTED_TRAINING_SEMANTICS: dict[str, Any] = {
 
 STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD: dict[str, Any] = {
     "trainer_config": {
-        "seed": 0,
+        "seed": 20260719,
         "max_episodes": 16,
         "max_steps_per_episode": 600,
         "exp_epsilon": 0.05,
         "batch_size": 32,
+        "bidding_batch_size": 32,
+        "bidding_update_interval": 1,
         "learning_rate": 0.0001,
         "rmsprop_alpha": 0.99,
         "rmsprop_momentum": 0.0,
@@ -365,7 +381,7 @@ STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD: dict[str, Any] = {
         "max_grad_norm": 40.0,
         "optimizer_steps": 1,
         "buffer_capacity": 4096,
-        "rng_seed": 0,
+        "rng_seed": 20260719,
         "device": "cuda",
         "amp_enabled": False,
         "amp_dtype": "float16",

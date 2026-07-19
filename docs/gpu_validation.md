@@ -2,21 +2,27 @@
 
 ## Result
 
-**Empirical GPU validation: NOT RUN**
+**Standard V2 M1 manual GPU validation: PASSED**
 
-Reason: the audit host has no NVIDIA device or driver interface. PyTorch
-reported `cuda_available=false`, `gpu_count=0`, `torch.version.cuda=null`, and
-`nccl_available=false`. `nvidia-smi` is absent. Docker is available, but its
-configured runtimes are `runc` and `io.containerd.runc.v2`; no NVIDIA runtime
-is configured.
+Source `408c97a25088451d884d9836ce6f6fbf32d810c6` was built and tested on
+`LocalServer:/opt/DouZero` in `douzero-test:latest`, immutable image ID
+`sha256:417ae0638a9ffa1cc1ba41c2a23e9a20074866b79a7b7a08e6efe1b4221ac2cb`.
+The sanitized environment records Python 3.12.3, PyTorch 2.12.1+cu132, CUDA
+13.2, driver 595.71.05, and one RTX 5070. No GitHub GPU workflow was used.
 
-The sanitized probe was run on 2026-07-15 with Python 3.14.6, PyTorch 2.13.0,
-Darwin arm64, and Docker Desktop. Hostname, username, paths, GPU UUIDs, serial
-numbers, process lists, and environment variables are deliberately excluded.
+The auditable bundle is
+`benchmarks/evidence/standard_v2_m1_408c97a/`. It includes the Docker build
+log and command inventory, full CPU pytest log, explicit CUDA pytest log,
+environment JSON, B=1/32/64/128 bidding benchmark, raw R1 training metrics,
+strictly generated unified benchmark, and `SHA256SUMS`. Hostname, username,
+GPU UUIDs, serial numbers, process lists, and environment variables are
+deliberately excluded.
 
-No peak-memory, samples/s, decisions/s, learner-steps/s, compile-time, graph
-break, or eager-versus-compile number is available. CPU tests and short CPU
-rollouts are not substitutes for these measurements.
+B=32 bidding head forward/backward passed the 1.5 ms gate at 1.055507 ms mean
+and 1.198880 ms p95. The additional 16-game R1 repeat observed a parameter
+update at 8.009856 games/s and 266.845 MiB peak allocated VRAM. The checked-in
+canonical baseline remains 7.896824 games/s; both artifact digests are recorded
+in the evidence manifest rather than presenting timing variance as a rewrite.
 
 There are also independent implementation blockers: standard learned-bidding
 DDP, joint/alternating belief DDP synchronization, and distributed trainer
@@ -85,15 +91,14 @@ Without both inputs, `belief_frozen.json` and `belief_joint.json` explicitly say
 
 ## Remaining Gate
 
-Single-GPU CUDA checkpoint resume remains **NOT RUN** on this host. In
-contrast, fresh single-process CPU standard and joint save/resume smokes pass;
-they are implementation evidence, not CUDA evidence. Target validation must
-run standard full games, FP32/FP16/BF16 where supported, frozen and joint
-belief modes, the controlled non-finite AMP fallback, and strict checkpoint
-resume. The blocked standard/joint DDP graph and distributed checkpoint path
-must be implemented before rank-local seeds and replay, rank-zero-only side
-effects, or clean NCCL shutdown can be empirically accepted. The manual script
-returns exit 3 while those blockers remain.
+Single-GPU CUDA standard checkpoint resume, the CUDA input-error contract, and
+format 7 async checkpoint compatibility passed in the explicit Docker test
+set. Broader P17 validation still requires FP16/BF16, controlled non-finite AMP
+fallback, and compatible frozen/joint belief artifacts. The blocked
+standard/joint DDP graph and distributed checkpoint path must be implemented
+before rank-local seeds and replay, rank-zero-only side effects, or clean NCCL
+shutdown can be empirically accepted. The generic manual script continues to
+return nonzero while those independent blockers remain.
 
 `torch.compile` remains disabled by default. It must not be recommended until
 first-compile cost, graph breaks, dynamic legal-action behavior, feature-path

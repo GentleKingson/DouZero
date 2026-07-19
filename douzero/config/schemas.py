@@ -515,6 +515,9 @@ class TrainingConfig:
     total_frames: int = 100000000000
     exp_epsilon: float = 0.01
     batch_size: int = 32
+    # ``None`` inherits the resolved play batch size in train_v2.py.
+    bidding_batch_size: int | None = None
+    bidding_update_interval: int = 1
     unroll_length: int = 100
     num_buffers: int = 50
     num_threads: int = 4

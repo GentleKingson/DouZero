@@ -37,6 +37,27 @@ class NumericalError(RuntimeError):
     """
 
 
+def assert_tensor_true(
+    condition: torch.Tensor,
+    message: str,
+    *,
+    error_type: type[Exception] = ValueError,
+) -> None:
+    """Synchronously validate one device condition and raise a Python error.
+
+    This helper guards public model and loss inputs.  A host-visible scalar
+    read is intentional: a CUDA device assertion is asynchronous, changes the
+    documented exception type, and can leave the CUDA context unusable.
+    """
+
+    if not isinstance(condition, torch.Tensor) or condition.numel() != 1:
+        raise TypeError("tensor condition must contain exactly one value")
+    if condition.dtype != torch.bool:
+        raise TypeError("tensor condition must have bool dtype")
+    if not bool(condition.detach().item()):
+        raise error_type(message)
+
+
 def assert_finite(tensor: torch.Tensor, name: str) -> None:
     """Raise :class:`NumericalError` if ``tensor`` contains any NaN or Inf.
 

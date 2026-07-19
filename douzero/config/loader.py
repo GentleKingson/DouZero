@@ -269,7 +269,9 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "num_actors": int, "games_per_actor": int,
     "training_device": str, "load_model": bool,
     "disable_checkpoint": bool, "savedir": str, "total_frames": int,
-    "exp_epsilon": float, "batch_size": int, "unroll_length": int,
+    "exp_epsilon": float, "batch_size": int,
+    "bidding_batch_size": (int, type(None)), "bidding_update_interval": int,
+    "unroll_length": int,
     "num_buffers": int, "num_threads": int, "max_grad_norm": float,
     "v2_training_mode": str,
     "sync_interval_updates": int, "policy_snapshot_slots": int,
@@ -330,7 +332,15 @@ def _check_field(name: str, value: Any, source: str) -> None:
         return
     # bool is a subclass of int; for int fields we must reject bools, and for
     # float fields we accept int (numpy/JSON style) but reject bool.
-    if expected is int:
+    if expected == (int, type(None)):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int)
+        ):
+            raise TypeError(
+                f"Config field {name!r} ({source}) must be int or null, got "
+                f"{type(value).__name__}: {value!r}"
+            )
+    elif expected is int:
         if isinstance(value, bool) or not isinstance(value, int):
             raise TypeError(
                 f"Config field {name!r} ({source}) must be int, got "
@@ -441,6 +451,10 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         raise ValueError("belief_supervised_episodes must be non-negative")
     if cfg.first_bidder_mode not in {"rotate", "seeded_random"}:
         raise ValueError("first_bidder_mode must be 'rotate' or 'seeded_random'")
+    if cfg.bidding_batch_size is not None and cfg.bidding_batch_size < 1:
+        raise ValueError("bidding_batch_size must be >= 1 when set")
+    if cfg.bidding_update_interval < 1:
+        raise ValueError("bidding_update_interval must be >= 1")
 
 
 # P01 only supports the "legacy" feature/rule/model versions. Later phases
@@ -497,7 +511,8 @@ _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
     "xpid", "save_interval", "objective",
     "actor_device_cpu", "gpu_devices", "num_actor_devices", "num_actors",
     "training_device", "load_model", "disable_checkpoint", "savedir",
-    "total_frames", "exp_epsilon", "batch_size", "unroll_length",
+    "total_frames", "exp_epsilon", "batch_size", "bidding_batch_size",
+    "bidding_update_interval", "unroll_length",
     "num_buffers", "num_threads", "max_grad_norm",
     "sync_interval_updates", "policy_snapshot_slots", "amp_enabled",
     "amp_dtype", "amp_fallback_on_nonfinite", "pin_memory",

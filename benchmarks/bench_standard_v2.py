@@ -769,6 +769,180 @@ def _validate_cycle_metrics(payload: object) -> dict[str, Any]:
     }
 
 
+def validate_unified_benchmark_output(payload: object) -> dict[str, Any]:
+    """Fail closed on a final checked-in Standard V2 R1 artifact."""
+
+    root_fields = {
+        "schema_version", "contract_version", "config_hash",
+        "training_semantics_hash", "benchmark_workload_hash",
+        "reference_digest", "coverage", "performance", "privacy",
+    }
+    artifact = _require_mapping(payload, "unified_benchmark", fields=root_fields)
+    expected_identity = {
+        "schema_version": STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
+        "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
+        "config_hash": STANDARD_V2_R1_CONFIG_HASH,
+        "training_semantics_hash": STANDARD_V2_R1_TRAINING_SEMANTICS_HASH,
+        "benchmark_workload_hash": STANDARD_V2_R1_BENCHMARK_WORKLOAD_HASH,
+        "reference_digest": STANDARD_V2_R1_REFERENCE_DIGEST,
+    }
+    for name, expected in expected_identity.items():
+        if artifact[name] != expected:
+            raise ValueError(f"unified_benchmark.{name} is not frozen R1")
+    reference = build_standard_v2_reference()
+    if artifact["coverage"] != reference["coverage"]:
+        raise ValueError("unified_benchmark.coverage disagrees with the reference")
+    if artifact["privacy"] != "sanitized_no_host_or_device_identifiers":
+        raise ValueError("unified_benchmark privacy contract is invalid")
+
+    performance = _require_mapping(
+        artifact["performance"],
+        "unified_benchmark.performance",
+        fields={
+            "status", "measurement", "counts", "rates", "queue_latency_ms",
+            "gpu_seconds", "staging_seconds", "peak_vram_mib",
+        },
+    )
+    if performance["status"] == "not_run":
+        null_counts = _require_mapping(
+            performance["counts"], "unified_benchmark.performance.counts",
+            fields=set(_COUNT_FIELDS),
+        )
+        null_rates = _require_mapping(
+            performance["rates"], "unified_benchmark.performance.rates",
+            fields=set(_RATE_FIELDS),
+        )
+        queue = _require_mapping(
+            performance["queue_latency_ms"],
+            "unified_benchmark.performance.queue_latency_ms",
+            fields={"p50", "p95"},
+        )
+        gpu = _require_mapping(
+            performance["gpu_seconds"],
+            "unified_benchmark.performance.gpu_seconds",
+            fields={"inference", "learner"},
+        )
+        if (
+            performance["measurement"] is not None
+            or performance["staging_seconds"] is not None
+            or performance["peak_vram_mib"] is not None
+            or any(value is not None for value in null_counts.values())
+            or any(value is not None for value in null_rates.values())
+            or any(value is not None for value in queue.values())
+            or any(value is not None for value in gpu.values())
+        ):
+            raise ValueError("not_run benchmark contains measured values")
+        return artifact
+    if performance["status"] != "measured":
+        raise ValueError("unified_benchmark.performance.status is invalid")
+
+    counts = _validate_counts(
+        performance["counts"], "unified_benchmark.performance.counts"
+    )
+    frozen_trainer = STANDARD_V2_R1_EXPECTED_BENCHMARK_WORKLOAD[
+        "trainer_config"
+    ]
+    if counts["games"] != frozen_trainer["max_episodes"]:
+        raise ValueError("unified benchmark games disagree with frozen workload")
+    if counts["learner_steps"] != frozen_trainer["optimizer_steps"]:
+        raise ValueError("unified benchmark steps disagree with frozen workload")
+
+    measurement = _require_mapping(
+        performance["measurement"],
+        "unified_benchmark.performance.measurement",
+        fields={
+            "source_schema_version", "device_type", "training_wall_seconds",
+            "phase_wall_seconds", "amp", "compile", "distributed",
+            "parameter_update_observed", "metrics_history",
+        },
+    )
+    if measurement["source_schema_version"] not in {
+        _TRAINING_METRICS_SCHEMA_VERSION, _CYCLE_METRICS_SCHEMA_VERSION,
+    }:
+        raise ValueError("unified benchmark source schema is unsupported")
+    if measurement["device_type"] != "cuda":
+        raise ValueError("unified measured benchmark must come from CUDA")
+    if measurement["parameter_update_observed"] is not True:
+        raise ValueError("unified measured benchmark requires an update")
+    training_wall = _require_number(
+        measurement["training_wall_seconds"],
+        "unified_benchmark.performance.measurement.training_wall_seconds",
+        positive=True,
+    )
+    raw_wall = _require_mapping(
+        measurement["phase_wall_seconds"],
+        "unified_benchmark.performance.measurement.phase_wall_seconds",
+        fields={"total", "collection", "optimization"},
+    )
+    wall = {
+        name: _require_number(
+            raw_wall[name],
+            f"unified_benchmark.performance.measurement.phase_wall_seconds.{name}",
+            positive=True,
+        )
+        for name in ("total", "collection", "optimization")
+    }
+    if not math.isclose(wall["total"], training_wall, abs_tol=1.0e-6):
+        raise ValueError("unified benchmark total wall time is inconsistent")
+    _validate_phase_wall(
+        wall, "unified_benchmark.performance.measurement.phase_wall_seconds",
+        bound_overhead=False,
+    )
+    _validate_amp(
+        measurement["amp"],
+        "unified_benchmark.performance.measurement.amp",
+        include_observation=True,
+    )
+    _validate_compile(
+        measurement["compile"],
+        "unified_benchmark.performance.measurement.compile",
+    )
+    _validate_distributed(
+        measurement["distributed"],
+        "unified_benchmark.performance.measurement.distributed",
+    )
+    _validate_metrics_history(
+        measurement["metrics_history"],
+        "unified_benchmark.performance.measurement.metrics_history",
+    )
+    _validate_rates(
+        performance["rates"], "unified_benchmark.performance.rates",
+        expected={
+            "games_per_second": (counts["games"], wall["collection"]),
+            "cardplay_decisions_per_second": (
+                counts["cardplay_decisions"], wall["collection"]
+            ),
+            "bidding_decisions_per_second": (
+                counts["bidding_decisions"], wall["collection"]
+            ),
+            "play_transitions_per_second": (
+                counts["play_transitions"], wall["collection"]
+            ),
+            "bid_transitions_per_second": (
+                counts["bid_transitions"], wall["collection"]
+            ),
+            "learner_samples_per_second": (
+                counts["learner_samples"], wall["optimization"]
+            ),
+            "learner_steps_per_second": (
+                counts["learner_steps"], wall["optimization"]
+            ),
+        },
+    )
+    _validate_optional_sections(
+        queue=performance["queue_latency_ms"],
+        gpu_seconds=performance["gpu_seconds"],
+        staging_seconds=performance["staging_seconds"],
+        prefix="unified_benchmark.performance",
+    )
+    _require_number(
+        performance["peak_vram_mib"],
+        "unified_benchmark.performance.peak_vram_mib",
+        positive=True,
+    )
+    return artifact
+
+
 def build_unified_benchmark(
     *,
     training_metrics: dict[str, Any] | None = None,
@@ -804,7 +978,7 @@ def build_unified_benchmark(
         source["gpu_seconds"] if source is not None
         else {"inference": None, "learner": None}
     )
-    return {
+    artifact = {
         "schema_version": STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
         "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
         "config_hash": STANDARD_V2_R1_CONFIG_HASH,
@@ -828,6 +1002,8 @@ def build_unified_benchmark(
         },
         "privacy": "sanitized_no_host_or_device_identifiers",
     }
+    validate_unified_benchmark_output(artifact)
+    return artifact
 
 
 def _write_json(path: str, payload: dict[str, Any]) -> None:

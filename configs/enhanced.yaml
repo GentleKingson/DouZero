@@ -39,11 +39,14 @@ disable_checkpoint: false # (ignored; omit --checkpoint_path to skip V2 save)
 savedir: douzero_v2_checkpoints  # (ignored; V2 output paths are explicit CLI args)
 
 # --- Hyperparameters --- #
-# Consumed: exp_epsilon, batch_size, max_grad_norm.
+# Consumed: exp_epsilon, batch_size, bidding batch/update controls,
+# max_grad_norm.
 # Ignored: total_frames, unroll_length, num_buffers, num_threads.
 total_frames: 600000      # (ignored; train_v2.py uses --episodes / max_episodes)
 exp_epsilon: 0.05         # consumed: exploration epsilon
 batch_size: 32            # consumed: minibatch size
+bidding_batch_size: null  # consumed: null inherits batch_size
+bidding_update_interval: 1  # consumed: bid loss cadence
 unroll_length: 100        # (ignored; legacy multiprocess buffer only)
 num_buffers: 50           # (ignored; legacy multiprocess buffer only)
 num_threads: 4            # (ignored; legacy multiprocess learner only)

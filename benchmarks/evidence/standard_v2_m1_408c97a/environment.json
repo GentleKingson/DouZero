@@ -1,0 +1,51 @@
+{
+  "docker": {
+    "cli_available": false,
+    "daemon_available": false,
+    "runtimes": []
+  },
+  "nvidia_smi": {
+    "available": true,
+    "driver_version": "595.71.05",
+    "gpus": [
+      {
+        "index": 0,
+        "memory_total_mib": 12227,
+        "name": "NVIDIA GeForce RTX 5070"
+      }
+    ]
+  },
+  "os": {
+    "machine": "x86_64",
+    "release": "7.0.0-28-generic",
+    "system": "Linux"
+  },
+  "privacy": "sanitized_no_host_or_device_identifiers",
+  "python": "3.12.3",
+  "schema_version": "p17-gpu-environment-v1",
+  "status": "available",
+  "torch": {
+    "cuda_available": true,
+    "cuda_version": "13.2",
+    "devices": [
+      {
+        "bf16_supported": true,
+        "capability": [
+          12,
+          0
+        ],
+        "index": 0,
+        "name": "NVIDIA GeForce RTX 5070",
+        "total_memory_mib": 11771
+      }
+    ],
+    "gpu_count": 1,
+    "nccl_available": true,
+    "nccl_version": [
+      2,
+      29,
+      7
+    ],
+    "version": "2.12.1+cu132"
+  }
+}

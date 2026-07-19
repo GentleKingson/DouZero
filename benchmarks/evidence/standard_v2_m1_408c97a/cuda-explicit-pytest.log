@@ -1,0 +1,16 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /opt/venv/bin/python
+cachedir: .pytest_cache
+hypothesis profile 'default'
+rootdir: /workspace/DouZero
+configfile: pyproject.toml
+plugins: timeout-2.4.0, hypothesis-6.155.3
+collecting ... collected 5 items
+
+tests/test_p17_bidding.py::test_batched_bidding_cuda_mixed_source_forward_loss_backward PASSED [ 20%]
+tests/test_p17_bidding.py::test_cuda_bidding_validation_raises_python_errors_without_poisoning_context PASSED [ 40%]
+tests/test_p17_bidding.py::test_standard_training_step_and_strict_resume PASSED [ 60%]
+tests/test_p17_joint_belief.py::test_alternating_belief_skips_bidding_cadence_and_resumes_exactly PASSED [ 80%]
+tests/test_standard_v2_contract.py::test_async_checkpoint_v7_binds_protocol_and_loads_v4 PASSED [100%]
+
+============================== 5 passed in 3.09s ===============================

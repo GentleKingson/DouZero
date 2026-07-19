@@ -34,7 +34,7 @@ from douzero.evaluation.scenario import (
 )
 from douzero.evaluation.statistics import deal_cluster_means, paired_bootstrap_ci
 from douzero.models_v2 import ModelV2, ModelV2Config
-from douzero.models_v2.output import BiddingModelOutput
+from douzero.models_v2.output import BatchedBiddingOutput, BiddingModelOutput
 from douzero.observation import build_v2_schema
 from douzero.observation.bidding import get_bidding_obs_v2
 from douzero.training.bidding import (
@@ -44,6 +44,18 @@ from douzero.training.bidding import (
 )
 from douzero.training.v2_trainer import TrainerConfig, V2Trainer
 from evaluate_paired import generate_deals
+
+
+def _batch_bidding_output(output: BiddingModelOutput) -> BatchedBiddingOutput:
+    return BatchedBiddingOutput(
+        bid_logits=output.bid_logits.unsqueeze(0),
+        bid_action_mask=output.bid_action_mask.unsqueeze(0),
+        landlord_win_logit=output.landlord_win_logit.reshape(1),
+        expected_landlord_score=output.expected_landlord_score.reshape(1),
+        uncertainty=(
+            None if output.uncertainty is None else output.uncertainty.reshape(1)
+        ),
+    )
 
 
 def _model(*, belief_enabled: bool = False) -> ModelV2:
@@ -706,9 +718,10 @@ def test_behavior_bid_follows_actor_outcome_value_gradient(source_policy, actor_
     before = torch.softmax(logits.detach().masked_fill(~action_mask, -torch.inf), dim=0)[
         action
     ]
+    minibatch = BiddingMinibatch([transition])
     loss = bidding_loss(
-        [output],
-        BiddingMinibatch([transition]),
+        _batch_bidding_output(output),
+        minibatch.to_targets(logits.device),
         lambda_policy=1.0,
         lambda_landlord_win=0.0,
         lambda_landlord_score=0.0,
@@ -765,9 +778,10 @@ def test_failed_rule_bid_remains_an_explicit_imitation_target():
         torch.tensor(0.0),
         torch.tensor(0.0),
     )
+    minibatch = BiddingMinibatch([transition])
     loss = bidding_loss(
-        [output],
-        BiddingMinibatch([transition]),
+        _batch_bidding_output(output),
+        minibatch.to_targets(logits.device),
         lambda_policy=1.0,
         lambda_landlord_win=0.0,
         lambda_landlord_score=0.0,

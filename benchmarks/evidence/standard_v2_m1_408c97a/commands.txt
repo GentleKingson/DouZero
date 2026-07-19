@@ -1,0 +1,12 @@
+cd /opt/DouZero
+git status --short --branch
+git checkout --detach 408c97a25088451d884d9836ce6f6fbf32d810c6
+docker build --progress=plain --build-arg DOUZERO_GIT_SHA="408c97a25088451d884d9836ce6f6fbf32d810c6" -t douzero-test:latest .
+docker run --rm --mount type=bind,src=/opt/DouZero/.git,dst=/workspace/DouZero/.git,readonly douzero-test:latest
+docker run --rm --gpus all --mount type=bind,src=/opt/DouZero/.git,dst=/workspace/DouZero/.git,readonly douzero-test:latest python -m pytest -vv tests/test_p17_bidding.py::test_batched_bidding_cuda_mixed_source_forward_loss_backward tests/test_p17_bidding.py::test_cuda_bidding_validation_raises_python_errors_without_poisoning_context tests/test_p17_bidding.py::test_standard_training_step_and_strict_resume tests/test_p17_joint_belief.py::test_alternating_belief_skips_bidding_cadence_and_resumes_exactly tests/test_standard_v2_contract.py::test_async_checkpoint_v7_binds_protocol_and_loads_v4
+docker run --rm --gpus all --mount type=bind,src=/tmp/douzero-pr25-m1-408c97a,dst=/evidence douzero-test:latest python tools/gpu_validation_probe.py --output /evidence/environment.json
+docker run --rm --gpus all --mount type=bind,src=/tmp/douzero-pr25-m1-408c97a,dst=/evidence douzero-test:latest python -m benchmarks.bench_bidding_batch --device cuda --batch-sizes 1 32 64 128 --warmup 20 --iterations 100 --output /evidence/bidding-benchmark.json
+docker run --rm --gpus all --mount type=bind,src=/tmp/douzero-pr25-m1-408c97a,dst=/evidence --mount type=bind,src=/opt/DouZero/.git,dst=/workspace/DouZero/.git,readonly douzero-test:latest python train_v2.py --config configs/standard_v2.yaml --episodes 16 --optimizer_steps 1 --device cuda --metrics_path /evidence/training-metrics.json
+docker run --rm --mount type=bind,src=/tmp/douzero-pr25-m1-408c97a,dst=/evidence douzero-test:latest python -m benchmarks.bench_standard_v2 --training-metrics /evidence/training-metrics.json --reference-output /evidence/standard-v2-r1-reference.json --output /evidence/standard-v2-r1-single-gpu.json
+docker run --rm --mount type=bind,src=/tmp/douzero-pr25-m1-408c97a,dst=/evidence douzero-test:latest python -c "import json; p=json.load(open('/evidence/bidding-benchmark.json')); r=next(x for x in p['results'] if x['batch_size']==32)['head_forward_backward']; assert r['mean_ms'] <= 1.5 and r['p95_ms'] <= 1.5"
+git status --short --branch

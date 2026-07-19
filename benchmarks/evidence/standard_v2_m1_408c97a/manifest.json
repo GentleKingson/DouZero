@@ -1,0 +1,33 @@
+{
+  "canonical_checked_in_baseline": {
+    "games_per_second": 7.896824,
+    "learner_samples_per_second": 262.392942,
+    "play_transitions_per_second": 379.047554,
+    "sha256": "c1513aa2a828c2832e1a980a00fdec6673c8d3e3568a792cd602224f1c30d23d"
+  },
+  "docker_image_id": "sha256:417ae0638a9ffa1cc1ba41c2a23e9a20074866b79a7b7a08e6efe1b4221ac2cb",
+  "dockerfile_sha256": "36c8f11fd7cabc9d341756a11169fa1797756c2997daabc79f4808fb4f0a86a4",
+  "gpu_workflow_used": false,
+  "microbenchmark_b32": {
+    "gate_ms": 1.5,
+    "mean_ms": 1.0555068796873093,
+    "p95_ms": 1.1988799571990967,
+    "status": "passed"
+  },
+  "privacy": "sanitized_no_host_or_device_identifiers",
+  "repeated_r1_run": {
+    "bid_transitions_per_second": 22.027104,
+    "games_per_second": 8.009856,
+    "learner_samples_per_second": 261.953683,
+    "parameter_update_observed": true,
+    "peak_vram_mib": 266.845,
+    "play_transitions_per_second": 384.473094,
+    "sha256": "58ea23ac02395835910d2ee2e119a23461a8f296782834e39c73784ebf766a87"
+  },
+  "schema_version": "standard-v2-m1-manual-gpu-evidence-v1",
+  "source_git_sha": "408c97a25088451d884d9836ce6f6fbf32d810c6",
+  "tests": {
+    "cpu_full": "passed",
+    "cuda_explicit": "5 passed"
+  }
+}

@@ -122,14 +122,15 @@ belief, loss, policy snapshot, and full source Git SHA. Resume rejects an
 unknown or different source SHA before restoring model/optimizer state; a
 wheel or source archive without Git metadata must set `DOUZERO_GIT_SHA` to the
 exact build commit. Standard and joint trainer checkpoint save/resume remains
-single-process only and fails closed when DDP is enabled. Trainer-checkpoint
-format 3 remains the single-process format and records
-`training_topology=single_process` plus `training_world_size=1`. Async runs use
-format 4 and additionally bind actor count, interleaved games per actor,
-compact replay schema, snapshot publication semantics, and request
-ordering/batching semantics. Format 3 has
-an explicit single-process compatibility path; formats 1/2, unknown versions,
-unknown topology, and cross-topology resume are rejected.
+single-process only and fails closed when DDP is enabled. New single-process
+and async checkpoints use format 7 with trainer identity version 2, the
+complete `TrainerConfig`, and the persisted bidding-eligible-step counter.
+Legacy formats 3/4/5/6 are accepted only under the same
+exact source Git SHA; they are shape compatibility paths, not cross-commit
+migrations. A legacy identity without M1 bidding controls additionally requires
+the default-equivalent batch size and update cadence. Formats 1/2, unknown
+versions, unknown topology, and cross-topology resume are rejected before state
+restoration.
 
 ## V2 single-GPU throughput topology
 
@@ -185,9 +186,10 @@ release/acquire hand-off prevents the `DONE` state from acting as an assumed
 RawArray memory barrier.
 
 Tensor value validation occurs while model-input bundles are still on CPU.
-CUDA model guards use asynchronous device assertions rather than Python
-`bool(tensor)` scalar reads, avoiding mask, role, and chosen-index host
-synchronization in the inference and learner hot paths.
+CUDA model guards use one compatibility wrapper: runtimes that provide a
+device-side assertion avoid host synchronization, while runtimes without that
+private capability fall back to one public scalar check. Model and loss code
+never call a private Torch API directly.
 
 `v2_training_mode`, `num_actors`, and `games_per_actor` may be set in typed
 YAML. Explicit CLI flags override YAML. With no YAML or topology flags the

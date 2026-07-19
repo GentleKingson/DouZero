@@ -69,7 +69,13 @@ from .config import HISTORY_ENCODER_TRANSFORMER, ModelV2Config, SUPPORTED_ROLES
 from .fusion import StateActionFusion
 from .heads import BiddingHeads, PriorHead, StrategyAuxiliaryHeads, ValueHeads
 from .history_encoder import build_history_encoder
-from .output import BatchedModelOutput, BiddingModelOutput, ModelOutput
+from .batch import BatchedBiddingInput
+from .output import (
+    BatchedBiddingOutput,
+    BatchedModelOutput,
+    BiddingModelOutput,
+    ModelOutput,
+)
 from .state_encoder import StateEncoder
 
 #: The number of card-set sub-blocks the state encoder consumes from the state
@@ -268,7 +274,7 @@ class ModelV2(nn.Module):
             ) from exc
 
     def forward_bidding(self, observation) -> BiddingModelOutput:
-        """Run the public bidding path without encoding card-play actions."""
+        """Run the scalar bidding path without batch construction overhead."""
         from douzero.observation.bidding import BiddingObservationV2
 
         if self.bidding_heads is None or self.bidding_schema is None:
@@ -285,20 +291,68 @@ class ModelV2(nn.Module):
             )
         parameter = next(self.bidding_heads.parameters())
         features = observation.to_tensor(parameter.device).to(parameter.dtype)
-        head_out = self.bidding_heads(features)
+        head_out = self._forward_bidding_head(features)
         mask = torch.from_numpy(observation.bid_action_mask.copy()).to(
             device=parameter.device, dtype=torch.bool
         )
-        if self.config.nan_guard:
-            from .numerical import assert_finite
-
-            for name in (
-                "bid_logits", "landlord_win_logit", "expected_landlord_score"
-            ):
-                assert_finite(head_out[name], name)
-            if head_out["uncertainty"] is not None:
-                assert_finite(head_out["uncertainty"], "bidding_uncertainty")
         return BiddingModelOutput(
+            bid_logits=head_out["bid_logits"],
+            bid_action_mask=mask,
+            landlord_win_logit=head_out["landlord_win_logit"],
+            expected_landlord_score=head_out["expected_landlord_score"],
+            uncertainty=head_out["uncertainty"],
+        )
+
+    def _forward_bidding_head(self, features: torch.Tensor) -> dict[str, torch.Tensor | None]:
+        if self.bidding_heads is None:
+            raise RuntimeError("bidding heads are disabled")
+        head_out = self.bidding_heads(features)
+        if self.config.nan_guard:
+            from .numerical import NumericalError, assert_tensor_true
+
+            values = [
+                head_out["bid_logits"],
+                head_out["landlord_win_logit"],
+                head_out["expected_landlord_score"],
+            ]
+            if head_out["uncertainty"] is not None:
+                values.append(head_out["uncertainty"])
+            assert_tensor_true(
+                torch.stack([torch.isfinite(value).all() for value in values]).all(),
+                "batched bidding output contains NaN or Inf",
+                error_type=NumericalError,
+            )
+        return head_out
+
+    def forward_bidding_batched(
+        self, inputs: BatchedBiddingInput
+    ) -> BatchedBiddingOutput:
+        """Run one dense bidding forward for every row in ``inputs``."""
+
+        if self.bidding_heads is None or self.bidding_schema is None:
+            raise RuntimeError(
+                "forward_bidding_batched requires "
+                "ModelV2Config(bidding_enabled=True)"
+            )
+        if not isinstance(inputs, BatchedBiddingInput):
+            raise TypeError("forward_bidding_batched requires BatchedBiddingInput")
+        expected_hash = self.bidding_schema.stable_hash()
+        if inputs.feature_schema_hash != expected_hash:
+            raise ValueError(
+                "bidding feature schema mismatch: input was encoded under "
+                f"{inputs.feature_schema_hash}, model expects {expected_hash}"
+            )
+        if inputs.features.shape[1] != self.bidding_schema.input_width:
+            raise ValueError(
+                "bidding input width mismatch: input has "
+                f"{inputs.features.shape[1]}, model expects "
+                f"{self.bidding_schema.input_width}"
+            )
+        parameter = next(self.bidding_heads.parameters())
+        features = inputs.features.to(device=parameter.device, dtype=parameter.dtype)
+        mask = inputs.legal_mask.to(device=parameter.device, dtype=torch.bool)
+        head_out = self._forward_bidding_head(features)
+        return BatchedBiddingOutput(
             bid_logits=head_out["bid_logits"],
             bid_action_mask=mask,
             landlord_win_logit=head_out["landlord_win_logit"],
@@ -607,13 +661,12 @@ class ModelV2(nn.Module):
             raise ValueError("ModelV2.forward_batched requires a non-empty batch")
         if action_mask.shape != (batch, actions) or action_mask.dtype != torch.bool:
             raise ValueError("action_mask must be bool with shape (B, A)")
-        legal_rows = action_mask.any(dim=1).all()
-        if action_mask.device.type == "cuda":
-            torch._assert_async(
-                legal_rows, "every batched decision must contain a legal action"
-            )
-        elif not bool(legal_rows):
-            raise ValueError("every batched decision must contain a legal action")
+        from .numerical import assert_tensor_true
+
+        assert_tensor_true(
+            action_mask.any(dim=1).all(),
+            "every batched decision must contain a legal action",
+        )
         if acting_role.shape != (batch,) or acting_role.dtype != torch.long:
             raise ValueError("acting_role must be long with shape (B,)")
 

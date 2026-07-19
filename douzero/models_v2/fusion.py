@@ -211,11 +211,10 @@ class StateActionFusion(nn.Module):
         if role_indices.shape != (batch,) or role_indices.dtype != torch.long:
             raise ValueError("role_indices must be long with shape (B,)")
         valid_roles = ((role_indices >= 0) & (role_indices < self.num_roles)).all()
-        if role_indices.device.type == "cuda":
-            torch._assert_async(valid_roles, "role_indices contains an unsupported role")
-            role_indices = role_indices.clamp(0, self.num_roles - 1)
-        elif not bool(valid_roles):
-            raise ValueError("role_indices contains an unsupported role")
+        from .numerical import assert_tensor_true
+
+        assert_tensor_true(valid_roles, "role_indices contains an unsupported role")
+        role_indices = role_indices.clamp(0, self.num_roles - 1)
         state_b = state_trunk.unsqueeze(1).expand(-1, actions, -1)
         history_b = history_summary.unsqueeze(1).expand(-1, actions, -1)
         parts = [state_b, history_b, action_embeddings]
