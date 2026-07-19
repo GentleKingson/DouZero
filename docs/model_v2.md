@@ -120,14 +120,17 @@ actions could be self-imitation labels, fail strict identity validation.
   public observation modules. Corrupting `infoset.all_handcards` (the true
   hidden hands) does not change the model output.
 
-### Batch scope (one decision per forward)
+### Scalar and batched forward contracts
 
-The model supports **one decision per forward pass** with a **variable number of
-legal actions** (the action path is `(N, action_width)` with no fixed max).
-It does not expose a `(B, N, ...)` multi-decision forward. `V2Trainer` samples
-decision minibatches but forwards their variable-action observations one at a
-time before gathering the chosen-action tensors into the batched loss. Do not
-assume a padded multi-decision model contract from the learner's minibatch API.
+`forward()` and `ModelInputBundle` retain the original one-decision,
+variable-`N` API used by deployment, evaluation and export. Training additionally
+uses `BatchedModelInputBundle`, `observation_batch_to_model_inputs()` and
+`forward_batched()` with state/context/history `[B, ...]`, actions
+`[B, Amax, action_width]`, a boolean `[B, Amax]` action mask, role indices
+`[B]`, and chosen indices `[B]`. One vectorized forward is followed by a
+legal-row gather. Padding never participates in selection or loss; a row with
+zero legal actions fails closed. The batched path adds no parameters, so the
+configuration hash and `state_dict` identity are unchanged.
 
 ### Output dictionary and sign convention
 

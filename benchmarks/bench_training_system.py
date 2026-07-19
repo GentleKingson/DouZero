@@ -25,6 +25,11 @@ from douzero.env.env import Env, get_obs, get_obs_factorized
 from douzero.models_v2 import ModelV2, ModelV2Config, observation_to_model_inputs
 from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.runtime import SafeMixedPrecision, VersionedPolicyPool
+from douzero.training.v2_buffer import (
+    CompactTensorReplayBuffer,
+    CompactTensorTransition,
+    Transition,
+)
 
 
 def _measure(fn, rounds: int, warmup: int = 1) -> dict[str, float | int]:
@@ -74,7 +79,8 @@ def build_report(rounds: int) -> dict:
 
     schema = build_v2_schema()
     v2 = ModelV2(schema, ModelV2Config()).eval()
-    v2_bundle = observation_to_model_inputs(get_obs_v2(env.infoset))
+    v2_obs = get_obs_v2(env.infoset)
+    v2_bundle = observation_to_model_inputs(v2_obs)
 
     def legacy_forward():
         with torch.inference_mode():
@@ -150,6 +156,20 @@ def build_report(rounds: int) -> dict:
         if done:
             step_env = _decision(1401)
 
+    replay_record = CompactTensorTransition.from_transition(Transition(
+        obs=v2_obs,
+        action_index=0,
+        position=v2_obs.public.acting_role,
+        target_win=1.0,
+        target_score=1.0,
+        target_log_score=0.0,
+    ))
+    compact_replay = CompactTensorReplayBuffer(capacity_transitions=4096)
+    compact_replay.add_many([replay_record] * 4032)
+
+    def compact_replay_ingest_near_capacity():
+        compact_replay.add_many([replay_record] * 64)
+
     ddp_status = (
         "available_via_torchrun; not_run_in_single_process_benchmark"
         if torch.distributed.is_available()
@@ -169,6 +189,9 @@ def build_report(rounds: int) -> dict:
             "queue_wait": _measure(queue_wait, rounds),
             "learner_forward_backward_step": _measure(learner_step, rounds),
             "weight_sync": _measure(weight_sync, rounds),
+            "compact_replay_ingest_64_near_capacity": _measure(
+                compact_replay_ingest_near_capacity, rounds
+            ),
         },
         "forward_comparison_ms": {
             "legacy_fp32": _measure(legacy_forward, rounds),

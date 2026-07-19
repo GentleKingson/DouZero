@@ -68,10 +68,15 @@ from douzero.training.calibration import (
     reliability_bins,
 )
 from douzero.training.v2_buffer import (
+    ACTION_BUCKET_LIMITS,
+    COMPACT_REPLAY_SCHEMA_VERSION,
+    CompactTensorTransition,
+    CompactTensorReplayBuffer,
     Episode,
     Minibatch,
     Transition,
     V2ReplayBuffer,
+    action_count_bucket,
 )
 from douzero.training.v2_trainer import (
     TrainerConfig,
@@ -119,6 +124,11 @@ __all__ = [
     "nll",
     "reliability_bins",
     "Episode",
+    "ACTION_BUCKET_LIMITS",
+    "COMPACT_REPLAY_SCHEMA_VERSION",
+    "CompactTensorTransition",
+    "CompactTensorReplayBuffer",
+    "action_count_bucket",
     "Minibatch",
     "Transition",
     "V2ReplayBuffer",

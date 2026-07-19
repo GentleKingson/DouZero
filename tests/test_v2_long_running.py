@@ -140,6 +140,22 @@ def _run(tmp_path, trainer, *, cycles, state=None, stop=None, keep=3):
     return runner.run()
 
 
+def _cleanup_test_runner(tmp_path, trainer, stop):
+    series = CheckpointSeries(str(tmp_path / "cleanup.pt"), 1)
+    runner = LongRunningTrainer(
+        trainer,
+        LongRunningConfig(
+            episodes_per_cycle=1,
+            optimizer_steps_per_cycle=0,
+            max_cycles=1,
+            checkpoint_every_cycles=0,
+        ),
+        series,
+        stop_controller=stop,
+    )
+    return runner, series
+
+
 def _assert_nested_equal(left, right):
     if isinstance(left, torch.Tensor):
         assert torch.equal(left, right)
@@ -495,6 +511,63 @@ def test_resume_identity_mismatch_fails_closed(tmp_path):
     )
     with pytest.raises(ValueError, match="resume identity mismatch"):
         _run(tmp_path, trainer, cycles=1, state=state)
+
+
+def test_single_process_migrates_pre_interleaved_cycle_identity(tmp_path):
+    trainer = _DeterministicTrainer()
+    config = LongRunningConfig(
+        episodes_per_cycle=2,
+        optimizer_steps_per_cycle=2,
+        max_cycles=1,
+        checkpoint_every_cycles=0,
+    )
+    previous_identity = config.resume_identity()
+    previous_identity.pop("games_per_actor")
+    previous_identity["request_ordering_semantics"] = (
+        "policy_bucket_fifo_post_first_window_v2"
+    )
+    state = LongRunningState(
+        policy_version=trainer.policy_version,
+        cycle_identity=previous_identity,
+    )
+
+    restored, reason, _records = LongRunningTrainer(
+        trainer,
+        config,
+        CheckpointSeries(str(tmp_path / "migrated.pt"), 1),
+        state=state,
+    ).run()
+
+    assert reason == "max_cycles"
+    assert restored.cycle_identity == config.resume_identity()
+
+
+def test_async_rejects_pre_interleaved_cycle_identity(tmp_path):
+    trainer = _DeterministicTrainer()
+    config = LongRunningConfig(
+        episodes_per_cycle=2,
+        optimizer_steps_per_cycle=2,
+        max_cycles=1,
+        v2_training_mode="async_single_gpu",
+        num_actors=4,
+    )
+    previous_identity = config.resume_identity()
+    previous_identity.pop("games_per_actor")
+    previous_identity["request_ordering_semantics"] = (
+        "policy_bucket_fifo_post_first_window_v2"
+    )
+    state = LongRunningState(
+        policy_version=trainer.policy_version,
+        cycle_identity=previous_identity,
+    )
+
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        LongRunningTrainer(
+            trainer,
+            config,
+            CheckpointSeries(str(tmp_path / "rejected.pt"), 1),
+            state=state,
+        )
 
 
 def test_checkpoint_failure_keeps_previous_valid_checkpoint_and_manifest(tmp_path):
@@ -1112,6 +1185,89 @@ def test_checkpoint_series_lock_is_exclusive_across_processes(tmp_path, run_id):
             process.join()
     assert process.exitcode == 0
     assert not CheckpointSeries(base, 1).lock_path.exists()
+
+
+def test_shutdown_failure_still_releases_checkpoint_series_lock(tmp_path):
+    trainer = _DeterministicTrainer()
+    shutdown_calls = 0
+
+    def failing_shutdown():
+        nonlocal shutdown_calls
+        shutdown_calls += 1
+        raise RuntimeError("injected trainer shutdown failure")
+
+    trainer.shutdown = failing_shutdown
+    stop = StopController()
+    stop.request("stop_event")
+    runner, series = _cleanup_test_runner(tmp_path, trainer, stop)
+    assert series.lock_path.exists()
+
+    with pytest.raises(RuntimeError, match="injected trainer shutdown failure"):
+        runner.run()
+
+    assert shutdown_calls == 1
+    assert not series.lock_path.exists()
+    contender = CheckpointSeries(str(series.base), 1)
+    contender.acquire("next-run")
+    contender.release()
+
+
+def test_stop_restore_failure_still_runs_shutdown_and_releases_lock(tmp_path):
+    cleanup_order = []
+
+    class FailingRestoreStop(StopController):
+        def restore(self):
+            super().restore()
+            cleanup_order.append("restore")
+            raise RuntimeError("injected signal restore failure")
+
+    trainer = _DeterministicTrainer()
+
+    def failing_shutdown():
+        cleanup_order.append("shutdown")
+        raise RuntimeError("later shutdown cleanup failure")
+
+    trainer.shutdown = failing_shutdown
+    stop = FailingRestoreStop()
+    stop.request("stop_event")
+    runner, series = _cleanup_test_runner(tmp_path, trainer, stop)
+
+    with pytest.raises(RuntimeError, match="injected signal restore failure"):
+        runner.run()
+
+    assert cleanup_order == ["restore", "shutdown"]
+    assert not series.lock_path.exists()
+
+
+def test_training_failure_keeps_priority_over_all_cleanup_failures(tmp_path):
+    cleanup_order = []
+
+    class FailingRestoreStop(StopController):
+        def restore(self):
+            super().restore()
+            cleanup_order.append("restore")
+            raise RuntimeError("cleanup restore must not replace training failure")
+
+    trainer = _DeterministicTrainer()
+
+    def failing_collection(_count):
+        raise ValueError("injected original training failure")
+
+    def failing_shutdown():
+        cleanup_order.append("shutdown")
+        raise RuntimeError("cleanup shutdown must not replace training failure")
+
+    trainer.collect_episodes = failing_collection
+    trainer.shutdown = failing_shutdown
+    runner, series = _cleanup_test_runner(
+        tmp_path, trainer, FailingRestoreStop()
+    )
+
+    with pytest.raises(ValueError, match="injected original training failure"):
+        runner.run()
+
+    assert cleanup_order == ["restore", "shutdown"]
+    assert not series.lock_path.exists()
 
 
 def test_production_loop_streams_metrics_without_retaining_history(tmp_path):

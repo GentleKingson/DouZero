@@ -48,6 +48,8 @@ import random
 import copy
 import hashlib
 import json
+import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -60,14 +62,22 @@ from douzero.runtime import DistributedContext, SafeMixedPrecision
 
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
-from douzero.models_v2.batch import observation_to_model_inputs
+from douzero.models_v2.batch import (
+    observation_batch_to_model_inputs,
+    observation_to_model_inputs,
+)
 from douzero.models_v2.model import ModelV2
 from douzero.observation.encode_v2 import get_obs_v2
 from douzero.observation.bidding import get_bidding_obs_v2
 
 from douzero.training.decision_policy import DecisionConfig, select_action
 from douzero.training.losses import LossComponents, LossConfig, MultiObjectiveLoss
-from douzero.training.v2_buffer import Episode, Transition, V2ReplayBuffer
+from douzero.training.v2_buffer import (
+    Episode,
+    Transition,
+    V2ReplayBuffer,
+    action_count_bucket,
+)
 from douzero.training.bidding import (
     BiddingPolicyConfig,
     BiddingReplayBuffer,
@@ -80,9 +90,17 @@ from douzero.training.bidding import (
 # Format 3 makes the resume topology explicit. Formats 1/2 predated this
 # contract and are intentionally rejected rather than guessed to be safe for a
 # different process topology.
-_TRAINER_CHECKPOINT_VERSION = 3
+_TRAINER_CHECKPOINT_VERSION = 4
+_COMPATIBLE_TRAINER_CHECKPOINT_VERSIONS = frozenset({3, 4})
 _SINGLE_PROCESS_TOPOLOGY = "single_process"
+_ASYNC_SINGLE_GPU_TOPOLOGY = "async_single_gpu"
+_ASYNC_UNSUPPORTED_DECISION_MODES = frozenset({
+    "pure_prior", "uncertainty_gated_prior",
+})
 _POLICY_STEP_SEMANTICS = "absolute_v1"
+_SNAPSHOT_PUBLICATION_SEMANTICS = "cycle_quiescent_atomic_copy_v1"
+_REQUEST_ORDERING_SEMANTICS = "policy_inference_bucket_interleaved_games_v3"
+_ACTOR_RNG_RESUME_SEMANTICS = "restart_from_configured_seeds_v1"
 
 
 @dataclass
@@ -129,6 +147,12 @@ class TrainerConfig:
     belief_alternating_interval: int = 1
     belief_supervised_batch_size: int = 16
     first_bidder_mode: str = "rotate"
+    v2_training_mode: str = _SINGLE_PROCESS_TOPOLOGY
+    num_actors: int = 1
+    games_per_actor: int = 4
+    replay_schema_version: int = 1
+    snapshot_publication_semantics: str = _SNAPSHOT_PUBLICATION_SEMANTICS
+    request_ordering_semantics: str = _REQUEST_ORDERING_SEMANTICS
 
     def __post_init__(self) -> None:
         """Validate ranges so a malformed config fails fast (P06 r2).
@@ -196,6 +220,20 @@ class TrainerConfig:
             raise ValueError("belief_supervised_batch_size must be >= 1")
         if self.first_bidder_mode not in {"rotate", "seeded_random"}:
             raise ValueError("first_bidder_mode must be 'rotate' or 'seeded_random'")
+        if self.v2_training_mode not in {
+            _SINGLE_PROCESS_TOPOLOGY, _ASYNC_SINGLE_GPU_TOPOLOGY
+        }:
+            raise ValueError("unknown v2_training_mode")
+        if self.num_actors < 1:
+            raise ValueError("num_actors must be >= 1")
+        if self.games_per_actor < 1:
+            raise ValueError("games_per_actor must be >= 1")
+        if self.replay_schema_version != 1:
+            raise ValueError("unknown compact replay schema version")
+        if self.snapshot_publication_semantics != _SNAPSHOT_PUBLICATION_SEMANTICS:
+            raise ValueError("unknown snapshot publication semantics")
+        if self.request_ordering_semantics != _REQUEST_ORDERING_SEMANTICS:
+            raise ValueError("unknown request ordering semantics")
 
 
 @dataclass
@@ -205,6 +243,7 @@ class TrainerStats:
     episodes_completed: int = 0
     episodes_per_team: dict[str, int] = field(default_factory=dict)
     transitions_collected: int = 0
+    decisions_collected: int = 0
     optimizer_steps: int = 0
     last_loss: dict[str, float] = field(default_factory=dict)
     grad_norm_last_step: float = 0.0
@@ -435,6 +474,34 @@ class V2Trainer:
         self.decision_config = decision_config or DecisionConfig()
         self.device = torch.device(self.config.device)
         self.distributed = distributed_context or DistributedContext(enabled=False)
+        self.async_mode = self.config.v2_training_mode == _ASYNC_SINGLE_GPU_TOPOLOGY
+        if self.async_mode:
+            if self.decision_config.mode in _ASYNC_UNSUPPORTED_DECISION_MODES:
+                raise NotImplementedError(
+                    "async_single_gpu does not publish prior_logit and rejects "
+                    f"decision mode {self.decision_config.mode!r}; use a value-based "
+                    "decision mode or single_process"
+                )
+            if self.device.type != "cuda" or not torch.cuda.is_available():
+                raise RuntimeError(
+                    "async_single_gpu requires an available CUDA device and never falls back"
+                )
+            if self.distributed.enabled:
+                raise ValueError("async_single_gpu rejects DDP")
+            unsupported = (
+                self.standard_mode
+                or self.belief_model is not None
+                or self.bc_schedule.base_lambda > 0
+                or self.model.config.style_enabled
+                or self.model.config.strategy_features_enabled
+                or self.model.config.strategy_aux_enabled
+                or policy_pool is not None
+                or opening_sampler is not None
+            )
+            if unsupported:
+                raise NotImplementedError(
+                    "async_single_gpu supports only base legacy-ruleset V2"
+                )
         if self.distributed.enabled and self.distributed.device != self.device:
             raise ValueError(
                 "distributed context device does not match TrainerConfig.device: "
@@ -480,7 +547,9 @@ class V2Trainer:
         # call the local module directly. Optimizer closures continue to use
         # ``self.model`` so training forward/backward remains synchronized.
         self.inference_model = (
-            self.model.module if self.distributed.enabled else self.model
+            copy.deepcopy(self.model).to(self.device).eval()
+            if self.async_mode
+            else (self.model.module if self.distributed.enabled else self.model)
         )
         self.mixed_precision = SafeMixedPrecision(
             self.device,
@@ -488,6 +557,7 @@ class V2Trainer:
             dtype=self.config.amp_dtype,
             fallback_on_nonfinite=self.config.amp_fallback_on_nonfinite,
         )
+        self._learner_gpu_seconds = 0.0
         # P06 r4: reject a "valid but trains nothing" configuration.
         # (a) optimizer_steps > 0 with all loss weights at 0 produces a
         #     zero-gradient step that silently changes nothing.
@@ -547,7 +617,19 @@ class V2Trainer:
             momentum=self.config.rmsprop_momentum,
             eps=self.config.rmsprop_epsilon,
         )
-        self.buffer = V2ReplayBuffer(capacity_transitions=self.config.buffer_capacity)
+        if self.async_mode:
+            from douzero.training.v2_buffer import (
+                CompactTensorReplayBuffer,
+                compact_model_input_shapes,
+            )
+
+            self.buffer = CompactTensorReplayBuffer(
+                self.config.buffer_capacity,
+                expected_schema_hash=self.model.schema.stable_hash(),
+                expected_tensor_shapes=compact_model_input_shapes(self.model.schema),
+            )
+        else:
+            self.buffer = V2ReplayBuffer(capacity_transitions=self.config.buffer_capacity)
         self.bidding_buffer = BiddingReplayBuffer(self.config.buffer_capacity)
         # P06 r3: respect the project's seed=0 → no-op contract. When
         # rng_seed is 0, use system entropy (random.Random() with no arg)
@@ -637,15 +719,355 @@ class V2Trainer:
                 max_steps=self.config.max_steps_per_episode,
                 logger=matchup_logger,
             )
+        self._async_runtime_started = False
+        if self.async_mode:
+            self._async_snapshot = self.policy_step
+            self._async_pending_scheduler = None
+            self._async_stagers = {}
+            self._reset_async_interval_metrics()
 
     # ------------------------------------------------------------------ #
     # Self-play episode collection
     # ------------------------------------------------------------------ #
+    def _reset_async_interval_metrics(self) -> None:
+        self._async_request_count = 0
+        self._async_action_count = 0
+        self._async_microbatch_count = 0
+        self._async_claimed_count = 0
+        self._async_queue_latencies_ms = []
+        self._async_inference_seconds = 0.0
+        self._async_segment_seconds = {
+            "claim_wait": 0.0,
+            "slot_read": 0.0,
+            "collate": 0.0,
+            "h2d": 0.0,
+            "forward": 0.0,
+            "d2h": 0.0,
+            "publish": 0.0,
+            "replay_drain": 0.0,
+        }
+        self._async_claim_size_histogram = {}
+        self._async_bucket_histogram = {}
+        self._async_batch_size_histogram = {}
+
+    @staticmethod
+    def _increment_histogram(histogram: dict[str, int], value) -> None:
+        key = str(value)
+        histogram[key] = histogram.get(key, 0) + 1
+
+    def _async_actor_runtime_kwargs(self) -> dict:
+        """Bind the two actor RNG domains to their declared config fields."""
+        return {
+            "environment_seed": self.config.seed,
+            "action_rng_seed": self.config.rng_seed,
+            "epsilon": self.config.exp_epsilon,
+            "max_steps": self.config.max_steps_per_episode,
+            "decision_config": self.decision_config,
+            "ruleset": None,
+            "feature_schema_hash": self.model.schema.stable_hash(),
+            "policy_version": self.policy_version,
+            "policy_step": self._async_policy_step,
+            "games_per_actor": self.config.games_per_actor,
+        }
+
+    def _start_async_runtime(self) -> None:
+        from douzero.training.async_single_gpu import (
+            AsyncRequestCoordinator,
+            PendingRequestScheduler,
+            SharedReplaySlots,
+            async_actor_main,
+        )
+
+        context = __import__("multiprocessing").get_context("spawn")
+        self._async_tasks = context.Queue()
+        self._async_events = context.Queue()
+        self._async_policy_step = context.Value("q", self.policy_step, lock=True)
+        self._async_max_inference_batch = (
+            self.config.num_actors * self.config.games_per_actor
+        )
+        self._async_coordinator = AsyncRequestCoordinator(
+            self.model.schema,
+            num_slots=max(self._async_max_inference_batch, 2),
+            max_actions=4096,
+            request_timeout_seconds=30.0,
+        )
+        self._async_replay_slots = SharedReplaySlots(
+            self.model.schema,
+            num_slots=max(
+                self.config.num_actors * self.config.games_per_actor * 2,
+                min(self.config.batch_size * 2, 64),
+            ),
+            max_actions=4096,
+        )
+        self._async_pending_scheduler = PendingRequestScheduler(
+            max_batch_size=self._async_max_inference_batch,
+            target_batch_size=4,
+            max_delay_seconds=0.002,
+        )
+        self._async_stagers = {}
+        self._async_workers = []
+        for actor_id in range(self.config.num_actors):
+            process = context.Process(
+                target=async_actor_main,
+                args=(
+                    actor_id, self._async_tasks, self._async_events,
+                    self._async_coordinator, self._async_replay_slots,
+                ),
+                kwargs=self._async_actor_runtime_kwargs(),
+                name=f"douzero-v2-actor-{actor_id}",
+            )
+            process.start()
+            self._async_workers.append(process)
+        self._async_runtime_started = True
+        self._async_snapshot = self.policy_step
+        self._reset_async_interval_metrics()
+
+    def _drain_async_replay(self) -> int:
+        started = time.perf_counter()
+        try:
+            records = self._async_replay_slots.read_ready(
+                self.model.schema.stable_hash(), self.policy_version
+            )
+            self.buffer.add_many(records)
+        except BaseException as exc:
+            self._async_coordinator.fail(
+                f"shared replay validation failed: {type(exc).__name__}: {exc}"
+            )
+            raise
+        finally:
+            segments = getattr(self, "_async_segment_seconds", None)
+            if segments is not None:
+                segments["replay_drain"] += time.perf_counter() - started
+        return len(records)
+
+    def _service_async_requests(self, wait_seconds: float = 0.001) -> int:
+        """Service requests and publish any main-process failure globally."""
+        try:
+            return self._service_async_requests_impl(wait_seconds)
+        except BaseException as exc:
+            self._async_coordinator.fail(
+                f"main inference service failed: {type(exc).__name__}: {exc}"
+            )
+            raise
+
+    def _service_async_requests_impl(self, wait_seconds: float = 0.001) -> int:
+        from douzero.training.async_single_gpu import PinnedObservationBatchStager
+
+        scheduler = self._async_pending_scheduler
+        scheduled = None
+
+        def claim(wait: float) -> int:
+            claim_started = time.perf_counter()
+            requests = self._async_coordinator.claim_ready(
+                max_items=self._async_max_inference_batch,
+                wait_seconds=wait,
+            )
+            self._async_segment_seconds["claim_wait"] += (
+                time.perf_counter() - claim_started
+            )
+            if requests:
+                for request in requests:
+                    if request.policy_snapshot != self._async_snapshot:
+                        self._async_coordinator.fail(
+                            "request references an unpublished snapshot"
+                        )
+                        raise RuntimeError("async request policy snapshot mismatch")
+                self._async_claimed_count += len(requests)
+                self._increment_histogram(
+                    self._async_claim_size_histogram, len(requests)
+                )
+                scheduler.add(requests)
+            return len(requests)
+
+        # Merge requests already visible in the coordinator before selecting
+        # a retained group. This prevents an aged singleton from launching
+        # just as compatible peers arrive.
+        claim(0.0 if scheduler.pending_count else wait_seconds)
+        scheduled = scheduler.pop_ready()
+        if scheduled is None:
+            claim(wait_seconds)
+            scheduled = scheduler.pop_ready()
+        if scheduled is None:
+            return 0
+
+        grouping_key, group = scheduled
+        _snapshot, bucket = grouping_key
+        capacity = (
+            int(bucket)
+            if isinstance(bucket, int)
+            else min(
+                self._async_coordinator.slots.max_actions,
+                1 << (max(item.action_count for item in group) - 1).bit_length(),
+            )
+        )
+        stager = self._async_stagers.get(capacity)
+        if stager is None:
+            stager = PinnedObservationBatchStager(
+                self._async_coordinator.slots,
+                max_batch_size=self._async_max_inference_batch,
+                action_capacity=capacity,
+            )
+            self._async_stagers[capacity] = stager
+
+        slot_read_started = time.perf_counter()
+        batch_size = stager.gather_slots(
+            [request.slot_id for request in group]
+        )
+        self._async_segment_seconds["slot_read"] += (
+            time.perf_counter() - slot_read_started
+        )
+        collate_started = time.perf_counter()
+        batched = stager.batch_view(
+            batch_size, self.model.schema.stable_hash()
+        )
+        self._async_segment_seconds["collate"] += (
+            time.perf_counter() - collate_started
+        )
+
+        h2d_started = torch.cuda.Event(enable_timing=True)
+        h2d_finished = torch.cuda.Event(enable_timing=True)
+        forward_finished = torch.cuda.Event(enable_timing=True)
+        d2h_finished = torch.cuda.Event(enable_timing=True)
+        h2d_started.record()
+        batched.to(self.device, non_blocking=True)
+        h2d_finished.record()
+        with torch.inference_mode(), self.mixed_precision.autocast():
+            output = self.inference_model.forward_batched(
+                batched.state_card_vectors,
+                batched.state_context_flat,
+                batched.context_card_vectors,
+                batched.context_flat,
+                batched.history_tokens,
+                batched.history_key_padding_mask,
+                batched.action_features,
+                batched.action_mask,
+                batched.acting_role,
+            )
+            packed_output = torch.stack(
+                (
+                    output.win_logit.squeeze(-1),
+                    output.score_if_win.squeeze(-1),
+                    output.score_if_loss.squeeze(-1),
+                    output.p_win.squeeze(-1),
+                    output.score_mean.squeeze(-1),
+                ),
+                dim=-1,
+            ).float().contiguous()
+        forward_finished.record()
+        packed_cpu = stager.stage_outputs(packed_output)
+        d2h_finished.record()
+        d2h_finished.synchronize()
+
+        h2d_seconds = h2d_started.elapsed_time(h2d_finished) / 1000.0
+        forward_seconds = h2d_finished.elapsed_time(forward_finished) / 1000.0
+        d2h_seconds = forward_finished.elapsed_time(d2h_finished) / 1000.0
+        self._async_segment_seconds["h2d"] += h2d_seconds
+        self._async_segment_seconds["forward"] += forward_seconds
+        self._async_segment_seconds["d2h"] += d2h_seconds
+        self._async_inference_seconds += forward_seconds
+
+        publish_started = time.perf_counter()
+        slots = self._async_coordinator.slots
+        for row, request in enumerate(group):
+            count = request.action_count
+            slots.output_values[request.slot_id, :count].copy_(
+                packed_cpu[row, :count]
+            )
+            self._async_coordinator.complete(request.slot_id)
+            if request.submitted_ns > 0:
+                self._async_queue_latencies_ms.append(
+                    (time.monotonic_ns() - request.submitted_ns) / 1_000_000.0
+                )
+        self._async_segment_seconds["publish"] += (
+            time.perf_counter() - publish_started
+        )
+        self._async_request_count += len(group)
+        self._async_action_count += sum(item.action_count for item in group)
+        self._async_microbatch_count += 1
+        self._increment_histogram(self._async_bucket_histogram, bucket)
+        self._increment_histogram(self._async_batch_size_histogram, len(group))
+        return len(group)
+
+    def _publish_async_snapshot(self) -> None:
+        """Atomically switch inference weights only at a quiescent boundary."""
+        self._async_coordinator.quiesce()
+        self.inference_model.load_state_dict(self.model.state_dict(), strict=True)
+        self.inference_model.eval()
+        torch.cuda.synchronize(self.device)
+        with self._async_policy_step.get_lock():
+            self._async_policy_step.value = self.policy_step
+        self._async_snapshot = self.policy_step
+
+    def _collect_episodes_async(self, target: int) -> None:
+        """Collect async episodes while propagating every coordinator failure."""
+        try:
+            self._collect_episodes_async_impl(target)
+        except BaseException as exc:
+            if self._async_runtime_started:
+                self._async_coordinator.fail(
+                    f"main async collection failed: {type(exc).__name__}: {exc}"
+                )
+            raise
+
+    def _collect_episodes_async_impl(self, target: int) -> None:
+        if target < 0:
+            raise ValueError("num_episodes must be non-negative")
+        if not self._async_runtime_started:
+            self._start_async_runtime()
+        for episode_id in range(target):
+            self._async_tasks.put(episode_id)
+        completed = 0
+        expected_transitions = 0
+        received_transitions = 0
+        while completed < target or received_transitions < expected_transitions:
+            self._service_async_requests()
+            received_transitions += self._drain_async_replay()
+            for process in self._async_workers:
+                if process.exitcode is not None:
+                    self._async_coordinator.fail(
+                        f"worker {process.name} exited with code {process.exitcode}"
+                    )
+                    raise RuntimeError("async V2 actor exited unexpectedly")
+            try:
+                event = self._async_events.get_nowait()
+            except __import__("queue").Empty:
+                continue
+            if event[0] == "failed":
+                raise RuntimeError(f"async actor {event[1]} failed: {event[2]}")
+            if event[0] == "started":
+                self._async_coordinator.active_games += 1
+                continue
+            if event[0] == "completed":
+                completed += 1
+                self._async_coordinator.active_games -= 1
+                count = int(event[3])
+                decision_count = int(event[6])
+                expected_transitions += count
+                self.stats.episodes_completed += 1
+                self.stats.transitions_collected += count
+                self.stats.decisions_collected += decision_count
+                team = "landlord" if int(event[4]) == 0 else "farmer"
+                self.stats.episodes_per_team[team] = (
+                    self.stats.episodes_per_team.get(team, 0) + 1
+                )
+        # Queue implementations may publish the final slot just after the
+        # completion event; drain until counters agree, never guess.
+        deadline = time.monotonic() + self._async_coordinator.request_timeout_seconds
+        while received_transitions < expected_transitions:
+            received_transitions += self._drain_async_replay()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out committing completed async episodes")
+            time.sleep(0.001)
+
     def collect_episodes(self, num_episodes: int | None = None) -> None:
         """Run ``num_episodes`` self-play games and add them to the buffer."""
         target = num_episodes if num_episodes is not None else self.config.max_episodes
+        if self.async_mode:
+            self._collect_episodes_async(target)
+            return
         for _ in range(target):
             episode = self._run_one_episode()
+            self.stats.decisions_collected += len(episode.action_trace)
             self.stats.redeals += episode.redeal_count
             self.stats.max_redeals_exceeded += int(
                 episode.max_redeals_exceeded
@@ -677,6 +1099,166 @@ class V2Trainer:
                 self.stats.bidding_transitions_collected += len(
                     episode.bidding_transitions
                 )
+
+    def _reset_cycle_interval_metrics(self) -> None:
+        self._learner_gpu_seconds = 0.0
+        if self.async_mode:
+            self._reset_async_interval_metrics()
+
+    def _quiesce_cycle_boundary(
+        self, *, consume_interval_metrics: bool
+    ) -> dict[str, object]:
+        """Quiesce, optionally consuming metrics for one controller cycle."""
+        learner_gpu_seconds = self._learner_gpu_seconds
+        if self.async_mode:
+            if not self._async_runtime_started:
+                status = {
+                    "active_slots": 0, "in_flight_slots": 0,
+                    "ready_requests": 0, "running_requests": 0,
+                    "replay_occupancy": len(self.buffer),
+                    "bidding_replay_occupancy": 0, "quiesce_seconds": 0.0,
+                    "requests_per_microbatch": 0.0,
+                    "actions_per_microbatch": 0.0,
+                    "inference_queue_p50_ms": 0.0,
+                    "inference_queue_p95_ms": 0.0,
+                    "inference_gpu_seconds": 0.0,
+                    "learner_gpu_seconds": learner_gpu_seconds,
+                    "policy_lag": 0,
+                    "games_per_actor": self.config.games_per_actor,
+                    "claimed_requests": 0,
+                    "pending_requests": 0,
+                    "claim_size_histogram": {},
+                    "inference_bucket_histogram": {},
+                    "microbatch_size_histogram": {},
+                }
+                for name in (
+                    "claim_wait", "slot_read", "collate", "h2d",
+                    "forward", "d2h", "publish", "replay_drain",
+                ):
+                    status[f"{name}_seconds"] = 0.0
+                if consume_interval_metrics:
+                    self._reset_cycle_interval_metrics()
+                return status
+            started = time.perf_counter()
+            self._drain_async_replay()
+            counts = self._async_coordinator.quiesce()
+            latencies = sorted(self._async_queue_latencies_ms)
+            percentile = lambda q: (
+                latencies[min(len(latencies) - 1, int((len(latencies) - 1) * q))]
+                if latencies else 0.0
+            )
+            status = {
+                "active_slots": counts["writing"] + counts["ready"] + counts["running"],
+                "in_flight_slots": counts["ready"] + counts["running"],
+                "ready_requests": counts["ready"],
+                "running_requests": counts["running"],
+                "replay_occupancy": len(self.buffer),
+                "bidding_replay_occupancy": 0,
+                "quiesce_seconds": time.perf_counter() - started,
+                "requests_per_microbatch": (
+                    self._async_request_count / max(1, self._async_microbatch_count)
+                ),
+                "actions_per_microbatch": (
+                    self._async_action_count / max(1, self._async_microbatch_count)
+                ),
+                "inference_queue_p50_ms": percentile(0.50),
+                "inference_queue_p95_ms": percentile(0.95),
+                "inference_gpu_seconds": self._async_inference_seconds,
+                "learner_gpu_seconds": learner_gpu_seconds,
+                "policy_lag": self.policy_step - self._async_snapshot,
+                "games_per_actor": getattr(
+                    getattr(self, "config", None), "games_per_actor", 4
+                ),
+                "claimed_requests": getattr(self, "_async_claimed_count", 0),
+                "pending_requests": getattr(
+                    getattr(self, "_async_pending_scheduler", None),
+                    "pending_count", 0,
+                ),
+                "claim_size_histogram": dict(
+                    getattr(self, "_async_claim_size_histogram", {})
+                ),
+                "inference_bucket_histogram": dict(
+                    getattr(self, "_async_bucket_histogram", {})
+                ),
+                "microbatch_size_histogram": dict(
+                    getattr(self, "_async_batch_size_histogram", {})
+                ),
+            }
+            segments = getattr(self, "_async_segment_seconds", {})
+            for name in (
+                "claim_wait", "slot_read", "collate", "h2d",
+                "forward", "d2h", "publish", "replay_drain",
+            ):
+                status[f"{name}_seconds"] = float(segments.get(name, 0.0))
+            if consume_interval_metrics:
+                self._reset_cycle_interval_metrics()
+            return status
+        status = {
+            "active_slots": 0,
+            "in_flight_slots": 0,
+            "ready_requests": 0,
+            "running_requests": 0,
+            "replay_occupancy": len(self.buffer),
+            "bidding_replay_occupancy": len(self.bidding_buffer),
+            "quiesce_seconds": 0.0,
+            "learner_gpu_seconds": learner_gpu_seconds,
+        }
+        if consume_interval_metrics:
+            self._reset_cycle_interval_metrics()
+        return status
+
+    def quiesce_cycle_boundary(self) -> dict[str, object]:
+        """Establish a checkpoint-safe boundary and consume cycle metrics."""
+        return self._quiesce_cycle_boundary(consume_interval_metrics=True)
+
+    def clear_replay(self) -> None:
+        """Clear card-play and bidding replay at an explicit cycle boundary."""
+        self.buffer.clear()
+        self.bidding_buffer.clear()
+
+    def shutdown(self) -> None:
+        """Release trainer background resources (none in single-process mode)."""
+        if self.async_mode and self._async_runtime_started:
+            active_exception = sys.exc_info()[0] is not None
+            cleanup_error: BaseException | None = None
+            alive = []
+            try:
+                # Wake actors blocked in acquire/wait_done/replay handoff before
+                # waiting for process joins. Queue sentinels alone cannot wake
+                # an actor that is already waiting on an inference request.
+                self._async_coordinator.request_shutdown()
+                for _ in self._async_workers:
+                    self._async_tasks.put(None)
+                deadline = time.monotonic() + 5.0
+                for process in self._async_workers:
+                    process.join(max(0.0, deadline - time.monotonic()))
+                alive = [process for process in self._async_workers if process.is_alive()]
+                if alive:
+                    cleanup_error = RuntimeError("async actor shutdown timed out")
+            except BaseException as exc:
+                cleanup_error = exc
+            finally:
+                for process in self._async_workers:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(1.0)
+                for close in (
+                    self._async_coordinator.shutdown,
+                    self._async_replay_slots.close,
+                    self._async_tasks.close,
+                    self._async_events.close,
+                ):
+                    try:
+                        close()
+                    except BaseException as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                getattr(self, "_async_stagers", {}).clear()
+                self._async_pending_scheduler = None
+                self._async_runtime_started = False
+            if cleanup_error is not None and not active_exception:
+                raise cleanup_error
+        return None
 
     def _run_one_episode(self) -> Episode:
         """Play one game to terminal, recording decisions and labels."""
@@ -819,6 +1401,8 @@ class V2Trainer:
                         position=position,
                         trace_index=len(episode.action_trace),
                         policy_id=policy_version_at_start,
+                        policy_version=policy_version_at_start,
+                        policy_step=policy_step_at_start,
                     )
                 )
             episode.action_trace.append((position, tuple(sorted(action))))
@@ -913,6 +1497,30 @@ class V2Trainer:
             belief_features=belief_features,
             belief_stop_gradient=self.belief_training_mode != "joint",
         )
+
+    def _forward_batched_bundle(self, bundle, belief_features=None):
+        """Move a padded decision batch once and execute one model forward."""
+        if self.distributed.enabled:
+            raise RuntimeError("forward_batched is not routed through the DDP wrapper")
+        bundle.to(self.device)
+        if belief_features is not None:
+            belief_features = belief_features.to(self.device)
+        with self.mixed_precision.autocast():
+            return self.model.forward_batched(
+                bundle.state_card_vectors,
+                bundle.state_context_flat,
+                bundle.context_card_vectors,
+                bundle.context_flat,
+                bundle.history_tokens,
+                bundle.history_key_padding_mask,
+                bundle.action_features,
+                bundle.action_mask,
+                bundle.acting_role,
+                belief_features=belief_features,
+                belief_stop_gradient=self.belief_training_mode != "joint",
+                strategy_features=bundle.strategy_features,
+                style_features=bundle.style_features,
+            )
 
     def _inference_forward_bundle(self, bundle, belief_features=None):
         """Forward rank-local self-play without entering a DDP sync point."""
@@ -1157,6 +1765,17 @@ class V2Trainer:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
+    def _v3_trainer_config_identity(self) -> tuple[dict, str]:
+        payload = asdict(self.config)
+        for name in (
+            "v2_training_mode", "num_actors", "games_per_actor",
+            "replay_schema_version",
+            "snapshot_publication_semantics", "request_ordering_semantics",
+        ):
+            payload.pop(name, None)
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
     def _require_single_process_checkpoint_io(self, operation: str) -> None:
         """Reject distributed trainer save/resume before touching the path."""
         if self.distributed.enabled or self.distributed.world_size != 1:
@@ -1170,6 +1789,8 @@ class V2Trainer:
     ) -> dict:
         """Atomically save resumable optimizer/counter/RNG and identity state."""
         self._require_single_process_checkpoint_io("save")
+        if self.async_mode:
+            self._quiesce_cycle_boundary(consume_interval_metrics=False)
         from douzero.observation.bidding import (
             BIDDING_ACTION_SCHEMA_VERSION,
             BIDDING_HEAD_VERSION,
@@ -1197,10 +1818,17 @@ class V2Trainer:
                 "resumable trainer checkpoints require a full source Git SHA; "
                 "build from a Git checkout or set DOUZERO_GIT_SHA"
             )
-        trainer_config, trainer_config_hash = self._trainer_config_identity()
+        checkpoint_version = (
+            3 if self.config.v2_training_mode == _SINGLE_PROCESS_TOPOLOGY
+            else _TRAINER_CHECKPOINT_VERSION
+        )
+        if checkpoint_version == 3:
+            trainer_config, trainer_config_hash = self._v3_trainer_config_identity()
+        else:
+            trainer_config, trainer_config_hash = self._trainer_config_identity()
         bundle = {
-            "checkpoint_version": _TRAINER_CHECKPOINT_VERSION,
-            "training_topology": _SINGLE_PROCESS_TOPOLOGY,
+            "checkpoint_version": checkpoint_version,
+            "training_topology": self.config.v2_training_mode,
             "training_world_size": 1,
             "source_git_sha": source_sha,
             "model_state_dict": self.model.state_dict(),
@@ -1262,6 +1890,15 @@ class V2Trainer:
                 "belief_alternating_interval": self.config.belief_alternating_interval,
                 "belief_supervised_batch_size": self.config.belief_supervised_batch_size,
             })
+        if checkpoint_version >= 4:
+            bundle.update({
+                "num_actors": self.config.num_actors,
+                "games_per_actor": self.config.games_per_actor,
+                "replay_schema_version": self.config.replay_schema_version,
+                "snapshot_publication_semantics": self.config.snapshot_publication_semantics,
+                "request_ordering_semantics": self.config.request_ordering_semantics,
+                "actor_rng_resume_semantics": _ACTOR_RNG_RESUME_SEMANTICS,
+            })
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(
@@ -1297,6 +1934,12 @@ class V2Trainer:
                 "belief_supervised_weight", "belief_alternating_interval",
                 "belief_supervised_batch_size",
             ])
+        if checkpoint_version >= 4:
+            identity_keys.extend([
+                "num_actors", "games_per_actor", "replay_schema_version",
+                "snapshot_publication_semantics", "request_ordering_semantics",
+                "actor_rng_resume_semantics",
+            ])
         identity = {
             key: bundle[key]
             for key in identity_keys
@@ -1307,6 +1950,11 @@ class V2Trainer:
     def load_training_checkpoint(self, path: str) -> dict:
         """Strictly restore a checkpoint saved by :meth:`save_training_checkpoint`."""
         self._require_single_process_checkpoint_io("resume")
+        if self.async_mode and self._async_runtime_started:
+            raise RuntimeError(
+                "async checkpoint resume requires a fresh V2Trainer before "
+                "Actor startup; live Actors retain process-local RNG state"
+            )
         from douzero.checkpoint.io import CheckpointCompatibilityError
         from douzero.observation.bidding import (
             BIDDING_ACTION_SCHEMA_VERSION,
@@ -1314,11 +1962,15 @@ class V2Trainer:
         )
 
         bundle = torch.load(path, map_location=self.device, weights_only=True)
-        if (
-            not isinstance(bundle, dict)
-            or bundle.get("checkpoint_version") != _TRAINER_CHECKPOINT_VERSION
-        ):
+        if not isinstance(bundle, dict):
             raise CheckpointCompatibilityError("unsupported V2 trainer checkpoint")
+        checkpoint_version = bundle.get("checkpoint_version")
+        if checkpoint_version not in _COMPATIBLE_TRAINER_CHECKPOINT_VERSIONS:
+            raise CheckpointCompatibilityError("unsupported V2 trainer checkpoint")
+        if checkpoint_version == 3 and self.config.v2_training_mode != _SINGLE_PROCESS_TOPOLOGY:
+            raise CheckpointCompatibilityError(
+                "v3 checkpoints are single_process only and cannot resume async_single_gpu"
+            )
         active_ruleset = self.ruleset or RuleSet.legacy()
         source_sha = git_sha()
         if (
@@ -1330,7 +1982,7 @@ class V2Trainer:
                 "resumable trainer checkpoints require a full runtime Git SHA"
             )
         expected = {
-            "training_topology": _SINGLE_PROCESS_TOPOLOGY,
+            "training_topology": self.config.v2_training_mode,
             "training_world_size": 1,
             "source_git_sha": source_sha,
             "policy_version": self.policy_version,
@@ -1363,8 +2015,19 @@ class V2Trainer:
             "replay_resume_policy": "flushed_checkpoint_boundary_v1",
         }
         trainer_config, trainer_config_hash = self._trainer_config_identity()
+        if checkpoint_version == 3:
+            trainer_config, trainer_config_hash = self._v3_trainer_config_identity()
         expected["trainer_config"] = trainer_config
         expected["trainer_config_hash"] = trainer_config_hash
+        if checkpoint_version >= 4:
+            expected.update({
+                "num_actors": self.config.num_actors,
+                "games_per_actor": self.config.games_per_actor,
+                "replay_schema_version": self.config.replay_schema_version,
+                "snapshot_publication_semantics": self.config.snapshot_publication_semantics,
+                "request_ordering_semantics": self.config.request_ordering_semantics,
+                "actor_rng_resume_semantics": _ACTOR_RNG_RESUME_SEMANTICS,
+            })
         if self.belief_training_mode != "frozen":
             expected.update({
                 "belief_training_mode": self.belief_training_mode,
@@ -1453,12 +2116,17 @@ class V2Trainer:
             np.random.RandomState().set_state(probe_numpy)
             probe_torch_rng = torch.Generator(device="cpu")
             probe_torch_rng.set_state(rng["torch"].cpu())
+            cuda_rng_state = rng["cuda"]
             if self.device.type == "cuda":
-                if not isinstance(rng["cuda"], torch.Tensor):
+                if not isinstance(cuda_rng_state, torch.Tensor):
                     raise ValueError("CUDA trainer resume requires CUDA RNG state")
+                # ``map_location=self.device`` also moves serialized RNG state.
+                # PyTorch generators require their opaque state as a CPU
+                # ByteTensor even when the generator itself targets CUDA.
+                cuda_rng_state = cuda_rng_state.cpu()
                 probe_cuda_rng = torch.Generator(device=self.device)
-                probe_cuda_rng.set_state(rng["cuda"])
-            elif rng["cuda"] is not None:
+                probe_cuda_rng.set_state(cuda_rng_state)
+            elif cuda_rng_state is not None:
                 raise ValueError("CPU trainer checkpoint must not carry CUDA RNG state")
             policy_step = bundle["policy_step"]
             if (
@@ -1514,17 +2182,25 @@ class V2Trainer:
         self._opening_prediction_sum = float(counters["opening_prediction_sum"])
         self._opening_prediction_count = int(counters["opening_prediction_count"])
         self._first_bidder_game_index = int(counters["first_bidder_game_index"])
+        if self.async_mode:
+            self.inference_model.load_state_dict(self.model.state_dict(), strict=True)
+            self.inference_model.eval()
+            self._async_snapshot = self.policy_step
+            if self._async_runtime_started:
+                with self._async_policy_step.get_lock():
+                    self._async_policy_step.value = self.policy_step
         self.rng.setstate(rng["trainer"])
         random.setstate(rng["python"])
         np.random.set_state(self._decode_numpy_rng_state(rng["numpy"]))
         torch.random.set_rng_state(rng["torch"].cpu())
-        if rng["cuda"] is not None:
-            torch.cuda.set_rng_state(rng["cuda"], self.device)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, self.device)
         self.model.eval()
         if self.belief_model is not None:
             self.belief_model.eval()
         self._restore_belief_trainability()
         identity = {name: bundle[name] for name in expected}
+        identity["checkpoint_version"] = checkpoint_version
         identity["policy_step_semantics"] = policy_step_semantics
         identity["long_running_state"] = bundle.get("long_running_state")
         return identity
@@ -1580,43 +2256,123 @@ class V2Trainer:
             def loss_closure():
                 nonlocal components, aux_diag, bc_diag, bid_diag, belief_diag
                 nonlocal win_logit, score_if_win, score_if_loss
-                gathered_win: list[torch.Tensor] = []
-                gathered_siw: list[torch.Tensor] = []
-                gathered_sil: list[torch.Tensor] = []
-                gathered_aux: dict[str, list[torch.Tensor]] = {
-                    "min_turns_after": [], "regain_initiative_logit": [],
-                    "teammate_finish_logit": [], "spring_probability_logit": [],
-                    "structure_cost": [],
-                }
-                for i, obs in enumerate(batch.observations):
-                    bundle = observation_to_model_inputs(
-                        obs, self.model.strategy_feature_config(),
-                        style_enabled=self.model.config.style_enabled,
-                    )
-                    out = self._forward_bundle(
-                        bundle,
-                        self._compute_belief_feature(
-                            obs, differentiable=differentiable_belief
-                        ),
-                    )
-                    idx = int(batch.action_indices[i].item())
-                    gathered_win.append(out.win_logit[idx : idx + 1])
-                    gathered_siw.append(out.score_if_win[idx : idx + 1])
-                    gathered_sil.append(out.score_if_loss[idx : idx + 1])
-                    if self.model.config.strategy_aux_enabled:
-                        for name in gathered_aux:
-                            tensor = getattr(out, name)
-                            if tensor is None:
-                                raise RuntimeError(
-                                    f"strategy auxiliary head {name!r} disappeared mid-training"
-                                )
-                            gathered_aux[name].append(tensor[idx : idx + 1])
+                gathered_aux: dict[str, torch.Tensor] = {}
+                if not self.distributed.enabled:
+                    from douzero.models_v2.batch import model_input_bundles_to_batch
 
-                # Keep all numerically sensitive objectives in float32 even
-                # when the model forward ran under autocast.
-                win_logit = torch.cat(gathered_win, dim=0).float()
-                score_if_win = torch.cat(gathered_siw, dim=0).float()
-                score_if_loss = torch.cat(gathered_sil, dim=0).float()
+                    output_names = (
+                        "win_logit", "score_if_win", "score_if_loss",
+                        "min_turns_after", "regain_initiative_logit",
+                        "teammate_finish_logit", "spring_probability_logit",
+                        "structure_cost",
+                    )
+                    rows: dict[str, list[torch.Tensor | None]] = {
+                        name: [None] * len(batch.action_indices)
+                        for name in output_names
+                    }
+                    groups: dict[int | str, list[int]] = {}
+                    for index in range(len(batch.action_indices)):
+                        action_count = (
+                            len(batch.observations[index].actions.legal_actions)
+                            if batch.model_inputs is None
+                            else int(batch.model_inputs[index].action_features.shape[0])
+                        )
+                        groups.setdefault(
+                            action_count_bucket(action_count), []
+                        ).append(index)
+
+                    for indices in groups.values():
+                        chosen = batch.action_indices[indices]
+                        if batch.model_inputs is None:
+                            observations = [batch.observations[i] for i in indices]
+                            bundle = observation_batch_to_model_inputs(
+                                observations,
+                                chosen,
+                                strategy_config=self.model.strategy_feature_config(),
+                                style_enabled=self.model.config.style_enabled,
+                            )
+                            belief_values = [
+                                self._compute_belief_feature(
+                                    obs, differentiable=differentiable_belief
+                                )
+                                for obs in observations
+                            ]
+                            belief_features = (
+                                torch.stack(belief_values)
+                                if belief_values and belief_values[0] is not None
+                                else None
+                            )
+                        else:
+                            bundle = model_input_bundles_to_batch(
+                                [batch.model_inputs[i] for i in indices], chosen
+                            )
+                            # Compact replay is currently async-only, and async
+                            # startup rejects every belief mode. It intentionally
+                            # stores model tensors rather than ObservationV2.
+                            belief_features = None
+                        out = self._forward_batched_bundle(bundle, belief_features)
+                        gathered = out.gather_chosen(bundle.chosen_action_index)
+                        for name in output_names:
+                            value = gathered[name]
+                            if value is None:
+                                continue
+                            for row, original_index in enumerate(indices):
+                                rows[name][original_index] = value[row : row + 1].float()
+
+                    def combine(name: str) -> torch.Tensor:
+                        values = rows[name]
+                        if any(value is None for value in values):
+                            raise RuntimeError(
+                                f"batched learner output {name!r} is partially populated"
+                            )
+                        return torch.cat(values, dim=0)  # type: ignore[arg-type]
+
+                    win_logit = combine("win_logit")
+                    score_if_win = combine("score_if_win")
+                    score_if_loss = combine("score_if_loss")
+                    for name in output_names[3:]:
+                        if all(value is not None for value in rows[name]):
+                            gathered_aux[name] = combine(name)
+                else:
+                    gathered_win: list[torch.Tensor] = []
+                    gathered_siw: list[torch.Tensor] = []
+                    gathered_sil: list[torch.Tensor] = []
+                    gathered_aux_lists: dict[str, list[torch.Tensor]] = {
+                        "min_turns_after": [], "regain_initiative_logit": [],
+                        "teammate_finish_logit": [], "spring_probability_logit": [],
+                        "structure_cost": [],
+                    }
+                    for i, obs in enumerate(batch.observations):
+                        scalar_bundle = observation_to_model_inputs(
+                            obs, self.model.strategy_feature_config(),
+                            style_enabled=self.model.config.style_enabled,
+                        )
+                        scalar_out = self._forward_bundle(
+                            scalar_bundle,
+                            self._compute_belief_feature(
+                                obs, differentiable=differentiable_belief
+                            ),
+                        )
+                        idx = int(batch.action_indices[i].item())
+                        gathered_win.append(scalar_out.win_logit[idx : idx + 1])
+                        gathered_siw.append(scalar_out.score_if_win[idx : idx + 1])
+                        gathered_sil.append(scalar_out.score_if_loss[idx : idx + 1])
+                        if self.model.config.strategy_aux_enabled:
+                            for name in gathered_aux_lists:
+                                tensor = getattr(scalar_out, name)
+                                if tensor is None:
+                                    raise RuntimeError(
+                                        f"strategy auxiliary head {name!r} disappeared mid-training"
+                                    )
+                                gathered_aux_lists[name].append(tensor[idx : idx + 1])
+                    win_logit = torch.cat(gathered_win, dim=0).float()
+                    score_if_win = torch.cat(gathered_siw, dim=0).float()
+                    score_if_loss = torch.cat(gathered_sil, dim=0).float()
+                    gathered_aux = {
+                        name: torch.cat(values, dim=0).float()
+                        for name, values in gathered_aux_lists.items()
+                        if values
+                    }
                 labels = {
                     "target_win": batch.target_win.to(self.device),
                     "target_score": batch.target_score.to(self.device),
@@ -1647,10 +2403,7 @@ class V2Trainer:
                     targets = {
                         name: value.to(self.device) for name, value in targets.items()
                     }
-                    predictions = {
-                        name: torch.cat(values, dim=0).float()
-                        for name, values in gathered_aux.items()
-                    }
+                    predictions = gathered_aux
                     aux_components = strategy_auxiliary_loss(
                         predictions, targets, self.loss_fn.config
                     )
@@ -1713,6 +2466,11 @@ class V2Trainer:
                         total = total + weighted_belief
                 return total
 
+            gpu_start = gpu_end = None
+            if self.device.type == "cuda":
+                gpu_start = torch.cuda.Event(enable_timing=True)
+                gpu_end = torch.cuda.Event(enable_timing=True)
+                gpu_start.record()
             step_result = self.mixed_precision.step(
                 loss_closure, self.optimizer, self._optimizer_parameters,
                 max_grad_norm=self.config.max_grad_norm,
@@ -1722,6 +2480,10 @@ class V2Trainer:
                 capture_retry_state=self._capture_retry_rng_state,
                 restore_retry_state=self._restore_retry_rng_state,
             )
+            if gpu_end is not None:
+                gpu_end.record()
+                gpu_end.synchronize()
+                self._learner_gpu_seconds += gpu_start.elapsed_time(gpu_end) / 1000.0
             if components is None or win_logit is None:
                 raise RuntimeError("optimizer closure did not produce diagnostics")
             total_loss = step_result.loss
@@ -1729,6 +2491,8 @@ class V2Trainer:
             self.stats.amp_fallbacks = self.mixed_precision.fallback_count
             self.stats.optimizer_steps += 1
             self.policy_step += 1
+            if self.async_mode:
+                self._publish_async_snapshot()
             if belief_diag:
                 self.stats.belief_supervised_steps += 1
             # Merge BC diagnostics into the last_loss log dict when active.

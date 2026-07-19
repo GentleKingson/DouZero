@@ -36,7 +36,13 @@ guard enforces this at the deployment boundary.
 from __future__ import annotations
 
 from douzero.models_v2.action_encoder import ActionEncoder
-from douzero.models_v2.batch import ModelInputBundle, observation_to_model_inputs
+from douzero.models_v2.batch import (
+    BatchedModelInputBundle,
+    ModelInputBundle,
+    model_input_bundles_to_batch,
+    observation_batch_to_model_inputs,
+    observation_to_model_inputs,
+)
 from douzero.models_v2.card_encoder import CardSetEncoder, MultiCardSetEncoder
 from douzero.models_v2.config import (
     HISTORY_ENCODER_LSTM,
@@ -67,6 +73,9 @@ __all__ = [
     "HISTORY_ENCODER_LSTM",
     # batch bridge
     "ModelInputBundle",
+    "BatchedModelInputBundle",
+    "observation_batch_to_model_inputs",
+    "model_input_bundles_to_batch",
     "observation_to_model_inputs",
     # sub-modules (for tests / introspection)
     "CardSetEncoder",

@@ -12,6 +12,7 @@ def test_training_system_benchmark_reports_all_required_components():
         "queue_wait",
         "learner_forward_backward_step",
         "weight_sync",
+        "compact_replay_ingest_64_near_capacity",
     }
     assert set(report["forward_comparison_ms"]) == {
         "legacy_fp32",

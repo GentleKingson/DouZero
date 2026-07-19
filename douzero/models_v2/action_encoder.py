@@ -79,9 +79,10 @@ class ActionEncoder(nn.Module):
         torch.Tensor
             Shape ``(N, hidden_size)``.
         """
-        if action_features.ndim != 2:
+        if action_features.ndim not in (2, 3):
             raise ValueError(
-                f"action_features must be 2-D (N, action_width), got shape {tuple(action_features.shape)}"
+                "action_features must be (N, action_width) or "
+                f"(B, A, action_width), got shape {tuple(action_features.shape)}"
             )
         if action_features.shape[-1] != self.action_width:
             raise ValueError(
@@ -99,7 +100,7 @@ class ActionEncoder(nn.Module):
                 raise ValueError(
                     "strategy_features are required by a strategy-enabled ActionEncoder"
                 )
-            expected = (action_features.shape[0], self.strategy_width)
+            expected = (*action_features.shape[:-1], self.strategy_width)
             if tuple(strategy_features.shape) != expected:
                 raise ValueError(
                     f"strategy_features must have shape {expected}, got "

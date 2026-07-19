@@ -159,6 +159,23 @@ by default — arbitrary code execution via pickle is never the default path.
 The removed `TRAINING_CHECKPOINT_TRUSTED` constant (always `True`) was a
 pseudo-gate that provided no real protection; it has been deleted.
 
+## Resumable V2 trainer topology
+
+Long-running `single_process` checkpoints remain format 3 and load through the
+existing strict identity path. Format 4 is reserved for `async_single_gpu` and
+adds `num_actors`, `games_per_actor`, compact replay schema version,
+`cycle_quiescent_atomic_copy_v1` snapshot publication, and
+`policy_inference_bucket_interleaved_games_v3` request semantics. It also binds Actor
+resume behavior to `restart_from_configured_seeds_v1`: environment and action
+RNG streams restart from `seed + actor_id` and `rng_seed + actor_id` because
+process-local Actor RNG states are not serialized. A v3 checkpoint is
+accepted only by `single_process`; v3 to async, v4 async to single-process,
+unknown versions, and unknown topology fail before model or optimizer state is
+mutated. Async resume is a safe empty cycle boundary, not a claim of bitwise
+N+M determinism. Resume is rejected after Actor startup: callers must load into
+a fresh `V2Trainer`, then start Actors, so the declared restart-from-seeds RNG
+semantics cannot diverge from already-running process-local streams.
+
 ## Round-trip and tests
 
 `tests/test_checkpoint_manifest.py` pins:

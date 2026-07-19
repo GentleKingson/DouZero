@@ -188,3 +188,41 @@ class StateActionFusion(nn.Module):
         for block in self.blocks:
             h = block(h)
         return self.out_norm(h)
+
+    def forward_batched(
+        self,
+        state_trunk: torch.Tensor,
+        history_summary: torch.Tensor,
+        action_embeddings: torch.Tensor,
+        role_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse ``B`` decisions with ``A`` padded action rows in one call."""
+        if action_embeddings.ndim != 3:
+            raise ValueError("batched action_embeddings must have shape (B, A, H)")
+        batch, actions, hidden = action_embeddings.shape
+        if actions == 0:
+            raise ValueError("batched action_embeddings has zero action rows")
+        if hidden != self.hidden_size:
+            raise ValueError("batched action embedding width mismatch")
+        if state_trunk.shape != (batch, hidden):
+            raise ValueError("batched state_trunk must have shape (B, H)")
+        if history_summary.shape != (batch, hidden):
+            raise ValueError("batched history_summary must have shape (B, H)")
+        if role_indices.shape != (batch,) or role_indices.dtype != torch.long:
+            raise ValueError("role_indices must be long with shape (B,)")
+        valid_roles = ((role_indices >= 0) & (role_indices < self.num_roles)).all()
+        if role_indices.device.type == "cuda":
+            torch._assert_async(valid_roles, "role_indices contains an unsupported role")
+            role_indices = role_indices.clamp(0, self.num_roles - 1)
+        elif not bool(valid_roles):
+            raise ValueError("role_indices contains an unsupported role")
+        state_b = state_trunk.unsqueeze(1).expand(-1, actions, -1)
+        history_b = history_summary.unsqueeze(1).expand(-1, actions, -1)
+        parts = [state_b, history_b, action_embeddings]
+        if self.role_embed is not None:
+            parts.append(self.role_embed(role_indices).unsqueeze(1).expand(-1, actions, -1))
+        fused = torch.cat(parts, dim=-1)
+        h = self.input_proj(fused)
+        for block in self.blocks:
+            h = block(h)
+        return self.out_norm(h)

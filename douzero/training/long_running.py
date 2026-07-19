@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -22,8 +23,49 @@ from pathlib import Path
 from threading import Event, current_thread, main_thread
 from typing import Callable
 
+from douzero.runtime.cleanup import run_cleanup_steps
+
 
 _RUN_STATE_VERSION = 3
+_PRE_INTERLEAVED_REQUEST_ORDERING = "policy_bucket_fifo_post_first_window_v2"
+
+
+def _peak_ram_bytes() -> int | None:
+    try:
+        import resource
+        import sys
+
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        return value if sys.platform == "darwin" else value * 1024
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+class _TrainerLifecycle:
+    """Compatibility adapter while keeping controller code buffer-agnostic."""
+
+    def __init__(self, trainer) -> None:
+        self._trainer = trainer
+
+    def quiesce_cycle_boundary(self):
+        method = getattr(self._trainer, "quiesce_cycle_boundary", None)
+        return method() if method is not None else {}
+
+    def clear_replay(self) -> None:
+        method = getattr(self._trainer, "clear_replay", None)
+        if method is not None:
+            method()
+            return
+        # Checkpoint-era test doubles predate the public lifecycle contract.
+        for name in ("buffer", "bidding_buffer"):
+            buffer = getattr(self._trainer, name, None)
+            if buffer is not None:
+                buffer.clear()
+
+    def shutdown(self) -> None:
+        method = getattr(self._trainer, "shutdown", None)
+        if method is not None:
+            method()
 
 
 @dataclass(frozen=True)
@@ -41,6 +83,13 @@ class LongRunningConfig:
     save_on_interrupt: bool = True
     eval_every_cycles: int = 0
     eval_fail_fast: bool = True
+    v2_training_mode: str = "single_process"
+    num_actors: int = 1
+    games_per_actor: int = 4
+    replay_schema_version: int = 1
+    snapshot_publication_semantics: str = "cycle_quiescent_atomic_copy_v1"
+    request_ordering_semantics: str = "policy_inference_bucket_interleaved_games_v3"
+    actor_rng_resume_semantics: str = "restart_from_configured_seeds_v1"
 
     def __post_init__(self) -> None:
         integer_nonnegative = (
@@ -60,12 +109,21 @@ class LongRunningConfig:
                 raise ValueError(f"{name} must be finite and >= 0")
         if self.keep_last_checkpoints < 1:
             raise ValueError("keep_last_checkpoints must be >= 1")
+        if self.num_actors < 1 or self.games_per_actor < 1:
+            raise ValueError("num_actors and games_per_actor must be >= 1")
 
-    def resume_identity(self) -> dict[str, int]:
+    def resume_identity(self) -> dict[str, int | str]:
         """Return fields that affect the mathematical N+M trajectory."""
         return {
             "episodes_per_cycle": self.episodes_per_cycle,
             "optimizer_steps_per_cycle": self.optimizer_steps_per_cycle,
+            "v2_training_mode": self.v2_training_mode,
+            "num_actors": self.num_actors,
+            "games_per_actor": self.games_per_actor,
+            "replay_schema_version": self.replay_schema_version,
+            "snapshot_publication_semantics": self.snapshot_publication_semantics,
+            "request_ordering_semantics": self.request_ordering_semantics,
+            "actor_rng_resume_semantics": self.actor_rng_resume_semantics,
         }
 
 
@@ -82,7 +140,7 @@ class LongRunningState:
     total_wall_seconds: float = 0.0
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     run_state_version: int = _RUN_STATE_VERSION
-    cycle_identity: dict[str, int] = field(default_factory=dict)
+    cycle_identity: dict[str, int | str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, payload: dict) -> "LongRunningState":
@@ -691,6 +749,7 @@ class LongRunningTrainer:
         collect_records: bool = False,
     ) -> None:
         self.trainer = trainer
+        self.lifecycle = _TrainerLifecycle(trainer)
         self.config = config
         self.checkpoints = checkpoint_series
         self.stop = stop_controller or StopController()
@@ -708,6 +767,30 @@ class LongRunningTrainer:
             policy_step=int(trainer.policy_step),
             cycle_identity=config.resume_identity(),
         )
+        legacy_cycle_identity = {
+            "episodes_per_cycle": config.episodes_per_cycle,
+            "optimizer_steps_per_cycle": config.optimizer_steps_per_cycle,
+        }
+        pre_interleaved_identity = config.resume_identity()
+        pre_interleaved_identity.pop("games_per_actor")
+        pre_interleaved_identity["request_ordering_semantics"] = (
+            _PRE_INTERLEAVED_REQUEST_ORDERING
+        )
+        if (
+            config.v2_training_mode == "single_process"
+            and (
+                (
+                    self.state.cycle_identity == legacy_cycle_identity
+                    and config.num_actors == 1
+                    and config.replay_schema_version == 1
+                )
+                or self.state.cycle_identity == pre_interleaved_identity
+            )
+        ):
+            # These fields are inert in single-process mode. Preserve both the
+            # original two-field v3 migration and checkpoints written before
+            # interleaved async games became part of the topology identity.
+            self.state.cycle_identity = config.resume_identity()
         if self.state.cycle_identity != config.resume_identity():
             raise ValueError(
                 "long-running resume identity mismatch: checkpoint has "
@@ -783,8 +866,8 @@ class LongRunningTrainer:
         )
         records: list[dict] = []
         reason = ""
-        self.stop.install()
         try:
+            self.stop.install()
             while True:
                 elapsed = self.clock() - started
                 self.state.total_wall_seconds = base_wall_seconds + elapsed
@@ -837,6 +920,7 @@ class LongRunningTrainer:
                                 if self.state.resume_source else ""
                             ),
                             "peak_memory_bytes": self.peak_memory(),
+                            "peak_ram_bytes": _peak_ram_bytes(),
                             "evaluation_status": "not_due",
                             "evaluation_error": "",
                             "stop_reason": reason,
@@ -878,6 +962,12 @@ class LongRunningTrainer:
 
                 cycle_started = self.clock()
                 amp_before = int(self.trainer.stats.amp_fallbacks)
+                transitions_before = int(self.trainer.stats.transitions_collected)
+                decisions_before = int(getattr(
+                    self.trainer.stats,
+                    "decisions_collected",
+                    transitions_before,
+                ))
                 collection_started = self.clock()
                 self.trainer.collect_episodes(episodes)
                 collection_seconds = self.clock() - collection_started
@@ -891,6 +981,9 @@ class LongRunningTrainer:
                         f"requested {steps} optimizer steps in cycle but took {steps_taken}"
                     )
                 optimization_seconds = self.clock() - optimization_started
+                quiesce_started = self.clock()
+                boundary_status = self.lifecycle.quiesce_cycle_boundary() or {}
+                quiesce_seconds = self.clock() - quiesce_started
 
                 self.state.cycle += 1
                 self.state.total_episodes = int(self.trainer.stats.episodes_completed)
@@ -949,8 +1042,7 @@ class LongRunningTrainer:
                         checkpoint_status = "failed"
                         checkpoint_error = type(exc).__name__
                 # Saving clears replay. Non-save boundaries deliberately do so too.
-                self.trainer.buffer.clear()
-                self.trainer.bidding_buffer.clear()
+                self.lifecycle.clear_replay()
 
                 eval_status = "not_due"
                 eval_error = ""
@@ -1004,6 +1096,93 @@ class LongRunningTrainer:
                     "cycle_wall_seconds": round(self.clock() - cycle_started, 6),
                     "collection_seconds": round(collection_seconds, 6),
                     "optimization_seconds": round(optimization_seconds, 6),
+                    "cycle_quiesce_seconds": round(quiesce_seconds, 6),
+                    "replay_occupancy": int(boundary_status.get("replay_occupancy", 0)),
+                    "active_slots": int(boundary_status.get("active_slots", 0)),
+                    "in_flight_slots": int(boundary_status.get("in_flight_slots", 0)),
+                    "transitions_per_second": round(
+                        (self.state.total_transitions - transitions_before)
+                        / max(collection_seconds, 1e-12), 6
+                    ),
+                    "decisions_per_second": round(
+                        (
+                            int(getattr(
+                                self.trainer.stats,
+                                "decisions_collected",
+                                self.state.total_transitions,
+                            ))
+                            - decisions_before
+                        )
+                        / max(collection_seconds, 1e-12), 6
+                    ),
+                    "trainable_decisions_per_second": round(
+                        (self.state.total_transitions - transitions_before)
+                        / max(collection_seconds, 1e-12), 6
+                    ),
+                    "learner_steps_per_second": round(
+                        steps_taken / max(optimization_seconds, 1e-12), 6
+                    ),
+                    "requests_per_microbatch": round(
+                        float(boundary_status.get("requests_per_microbatch", 0.0)), 6
+                    ),
+                    "actions_per_microbatch": round(
+                        float(boundary_status.get("actions_per_microbatch", 0.0)), 6
+                    ),
+                    "inference_queue_p50_ms": round(
+                        float(boundary_status.get("inference_queue_p50_ms", 0.0)), 6
+                    ),
+                    "inference_queue_p95_ms": round(
+                        float(boundary_status.get("inference_queue_p95_ms", 0.0)), 6
+                    ),
+                    "inference_gpu_seconds": round(
+                        float(boundary_status.get("inference_gpu_seconds", 0.0)), 6
+                    ),
+                    "learner_gpu_seconds": round(
+                        float(boundary_status.get("learner_gpu_seconds", 0.0)), 6
+                    ),
+                    "policy_lag": int(boundary_status.get("policy_lag", 0)),
+                    "games_per_actor": int(
+                        boundary_status.get("games_per_actor", 0)
+                    ),
+                    "claimed_requests": int(
+                        boundary_status.get("claimed_requests", 0)
+                    ),
+                    "pending_requests": int(
+                        boundary_status.get("pending_requests", 0)
+                    ),
+                    "claim_size_histogram": dict(
+                        boundary_status.get("claim_size_histogram", {})
+                    ),
+                    "inference_bucket_histogram": dict(
+                        boundary_status.get("inference_bucket_histogram", {})
+                    ),
+                    "microbatch_size_histogram": dict(
+                        boundary_status.get("microbatch_size_histogram", {})
+                    ),
+                    "claim_wait_seconds": round(
+                        float(boundary_status.get("claim_wait_seconds", 0.0)), 6
+                    ),
+                    "slot_read_seconds": round(
+                        float(boundary_status.get("slot_read_seconds", 0.0)), 6
+                    ),
+                    "collate_seconds": round(
+                        float(boundary_status.get("collate_seconds", 0.0)), 6
+                    ),
+                    "h2d_seconds": round(
+                        float(boundary_status.get("h2d_seconds", 0.0)), 6
+                    ),
+                    "forward_seconds": round(
+                        float(boundary_status.get("forward_seconds", 0.0)), 6
+                    ),
+                    "d2h_seconds": round(
+                        float(boundary_status.get("d2h_seconds", 0.0)), 6
+                    ),
+                    "publish_seconds": round(
+                        float(boundary_status.get("publish_seconds", 0.0)), 6
+                    ),
+                    "replay_drain_seconds": round(
+                        float(boundary_status.get("replay_drain_seconds", 0.0)), 6
+                    ),
                     "amp_fallback": int(self.trainer.stats.amp_fallbacks) - amp_before,
                     "checkpoint_path": checkpoint_path.name if checkpoint_path else "",
                     "checkpoint_status": checkpoint_status,
@@ -1013,6 +1192,8 @@ class LongRunningTrainer:
                         if self.state.resume_source else ""
                     ),
                     "peak_memory_bytes": self.peak_memory(),
+                    "peak_ram_bytes": _peak_ram_bytes(),
+                    "peak_vram_bytes": self.peak_memory(),
                     "evaluation_status": eval_status,
                     "evaluation_error": eval_error,
                     "stop_reason": boundary_reason,
@@ -1050,8 +1231,14 @@ class LongRunningTrainer:
                     reason = boundary_reason
                     break
         finally:
-            self.stop.restore()
-            self.checkpoints.release()
+            run_cleanup_steps(
+                (
+                    self.stop.restore,
+                    self.lifecycle.shutdown,
+                    self.checkpoints.release,
+                ),
+                preserve_active_exception=sys.exc_info()[0] is not None,
+            )
         return self.state, reason, records
 
 

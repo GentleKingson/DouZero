@@ -234,14 +234,14 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def test_cli_warns_on_nondefault_legacy_fields(tmp_path):
-    """A YAML config that sets a legacy multiprocess field (e.g. num_actors)
+    """A YAML config that sets an unconsumed legacy multiprocess field
     to a non-default value should produce a visible warning."""
     import importlib.util
 
     yaml_path = tmp_path / "warn.yaml"
     yaml_path.write_text(
         "feature_version: v2\nruleset: legacy\nmodel_version: v2\nobjective: adp\n"
-        "num_actors: 99\n"
+        "gpu_devices: '3'\n"
         "loss:\n  lambda_win: 1.0\n  lambda_score: 0.5\n"
         "  lambda_uncertainty: 0.0\n  score_delta: 1.0\n"
         "  score_target_transform: raw\n  score_clamp: 32.0\n"
@@ -267,7 +267,7 @@ def test_cli_warns_on_nondefault_legacy_fields(tmp_path):
     finally:
         sys.stderr = old_stderr
     output = captured.getvalue()
-    assert "num_actors" in output
+    assert "gpu_devices" in output
     assert "WARNING" in output
 
 

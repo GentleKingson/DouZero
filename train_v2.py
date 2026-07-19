@@ -43,10 +43,25 @@ CPU smoke (no GPU required):
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from douzero.config import load_config
 from douzero.runtime import maybe_set_global_deterministic, set_global_seed
+from douzero.runtime.cleanup import run_cleanup_steps
+
+
+def _cleanup_training_runtime(
+    trainer,
+    distributed,
+    *,
+    preserve_active_exception: bool,
+) -> None:
+    """Always release trainer and distributed resources in priority order."""
+    run_cleanup_steps(
+        (trainer.shutdown, distributed.close),
+        preserve_active_exception=preserve_active_exception,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -71,6 +86,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimizer_steps", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--batch_size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--buffer_capacity", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--v2_training_mode",
+        choices=["single_process", "async_single_gpu"],
+        default=argparse.SUPPRESS,
+        help="V2 execution topology (default: single_process).",
+    )
+    parser.add_argument(
+        "--num_actors", type=int, default=argparse.SUPPRESS,
+        help="CPU actor count for --v2_training_mode async_single_gpu.",
+    )
+    parser.add_argument(
+        "--games_per_actor", type=int, default=argparse.SUPPRESS,
+        help="Interleaved games maintained by each async V2 actor.",
+    )
     parser.add_argument("--exp_epsilon", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--learning_rate", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--rmsprop_alpha", type=float, default=argparse.SUPPRESS)
@@ -280,10 +309,10 @@ def _assert_v2_identity(cfg) -> None:
         )
 
 
-#: Legacy multiprocess fields the P06 V2 trainer does NOT consume. Each entry
+#: Legacy multiprocess fields the V2 trainer does NOT consume. Each entry
 #: maps the field name to its TrainingConfig default; a non-default value in a
 #: YAML config triggers a visible warning (P06 r3 fix: these were silently
-#: ignored in r0-r2). P14's high-throughput trainer will consume them.
+#: ignored in r0-r2).
 _UNSUPPORTED_LEGACY_FIELDS: dict[str, object] = {
     "xpid": "douzero",
     "save_interval": 30,
@@ -291,7 +320,6 @@ _UNSUPPORTED_LEGACY_FIELDS: dict[str, object] = {
     "actor_device_cpu": False,
     "gpu_devices": "0",
     "num_actor_devices": 1,
-    "num_actors": 5,
     "training_device": "0",
     "load_model": False,
     "disable_checkpoint": False,
@@ -304,13 +332,11 @@ _UNSUPPORTED_LEGACY_FIELDS: dict[str, object] = {
 
 def _warn_unsupported_legacy_fields(cfg) -> None:
     """Print a visible warning when a YAML config sets a legacy multiprocess
-    field to a non-default value the P06 V2 trainer will silently ignore.
+    field to a non-default value the V2 trainer will silently ignore.
 
-    P06 r3 fix: the enhanced.yaml carries these fields for TrainingConfig
-    schema compatibility, but the single-process trainer does not consume
-    them. Rather than silently accepting a user's tuned ``num_actors: 16``
-    (which would have NO effect), we print a stderr warning naming each
-    ignored field so the user knows the V2 trainer path does not use it.
+    The enhanced YAML carries these fields for TrainingConfig schema
+    compatibility. Print a stderr warning naming each ignored field rather
+    than accepting it silently.
     """
     if cfg is None:
         return
@@ -324,11 +350,25 @@ def _warn_unsupported_legacy_fields(cfg) -> None:
 
         print(
             "[train_v2] WARNING: the following legacy multiprocess fields are "
-            "set in the config but NOT consumed by the P06 single-process V2 "
-            "trainer. They will be consumed by P14's high-throughput trainer.\n"
+            "set in the config but NOT consumed by the V2 trainer.\n"
             + "\n".join(ignored),
             file=sys.stderr,
         )
+
+
+def _resolve_v2_topology(args, yaml_cfg) -> tuple[str, int]:
+    """Resolve topology fields with the CLI > YAML > default contract."""
+    yaml_mode = getattr(yaml_cfg, "v2_training_mode", None)
+    mode = getattr(args, "v2_training_mode", yaml_mode or "single_process")
+    yaml_actors = getattr(yaml_cfg, "num_actors", None)
+    actors = getattr(
+        args,
+        "num_actors",
+        yaml_actors if yaml_actors is not None else (
+            4 if mode == "async_single_gpu" else 1
+        ),
+    )
+    return mode, actors
 
 
 def _resolve_ruleset(cfg):
@@ -816,9 +856,7 @@ def main() -> None:
     # silently pair them with the wrong observation path.
     _assert_v2_identity(yaml_cfg)
 
-    # P06 r3: warn about legacy multiprocess fields the V2 trainer does not
-    # consume, so a user who tunes num_actors / gpu_devices / etc. in the
-    # YAML is alerted that the single-process trainer ignores them.
+    # Warn only for legacy fields the V2 trainer still does not consume.
     _warn_unsupported_legacy_fields(yaml_cfg)
 
     # Build the seed/deterministic resolver. ``resolve(cli_dest, yaml_value,
@@ -849,6 +887,14 @@ def main() -> None:
     ddp_backend = resolve(
         "ddp_backend", yaml_cfg.ddp_backend if yaml_cfg else None, "auto"
     )
+    v2_training_mode, num_actors = _resolve_v2_topology(args, yaml_cfg)
+    games_per_actor = resolve(
+        "games_per_actor",
+        yaml_cfg.games_per_actor if yaml_cfg else None,
+        defaults.games_per_actor,
+    )
+    if v2_training_mode == "async_single_gpu" and ddp_enabled:
+        raise ValueError("async_single_gpu rejects DDP; use one main GPU process")
     loss_cfg = _build_loss_config(yaml_cfg)
     model_cfg = _build_model_cfg(yaml_cfg)
     belief_training_mode = resolve(
@@ -885,6 +931,12 @@ def main() -> None:
 
     import torch
 
+    if v2_training_mode == "async_single_gpu" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "--v2_training_mode async_single_gpu requires CUDA; CUDA is unavailable. "
+            "The trainer will not fall back to single_process."
+        )
+
     from douzero.runtime.distributed import initialize_distributed
 
     distributed = initialize_distributed(
@@ -894,7 +946,11 @@ def main() -> None:
         import atexit
 
         atexit.register(distributed.close)
-    requested_device = resolve("device", None, "cpu")
+    requested_device = resolve(
+        "device", None, "cuda" if v2_training_mode == "async_single_gpu" else "cpu"
+    )
+    if v2_training_mode == "async_single_gpu" and requested_device == "cpu":
+        raise ValueError("async_single_gpu requires --device cuda or --device auto")
     if distributed.enabled:
         learner_device = distributed.device
     elif requested_device == "auto":
@@ -927,6 +983,11 @@ def main() -> None:
         "compile_model", yaml_cfg.compile_model if yaml_cfg else None, False
     )
     if compile_enabled:
+        if v2_training_mode == "async_single_gpu":
+            raise NotImplementedError(
+                "async_single_gpu torch.compile is disabled until fixed-bucket "
+                "graphs are validated"
+            )
         if belief_training_mode != "frozen":
             raise NotImplementedError(
                 "compile_model has not been validated with joint/alternating "
@@ -1015,6 +1076,9 @@ def main() -> None:
             yaml_cfg.first_bidder_mode if yaml_cfg else None,
             defaults.first_bidder_mode,
         ),
+        v2_training_mode=v2_training_mode,
+        num_actors=num_actors,
+        games_per_actor=games_per_actor,
     )
     if distributed.enabled and trainer_cfg.belief_training_mode != "frozen":
         raise NotImplementedError(
@@ -1023,6 +1087,27 @@ def main() -> None:
         )
 
     ruleset = _resolve_ruleset(yaml_cfg)
+    if v2_training_mode == "async_single_gpu":
+        unsupported = []
+        if ruleset is not None:
+            unsupported.append("standard bidding")
+        for name in (
+            "belief_enabled", "style_enabled", "strategy_features_enabled",
+            "strategy_aux_enabled", "human_prior_enabled",
+        ):
+            if bool(getattr(model_cfg, name, False)):
+                unsupported.append(name)
+        if loss_cfg.lambda_bc > 0:
+            unsupported.append("RL+BC")
+        if yaml_cfg is not None and getattr(yaml_cfg, "curriculum", None) is not None:
+            curriculum = yaml_cfg.curriculum
+            if getattr(curriculum, "enabled", False):
+                unsupported.append("curriculum")
+        if unsupported:
+            raise NotImplementedError(
+                "async_single_gpu currently supports only the base legacy-ruleset "
+                "V2 path; unsupported: " + ", ".join(sorted(set(unsupported)))
+            )
     decision_cfg = _build_decision_config(yaml_cfg)
     bidding_policy_cfg = None
     if ruleset is not None:
@@ -1113,8 +1198,6 @@ def main() -> None:
     # bc_aux_samples, and bc.schedule -> BCSchedule, so the YAML config
     # ACTUALLY drives the BC auxiliary term end-to-end (not just the
     # programmatic interface tested in isolation).
-    import sys  # noqa: F811 — local import keeps the BC block self-contained
-
     bc_aux_samples = None
     bc_schedule = None
     bc_cfg = getattr(yaml_cfg, "bc", None) if yaml_cfg is not None else None
@@ -1314,6 +1397,14 @@ def main() -> None:
                 save_on_interrupt=getattr(args, "save_on_interrupt", True),
                 eval_every_cycles=getattr(args, "eval_every_cycles", 0),
                 eval_fail_fast=getattr(args, "eval_fail_fast", True),
+                v2_training_mode=trainer_cfg.v2_training_mode,
+                num_actors=trainer_cfg.num_actors,
+                games_per_actor=trainer_cfg.games_per_actor,
+                replay_schema_version=trainer_cfg.replay_schema_version,
+                snapshot_publication_semantics=(
+                    trainer_cfg.snapshot_publication_semantics
+                ),
+                request_ordering_semantics=trainer_cfg.request_ordering_semantics,
             )
             eval_command = getattr(args, "eval_command", "")
             if long_cfg.eval_every_cycles and not eval_command:
@@ -1461,7 +1552,11 @@ def main() -> None:
                 ),
             )
     finally:
-        distributed.close()
+        _cleanup_training_runtime(
+            trainer,
+            distributed,
+            preserve_active_exception=sys.exc_info()[0] is not None,
+        )
     if distributed.is_rank_zero:
         print(
         f"[train_v2] episodes_completed={stats.episodes_completed} "

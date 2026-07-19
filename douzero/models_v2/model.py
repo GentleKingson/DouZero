@@ -69,7 +69,7 @@ from .config import HISTORY_ENCODER_TRANSFORMER, ModelV2Config, SUPPORTED_ROLES
 from .fusion import StateActionFusion
 from .heads import BiddingHeads, PriorHead, StrategyAuxiliaryHeads, ValueHeads
 from .history_encoder import build_history_encoder
-from .output import BiddingModelOutput, ModelOutput
+from .output import BatchedModelOutput, BiddingModelOutput, ModelOutput
 from .state_encoder import StateEncoder
 
 #: The number of card-set sub-blocks the state encoder consumes from the state
@@ -566,6 +566,127 @@ class ModelV2(nn.Module):
                     assert_finite(tensor, name)
 
         return ModelOutput(
+            win_logit=head_out["win_logit"],
+            score_if_win=head_out["score_if_win"],
+            score_if_loss=head_out["score_if_loss"],
+            p_win=head_out["p_win"],
+            score_mean=head_out["score_mean"],
+            action_mask=action_mask,
+            prior_logit=prior_logit,
+            **aux_out,
+        )
+
+    def forward_batched(
+        self,
+        state_card_vectors: tuple[torch.Tensor, ...],
+        state_context_flat: torch.Tensor,
+        context_card_vectors: tuple[torch.Tensor, ...],
+        context_flat: torch.Tensor,
+        history_tokens: torch.Tensor,
+        history_key_padding_mask: torch.Tensor,
+        action_features: torch.Tensor,
+        action_mask: torch.Tensor,
+        acting_role: torch.Tensor,
+        belief_features: torch.Tensor | None = None,
+        belief_stop_gradient: bool = True,
+        allow_missing_belief_features: bool = False,
+        strategy_features: torch.Tensor | None = None,
+        style_features: torch.Tensor | None = None,
+    ) -> BatchedModelOutput:
+        """Run one vectorized forward over padded ``[B, Amax, ...]`` inputs.
+
+        This method adds no modules or parameters, so the model configuration
+        hash and ``state_dict`` identity are exactly those of the scalar API.
+        Padding is carried through the cheap action path and is never eligible
+        for selection or gathered learner loss.
+        """
+        if action_features.ndim != 3:
+            raise ValueError("action_features must have shape (B, A, action_width)")
+        batch, actions, _ = action_features.shape
+        if batch == 0 or actions == 0:
+            raise ValueError("ModelV2.forward_batched requires a non-empty batch")
+        if action_mask.shape != (batch, actions) or action_mask.dtype != torch.bool:
+            raise ValueError("action_mask must be bool with shape (B, A)")
+        legal_rows = action_mask.any(dim=1).all()
+        if action_mask.device.type == "cuda":
+            torch._assert_async(
+                legal_rows, "every batched decision must contain a legal action"
+            )
+        elif not bool(legal_rows):
+            raise ValueError("every batched decision must contain a legal action")
+        if acting_role.shape != (batch,) or acting_role.dtype != torch.long:
+            raise ValueError("acting_role must be long with shape (B,)")
+
+        all_card_vectors = state_card_vectors + context_card_vectors
+        full_context_flat = torch.cat([state_context_flat, context_flat], dim=-1)
+        state_trunk = self.state_encoder(all_card_vectors, full_context_flat)
+        if state_trunk.ndim != 2 or state_trunk.shape[0] != batch:
+            raise ValueError("batched state inputs must share leading dimension B")
+
+        if self.belief_proj is not None:
+            from douzero.belief.model import BELIEF_FEATURE_DIM
+
+            if belief_features is None:
+                if not allow_missing_belief_features:
+                    raise ValueError("belief_features are required by this model")
+                belief_features = state_trunk.new_zeros((batch, BELIEF_FEATURE_DIM))
+            if belief_features.shape != (batch, BELIEF_FEATURE_DIM):
+                raise ValueError(
+                    f"belief_features must have shape ({batch}, {BELIEF_FEATURE_DIM})"
+                )
+            belief_features = belief_features.to(state_trunk.device, state_trunk.dtype)
+            if belief_stop_gradient:
+                belief_features = belief_features.detach()
+            state_trunk = state_trunk + self.belief_proj(belief_features)
+        elif belief_features is not None:
+            raise ValueError("belief_features were passed to a belief-disabled model")
+
+        if self.style_encoder is not None:
+            from douzero.style.features import STYLE_FEATURE_WIDTH
+
+            if style_features is None or style_features.shape != (
+                batch, STYLE_FEATURE_WIDTH
+            ):
+                raise ValueError(
+                    f"style_features must have shape ({batch}, {STYLE_FEATURE_WIDTH})"
+                )
+            state_trunk = state_trunk + self.style_encoder(
+                style_features.to(state_trunk.device, state_trunk.dtype)
+            )
+        elif style_features is not None:
+            raise ValueError("style_features were passed to a style-disabled model")
+
+        history_summary = self.history_encoder(
+            history_tokens, history_key_padding_mask
+        )
+        action_embeddings = self.action_encoder(action_features, strategy_features)
+        fused = self.fusion.forward_batched(
+            state_trunk, history_summary, action_embeddings, acting_role
+        )
+        head_out = self.heads(fused)
+        if self.config.nan_guard:
+            from .numerical import assert_finite
+
+            assert_finite(fused, "batched_fused")
+            for name, value in head_out.items():
+                assert_finite(value, f"batched_{name}")
+        prior_logit = self.prior_head(fused) if self.prior_head is not None else None
+        aux_out: dict[str, torch.Tensor | None] = {
+            "min_turns_after": None,
+            "regain_initiative_logit": None,
+            "teammate_finish_logit": None,
+            "spring_probability_logit": None,
+            "structure_cost": None,
+        }
+        if self.strategy_aux_heads is not None:
+            aux_out.update(self.strategy_aux_heads(fused))
+        if self.config.nan_guard:
+            if prior_logit is not None:
+                assert_finite(prior_logit, "batched_prior_logit")
+            for name, value in aux_out.items():
+                if value is not None:
+                    assert_finite(value, f"batched_{name}")
+        return BatchedModelOutput(
             win_logit=head_out["win_logit"],
             score_if_win=head_out["score_if_win"],
             score_if_loss=head_out["score_if_loss"],

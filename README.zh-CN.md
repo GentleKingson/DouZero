@@ -200,6 +200,31 @@ checkpoint artifact 冲突时会在写入前失败。
 细节见
 [V2 长期训练状态机](docs/training_system.md#long-running-v2-state-machine)。
 
+V2 还提供实验性的多 CPU Actor + 单 GPU 集中推理模式。CUDA 不可用时会直接
+失败，不会回退；该模式也拒绝 DDP：
+
+```bash
+python train_v2.py --v2_training_mode async_single_gpu --device cuda \
+  --num_actors 4 --games_per_actor 4 \
+  --episodes 64 --optimizer_steps 8 --batch_size 64
+```
+
+当前异步支持范围刻意限定为 legacy ruleset 的基础 V2 出牌训练。standard
+bidding、league、curriculum、RL+BC、style、strategy 和 belief 组合都会在
+worker 启动前 fail closed。默认仍是 `single_process`，原有组合保持不变。
+由于异步响应协议尚未发布 `prior_logit`，`pure_prior` 和
+`uncertainty_gated_prior` 也会在 CUDA 检查及 worker 启动前 fail closed。
+compact replay 会在共享槽归还前和写入 replay 前分别校验 schema、Tensor、
+动作、标签及 provenance。Actor 故障与 shutdown 使用 spawn 进程共享信号，
+主进程推理故障也会发布同一 abort 信号，使正在等待槽位的其他 worker 能
+及时退出；清理错误不会覆盖正在传播的训练异常。每个 Actor 默认交错推进四局，
+请求按粗粒度推理专用 bucket 持久排队，并直接写入复用的 pinned batch；cycle
+指标会记录分段耗时和 batch 直方图。推理结果只会在每个槽位的
+进程共享 Event 建立响应内存屏障后发布。cycle 指标按区间统计，仅由公共生命
+周期边界读取并重置。Actor 发牌使用 `seed + actor_id`，epsilon 动作采样使用
+`rng_seed + actor_id`。异步恢复后，进程本地 RNG 会从配置 seed 重新开始，
+因此保证的是安全 cycle-boundary resume，而不是 bitwise N+M 等价。
+
 V2 单 GPU，并输出 checkpoint 与 metrics（PowerShell）：
 
 ```powershell

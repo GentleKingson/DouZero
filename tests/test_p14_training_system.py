@@ -539,6 +539,32 @@ def test_ddp_unsupported_file_side_effects_fail_fast(
         )
 
 
+def test_train_v2_cleanup_closes_distributed_after_shutdown_failure():
+    import train_v2
+
+    calls = []
+
+    class TrainerStub:
+        @staticmethod
+        def shutdown():
+            calls.append("shutdown")
+            raise RuntimeError("injected trainer shutdown failure")
+
+    class DistributedStub:
+        @staticmethod
+        def close():
+            calls.append("distributed_close")
+
+    with pytest.raises(RuntimeError, match="injected trainer shutdown failure"):
+        train_v2._cleanup_training_runtime(
+            TrainerStub(),
+            DistributedStub(),
+            preserve_active_exception=False,
+        )
+
+    assert calls == ["shutdown", "distributed_close"]
+
+
 @pytest.mark.parametrize(
     ("extra_args", "message"),
     [
