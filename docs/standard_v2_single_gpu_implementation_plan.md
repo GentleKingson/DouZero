@@ -147,7 +147,7 @@ flowchart LR
 - 基准脚本同时报告 head forward/backward、包含 observation tensorization、targets、实际 loss、optimizer 和 diagnostics 的 learner wall time；scalar fast path 与 batched wrapper 均分开报告 eval + inference-mode FP32 的 forward-only 和完整 argmax/host-result 决策延迟，p95 使用 nearest-rank 定义。
 - R1 seed 固定为非零值 `20260719`。旧的 16 局随机 workload 数字不再作为 M0/M1 可比证据；更新后的 CUDA artifact 必须绑定精确 head、镜像、环境、命令和完整 JSON。
 - 固定 seed 的 16 局 FP32 baseline 为 7.897 games/s、379.048 play transitions/s、21.716 bid transitions/s、262.393 learner samples/s，peak allocated VRAM 266.845 MiB。该结果只描述当前 head，不与旧 seed/workload 的 M0 数字计算 uplift；端到端提升结论必须在同一硬件、镜像构建环境、seed 和 workload 下成对运行 base/head。
-- `Standard V2 M1 GPU Evidence` 对同仓库 PR 自动运行（并保留手动触发），只在受信任代码上使用 self-hosted NVIDIA runner。它以不可变 tag 构建精确 head、随后只通过 image ID 运行，强制 B=32 mean/p95 均不高于 1.5 ms，并上传 CUDA pytest、完整 16 局 R1 baseline、环境、来源清单和 SHA-256 清单。
+- M1 不使用 GitHub GPU workflow。目标硬件验收按仓库 `AGENTS.md` 在 `LocalServer:/opt/DouZero` 的 Docker 容器中手动执行，记录精确 source SHA、标准镜像 ID、CUDA pytest、B=32 mean/p95 门槛和完整 16 局 R1 baseline；CPU CI 继续负责可移植回归检查。
 
 ### M2：Async Standard Protocol v2
 
