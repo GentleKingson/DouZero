@@ -821,7 +821,7 @@ def test_standard_training_step_and_strict_resume(tmp_path):
         lambda_bid_score=0.25,
     )
     trainer_cfg = TrainerConfig(
-        max_episodes=1,
+        max_episodes=2,
         optimizer_steps=1,
         batch_size=1,
         bidding_batch_size=2,

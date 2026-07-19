@@ -13,7 +13,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any, Mapping
 
 
-STANDARD_V2_R1_CONTRACT_VERSION = "standard-v2-r1-contract-v1"
+STANDARD_V2_R1_CONTRACT_VERSION = "standard-v2-r1-contract-v2"
 STANDARD_V2_REFERENCE_SCHEMA_VERSION = "standard-v2-r1-reference-v1"
 STANDARD_V2_BENCHMARK_SCHEMA_VERSION = "standard-v2-r1-benchmark-v1"
 STANDARD_V2_R1_REFERENCE_DIGEST = (
