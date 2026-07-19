@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
 import torch
+import yaml
 
 from benchmarks.bench_standard_v2 import build_unified_benchmark
 from benchmarks.standard_v2_reference import build_standard_v2_reference
@@ -312,6 +314,69 @@ def test_non_r1_resolved_config_cannot_emit_r1_metrics(identity_overrides):
         "reference_digest": None,
         "qualification": "non_r1",
     }
+    assert "standard_v2" not in report
+
+
+@pytest.mark.parametrize(
+    ("cli_args", "loss_override"),
+    [
+        (["--batch_size", "1"], None),
+        (["--exp_epsilon", "0.2"], None),
+        (["--amp_enabled", "--amp_dtype", "bfloat16"], None),
+        (["--bidding_policy", "rule"], None),
+        (["--first_bidder_mode", "seeded_random"], None),
+        ([], {"lambda_win": 0.75}),
+    ],
+    ids=(
+        "batch-size-cli",
+        "epsilon-cli",
+        "amp-cli",
+        "bidding-policy-cli",
+        "first-bidder-cli",
+        "loss-weight-yaml",
+    ),
+)
+def test_train_v2_overrides_cannot_emit_r1_metrics(
+    tmp_path, monkeypatch, cli_args, loss_override
+):
+    import train_v2
+
+    config_path = ROOT / "configs" / "standard_v2.yaml"
+    if loss_override is not None:
+        config_payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        config_payload["loss"].update(loss_override)
+        config_path = tmp_path / "non-r1-standard-v2.yaml"
+        config_path.write_text(
+            yaml.safe_dump(config_payload, sort_keys=False), encoding="utf-8"
+        )
+    metrics_path = tmp_path / "training-metrics.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_v2.py",
+            "--config",
+            str(config_path),
+            "--episodes",
+            "0",
+            "--optimizer_steps",
+            "0",
+            "--device",
+            "cpu",
+            "--metrics_path",
+            str(metrics_path),
+            *cli_args,
+        ],
+    )
+
+    train_v2.main()
+
+    report = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert report["benchmark_identity"]["qualification"] == "non_r1"
+    assert report["benchmark_identity"]["config_hash"] != (
+        STANDARD_V2_R1_CONFIG_HASH
+    )
+    assert report["benchmark_identity"]["reference_digest"] is None
     assert "standard_v2" not in report
 
 
