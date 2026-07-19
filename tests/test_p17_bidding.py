@@ -325,13 +325,20 @@ def test_batched_bidding_output_matches_scalar_wrapper_for_mixed_masks():
         torch.stack([output.bid_action_mask for output in scalars]),
     )
     for index, scalar in enumerate(scalars):
-        assert torch.allclose(batched.bid_logits[index], scalar.bid_logits)
-        assert torch.allclose(
-            batched.landlord_win_logit[index], scalar.landlord_win_logit
+        torch.testing.assert_close(
+            batched.bid_logits[index], scalar.bid_logits, atol=1e-6, rtol=1e-6
         )
-        assert torch.allclose(
+        torch.testing.assert_close(
+            batched.landlord_win_logit[index],
+            scalar.landlord_win_logit,
+            atol=1e-6,
+            rtol=1e-6,
+        )
+        torch.testing.assert_close(
             batched.expected_landlord_score[index],
             scalar.expected_landlord_score,
+            atol=1e-6,
+            rtol=1e-6,
         )
     assert tuple(model.state_dict()) == state_keys
 
