@@ -399,6 +399,44 @@ def test_batched_bidding_loss_and_gradients_match_b1_compatibility_path():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_batched_bidding_cuda_mixed_source_forward_loss_backward():
+    ruleset = RuleSet.standard()
+    observations = [
+        get_bidding_obs_v2(_raw_bidding_obs(history=history), ruleset=ruleset)
+        for history in ((), (("0", 1),), (("0", 1), ("1", 2)))
+    ]
+    transitions = [
+        _labelled_bidding_transition(observations[0], 1, source_policy="rule"),
+        _labelled_bidding_transition(
+            observations[1], 2, source_policy="learned"
+        ),
+        _labelled_bidding_transition(
+            observations[2], 3, source_policy="epsilon_random"
+        ),
+    ]
+    model = ModelV2(build_v2_schema(), _tiny_config()).cuda().train()
+    output = model.forward_bidding_batched(
+        bidding_observations_to_model_input(observations)
+    )
+    assert output.bid_logits.device.type == "cuda"
+    assert output.argmax_bids().shape == (3,)
+    minibatch = BiddingMinibatch(transitions)
+    components = bidding_loss(
+        output,
+        minibatch.to_targets(output.bid_logits.device),
+        lambda_policy=1.0,
+        lambda_landlord_win=0.5,
+        lambda_landlord_score=0.25,
+    )
+    components.total.backward()
+    assert torch.isfinite(components.total)
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.bidding_heads.parameters()
+    )
+
+
 def test_batched_bidding_contract_rejects_empty_and_illegal_rows():
     schema_hash = build_v2_schema().stable_hash()
     with pytest.raises(ValueError, match="legal action"):

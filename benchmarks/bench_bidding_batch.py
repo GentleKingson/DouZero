@@ -10,6 +10,7 @@ from pathlib import Path
 
 import torch
 
+from douzero._version import git_sha
 from douzero.models_v2 import BatchedBiddingInput, ModelV2, ModelV2Config
 from douzero.observation.schema import build_v2_schema
 
@@ -95,9 +96,19 @@ def run_benchmark(
             "iterations": iterations,
         })
 
+    device_metadata = None
+    if target.type == "cuda":
+        properties = torch.cuda.get_device_properties(target)
+        device_metadata = {
+            "name": properties.name,
+            "total_memory_mib": properties.total_memory / (1024 * 1024),
+            "compute_capability": f"{properties.major}.{properties.minor}",
+        }
     return {
         "schema_version": "standard-v2-bidding-microbenchmark-v1",
+        "source_git_sha": git_sha(),
         "device": str(target),
+        "device_metadata": device_metadata,
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
         "batch_sizes": list(batch_sizes),
