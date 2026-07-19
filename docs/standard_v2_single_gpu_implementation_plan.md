@@ -2,7 +2,7 @@
 
 ## 1. 文档状态
 
-- 状态：实施中（M0 已完成，下一步 M1）
+- 状态：实施中（M0、M1 已完成，下一步 M2）
 - 基准日期：2026-07-19
 - 目标硬件：单张 NVIDIA GPU，首个验收环境为 RTX 5070 12 GB
 - 目标入口：`train_v2.py --config configs/standard_v2.yaml`
@@ -107,7 +107,7 @@ flowchart LR
 
 - 冻结配置与版本注册表：`douzero/training/standard_v2_contract.py`。
 - 固定 corpus 与参考执行器：`benchmarks/standard_v2_reference.py`。
-- Golden reference：`benchmarks/baselines/standard_v2_r1_reference.json`，digest 为 `8817274e665ad6296e688044326e4c2ad1a682d6e78b6124e61081bf0f3e014e`。
+- Golden reference：`benchmarks/baselines/standard_v2_r1_reference.json`；M1 增加独立 bidding batch 语义后 contract 显式升级为 v2，当前 digest 为 `bfcefc9ab6f26f3f259c144bdf7adb7d5f1677b5e7c1a20b5024ab56dd05af18`。
 - R1 身份拆分为训练语义 hash 与 benchmark workload hash；后者绑定完整 `TrainerConfig`、设备、world size 和执行拓扑，组合 config hash 同时覆盖两者。
 - 统一基准入口：`python -m benchmarks.bench_standard_v2`。
 - 单 GPU 实测基线：`benchmarks/baselines/standard_v2_r1_single_gpu.json`。
@@ -123,19 +123,28 @@ Async checkpoint format 已升级到 `5` 并写入上述当前协议字段；for
 
 目标：独立消除 standard learner 当前最大的确定性热点，不改变模型参数或 checkpoint 模型身份。
 
-- [ ] **SV2-101** 新增 `BatchedBiddingInput`，包含 `[B, input_width]` features 和 `[B, 4]` legal mask。
-- [ ] **SV2-102** 新增 `BatchedBiddingOutput`，包含 `[B, 4]` logits、landlord win、expected score 和 optional uncertainty。
-- [ ] **SV2-103** 实现 `ModelV2.forward_bidding_batched()`；标量 `forward_bidding()` 改为 B=1 兼容包装。
-- [ ] **SV2-104** 重写 `bidding_loss()`，直接消费批量输出和批量 targets，不再 stack Python output objects。
-- [ ] **SV2-105** 移除 bidding output/mask 上逐样本的 CUDA host sync，CUDA 合法性检查使用异步断言或一次性批量检查。
-- [ ] **SV2-106** 增加独立的 `bidding_batch_size`，默认保持与旧 `batch_size` 相同以兼容旧配置。
-- [ ] **SV2-107** 可选增加 `bidding_update_interval`，使 play/bid 数据率不再强制一一同步。
-- [ ] **SV2-108** 增加标量/批量 output、loss、gradient、illegal-mask 和 mixed-source-policy 对照测试。
-- [ ] **SV2-109** 增加 B=1/32/64/128 CUDA microbenchmark。
+- [x] **SV2-101** 新增 `BatchedBiddingInput`，包含 `[B, input_width]` features 和 `[B, 4]` legal mask。
+- [x] **SV2-102** 新增 `BatchedBiddingOutput`，包含 `[B, 4]` logits、landlord win、expected score 和 optional uncertainty。
+- [x] **SV2-103** 实现 `ModelV2.forward_bidding_batched()`；标量 `forward_bidding()` 改为 B=1 兼容包装。
+- [x] **SV2-104** 重写 `bidding_loss()`，直接消费批量输出和批量 targets，不再 stack Python output objects。
+- [x] **SV2-105** 移除 bidding output/mask 上逐样本的 CUDA host sync，CUDA 合法性检查使用异步断言或一次性批量检查。
+- [x] **SV2-106** 增加独立的 `bidding_batch_size`，默认保持与旧 `batch_size` 相同以兼容旧配置。
+- [x] **SV2-107** 增加 `bidding_update_interval`，使 play/bid 数据率不再强制一一同步。
+- [x] **SV2-108** 增加标量/批量 output、loss、gradient、illegal-mask 和 mixed-source-policy 对照测试。
+- [x] **SV2-109** 增加 B=1/32/64/128 CUDA microbenchmark。
 
 交付物：批量 bidding API、批量 loss、独立 bidding batch 配置、性能测试。
 
 退出门槛：FP32 output/loss/gradient 在声明容差内一致；B=32 bidding 前后向在 RTX 5070 上不高于 1.5 ms；模型 `state_dict` key 和 checkpoint architecture identity 不变。
+
+#### M1 实施结果（2026-07-19）
+
+- 新增 dense bidding tensor contract 与单次批量 forward；训练热路径不再逐样本构造 `BiddingModelOutput` 或 stack Python outputs。
+- `bidding_loss()` 直接消费 `BatchedBiddingOutput` 和 `BatchedBiddingTargets`；CUDA mask/action 合法性使用批量异步断言，零 credit batch 保持有限零梯度。
+- `bidding_batch_size` 默认继承 play `batch_size`，`bidding_update_interval` 默认 1；两个字段进入 CLI、YAML、TrainerConfig、checkpoint trainer identity 和 R1 evidence identity。
+- bidding 模型参数和 `state_dict` key 未改变；旧 format 3/4 以及默认等价的 pre-M1 format 5 trainer identity 通过显式兼容路径加载，非默认新语义失败关闭。
+- RTX 5070、PyTorch 2.12.1+cu132、FP32、100 次采样的 forward+backward microbenchmark：B=1/32/64/128 平均分别为 0.957/0.964/0.976/0.964 ms；B=32 p95 为 1.072 ms。
+- 16 局冻结 workload 的单 GPU实测更新为 8.550 games/s、345.189 play transitions/s、24.046 bid transitions/s、253.914 learner samples/s，peak allocated VRAM 271.103 MiB。
 
 ### M2：Async Standard Protocol v2
 

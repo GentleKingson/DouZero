@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import sys
 from dataclasses import asdict, fields, replace
 from pathlib import Path
@@ -13,6 +14,7 @@ import yaml
 
 from benchmarks.bench_standard_v2 import build_unified_benchmark
 from benchmarks.standard_v2_reference import build_standard_v2_reference
+from douzero.checkpoint.io import CheckpointCompatibilityError
 from douzero.config import load_config
 from douzero.env.rules import RuleSet
 from douzero.models_v2.config import ModelV2Config
@@ -620,6 +622,24 @@ def test_async_checkpoint_v5_binds_protocol_and_loads_v4(tmp_path):
     assert identity["compact_bidding_replay_schema_version"] == 0
 
     bundle = torch.load(checkpoint, map_location="cuda", weights_only=True)
+    pre_m1 = copy.deepcopy(bundle)
+    pre_m1_config, pre_m1_hash = trainer._pre_m1_v5_trainer_config_identity()
+    pre_m1["trainer_config"] = pre_m1_config
+    pre_m1["trainer_config_hash"] = pre_m1_hash
+    pre_m1_path = tmp_path / "async-v5-pre-m1.pt"
+    torch.save(pre_m1, pre_m1_path)
+    pre_m1_restored = V2Trainer(_tiny_model(), config=config)
+    assert pre_m1_restored.load_training_checkpoint(str(pre_m1_path))[
+        "checkpoint_version"
+    ] == 5
+    incompatible_config = replace(config, bidding_batch_size=2)
+    with pytest.raises(
+        CheckpointCompatibilityError, match="pre-M1 format 5 checkpoint"
+    ):
+        V2Trainer(_tiny_model(), config=incompatible_config).load_training_checkpoint(
+            str(pre_m1_path)
+        )
+
     v4_config, v4_hash = trainer._v4_trainer_config_identity()
     bundle["checkpoint_version"] = 4
     bundle["trainer_config"] = v4_config

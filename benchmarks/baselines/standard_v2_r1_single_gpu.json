@@ -19,19 +19,19 @@
   "performance": {
     "counts": {
       "abandoned_bidding_transitions": 0,
-      "bid_transitions": 32,
-      "bidding_decisions": 32,
-      "cardplay_decisions": 1543,
+      "bid_transitions": 45,
+      "bidding_decisions": 45,
+      "cardplay_decisions": 1473,
       "games": 16,
       "learner_bidding_samples": 32,
       "learner_cardplay_samples": 32,
       "learner_samples": 64,
       "learner_steps": 1,
-      "play_transitions": 914
+      "play_transitions": 646
     },
     "gpu_seconds": {
       "inference": null,
-      "learner": 0.26431161499023437
+      "learner": 0.25119395446777343
     },
     "measurement": {
       "amp": {
@@ -55,26 +55,26 @@
       },
       "parameter_update_observed": true,
       "phase_wall_seconds": {
-        "collection": 2.477034,
-        "optimization": 0.265224,
-        "total": 2.742684
+        "collection": 1.871441,
+        "optimization": 0.252054,
+        "total": 2.123969
       },
       "source_schema_version": "p17-gpu-run-v1",
-      "training_wall_seconds": 2.742684
+      "training_wall_seconds": 2.123969
     },
-    "peak_vram_mib": 269.424,
+    "peak_vram_mib": 271.103,
     "queue_latency_ms": {
       "p50": null,
       "p95": null
     },
     "rates": {
-      "bid_transitions_per_second": 12.918676,
-      "bidding_decisions_per_second": 12.918676,
-      "cardplay_decisions_per_second": 622.922414,
-      "games_per_second": 6.459338,
-      "learner_samples_per_second": 241.305463,
-      "learner_steps_per_second": 3.770398,
-      "play_transitions_per_second": 368.989687
+      "bid_transitions_per_second": 24.045642,
+      "bidding_decisions_per_second": 24.045642,
+      "cardplay_decisions_per_second": 787.094009,
+      "games_per_second": 8.549562,
+      "learner_samples_per_second": 253.913844,
+      "learner_steps_per_second": 3.967404,
+      "play_transitions_per_second": 345.188547
     },
     "staging_seconds": null,
     "status": "measured"
