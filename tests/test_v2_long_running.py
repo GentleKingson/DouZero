@@ -513,6 +513,63 @@ def test_resume_identity_mismatch_fails_closed(tmp_path):
         _run(tmp_path, trainer, cycles=1, state=state)
 
 
+def test_single_process_migrates_pre_interleaved_cycle_identity(tmp_path):
+    trainer = _DeterministicTrainer()
+    config = LongRunningConfig(
+        episodes_per_cycle=2,
+        optimizer_steps_per_cycle=2,
+        max_cycles=1,
+        checkpoint_every_cycles=0,
+    )
+    previous_identity = config.resume_identity()
+    previous_identity.pop("games_per_actor")
+    previous_identity["request_ordering_semantics"] = (
+        "policy_bucket_fifo_post_first_window_v2"
+    )
+    state = LongRunningState(
+        policy_version=trainer.policy_version,
+        cycle_identity=previous_identity,
+    )
+
+    restored, reason, _records = LongRunningTrainer(
+        trainer,
+        config,
+        CheckpointSeries(str(tmp_path / "migrated.pt"), 1),
+        state=state,
+    ).run()
+
+    assert reason == "max_cycles"
+    assert restored.cycle_identity == config.resume_identity()
+
+
+def test_async_rejects_pre_interleaved_cycle_identity(tmp_path):
+    trainer = _DeterministicTrainer()
+    config = LongRunningConfig(
+        episodes_per_cycle=2,
+        optimizer_steps_per_cycle=2,
+        max_cycles=1,
+        v2_training_mode="async_single_gpu",
+        num_actors=4,
+    )
+    previous_identity = config.resume_identity()
+    previous_identity.pop("games_per_actor")
+    previous_identity["request_ordering_semantics"] = (
+        "policy_bucket_fifo_post_first_window_v2"
+    )
+    state = LongRunningState(
+        policy_version=trainer.policy_version,
+        cycle_identity=previous_identity,
+    )
+
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        LongRunningTrainer(
+            trainer,
+            config,
+            CheckpointSeries(str(tmp_path / "rejected.pt"), 1),
+            state=state,
+        )
+
+
 def test_checkpoint_failure_keeps_previous_valid_checkpoint_and_manifest(tmp_path):
     trainer = _DeterministicTrainer()
     state, _, _ = _run(tmp_path, trainer, cycles=1)

@@ -11,10 +11,10 @@
 # the single-target MSE in douzero.dmc.compute_loss regardless).
 #
 # IMPORTANT: only the fields marked "consumed" below are actually read by the
-# single-process V2 trainer (train_v2.py). The legacy
-# legacy multiprocessing fields (actor_device_cpu, gpu_devices, etc.) are
-# carried because this file is loaded as a TrainingConfig. Except for
-# num_actors, they are NOT consumed by the V2 trainer and non-default values
+# single-process V2 trainer (train_v2.py). Legacy multiprocessing fields
+# (actor_device_cpu, gpu_devices, etc.) are carried because this file is loaded
+# as a TrainingConfig. Except for num_actors and games_per_actor, they are NOT
+# consumed by the V2 trainer and non-default values
 # produce a visible warning at startup. Select the V2 device with --device;
 # use --checkpoint_path, --resume_checkpoint, and --metrics_path for V2
 # artifacts. Those options are CLI-only and are not fields in this YAML.
@@ -24,14 +24,15 @@ xpid: douzero_v2          # (ignored by train_v2.py; legacy multiprocess only)
 save_interval: 30         # (ignored by train_v2.py; legacy checkpoint only)
 objective: adp            # consumed: identity gate requires 'adp'
 
-# --- Legacy multiprocess settings (num_actors is consumed by async V2) --- #
+# --- Legacy multiprocess settings (Actor fields are consumed by async V2) --- #
 # These are carried for TrainingConfig schema compatibility. Setting any to
-# a non-default value except num_actors triggers a startup warning in
+# a non-default value except num_actors/games_per_actor triggers a warning in
 # train_v2.py. The remaining fields describe legacy train.py only.
 actor_device_cpu: false   # (ignored; V2 is single-process)
 gpu_devices: "0"          # (ignored; V2 placement uses --device)
 num_actor_devices: 1      # (ignored; single-process trainer)
 num_actors: 5             # consumed by async_single_gpu; inert in single_process
+games_per_actor: 4        # interleaved games per async V2 Actor
 training_device: "0"      # (ignored; V2 placement uses --device)
 load_model: false         # (ignored; V2 resume uses --resume_checkpoint)
 disable_checkpoint: false # (ignored; omit --checkpoint_path to skip V2 save)
@@ -48,7 +49,7 @@ num_buffers: 50           # (ignored; legacy multiprocess buffer only)
 num_threads: 4            # (ignored; legacy multiprocess learner only)
 max_grad_norm: 40.0       # consumed: gradient clip
 
-# P14 training-system controls. train_v2.py consumes topology, Actor count,
+# P14 training-system controls. train_v2.py consumes topology, Actor counts,
 # AMP, DDP, and compile
 # fields; sync_interval_updates, policy_snapshot_slots, and pin_memory remain
 # legacy/high-throughput fields and are not consumed by the single-process V2

@@ -96,6 +96,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--num_actors", type=int, default=argparse.SUPPRESS,
         help="CPU actor count for --v2_training_mode async_single_gpu.",
     )
+    parser.add_argument(
+        "--games_per_actor", type=int, default=argparse.SUPPRESS,
+        help="Interleaved games maintained by each async V2 actor.",
+    )
     parser.add_argument("--exp_epsilon", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--learning_rate", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--rmsprop_alpha", type=float, default=argparse.SUPPRESS)
@@ -884,6 +888,11 @@ def main() -> None:
         "ddp_backend", yaml_cfg.ddp_backend if yaml_cfg else None, "auto"
     )
     v2_training_mode, num_actors = _resolve_v2_topology(args, yaml_cfg)
+    games_per_actor = resolve(
+        "games_per_actor",
+        yaml_cfg.games_per_actor if yaml_cfg else None,
+        defaults.games_per_actor,
+    )
     if v2_training_mode == "async_single_gpu" and ddp_enabled:
         raise ValueError("async_single_gpu rejects DDP; use one main GPU process")
     loss_cfg = _build_loss_config(yaml_cfg)
@@ -1069,6 +1078,7 @@ def main() -> None:
         ),
         v2_training_mode=v2_training_mode,
         num_actors=num_actors,
+        games_per_actor=games_per_actor,
     )
     if distributed.enabled and trainer_cfg.belief_training_mode != "frozen":
         raise NotImplementedError(
@@ -1389,6 +1399,7 @@ def main() -> None:
                 eval_fail_fast=getattr(args, "eval_fail_fast", True),
                 v2_training_mode=trainer_cfg.v2_training_mode,
                 num_actors=trainer_cfg.num_actors,
+                games_per_actor=trainer_cfg.games_per_actor,
                 replay_schema_version=trainer_cfg.replay_schema_version,
                 snapshot_publication_semantics=(
                     trainer_cfg.snapshot_publication_semantics

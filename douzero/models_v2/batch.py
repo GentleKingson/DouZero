@@ -174,23 +174,26 @@ class BatchedModelInputBundle:
     def max_actions(self) -> int:
         return int(self.action_features.shape[1])
 
-    def to(self, device) -> "BatchedModelInputBundle":
+    def to(
+        self, device, *, non_blocking: bool = False
+    ) -> "BatchedModelInputBundle":
         """Move tensor fields to ``device`` and return this bundle."""
-        self.state_card_vectors = tuple(t.to(device) for t in self.state_card_vectors)
-        self.state_context_flat = self.state_context_flat.to(device)
-        self.context_card_vectors = tuple(t.to(device) for t in self.context_card_vectors)
-        self.context_flat = self.context_flat.to(device)
-        self.history_tokens = self.history_tokens.to(device)
-        self.history_key_padding_mask = self.history_key_padding_mask.to(device)
-        self.action_features = self.action_features.to(device)
-        self.action_mask = self.action_mask.to(device)
-        self.acting_role = self.acting_role.to(device)
+        move = lambda tensor: tensor.to(device, non_blocking=non_blocking)
+        self.state_card_vectors = tuple(move(t) for t in self.state_card_vectors)
+        self.state_context_flat = move(self.state_context_flat)
+        self.context_card_vectors = tuple(move(t) for t in self.context_card_vectors)
+        self.context_flat = move(self.context_flat)
+        self.history_tokens = move(self.history_tokens)
+        self.history_key_padding_mask = move(self.history_key_padding_mask)
+        self.action_features = move(self.action_features)
+        self.action_mask = move(self.action_mask)
+        self.acting_role = move(self.acting_role)
         if self.chosen_action_index is not None:
-            self.chosen_action_index = self.chosen_action_index.to(device)
+            self.chosen_action_index = move(self.chosen_action_index)
         if self.strategy_features is not None:
-            self.strategy_features = self.strategy_features.to(device)
+            self.strategy_features = move(self.strategy_features)
         if self.style_features is not None:
-            self.style_features = self.style_features.to(device)
+            self.style_features = move(self.style_features)
         return self
 
 

@@ -125,24 +125,30 @@ exact build commit. Standard and joint trainer checkpoint save/resume remains
 single-process only and fails closed when DDP is enabled. Trainer-checkpoint
 format 3 remains the single-process format and records
 `training_topology=single_process` plus `training_world_size=1`. Async runs use
-format 4 and additionally bind actor count, compact replay schema, snapshot
-publication semantics, and request ordering/batching semantics. Format 3 has
+format 4 and additionally bind actor count, interleaved games per actor,
+compact replay schema, snapshot publication semantics, and request
+ordering/batching semantics. Format 3 has
 an explicit single-process compatibility path; formats 1/2, unknown versions,
 unknown topology, and cross-topology resume are rejected.
 
 ## V2 single-GPU throughput topology
 
 `--v2_training_mode` defaults to `single_process`. The opt-in
-`async_single_gpu` topology uses `spawn` CPU actors, preallocated CPU shared
+`async_single_gpu` topology is experimental. It uses `spawn` CPU actors,
+preallocated CPU shared
 observation/replay slots, and queues containing only slot IDs plus small
 metadata. Actors make epsilon decisions with their local RNG and never own a
 CUDA tensor. The main process owns an independent inference model and learner
-model in one CUDA context, and groups requests by immutable policy snapshot
-and action-count bucket. Acting roles remain a vectorized model input instead
-of splitting otherwise compatible microbatches. The coalescing deadline starts
-after the first request arrives, so an initially empty queue cannot consume
-the entire batching window. A complete inference state is published only at a
-quiescent boundary. Both replay implementations sample uniformly across all
+model in one CUDA context. Each Actor interleaves `games_per_actor` games
+(default 4), submitting one inference request for every runnable game before
+waiting for the wave. The service retains claimed requests across iterations
+in FIFO deques keyed by immutable policy snapshot and a coarse inference-only
+action bucket (`64`, `512`, overflow). A group launches at four requests or a
+2 ms age bound, whichever comes first. These inference buckets are independent
+of the learner's finer replay buckets. Acting roles remain a vectorized model
+input instead of splitting otherwise compatible microbatches. A complete
+inference state is published only at a quiescent boundary. Both replay
+implementations sample uniformly across all
 resident transitions first, including action buckets smaller than the learner
 batch size. The learner then partitions the sampled records by action-count
 bucket and forwards each homogeneous sub-batch separately, reducing padding
@@ -164,11 +170,14 @@ version, checks every tensor's CPU device, dtype and structural shape, verifies
 the acting role and selected legal action, and rejects non-finite, partial, or
 out-of-domain labels and malformed policy provenance.
 
-Each inference group packs win, conditional-score, probability, and expected
-score outputs into one contiguous `[B, A, 5]` tensor and performs one blocking
-group-level device-to-host copy. CUDA events measure inference work without a
-hot-path global device synchronization; shared-slot writes then slice the
-single CPU staging tensor. Result tensors remain in lock-free shared storage,
+Shared SoA input fields are gathered directly into reusable pinned buffers;
+the inference path no longer creates a Python `ModelInputBundle` list or a
+second stack/pad allocation. H2D copies are non-blocking on the active CUDA
+stream. Each group packs win, conditional-score, probability, and expected
+score outputs into one contiguous `[B, A, 5]` tensor and copies it into a
+reused pinned output buffer before publishing one packed row per slot. CUDA
+events separately measure H2D, forward, and D2H. Result tensors remain in
+lock-free shared storage,
 but completion is published through a per-slot spawn-shared `Event`. The main
 process writes every result and then sets the event; the Actor waits on that
 event before it reads the state, request ID, or output tensors. This explicit
@@ -180,10 +189,11 @@ CUDA model guards use asynchronous device assertions rather than Python
 `bool(tensor)` scalar reads, avoiding mask, role, and chosen-index host
 synchronization in the inference and learner hot paths.
 
-Both `v2_training_mode` and `num_actors` may be set in typed YAML. Explicit CLI
-flags override YAML. With no YAML or topology flags the default remains
-`single_process` with one Actor; selecting async mode from the CLI without a
-config defaults to four Actors. A loaded YAML uses its typed Actor count.
+`v2_training_mode`, `num_actors`, and `games_per_actor` may be set in typed
+YAML. Explicit CLI flags override YAML. With no YAML or topology flags the
+default remains `single_process` with one Actor; selecting async mode from the
+CLI without a config defaults to four Actors and four interleaved games per
+Actor. A loaded YAML uses its typed values.
 
 | Combination | `single_process` | `async_single_gpu` |
 |---|---:|---:|
@@ -224,7 +234,9 @@ preserving the existing P0 cycle-boundary rule.
 
 Async throughput and GPU timing fields are interval metrics. The public cycle
 boundary captures and resets request/action/microbatch counters, queue latency
-samples, inference GPU time, and learner GPU time. Internal quiescence used by
+samples, claim/slot-read/collate/H2D/forward/D2H/publish/replay-drain time,
+claim-size/inference-bucket/microbatch-size histograms, inference GPU time, and
+learner GPU time. Internal quiescence used by
 checkpoint save/load does not consume the interval, so checkpoint publication
 cannot turn the controller's cycle record into zeros or cumulative values.
 

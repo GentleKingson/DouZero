@@ -27,6 +27,7 @@ from douzero.runtime.cleanup import run_cleanup_steps
 
 
 _RUN_STATE_VERSION = 3
+_PRE_INTERLEAVED_REQUEST_ORDERING = "policy_bucket_fifo_post_first_window_v2"
 
 
 def _peak_ram_bytes() -> int | None:
@@ -84,9 +85,10 @@ class LongRunningConfig:
     eval_fail_fast: bool = True
     v2_training_mode: str = "single_process"
     num_actors: int = 1
+    games_per_actor: int = 4
     replay_schema_version: int = 1
     snapshot_publication_semantics: str = "cycle_quiescent_atomic_copy_v1"
-    request_ordering_semantics: str = "policy_bucket_fifo_post_first_window_v2"
+    request_ordering_semantics: str = "policy_inference_bucket_interleaved_games_v3"
     actor_rng_resume_semantics: str = "restart_from_configured_seeds_v1"
 
     def __post_init__(self) -> None:
@@ -107,6 +109,8 @@ class LongRunningConfig:
                 raise ValueError(f"{name} must be finite and >= 0")
         if self.keep_last_checkpoints < 1:
             raise ValueError("keep_last_checkpoints must be >= 1")
+        if self.num_actors < 1 or self.games_per_actor < 1:
+            raise ValueError("num_actors and games_per_actor must be >= 1")
 
     def resume_identity(self) -> dict[str, int | str]:
         """Return fields that affect the mathematical N+M trajectory."""
@@ -115,6 +119,7 @@ class LongRunningConfig:
             "optimizer_steps_per_cycle": self.optimizer_steps_per_cycle,
             "v2_training_mode": self.v2_training_mode,
             "num_actors": self.num_actors,
+            "games_per_actor": self.games_per_actor,
             "replay_schema_version": self.replay_schema_version,
             "snapshot_publication_semantics": self.snapshot_publication_semantics,
             "request_ordering_semantics": self.request_ordering_semantics,
@@ -766,14 +771,25 @@ class LongRunningTrainer:
             "episodes_per_cycle": config.episodes_per_cycle,
             "optimizer_steps_per_cycle": config.optimizer_steps_per_cycle,
         }
+        pre_interleaved_identity = config.resume_identity()
+        pre_interleaved_identity.pop("games_per_actor")
+        pre_interleaved_identity["request_ordering_semantics"] = (
+            _PRE_INTERLEAVED_REQUEST_ORDERING
+        )
         if (
-            self.state.cycle_identity == legacy_cycle_identity
-            and config.v2_training_mode == "single_process"
-            and config.num_actors == 1
-            and config.replay_schema_version == 1
+            config.v2_training_mode == "single_process"
+            and (
+                (
+                    self.state.cycle_identity == legacy_cycle_identity
+                    and config.num_actors == 1
+                    and config.replay_schema_version == 1
+                )
+                or self.state.cycle_identity == pre_interleaved_identity
+            )
         ):
-            # Explicit v3 single-process migration: the old identity predates
-            # topology fields but already guaranteed an empty cycle boundary.
+            # These fields are inert in single-process mode. Preserve both the
+            # original two-field v3 migration and checkpoints written before
+            # interleaved async games became part of the topology identity.
             self.state.cycle_identity = config.resume_identity()
         if self.state.cycle_identity != config.resume_identity():
             raise ValueError(
@@ -1125,6 +1141,48 @@ class LongRunningTrainer:
                         float(boundary_status.get("learner_gpu_seconds", 0.0)), 6
                     ),
                     "policy_lag": int(boundary_status.get("policy_lag", 0)),
+                    "games_per_actor": int(
+                        boundary_status.get("games_per_actor", 0)
+                    ),
+                    "claimed_requests": int(
+                        boundary_status.get("claimed_requests", 0)
+                    ),
+                    "pending_requests": int(
+                        boundary_status.get("pending_requests", 0)
+                    ),
+                    "claim_size_histogram": dict(
+                        boundary_status.get("claim_size_histogram", {})
+                    ),
+                    "inference_bucket_histogram": dict(
+                        boundary_status.get("inference_bucket_histogram", {})
+                    ),
+                    "microbatch_size_histogram": dict(
+                        boundary_status.get("microbatch_size_histogram", {})
+                    ),
+                    "claim_wait_seconds": round(
+                        float(boundary_status.get("claim_wait_seconds", 0.0)), 6
+                    ),
+                    "slot_read_seconds": round(
+                        float(boundary_status.get("slot_read_seconds", 0.0)), 6
+                    ),
+                    "collate_seconds": round(
+                        float(boundary_status.get("collate_seconds", 0.0)), 6
+                    ),
+                    "h2d_seconds": round(
+                        float(boundary_status.get("h2d_seconds", 0.0)), 6
+                    ),
+                    "forward_seconds": round(
+                        float(boundary_status.get("forward_seconds", 0.0)), 6
+                    ),
+                    "d2h_seconds": round(
+                        float(boundary_status.get("d2h_seconds", 0.0)), 6
+                    ),
+                    "publish_seconds": round(
+                        float(boundary_status.get("publish_seconds", 0.0)), 6
+                    ),
+                    "replay_drain_seconds": round(
+                        float(boundary_status.get("replay_drain_seconds", 0.0)), 6
+                    ),
                     "amp_fallback": int(self.trainer.stats.amp_fallbacks) - amp_before,
                     "checkpoint_path": checkpoint_path.name if checkpoint_path else "",
                     "checkpoint_status": checkpoint_status,

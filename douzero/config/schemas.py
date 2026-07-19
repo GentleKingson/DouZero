@@ -505,6 +505,7 @@ class TrainingConfig:
     gpu_devices: str = "0"
     num_actor_devices: int = 1
     num_actors: int = 5
+    games_per_actor: int = 4
     training_device: str = "0"
     load_model: bool = False
     disable_checkpoint: bool = False

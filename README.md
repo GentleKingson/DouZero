@@ -214,12 +214,13 @@ writers, and metrics paths are rejected if they overlap checkpoint artifacts.
 See
 [the V2 long-running state machine](docs/training_system.md#long-running-v2-state-machine).
 
-V2 also has an explicit multi-CPU-actor, centralized single-GPU mode. It never
-falls back when CUDA is unavailable and it rejects DDP:
+V2 also has an experimental multi-CPU-actor, centralized single-GPU mode. It
+never falls back when CUDA is unavailable and it rejects DDP:
 
 ```bash
 python train_v2.py --v2_training_mode async_single_gpu --device cuda \
-  --num_actors 4 --episodes 64 --optimizer_steps 8 --batch_size 64
+  --num_actors 4 --games_per_actor 4 \
+  --episodes 64 --optimizer_steps 8 --batch_size 64
 ```
 
 The current async support scope is deliberately narrow: base legacy-ruleset
@@ -233,7 +234,10 @@ Compact replay records are schema-, tensor-, action-, label-, and provenance-
 validated before shared slots are released and before replay insertion. Actor
 or main inference failure and shutdown use spawn-shared signals so blocked
 peers exit promptly; cleanup does not replace an active training exception.
-Inference results are published only after a per-slot process-shared Event
+Each Actor interleaves four games by default. Requests are retained in coarse
+inference-only buckets, staged directly into reusable pinned batches, and
+reported with segmented timing and batch histograms. Inference results are
+published only after a per-slot process-shared Event
 establishes the response memory barrier. Cycle metrics are interval values and
 reset only when the public lifecycle boundary consumes them. Actor deals use
 `seed + actor_id`; epsilon sampling uses `rng_seed + actor_id`. Async resume

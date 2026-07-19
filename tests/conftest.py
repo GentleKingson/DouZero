@@ -8,16 +8,19 @@ make tests deterministic without modifying any production module.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+# CPU-only containers keep legacy tests off CUDA.  An explicitly GPU-enabled
+# Docker run exposes /dev/nvidiactl and must not be masked here; otherwise the
+# async CUDA smoke is unconditionally skipped even with ``--gpus all``. Set the
+# visibility before importing torch because CUDA reads it lazily during import
+# on some builds and during first use on others.
+if not Path("/dev/nvidiactl").exists():
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import numpy as np
 import pytest
 import torch
-
-# Force CPU for every test. The legacy models have no ``device`` argument and
-# probe ``torch.cuda.is_available()`` directly; setting the env var before torch
-# is imported would be ideal, but in practice CUDA is not present in the test
-# image, so this is belt-and-braces.
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 DEFAULT_SEED = 1234
 

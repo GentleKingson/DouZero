@@ -13,13 +13,14 @@ import queue
 import time
 import ctypes
 import math
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import IntEnum
 
 import torch
 import numpy as np
 
-from douzero.models_v2.batch import ModelInputBundle
+from douzero.models_v2.batch import BatchedModelInputBundle, ModelInputBundle
 from douzero.models_v2.config import SUPPORTED_ROLES
 from douzero.observation.schema import (
     action_width,
@@ -27,7 +28,26 @@ from douzero.observation.schema import (
     history_token_width,
     state_width,
 )
-from douzero.training.v2_buffer import action_count_bucket, compact_model_input_shapes
+from douzero.training.v2_buffer import compact_model_input_shapes
+
+
+# Inference has a different padding/launch tradeoff from learner replay.  The
+# learner keeps its fine-grained action buckets, while centralized inference
+# deliberately uses two broad buckets so a small actor pool does not fragment
+# into singleton GPU launches.
+INFERENCE_ACTION_BUCKET_LIMITS: tuple[int, ...] = (64, 512)
+
+
+def inference_action_count_bucket(action_count: int) -> int | str:
+    """Return the coarse centralized-inference padding bucket."""
+    if isinstance(action_count, bool) or not isinstance(action_count, int):
+        raise TypeError("action_count must be an int")
+    if action_count <= 0:
+        raise ValueError("action_count must be positive")
+    for limit in INFERENCE_ACTION_BUCKET_LIMITS:
+        if action_count <= limit:
+            return limit
+    return "overflow"
 
 
 def _shared_tensor(shape, dtype=torch.float32):
@@ -78,7 +98,7 @@ class RequestMetadata:
     def grouping_key(self) -> tuple[int, int | str]:
         return (
             self.policy_snapshot,
-            action_count_bucket(self.action_count),
+            inference_action_count_bucket(self.action_count),
         )
 
 
@@ -119,24 +139,35 @@ class SharedObservationSlots:
             (num_slots, max_actions, action_feature_width)
         )
         self.action_mask = shared((num_slots, max_actions), torch.bool)
-        self.output_win = shared((num_slots, max_actions))
-        self.output_score = shared((num_slots, max_actions))
-        self.output_score_win = shared((num_slots, max_actions))
-        self.output_score_loss = shared((num_slots, max_actions))
-        self.output_p_win = shared((num_slots, max_actions))
+        # Keep all response heads adjacent per action.  The inference service
+        # publishes one contiguous row copy; compatibility views retain the
+        # named fields used by the actor and protocol tests.
+        self.output_values = shared((num_slots, max_actions, 5))
+        self._bind_output_views()
         self.action_counts = shared((num_slots,), torch.int32)
         self.roles = shared((num_slots,), torch.int64)
 
     _TENSOR_FIELDS = (
         "state_cards", "state_flat", "context_cards", "context_flat",
         "history", "history_padding", "actions", "action_mask",
-        "output_win", "output_score", "output_score_win", "output_score_loss",
-        "output_p_win", "action_counts", "roles",
+        "output_values", "action_counts", "roles",
     )
+
+    _OUTPUT_VIEW_FIELDS = (
+        "output_win", "output_score_win", "output_score_loss",
+        "output_p_win", "output_score",
+    )
+
+    def _bind_output_views(self) -> None:
+        self.output_win = self.output_values[..., 0]
+        self.output_score_win = self.output_values[..., 1]
+        self.output_score_loss = self.output_values[..., 2]
+        self.output_p_win = self.output_values[..., 3]
+        self.output_score = self.output_values[..., 4]
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        for name in self._TENSOR_FIELDS:
+        for name in self._TENSOR_FIELDS + self._OUTPUT_VIEW_FIELDS:
             state.pop(name, None)
         return state
 
@@ -146,6 +177,7 @@ class SharedObservationSlots:
             self._TENSOR_FIELDS, self._shared_owners, self._shared_specs
         ):
             setattr(self, name, _restore_shared_tensor(owner, shape, dtype))
+        self._bind_output_views()
 
     def write(self, slot_id: int, bundle: ModelInputBundle) -> None:
         count = int(bundle.action_features.shape[0])
@@ -161,8 +193,12 @@ class SharedObservationSlots:
         self.context_flat[slot_id].copy_(bundle.context_flat)
         self.history[slot_id].copy_(bundle.history_tokens)
         self.history_padding[slot_id].copy_(bundle.history_key_padding_mask)
-        self.actions[slot_id].zero_()
-        self.action_mask[slot_id].zero_()
+        # Only mask state can make stale padded rows observable.  Clearing the
+        # previous live range avoids touching the full 4096-row slot on every
+        # decision; action rows in the new live range are overwritten below.
+        previous_count = int(self.action_counts[slot_id])
+        if previous_count:
+            self.action_mask[slot_id, :previous_count].zero_()
         self.actions[slot_id, :count].copy_(bundle.action_features)
         self.action_mask[slot_id, :count].copy_(bundle.action_mask)
         self.action_counts[slot_id] = count
@@ -187,6 +223,206 @@ class SharedObservationSlots:
             acting_role=role,
             feature_schema_hash=feature_schema_hash,
         )
+
+
+class PinnedObservationBatchStager:
+    """Reusable shared-SoA to pinned-batch staging for one action capacity."""
+
+    def __init__(
+        self,
+        slots: SharedObservationSlots,
+        *,
+        max_batch_size: int,
+        action_capacity: int,
+    ) -> None:
+        if max_batch_size < 1:
+            raise ValueError("max_batch_size must be positive")
+        if action_capacity < 1 or action_capacity > slots.max_actions:
+            raise ValueError("action_capacity is outside the shared slot range")
+        self.slots = slots
+        self.max_batch_size = int(max_batch_size)
+        self.action_capacity = int(action_capacity)
+
+        def pinned(shape, dtype):
+            return torch.empty(shape, dtype=dtype, pin_memory=True)
+
+        batch = self.max_batch_size
+        self.state_cards = pinned(
+            (batch, *slots.state_cards.shape[1:]), slots.state_cards.dtype
+        )
+        self.state_flat = pinned(
+            (batch, *slots.state_flat.shape[1:]), slots.state_flat.dtype
+        )
+        self.context_cards = pinned(
+            (batch, *slots.context_cards.shape[1:]), slots.context_cards.dtype
+        )
+        self.context_flat = pinned(
+            (batch, *slots.context_flat.shape[1:]), slots.context_flat.dtype
+        )
+        self.history = pinned(
+            (batch, *slots.history.shape[1:]), slots.history.dtype
+        )
+        self.history_padding = pinned(
+            (batch, *slots.history_padding.shape[1:]), slots.history_padding.dtype
+        )
+        self.actions = pinned(
+            (batch, action_capacity, slots.actions.shape[-1]), slots.actions.dtype
+        )
+        self.action_mask = pinned(
+            (batch, action_capacity), slots.action_mask.dtype
+        )
+        self.roles = pinned((batch,), slots.roles.dtype)
+        self.output_values = pinned((batch, action_capacity, 5), torch.float32)
+
+    @staticmethod
+    def _gather(source: torch.Tensor, indices: torch.Tensor, destination) -> None:
+        torch.index_select(source, 0, indices, out=destination)
+
+    def gather_slots(self, slot_ids: list[int]) -> int:
+        """Copy shared slot rows directly into the reusable pinned buffers."""
+        batch_size = len(slot_ids)
+        if not 1 <= batch_size <= self.max_batch_size:
+            raise ValueError("staged request count is outside batch capacity")
+        indices = torch.tensor(slot_ids, dtype=torch.long)
+        counts = self.slots.action_counts.index_select(0, indices)
+        if bool((counts < 1).any()) or bool((counts > self.action_capacity).any()):
+            raise ValueError("request action count is outside staging capacity")
+
+        self._gather(self.slots.state_cards, indices, self.state_cards[:batch_size])
+        self._gather(self.slots.state_flat, indices, self.state_flat[:batch_size])
+        self._gather(
+            self.slots.context_cards, indices, self.context_cards[:batch_size]
+        )
+        self._gather(self.slots.context_flat, indices, self.context_flat[:batch_size])
+        self._gather(self.slots.history, indices, self.history[:batch_size])
+        self._gather(
+            self.slots.history_padding,
+            indices,
+            self.history_padding[:batch_size],
+        )
+        self._gather(
+            self.slots.actions[:, :self.action_capacity],
+            indices,
+            self.actions[:batch_size],
+        )
+        self._gather(
+            self.slots.action_mask[:, :self.action_capacity],
+            indices,
+            self.action_mask[:batch_size],
+        )
+        self._gather(self.slots.roles, indices, self.roles[:batch_size])
+        return batch_size
+
+    def batch_view(
+        self,
+        batch_size: int,
+        feature_schema_hash: str,
+    ) -> BatchedModelInputBundle:
+        """Build the model-facing views over an already gathered batch."""
+        if not 1 <= batch_size <= self.max_batch_size:
+            raise ValueError("staged request count is outside batch capacity")
+        state_cards = self.state_cards[:batch_size]
+        context_cards = self.context_cards[:batch_size]
+        return BatchedModelInputBundle(
+            state_card_vectors=tuple(
+                state_cards[:, index] for index in range(state_cards.shape[1])
+            ),
+            state_context_flat=self.state_flat[:batch_size],
+            context_card_vectors=tuple(
+                context_cards[:, index] for index in range(context_cards.shape[1])
+            ),
+            context_flat=self.context_flat[:batch_size],
+            history_tokens=self.history[:batch_size],
+            history_key_padding_mask=self.history_padding[:batch_size],
+            action_features=self.actions[:batch_size],
+            action_mask=self.action_mask[:batch_size],
+            acting_role=self.roles[:batch_size],
+            chosen_action_index=None,
+            feature_schema_hashes=(feature_schema_hash,) * batch_size,
+        )
+
+    def stage_inputs(
+        self,
+        slot_ids: list[int],
+        feature_schema_hash: str,
+    ) -> BatchedModelInputBundle:
+        """Gather shared rows and return their model-facing pinned views."""
+        batch_size = self.gather_slots(slot_ids)
+        return self.batch_view(batch_size, feature_schema_hash)
+
+    def stage_outputs(self, values: torch.Tensor) -> torch.Tensor:
+        expected = (
+            values.shape[0], self.action_capacity, self.output_values.shape[-1]
+        )
+        if tuple(values.shape) != expected:
+            raise ValueError(
+                f"packed inference output must have shape {expected}, "
+                f"got {tuple(values.shape)}"
+            )
+        destination = self.output_values[:values.shape[0]]
+        destination.copy_(values, non_blocking=True)
+        return destination
+
+
+class PendingRequestScheduler:
+    """FIFO request groups retained across service iterations."""
+
+    def __init__(
+        self,
+        *,
+        max_batch_size: int,
+        target_batch_size: int = 4,
+        max_delay_seconds: float = 0.002,
+    ) -> None:
+        if max_batch_size < 1 or target_batch_size < 1:
+            raise ValueError("scheduler batch sizes must be positive")
+        if max_delay_seconds < 0:
+            raise ValueError("max_delay_seconds must be non-negative")
+        self.max_batch_size = int(max_batch_size)
+        self.target_batch_size = min(int(target_batch_size), self.max_batch_size)
+        self.max_delay_seconds = float(max_delay_seconds)
+        self._groups: dict[tuple[int, int | str], deque[RequestMetadata]] = (
+            defaultdict(deque)
+        )
+
+    def add(self, requests: list[RequestMetadata]) -> None:
+        for request in requests:
+            self._groups[request.grouping_key].append(request)
+
+    @property
+    def pending_count(self) -> int:
+        return sum(len(group) for group in self._groups.values())
+
+    def pop_ready(
+        self, *, now_ns: int | None = None
+    ) -> tuple[tuple[int, int | str], list[RequestMetadata]] | None:
+        if not self._groups:
+            return None
+        now_ns = time.monotonic_ns() if now_ns is None else int(now_ns)
+        eligible = []
+        for key, group in self._groups.items():
+            oldest_wait = max(0.0, (now_ns - group[0].submitted_ns) / 1e9)
+            if len(group) >= self.target_batch_size or (
+                oldest_wait >= self.max_delay_seconds
+            ):
+                eligible.append((key, group, oldest_wait))
+        if not eligible:
+            return None
+        # Prefer a launch that fills the GPU, then the oldest request.  FIFO is
+        # preserved within every (snapshot, inference bucket) group.
+        key, group, _ = max(
+            eligible,
+            key=lambda item: (
+                min(len(item[1]), self.max_batch_size), item[2]
+            ),
+        )
+        requests = [
+            group.popleft()
+            for _ in range(min(len(group), self.max_batch_size))
+        ]
+        if not group:
+            del self._groups[key]
+        return key, requests
 
 
 class SharedReplaySlots:
@@ -582,8 +818,9 @@ def async_actor_main(
     feature_schema_hash: str,
     policy_version: str,
     policy_step,
+    games_per_actor: int,
 ) -> None:
-    """CPU-only actor entry point.  CUDA is never imported or initialized."""
+    """CPU-only interleaved-game actor. CUDA is never initialized here."""
     import random
 
     from douzero.env.env import Env
@@ -600,105 +837,166 @@ def async_actor_main(
     )
     if environment_seed:
         np.random.seed((environment_seed + actor_id) % (1 << 32))
+    if games_per_actor < 1:
+        raise ValueError("games_per_actor must be positive")
     request_id = actor_id << 48
+
+    def start_game(task):
+        episode_id = int(task)
+        snapshot = int(policy_step.value)
+        event_queue.put(("started", actor_id, episode_id, snapshot))
+        env = Env("adp", ruleset=ruleset)
+        env.reset()
+        return {
+            "episode_id": episode_id,
+            "snapshot": snapshot,
+            "env": env,
+            "episode": Episode(
+                policy_version_at_start=policy_version,
+                policy_step_at_start=snapshot,
+            ),
+            "steps": 0,
+            "pending": None,
+        }
+
+    def finish_game(game) -> None:
+        episode = game["episode"]
+        episode.label_from_terminal()
+        for transition in episode.transitions:
+            replay_slots.write_transition(
+                transition,
+                observation_to_model_inputs(transition.obs),
+                game["snapshot"],
+                coordinator.request_timeout_seconds,
+                coordinator.abort_event,
+                coordinator.shutdown_event,
+            )
+        team = episode.terminal_result.get("winner_team", "landlord")
+        event_queue.put((
+            "completed", actor_id, game["episode_id"], len(episode.transitions),
+            0 if team == "landlord" else 1, game["snapshot"],
+            len(episode.action_trace),
+        ))
+
+    def apply_action(game, action_index, obs, position, legal_actions) -> bool:
+        episode = game["episode"]
+        if obs is not None:
+            episode.transitions.append(Transition(
+                obs=obs,
+                action_index=action_index,
+                position=position,
+                trace_index=len(episode.action_trace),
+                policy_id=policy_version,
+                policy_version=policy_version,
+                policy_step=game["snapshot"],
+            ))
+        action = legal_actions[action_index]
+        episode.action_trace.append((position, tuple(sorted(action))))
+        _obs, _reward, done, info = game["env"].step(action)
+        game["steps"] += 1
+        if done:
+            episode.terminal_result = info or {}
+            finish_game(game)
+            return True
+        if game["steps"] >= max_steps:
+            raise RuntimeError(f"actor episode exceeded max_steps={max_steps}")
+        return False
+
+    def advance_until_request_or_done(game) -> bool:
+        nonlocal request_id
+        while True:
+            position = game["env"]._acting_player_position
+            infoset = game["env"].infoset
+            legal_actions = infoset.legal_actions
+            if len(legal_actions) == 1:
+                if apply_action(game, 0, None, position, legal_actions):
+                    return True
+                continue
+
+            obs = get_obs_v2(infoset, ruleset=ruleset)
+            if epsilon > 0 and rng.random() < epsilon:
+                action_index = rng.randrange(len(legal_actions))
+                if apply_action(
+                    game, action_index, obs, position, legal_actions
+                ):
+                    return True
+                continue
+
+            bundle = observation_to_model_inputs(obs)
+            slot_id = coordinator.acquire(actor_id)
+            coordinator.slots.write(slot_id, bundle)
+            request_id += 1
+            coordinator.submit(
+                slot_id,
+                request_id=request_id,
+                policy_snapshot=game["snapshot"],
+            )
+            game["pending"] = (
+                slot_id, request_id, obs, position, legal_actions
+            )
+            return False
+
+    def resolve_request(game):
+        slot_id, pending_id, obs, position, legal_actions = game["pending"]
+        coordinator.wait_done(slot_id, pending_id)
+        count = int(coordinator.slots.action_counts[slot_id])
+        mask = coordinator.slots.action_mask[slot_id, :count].clone()
+        packed = coordinator.slots.output_values[slot_id, :count].clone()
+        coordinator.release(slot_id)
+        game["pending"] = None
+        output = ModelOutput(
+            win_logit=packed[:, 0:1],
+            score_if_win=packed[:, 1:2],
+            score_if_loss=packed[:, 2:3],
+            p_win=packed[:, 3:4],
+            score_mean=packed[:, 4:5],
+            action_mask=mask,
+        )
+        return (
+            select_action(output, decision_config), obs, position, legal_actions
+        )
+
     try:
+        active = []
         while True:
             if coordinator.shutdown_event.is_set():
                 return
             coordinator._raise_if_failed()
-            try:
-                task = task_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if task is None:
-                return
-            episode_id = int(task)
-            snapshot = int(policy_step.value)
-            event_queue.put(("started", actor_id, episode_id, snapshot))
-            env = Env("adp", ruleset=ruleset)
-            env.reset()
-            episode = Episode(
-                policy_version_at_start=policy_version,
-                policy_step_at_start=snapshot,
-            )
-            for _ in range(max_steps):
-                position = env._acting_player_position
-                infoset = env.infoset
-                legal_actions = infoset.legal_actions
-                if len(legal_actions) == 1:
-                    action_index = 0
-                else:
-                    obs = get_obs_v2(infoset, ruleset=ruleset)
-                    if epsilon > 0 and rng.random() < epsilon:
-                        action_index = rng.randrange(len(legal_actions))
-                    else:
-                        bundle = observation_to_model_inputs(obs)
-                        slot_id = coordinator.acquire(actor_id)
-                        coordinator.slots.write(slot_id, bundle)
-                        request_id += 1
-                        coordinator.submit(
-                            slot_id, request_id=request_id,
-                            policy_snapshot=snapshot,
-                        )
-                        coordinator.wait_done(slot_id, request_id)
-                        count = int(coordinator.slots.action_counts[slot_id])
-                        mask = coordinator.slots.action_mask[slot_id, :count].clone()
-                        win = coordinator.slots.output_win[slot_id, :count].clone().unsqueeze(-1)
-                        score_win = coordinator.slots.output_score_win[
-                            slot_id, :count
-                        ].clone().unsqueeze(-1)
-                        score_loss = coordinator.slots.output_score_loss[
-                            slot_id, :count
-                        ].clone().unsqueeze(-1)
-                        p_win = coordinator.slots.output_p_win[
-                            slot_id, :count
-                        ].clone().unsqueeze(-1)
-                        score_mean = coordinator.slots.output_score[
-                            slot_id, :count
-                        ].clone().unsqueeze(-1)
-                        output = ModelOutput(
-                            win_logit=win,
-                            score_if_win=score_win,
-                            score_if_loss=score_loss,
-                            p_win=p_win,
-                            score_mean=score_mean,
-                            action_mask=mask,
-                        )
-                        action_index = select_action(output, decision_config)
-                        coordinator.release(slot_id)
-                    episode.transitions.append(Transition(
-                        obs=obs,
-                        action_index=action_index,
-                        position=position,
-                        trace_index=len(episode.action_trace),
-                        policy_id=policy_version,
-                        policy_version=policy_version,
-                        policy_step=snapshot,
-                    ))
-                action = legal_actions[action_index]
-                episode.action_trace.append((position, tuple(sorted(action))))
-                _obs, _reward, done, info = env.step(action)
-                if done:
-                    episode.terminal_result = info or {}
+            while len(active) < games_per_actor:
+                try:
+                    task = (
+                        task_queue.get(timeout=0.1)
+                        if not active else task_queue.get_nowait()
+                    )
+                except queue.Empty:
                     break
-            else:
-                raise RuntimeError(f"actor episode exceeded max_steps={max_steps}")
-            episode.label_from_terminal()
-            for transition in episode.transitions:
-                replay_slots.write_transition(
-                    transition,
-                    observation_to_model_inputs(transition.obs),
-                    snapshot,
-                    coordinator.request_timeout_seconds,
-                    coordinator.abort_event,
-                    coordinator.shutdown_event,
-                )
-            team = episode.terminal_result.get("winner_team", "landlord")
-            event_queue.put((
-                "completed", actor_id, episode_id, len(episode.transitions),
-                0 if team == "landlord" else 1, snapshot,
-                len(episode.action_trace),
-            ))
+                if task is None:
+                    return
+                active.append(start_game(task))
+            if not active:
+                continue
+
+            completed = []
+            for game in tuple(active):
+                if advance_until_request_or_done(game):
+                    completed.append(game)
+            for game in completed:
+                active.remove(game)
+
+            pending_games = [
+                game for game in active if game["pending"] is not None
+            ]
+            # All games submit before this actor waits.  Responses are cloned
+            # and slots released for the whole wave before terminal replay
+            # publication can block on replay capacity.
+            resolved = [
+                (game, *resolve_request(game)) for game in pending_games
+            ]
+            for game, action_index, obs, position, legal_actions in resolved:
+                if apply_action(
+                    game, action_index, obs, position, legal_actions
+                ):
+                    active.remove(game)
     except BaseException as exc:
         if coordinator.shutdown_event.is_set() and not coordinator.abort_event.is_set():
             event_queue.put(("stopped", actor_id))

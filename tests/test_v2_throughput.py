@@ -25,9 +25,11 @@ from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.observation.encode_v2 import LegalActionBatch
 from douzero.training.async_single_gpu import (
     AsyncRequestCoordinator,
+    PendingRequestScheduler,
     RequestMetadata,
     SharedReplaySlots,
     SlotState,
+    inference_action_count_bucket,
 )
 from douzero.training.long_running import LongRunningTrainer
 from douzero.training.decision_policy import DecisionConfig
@@ -226,6 +228,41 @@ def test_scalar_and_batched_forward_padding_and_gather_parity():
 )
 def test_action_bucket_boundaries(count, expected):
     assert action_count_bucket(count) == expected
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [(1, 64), (64, 64), (65, 512), (512, 512), (513, "overflow")],
+)
+def test_inference_bucket_boundaries_are_independent_and_coarse(count, expected):
+    assert inference_action_count_bucket(count) == expected
+
+
+def test_pending_scheduler_retains_small_groups_and_flushes_by_size_or_age():
+    scheduler = PendingRequestScheduler(
+        max_batch_size=8, target_batch_size=4, max_delay_seconds=0.01
+    )
+    submitted_ns = 1_000_000_000
+    first = [
+        RequestMetadata(index, index, index + 1, 7, 12, 0, submitted_ns)
+        for index in range(2)
+    ]
+    scheduler.add(first)
+    assert scheduler.pop_ready(now_ns=submitted_ns + 1_000_000) is None
+    scheduler.add([
+        RequestMetadata(index, index, index + 1, 7, 20, 0, submitted_ns)
+        for index in range(2, 4)
+    ])
+    key, batch = scheduler.pop_ready(now_ns=submitted_ns + 2_000_000)
+    assert key == (7, 64)
+    assert [request.request_id for request in batch] == [1, 2, 3, 4]
+    assert scheduler.pending_count == 0
+
+    singleton = RequestMetadata(9, 0, 10, 7, 100, 0, submitted_ns)
+    scheduler.add([singleton])
+    key, batch = scheduler.pop_ready(now_ns=submitted_ns + 11_000_000)
+    assert key == (7, 512)
+    assert batch == [singleton]
 
 
 def test_async_request_grouping_keeps_roles_in_one_bucket_batch():
@@ -964,9 +1001,12 @@ def test_cross_topology_resume_is_rejected_before_restore(tmp_path):
         "checkpoint_version": 4,
         "training_topology": "async_single_gpu",
         "num_actors": 2,
+        "games_per_actor": 4,
         "replay_schema_version": 1,
         "snapshot_publication_semantics": "cycle_quiescent_atomic_copy_v1",
-        "request_ordering_semantics": "policy_bucket_fifo_post_first_window_v2",
+        "request_ordering_semantics": (
+            "policy_inference_bucket_interleaved_games_v3"
+        ),
     })
     async_path = tmp_path / "async.pt"
     torch.save(payload, async_path)
@@ -999,9 +1039,9 @@ def test_async_single_gpu_end_to_end_checkpoint_resume_and_shutdown(tmp_path):
     schema = build_v2_schema()
     model_config = ModelV2Config(hidden_size=16, history_layers=1, history_heads=1)
     trainer_config = TrainerConfig(
-        max_episodes=2,
+        max_episodes=8,
         optimizer_steps=1,
-        batch_size=1,
+        batch_size=4,
         buffer_capacity=256,
         exp_epsilon=0.1,
         device="cuda",
@@ -1012,9 +1052,13 @@ def test_async_single_gpu_end_to_end_checkpoint_resume_and_shutdown(tmp_path):
     checkpoint = tmp_path / "async.pt"
     workers = []
     try:
-        trainer.collect_episodes(2)
+        trainer.collect_episodes(8)
         boundary = trainer.quiesce_cycle_boundary()
         assert boundary["in_flight_slots"] == 0
+        assert boundary["pending_requests"] == 0
+        assert boundary["requests_per_microbatch"] > 1.0
+        assert boundary["microbatch_size_histogram"]
+        assert boundary["forward_seconds"] > 0.0
         before = {
             name: value.detach().clone()
             for name, value in trainer.model.state_dict().items()
@@ -1039,7 +1083,7 @@ def test_async_single_gpu_end_to_end_checkpoint_resume_and_shutdown(tmp_path):
     try:
         resumed.load_training_checkpoint(str(checkpoint))
         assert resumed.stats.optimizer_steps == 1
-        resumed.collect_episodes(2)
+        resumed.collect_episodes(4)
         assert resumed.step() is not None
         boundary = resumed.quiesce_cycle_boundary()
         assert boundary["active_slots"] == 0

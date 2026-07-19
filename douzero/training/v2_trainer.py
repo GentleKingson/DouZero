@@ -99,7 +99,7 @@ _ASYNC_UNSUPPORTED_DECISION_MODES = frozenset({
 })
 _POLICY_STEP_SEMANTICS = "absolute_v1"
 _SNAPSHOT_PUBLICATION_SEMANTICS = "cycle_quiescent_atomic_copy_v1"
-_REQUEST_ORDERING_SEMANTICS = "policy_bucket_fifo_post_first_window_v2"
+_REQUEST_ORDERING_SEMANTICS = "policy_inference_bucket_interleaved_games_v3"
 _ACTOR_RNG_RESUME_SEMANTICS = "restart_from_configured_seeds_v1"
 
 
@@ -149,6 +149,7 @@ class TrainerConfig:
     first_bidder_mode: str = "rotate"
     v2_training_mode: str = _SINGLE_PROCESS_TOPOLOGY
     num_actors: int = 1
+    games_per_actor: int = 4
     replay_schema_version: int = 1
     snapshot_publication_semantics: str = _SNAPSHOT_PUBLICATION_SEMANTICS
     request_ordering_semantics: str = _REQUEST_ORDERING_SEMANTICS
@@ -225,6 +226,8 @@ class TrainerConfig:
             raise ValueError("unknown v2_training_mode")
         if self.num_actors < 1:
             raise ValueError("num_actors must be >= 1")
+        if self.games_per_actor < 1:
+            raise ValueError("games_per_actor must be >= 1")
         if self.replay_schema_version != 1:
             raise ValueError("unknown compact replay schema version")
         if self.snapshot_publication_semantics != _SNAPSHOT_PUBLICATION_SEMANTICS:
@@ -719,15 +722,39 @@ class V2Trainer:
         self._async_runtime_started = False
         if self.async_mode:
             self._async_snapshot = self.policy_step
-            self._async_request_count = 0
-            self._async_action_count = 0
-            self._async_microbatch_count = 0
-            self._async_queue_latencies_ms = []
-            self._async_inference_seconds = 0.0
+            self._async_pending_scheduler = None
+            self._async_stagers = {}
+            self._reset_async_interval_metrics()
 
     # ------------------------------------------------------------------ #
     # Self-play episode collection
     # ------------------------------------------------------------------ #
+    def _reset_async_interval_metrics(self) -> None:
+        self._async_request_count = 0
+        self._async_action_count = 0
+        self._async_microbatch_count = 0
+        self._async_claimed_count = 0
+        self._async_queue_latencies_ms = []
+        self._async_inference_seconds = 0.0
+        self._async_segment_seconds = {
+            "claim_wait": 0.0,
+            "slot_read": 0.0,
+            "collate": 0.0,
+            "h2d": 0.0,
+            "forward": 0.0,
+            "d2h": 0.0,
+            "publish": 0.0,
+            "replay_drain": 0.0,
+        }
+        self._async_claim_size_histogram = {}
+        self._async_bucket_histogram = {}
+        self._async_batch_size_histogram = {}
+
+    @staticmethod
+    def _increment_histogram(histogram: dict[str, int], value) -> None:
+        key = str(value)
+        histogram[key] = histogram.get(key, 0) + 1
+
     def _async_actor_runtime_kwargs(self) -> dict:
         """Bind the two actor RNG domains to their declared config fields."""
         return {
@@ -740,11 +767,13 @@ class V2Trainer:
             "feature_schema_hash": self.model.schema.stable_hash(),
             "policy_version": self.policy_version,
             "policy_step": self._async_policy_step,
+            "games_per_actor": self.config.games_per_actor,
         }
 
     def _start_async_runtime(self) -> None:
         from douzero.training.async_single_gpu import (
             AsyncRequestCoordinator,
+            PendingRequestScheduler,
             SharedReplaySlots,
             async_actor_main,
         )
@@ -753,19 +782,29 @@ class V2Trainer:
         self._async_tasks = context.Queue()
         self._async_events = context.Queue()
         self._async_policy_step = context.Value("q", self.policy_step, lock=True)
+        self._async_max_inference_batch = (
+            self.config.num_actors * self.config.games_per_actor
+        )
         self._async_coordinator = AsyncRequestCoordinator(
             self.model.schema,
-            num_slots=max(self.config.num_actors * 2, 2),
+            num_slots=max(self._async_max_inference_batch, 2),
             max_actions=4096,
             request_timeout_seconds=30.0,
         )
         self._async_replay_slots = SharedReplaySlots(
             self.model.schema,
             num_slots=max(
-                self.config.num_actors * 8, min(self.config.batch_size * 2, 64)
+                self.config.num_actors * self.config.games_per_actor * 2,
+                min(self.config.batch_size * 2, 64),
             ),
             max_actions=4096,
         )
+        self._async_pending_scheduler = PendingRequestScheduler(
+            max_batch_size=self._async_max_inference_batch,
+            target_batch_size=4,
+            max_delay_seconds=0.002,
+        )
+        self._async_stagers = {}
         self._async_workers = []
         for actor_id in range(self.config.num_actors):
             process = context.Process(
@@ -781,13 +820,10 @@ class V2Trainer:
             self._async_workers.append(process)
         self._async_runtime_started = True
         self._async_snapshot = self.policy_step
-        self._async_request_count = 0
-        self._async_action_count = 0
-        self._async_microbatch_count = 0
-        self._async_queue_latencies_ms: list[float] = []
-        self._async_inference_seconds = 0.0
+        self._reset_async_interval_metrics()
 
     def _drain_async_replay(self) -> int:
+        started = time.perf_counter()
         try:
             records = self._async_replay_slots.read_ready(
                 self.model.schema.stable_hash(), self.policy_version
@@ -798,6 +834,10 @@ class V2Trainer:
                 f"shared replay validation failed: {type(exc).__name__}: {exc}"
             )
             raise
+        finally:
+            segments = getattr(self, "_async_segment_seconds", None)
+            if segments is not None:
+                segments["replay_drain"] += time.perf_counter() - started
         return len(records)
 
     def _service_async_requests(self, wait_seconds: float = 0.001) -> int:
@@ -811,88 +851,142 @@ class V2Trainer:
             raise
 
     def _service_async_requests_impl(self, wait_seconds: float = 0.001) -> int:
-        from collections import defaultdict
-        from douzero.models_v2.batch import model_input_bundles_to_batch
+        from douzero.training.async_single_gpu import PinnedObservationBatchStager
 
-        requests = self._async_coordinator.claim_ready(
-            max_items=max(1, self.config.batch_size), wait_seconds=wait_seconds
-        )
-        if not requests:
-            return 0
-        grouped = defaultdict(list)
-        for request in requests:
-            if request.policy_snapshot != self._async_snapshot:
-                self._async_coordinator.fail("request references an unpublished snapshot")
-                raise RuntimeError("async request policy snapshot mismatch")
-            grouped[request.grouping_key].append(request)
-        for group in grouped.values():
-            bundles = [
-                self._async_coordinator.slots.read_bundle(
-                    request.slot_id, self.model.schema.stable_hash()
-                )
-                for request in group
-            ]
-            batched = model_input_bundles_to_batch(bundles).to(self.device)
-            gpu_started = torch.cuda.Event(enable_timing=True)
-            gpu_finished = torch.cuda.Event(enable_timing=True)
-            gpu_started.record()
-            with torch.inference_mode(), self.mixed_precision.autocast():
-                output = self.inference_model.forward_batched(
-                    batched.state_card_vectors,
-                    batched.state_context_flat,
-                    batched.context_card_vectors,
-                    batched.context_flat,
-                    batched.history_tokens,
-                    batched.history_key_padding_mask,
-                    batched.action_features,
-                    batched.action_mask,
-                    batched.acting_role,
-                )
-                packed_output = torch.stack(
-                    (
-                        output.win_logit.squeeze(-1),
-                        output.score_if_win.squeeze(-1),
-                        output.score_if_loss.squeeze(-1),
-                        output.p_win.squeeze(-1),
-                        output.score_mean.squeeze(-1),
-                    ),
-                    dim=-1,
-                ).float().contiguous()
-            gpu_finished.record()
-            # One group-level D2H transfer replaces five transfers per row.
-            # The blocking copy also completes the timing events, so no global
-            # device synchronization is needed on this request hot path.
-            packed_cpu = packed_output.cpu()
-            self._async_inference_seconds += (
-                gpu_started.elapsed_time(gpu_finished) / 1000.0
+        scheduler = self._async_pending_scheduler
+        scheduled = None
+
+        def claim(wait: float) -> int:
+            claim_started = time.perf_counter()
+            requests = self._async_coordinator.claim_ready(
+                max_items=self._async_max_inference_batch,
+                wait_seconds=wait,
             )
-            for row, request in enumerate(group):
-                count = request.action_count
-                slots = self._async_coordinator.slots
-                slots.output_win[request.slot_id, :count].copy_(
-                    packed_cpu[row, :count, 0]
+            self._async_segment_seconds["claim_wait"] += (
+                time.perf_counter() - claim_started
+            )
+            if requests:
+                for request in requests:
+                    if request.policy_snapshot != self._async_snapshot:
+                        self._async_coordinator.fail(
+                            "request references an unpublished snapshot"
+                        )
+                        raise RuntimeError("async request policy snapshot mismatch")
+                self._async_claimed_count += len(requests)
+                self._increment_histogram(
+                    self._async_claim_size_histogram, len(requests)
                 )
-                slots.output_score_win[request.slot_id, :count].copy_(
-                    packed_cpu[row, :count, 1]
+                scheduler.add(requests)
+            return len(requests)
+
+        # Merge requests already visible in the coordinator before selecting
+        # a retained group. This prevents an aged singleton from launching
+        # just as compatible peers arrive.
+        claim(0.0 if scheduler.pending_count else wait_seconds)
+        scheduled = scheduler.pop_ready()
+        if scheduled is None:
+            claim(wait_seconds)
+            scheduled = scheduler.pop_ready()
+        if scheduled is None:
+            return 0
+
+        grouping_key, group = scheduled
+        _snapshot, bucket = grouping_key
+        capacity = (
+            int(bucket)
+            if isinstance(bucket, int)
+            else min(
+                self._async_coordinator.slots.max_actions,
+                1 << (max(item.action_count for item in group) - 1).bit_length(),
+            )
+        )
+        stager = self._async_stagers.get(capacity)
+        if stager is None:
+            stager = PinnedObservationBatchStager(
+                self._async_coordinator.slots,
+                max_batch_size=self._async_max_inference_batch,
+                action_capacity=capacity,
+            )
+            self._async_stagers[capacity] = stager
+
+        slot_read_started = time.perf_counter()
+        batch_size = stager.gather_slots(
+            [request.slot_id for request in group]
+        )
+        self._async_segment_seconds["slot_read"] += (
+            time.perf_counter() - slot_read_started
+        )
+        collate_started = time.perf_counter()
+        batched = stager.batch_view(
+            batch_size, self.model.schema.stable_hash()
+        )
+        self._async_segment_seconds["collate"] += (
+            time.perf_counter() - collate_started
+        )
+
+        h2d_started = torch.cuda.Event(enable_timing=True)
+        h2d_finished = torch.cuda.Event(enable_timing=True)
+        forward_finished = torch.cuda.Event(enable_timing=True)
+        d2h_finished = torch.cuda.Event(enable_timing=True)
+        h2d_started.record()
+        batched.to(self.device, non_blocking=True)
+        h2d_finished.record()
+        with torch.inference_mode(), self.mixed_precision.autocast():
+            output = self.inference_model.forward_batched(
+                batched.state_card_vectors,
+                batched.state_context_flat,
+                batched.context_card_vectors,
+                batched.context_flat,
+                batched.history_tokens,
+                batched.history_key_padding_mask,
+                batched.action_features,
+                batched.action_mask,
+                batched.acting_role,
+            )
+            packed_output = torch.stack(
+                (
+                    output.win_logit.squeeze(-1),
+                    output.score_if_win.squeeze(-1),
+                    output.score_if_loss.squeeze(-1),
+                    output.p_win.squeeze(-1),
+                    output.score_mean.squeeze(-1),
+                ),
+                dim=-1,
+            ).float().contiguous()
+        forward_finished.record()
+        packed_cpu = stager.stage_outputs(packed_output)
+        d2h_finished.record()
+        d2h_finished.synchronize()
+
+        h2d_seconds = h2d_started.elapsed_time(h2d_finished) / 1000.0
+        forward_seconds = h2d_finished.elapsed_time(forward_finished) / 1000.0
+        d2h_seconds = forward_finished.elapsed_time(d2h_finished) / 1000.0
+        self._async_segment_seconds["h2d"] += h2d_seconds
+        self._async_segment_seconds["forward"] += forward_seconds
+        self._async_segment_seconds["d2h"] += d2h_seconds
+        self._async_inference_seconds += forward_seconds
+
+        publish_started = time.perf_counter()
+        slots = self._async_coordinator.slots
+        for row, request in enumerate(group):
+            count = request.action_count
+            slots.output_values[request.slot_id, :count].copy_(
+                packed_cpu[row, :count]
+            )
+            self._async_coordinator.complete(request.slot_id)
+            if request.submitted_ns > 0:
+                self._async_queue_latencies_ms.append(
+                    (time.monotonic_ns() - request.submitted_ns) / 1_000_000.0
                 )
-                slots.output_score_loss[request.slot_id, :count].copy_(
-                    packed_cpu[row, :count, 2]
-                )
-                slots.output_p_win[request.slot_id, :count].copy_(
-                    packed_cpu[row, :count, 3]
-                )
-                slots.output_score[request.slot_id, :count].copy_(
-                    packed_cpu[row, :count, 4]
-                )
-                self._async_coordinator.complete(request.slot_id)
-                if request.submitted_ns > 0:
-                    self._async_queue_latencies_ms.append(
-                        (time.monotonic_ns() - request.submitted_ns) / 1_000_000.0
-                    )
-            self._async_request_count += len(group)
-            self._async_action_count += sum(item.action_count for item in group)
-            self._async_microbatch_count += 1
-        return len(requests)
+        self._async_segment_seconds["publish"] += (
+            time.perf_counter() - publish_started
+        )
+        self._async_request_count += len(group)
+        self._async_action_count += sum(item.action_count for item in group)
+        self._async_microbatch_count += 1
+        self._increment_histogram(self._async_bucket_histogram, bucket)
+        self._increment_histogram(self._async_batch_size_histogram, len(group))
+        return len(group)
 
     def _publish_async_snapshot(self) -> None:
         """Atomically switch inference weights only at a quiescent boundary."""
@@ -1009,15 +1103,11 @@ class V2Trainer:
     def _reset_cycle_interval_metrics(self) -> None:
         self._learner_gpu_seconds = 0.0
         if self.async_mode:
-            self._async_request_count = 0
-            self._async_action_count = 0
-            self._async_microbatch_count = 0
-            self._async_queue_latencies_ms = []
-            self._async_inference_seconds = 0.0
+            self._reset_async_interval_metrics()
 
     def _quiesce_cycle_boundary(
         self, *, consume_interval_metrics: bool
-    ) -> dict[str, int | float]:
+    ) -> dict[str, object]:
         """Quiesce, optionally consuming metrics for one controller cycle."""
         learner_gpu_seconds = self._learner_gpu_seconds
         if self.async_mode:
@@ -1034,7 +1124,18 @@ class V2Trainer:
                     "inference_gpu_seconds": 0.0,
                     "learner_gpu_seconds": learner_gpu_seconds,
                     "policy_lag": 0,
+                    "games_per_actor": self.config.games_per_actor,
+                    "claimed_requests": 0,
+                    "pending_requests": 0,
+                    "claim_size_histogram": {},
+                    "inference_bucket_histogram": {},
+                    "microbatch_size_histogram": {},
                 }
+                for name in (
+                    "claim_wait", "slot_read", "collate", "h2d",
+                    "forward", "d2h", "publish", "replay_drain",
+                ):
+                    status[f"{name}_seconds"] = 0.0
                 if consume_interval_metrics:
                     self._reset_cycle_interval_metrics()
                 return status
@@ -1065,7 +1166,30 @@ class V2Trainer:
                 "inference_gpu_seconds": self._async_inference_seconds,
                 "learner_gpu_seconds": learner_gpu_seconds,
                 "policy_lag": self.policy_step - self._async_snapshot,
+                "games_per_actor": getattr(
+                    getattr(self, "config", None), "games_per_actor", 4
+                ),
+                "claimed_requests": getattr(self, "_async_claimed_count", 0),
+                "pending_requests": getattr(
+                    getattr(self, "_async_pending_scheduler", None),
+                    "pending_count", 0,
+                ),
+                "claim_size_histogram": dict(
+                    getattr(self, "_async_claim_size_histogram", {})
+                ),
+                "inference_bucket_histogram": dict(
+                    getattr(self, "_async_bucket_histogram", {})
+                ),
+                "microbatch_size_histogram": dict(
+                    getattr(self, "_async_batch_size_histogram", {})
+                ),
             }
+            segments = getattr(self, "_async_segment_seconds", {})
+            for name in (
+                "claim_wait", "slot_read", "collate", "h2d",
+                "forward", "d2h", "publish", "replay_drain",
+            ):
+                status[f"{name}_seconds"] = float(segments.get(name, 0.0))
             if consume_interval_metrics:
                 self._reset_cycle_interval_metrics()
             return status
@@ -1083,7 +1207,7 @@ class V2Trainer:
             self._reset_cycle_interval_metrics()
         return status
 
-    def quiesce_cycle_boundary(self) -> dict[str, int | float]:
+    def quiesce_cycle_boundary(self) -> dict[str, object]:
         """Establish a checkpoint-safe boundary and consume cycle metrics."""
         return self._quiesce_cycle_boundary(consume_interval_metrics=True)
 
@@ -1129,6 +1253,8 @@ class V2Trainer:
                     except BaseException as exc:
                         if cleanup_error is None:
                             cleanup_error = exc
+                getattr(self, "_async_stagers", {}).clear()
+                self._async_pending_scheduler = None
                 self._async_runtime_started = False
             if cleanup_error is not None and not active_exception:
                 raise cleanup_error
@@ -1642,7 +1768,8 @@ class V2Trainer:
     def _v3_trainer_config_identity(self) -> tuple[dict, str]:
         payload = asdict(self.config)
         for name in (
-            "v2_training_mode", "num_actors", "replay_schema_version",
+            "v2_training_mode", "num_actors", "games_per_actor",
+            "replay_schema_version",
             "snapshot_publication_semantics", "request_ordering_semantics",
         ):
             payload.pop(name, None)
@@ -1766,6 +1893,7 @@ class V2Trainer:
         if checkpoint_version >= 4:
             bundle.update({
                 "num_actors": self.config.num_actors,
+                "games_per_actor": self.config.games_per_actor,
                 "replay_schema_version": self.config.replay_schema_version,
                 "snapshot_publication_semantics": self.config.snapshot_publication_semantics,
                 "request_ordering_semantics": self.config.request_ordering_semantics,
@@ -1808,7 +1936,7 @@ class V2Trainer:
             ])
         if checkpoint_version >= 4:
             identity_keys.extend([
-                "num_actors", "replay_schema_version",
+                "num_actors", "games_per_actor", "replay_schema_version",
                 "snapshot_publication_semantics", "request_ordering_semantics",
                 "actor_rng_resume_semantics",
             ])
@@ -1894,6 +2022,7 @@ class V2Trainer:
         if checkpoint_version >= 4:
             expected.update({
                 "num_actors": self.config.num_actors,
+                "games_per_actor": self.config.games_per_actor,
                 "replay_schema_version": self.config.replay_schema_version,
                 "snapshot_publication_semantics": self.config.snapshot_publication_semantics,
                 "request_ordering_semantics": self.config.request_ordering_semantics,

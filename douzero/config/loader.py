@@ -266,7 +266,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
 _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "xpid": str, "save_interval": int, "objective": str,
     "actor_device_cpu": bool, "gpu_devices": str, "num_actor_devices": int,
-    "num_actors": int, "training_device": str, "load_model": bool,
+    "num_actors": int, "games_per_actor": int,
+    "training_device": str, "load_model": bool,
     "disable_checkpoint": bool, "savedir": str, "total_frames": int,
     "exp_epsilon": float, "batch_size": int, "unroll_length": int,
     "num_buffers": int, "num_threads": int, "max_grad_norm": float,
@@ -413,6 +414,8 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         raise ValueError(
             "v2_training_mode must be 'single_process' or 'async_single_gpu'"
         )
+    if cfg.num_actors < 1 or cfg.games_per_actor < 1:
+        raise ValueError("num_actors and games_per_actor must be >= 1")
     if cfg.sync_interval_updates < 1:
         raise ValueError("sync_interval_updates must be >= 1")
     if cfg.policy_snapshot_slots < 2:
