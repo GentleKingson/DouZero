@@ -177,7 +177,9 @@ def resolved_standard_v2_config_identity(
             "seed": int(trainer_config.seed),
             "deterministic": bool(deterministic),
             "batch_size": int(trainer_config.batch_size),
-            "bidding_batch_size": int(trainer_config.bidding_batch_size),
+            "bidding_batch_size": int(
+                trainer_config.resolved_bidding_batch_size
+            ),
             "bidding_update_interval": int(
                 trainer_config.bidding_update_interval
             ),

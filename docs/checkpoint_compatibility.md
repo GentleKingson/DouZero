@@ -163,13 +163,16 @@ pseudo-gate that provided no real protection; it has been deleted.
 
 New resumable trainer checkpoints use format 6 for both `single_process` and
 `async_single_gpu`. Format 6 records identity version 2 and the complete
-`TrainerConfig`, including independent bidding batch size and update cadence.
+`TrainerConfig`, including the declared bidding batch inheritance and update
+cadence. `bidding_batch_size=None` remains preserved; runtime code reads the
+live `resolved_bidding_batch_size`, so replacing `batch_size` also updates the
+inherited bidding batch.
 Formats 3, 4, and 5 remain same-source-shape compatibility paths only: the
 runtime still requires the checkpoint's full `source_git_sha` to equal the
 running build. They are not a cross-commit migration promise. Missing M1
-bidding controls are accepted only when `bidding_batch_size == batch_size` and
-`bidding_update_interval == 1`; otherwise resume fails before model or optimizer
-state is mutated.
+bidding controls are accepted only when the resolved bidding batch equals
+`batch_size` and `bidding_update_interval == 1`; otherwise resume fails before
+model or optimizer state is mutated.
 
 Format 4 introduced the async actor/replay identity and format 5 added protocol,
 task, and commit semantics. A v3 checkpoint is accepted only by

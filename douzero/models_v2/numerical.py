@@ -43,7 +43,7 @@ def assert_tensor_true(
     *,
     error_type: type[Exception] = ValueError,
 ) -> None:
-    """Validate one device condition without relying on private Torch APIs.
+    """Validate one device condition through the Torch compatibility layer.
 
     CUDA uses Torch's optional device-side assertion when the runtime provides
     it and otherwise falls back to one synchronized scalar read. Keeping that
@@ -58,8 +58,13 @@ def assert_tensor_true(
     if condition.device.type == "cuda":
         async_assert = getattr(torch, "_assert_async", None)
         if callable(async_assert):
-            async_assert(condition, message)
-            return
+            try:
+                async_assert(condition, message)
+                return
+            except TypeError:
+                # Private signatures are not stable across Torch releases.
+                # Fall through to the public synchronized scalar contract.
+                pass
     if not bool(condition.detach()):
         raise error_type(message)
 

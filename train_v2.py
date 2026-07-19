@@ -1525,7 +1525,7 @@ def main() -> None:
         f"loss_cfg={loss_cfg.to_dict()} "
         f"decision={decision_cfg.to_dict()} "
         f"trainer=batch_size={trainer_cfg.batch_size} "
-        f"bidding_batch_size={trainer_cfg.bidding_batch_size} "
+        f"bidding_batch_size={trainer_cfg.resolved_bidding_batch_size} "
         f"bidding_update_interval={trainer_cfg.bidding_update_interval} "
         f"lr={trainer_cfg.learning_rate} "
         f"epsilon={trainer_cfg.exp_epsilon} "

@@ -185,9 +185,7 @@ class TrainerConfig:
 
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
-        if self.bidding_batch_size is None:
-            self.bidding_batch_size = self.batch_size
-        if (
+        if self.bidding_batch_size is not None and (
             isinstance(self.bidding_batch_size, bool)
             or not isinstance(self.bidding_batch_size, int)
             or self.bidding_batch_size < 1
@@ -216,6 +214,7 @@ class TrainerConfig:
             raise ValueError(
                 f"max_grad_norm must be positive and finite, got {self.max_grad_norm}"
             )
+
         if self.buffer_capacity < 1:
             raise ValueError(
                 f"buffer_capacity must be >= 1, got {self.buffer_capacity}"
@@ -281,6 +280,16 @@ class TrainerConfig:
             raise ValueError("unknown episode task semantics")
         if self.episode_commit_semantics != BASE_EPISODE_COMMIT_SEMANTICS:
             raise ValueError("unknown episode commit semantics")
+
+    @property
+    def resolved_bidding_batch_size(self) -> int:
+        """Return the bidding batch after applying live batch-size inheritance."""
+
+        return (
+            self.batch_size
+            if self.bidding_batch_size is None
+            else self.bidding_batch_size
+        )
 
 
 @dataclass
@@ -634,6 +643,12 @@ class V2Trainer:
             loss_cfg.lambda_bid_policy + loss_cfg.lambda_bid_win
             + loss_cfg.lambda_bid_score + loss_cfg.lambda_bid_regret
         )
+        non_bidding_loss_weight = (
+            loss_cfg.lambda_win
+            + loss_cfg.lambda_score
+            + loss_cfg.lambda_uncertainty
+            + self.strategy_aux_weight
+        )
         if not self.standard_mode and self.bidding_loss_weight > 0:
             raise ValueError("bidding loss weights require standard rules")
         if (
@@ -652,6 +667,17 @@ class V2Trainer:
                 f"all zeros. A zero-loss training run would silently produce "
                 f"no parameter change."
             )
+        if (
+            self.config.optimizer_steps > 0
+            and self.bidding_loss_weight > 0
+            and self.config.bidding_update_interval > 1
+            and non_bidding_loss_weight == 0
+        ):
+            raise ValueError(
+                "bidding_update_interval > 1 requires at least one non-bidding "
+                "value/strategy loss; otherwise skipped bidding steps have no "
+                "differentiable objective"
+            )
         if self.config.optimizer_steps > 0 and self.config.buffer_capacity < self.config.batch_size:
             raise ValueError(
                 f"buffer_capacity ({self.config.buffer_capacity}) must be >= "
@@ -661,11 +687,13 @@ class V2Trainer:
         if (
             self.config.optimizer_steps > 0
             and self.bidding_loss_weight > 0
-            and self.config.buffer_capacity < self.config.bidding_batch_size
+            and self.config.buffer_capacity
+            < self.config.resolved_bidding_batch_size
         ):
             raise ValueError(
                 f"buffer_capacity ({self.config.buffer_capacity}) must be >= "
-                f"bidding_batch_size ({self.config.bidding_batch_size}) when "
+                "resolved bidding_batch_size "
+                f"({self.config.resolved_bidding_batch_size}) when "
                 "bidding optimization is enabled"
             )
         self._value_parameters = list(self.model.parameters())
@@ -2253,7 +2281,7 @@ class V2Trainer:
         trainer_config, trainer_config_hash = self._trainer_config_identity()
         if checkpoint_version == 3:
             if (
-                self.config.bidding_batch_size != self.config.batch_size
+                self.config.resolved_bidding_batch_size != self.config.batch_size
                 or self.config.bidding_update_interval != 1
             ):
                 raise CheckpointCompatibilityError(
@@ -2263,7 +2291,7 @@ class V2Trainer:
             trainer_config, trainer_config_hash = self._v3_trainer_config_identity()
         elif checkpoint_version == 4:
             if (
-                self.config.bidding_batch_size != self.config.batch_size
+                self.config.resolved_bidding_batch_size != self.config.batch_size
                 or self.config.bidding_update_interval != 1
             ):
                 raise CheckpointCompatibilityError(
@@ -2278,7 +2306,7 @@ class V2Trainer:
             and "bidding_update_interval" not in bundle["trainer_config"]
         ):
             if (
-                self.config.bidding_batch_size != self.config.batch_size
+                self.config.resolved_bidding_batch_size != self.config.batch_size
                 or self.config.bidding_update_interval != 1
             ):
                 raise CheckpointCompatibilityError(
@@ -2501,15 +2529,18 @@ class V2Trainer:
         An AMP step retries once in float32; a float32 anomaly raises
         :class:`FloatingPointError`.
         """
+        belief_phase = self._belief_phase_for_step()
         local_batch_ready = len(self.buffer) >= self.config.batch_size
         bidding_update_due = (
             self.bidding_loss_weight > 0
+            and belief_phase != "belief"
             and self.stats.optimizer_steps % self.config.bidding_update_interval == 0
         )
         if bidding_update_due:
             local_batch_ready = (
                 local_batch_ready
-                and len(self.bidding_buffer) >= self.config.bidding_batch_size
+                and len(self.bidding_buffer)
+                >= self.config.resolved_bidding_batch_size
             )
         if not self.distributed.all_true(local_batch_ready):
             return None
@@ -2519,7 +2550,7 @@ class V2Trainer:
         bidding_batch = None
         if bidding_update_due:
             bidding_batch = self.bidding_buffer.sample(
-                self.config.bidding_batch_size, self.rng
+                self.config.resolved_bidding_batch_size, self.rng
             )
             if bidding_batch is None:
                 raise RuntimeError(
@@ -2531,7 +2562,6 @@ class V2Trainer:
         # the non-finite-loss guard raises. Without this, an exception
         # leaves the model in training mode, and subsequent self-play
         # collection would run with dropout active.
-        belief_phase = self._belief_phase_for_step()
         self._configure_belief_phase(belief_phase)
         differentiable_belief = self.belief_training_mode != "frozen"
         self.model.train()

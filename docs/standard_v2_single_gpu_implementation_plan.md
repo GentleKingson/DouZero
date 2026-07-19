@@ -127,7 +127,7 @@ flowchart LR
 - [x] **SV2-102** 新增 `BatchedBiddingOutput`，包含 `[B, 4]` logits、landlord win、expected score 和 optional uncertainty。
 - [x] **SV2-103** 实现 `ModelV2.forward_bidding_batched()`；标量 `forward_bidding()` 保留轻量路径并共享 bidding head 运算。
 - [x] **SV2-104** 重写 `bidding_loss()`，直接消费批量输出和批量 targets，不再 stack Python output objects。
-- [x] **SV2-105** 移除 bidding output/mask 上逐样本检查；批量合同使用一次聚合检查且不依赖 PyTorch 私有 API。
+- [x] **SV2-105** 移除 bidding output/mask 上逐样本检查；公共 model/loss 合同只使用公开 Torch API，集中式兼容层在可用且签名兼容时选择 `_assert_async`，否则同步回退。
 - [x] **SV2-106** 增加独立的 `bidding_batch_size`，默认保持与旧 `batch_size` 相同以兼容旧配置。
 - [x] **SV2-107** 增加 `bidding_update_interval`，使 play/bid 数据率不再强制一一同步。
 - [x] **SV2-108** 增加标量/批量 output、loss、gradient、illegal-mask 和 mixed-source-policy 对照测试。
@@ -141,12 +141,13 @@ flowchart LR
 
 - 新增 dense bidding tensor contract 与单次批量 forward；训练热路径不再逐样本构造 `BiddingModelOutput` 或 stack Python outputs。
 - `bidding_loss()` 直接消费 `BatchedBiddingOutput` 和 `BatchedBiddingTargets`，并保留旧 scalar-list API wrapper；mask/action 合法性使用公开 Torch 运算的一次批量检查，零 credit batch 保持有限零梯度。
-- `bidding_batch_size` 默认继承 play `batch_size`，`bidding_update_interval` 默认 1；两个字段进入 CLI、YAML、TrainerConfig、checkpoint trainer identity 和 R1 evidence identity。
+- `bidding_batch_size=None` 保留为声明式继承并由 `resolved_bidding_batch_size` 动态解析，`dataclasses.replace()` 修改 play batch 后不会遗留旧值。`bidding_update_interval` 默认 1；两个字段进入 CLI、YAML、TrainerConfig、checkpoint trainer identity 和 R1 evidence identity。
+- cadence 按全部已完成 optimizer steps 推进，但只在 value/joint phase 到期；strict belief-only phase 不读取 bidding replay、不计算 bidding loss，也不增加 bidding learner samples。纯 bidding loss 与 interval 跳步的无梯度组合在构造时失败关闭。
 - bidding 模型参数和 `state_dict` key 未改变；新 format 6 完整绑定 TrainerConfig，旧 format 3/4/5 只在同 source SHA 和默认等价的新字段下加载。
-- 基准脚本同时报告 head forward/backward、包含 observation tensorization、targets、实际 loss、optimizer 和 diagnostics 的 learner wall time，以及 scalar fast path 对 batched wrapper 的延迟对照。
+- 基准脚本同时报告 head forward/backward、包含 observation tensorization、targets、实际 loss、optimizer 和 diagnostics 的 learner wall time；scalar fast path 与 batched wrapper 均分开报告 eval + inference-mode FP32 的 forward-only 和完整 argmax/host-result 决策延迟，p95 使用 nearest-rank 定义。
 - R1 seed 固定为非零值 `20260719`。旧的 16 局随机 workload 数字不再作为 M0/M1 可比证据；更新后的 CUDA artifact 必须绑定精确 head、镜像、环境、命令和完整 JSON。
-- 固定 seed 的 16 局 FP32 baseline 为 7.897 games/s、379.048 play transitions/s、21.716 bid transitions/s、262.393 learner samples/s，peak allocated VRAM 266.845 MiB；后续 M1 对照复用相同 seed 和 workload。
-- 手动 `Standard V2 M1 GPU Evidence` workflow 在 self-hosted NVIDIA runner 上以 Docker 重建精确 head，上传 CUDA pytest、完整 benchmark JSON、环境、镜像 ID 和 SHA-256 清单。
+- 固定 seed 的 16 局 FP32 baseline 为 7.897 games/s、379.048 play transitions/s、21.716 bid transitions/s、262.393 learner samples/s，peak allocated VRAM 266.845 MiB。该结果只描述当前 head，不与旧 seed/workload 的 M0 数字计算 uplift；端到端提升结论必须在同一硬件、镜像构建环境、seed 和 workload 下成对运行 base/head。
+- `Standard V2 M1 GPU Evidence` 对同仓库 PR 自动运行（并保留手动触发），只在受信任代码上使用 self-hosted NVIDIA runner。它以不可变 tag 构建精确 head、随后只通过 image ID 运行，强制 B=32 mean/p95 均不高于 1.5 ms，并上传 CUDA pytest、完整 16 局 R1 baseline、环境、来源清单和 SHA-256 清单。
 
 ### M2：Async Standard Protocol v2
 

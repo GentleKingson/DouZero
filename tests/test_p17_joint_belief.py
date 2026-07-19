@@ -20,7 +20,12 @@ from douzero.belief.constraints import legal_mask
 from douzero.env.rules import RuleSet
 from douzero.models_v2 import ModelV2, ModelV2Config
 from douzero.observation.schema import build_v2_schema
-from douzero.training import LossConfig, TrainerConfig, V2Trainer
+from douzero.training import (
+    BiddingPolicyConfig,
+    LossConfig,
+    TrainerConfig,
+    V2Trainer,
+)
 
 
 def _public_observation(seed: int = 17):
@@ -335,6 +340,90 @@ def test_trainer_alternates_value_only_then_supervised_belief_parameters():
     assert _changed(belief_before, belief)
     assert trainer.stats.belief_supervised_steps == 1
     assert np.isfinite(trainer.stats.last_loss["belief_loss_total"])
+
+
+def test_alternating_belief_skips_bidding_cadence_and_resumes_exactly(tmp_path):
+    from douzero.belief.data import collect_random_dataset
+
+    def make_trainer() -> V2Trainer:
+        value = ModelV2(
+            build_v2_schema(),
+            ModelV2Config(
+                belief_enabled=True,
+                bidding_enabled=True,
+                hidden_size=32,
+                history_layers=1,
+                history_heads=4,
+                nan_guard=False,
+            ),
+        )
+        belief = BeliefModel(BeliefConfig(hidden_size=24, num_layers=1))
+        return V2Trainer(
+            value,
+            ruleset=RuleSet.standard(),
+            belief_model=belief,
+            belief_supervised_samples=collect_random_dataset(
+                2, seed=2401, ruleset=RuleSet.standard()
+            ).samples,
+            loss_config=LossConfig(
+                lambda_win=1.0,
+                lambda_score=0.5,
+                lambda_bid_policy=1.0,
+            ),
+            bidding_policy_config=BiddingPolicyConfig(policy="max"),
+            config=TrainerConfig(
+                seed=2401,
+                rng_seed=2401,
+                max_episodes=2,
+                max_steps_per_episode=400,
+                batch_size=1,
+                bidding_batch_size=1,
+                bidding_update_interval=2,
+                buffer_capacity=128,
+                optimizer_steps=1,
+                learning_rate=1e-3,
+                belief_training_mode="alternating",
+                belief_supervised_weight=0.5,
+                belief_supervised_batch_size=2,
+            ),
+        )
+
+    trainer = make_trainer()
+    trainer.collect_episodes()
+    assert trainer.step() is not None
+    assert trainer.stats.belief_phase == "value"
+    assert trainer.stats.learner_bidding_samples == 1
+
+    checkpoint = tmp_path / "alternating-bidding-cadence.pt"
+    trainer.save_training_checkpoint(str(checkpoint))
+    restored = make_trainer()
+    restored.load_training_checkpoint(str(checkpoint))
+    restored.collect_episodes()
+    restored.bidding_buffer.clear()
+
+    bidding_before = {
+        name: tensor.detach().clone()
+        for name, tensor in restored.model.bidding_heads.state_dict().items()
+    }
+    assert restored.step() is not None
+    assert restored.stats.optimizer_steps == 2
+    assert restored.stats.belief_phase == "belief"
+    assert restored.stats.learner_bidding_samples == 1
+    assert "loss_bid_policy" not in restored.stats.last_loss
+    assert all(
+        torch.equal(tensor, bidding_before[name])
+        for name, tensor in restored.model.bidding_heads.state_dict().items()
+    )
+
+    # Cadence advances on every optimizer step. Step 2 is a value phase and
+    # therefore requires bidding replay again because 2 % interval == 0.
+    assert restored.step() is None
+    restored.collect_episodes()
+    assert restored.step() is not None
+    assert restored.stats.optimizer_steps == 3
+    assert restored.stats.belief_phase == "value"
+    assert restored.stats.learner_bidding_samples == 2
+    assert "loss_bid_policy" in restored.stats.last_loss
 
 
 def test_joint_trainer_cpu_bfloat16_amp_is_finite_and_updates_belief():

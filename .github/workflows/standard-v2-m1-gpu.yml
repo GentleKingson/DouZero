@@ -1,75 +1,189 @@
-# Manual, commit-bound target-hardware evidence for the Standard V2 M1 gate.
+# Commit-bound target-hardware gate for the Standard V2 M1 contract.
 name: Standard V2 M1 GPU Evidence
 
 on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/standard-v2-m1-gpu.yml"
+      - "benchmarks/**"
+      - "configs/standard_v2.yaml"
+      - "douzero/models_v2/**"
+      - "douzero/training/**"
+      - "tests/test_p17_bidding.py"
+      - "tests/test_p17_joint_belief.py"
+      - "tests/test_standard_v2_contract.py"
+      - "train_v2.py"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: standard-v2-m1-gpu-${{ github.ref }}
-  cancel-in-progress: false
+  group: standard-v2-m1-gpu-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
+    # Never execute code from an untrusted fork on the self-hosted GPU runner.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, gpu, nvidia]
     timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      - name: Build exact-source test image
+      - name: Resolve exact source and immutable image identity
         run: |
+          set -euo pipefail
+          target_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "${target_sha}"
+          image_tag="douzero-test:m1-${target_sha}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker build --progress=plain \
-            --build-arg DOUZERO_GIT_SHA="${GITHUB_SHA}" \
-            -t douzero-test:latest .
+            --build-arg DOUZERO_GIT_SHA="${target_sha}" \
+            -t "${image_tag}" .
+          image_id="$(docker image inspect "${image_tag}" --format '{{.Id}}')"
+          test -n "${image_id}"
           mkdir -p artifacts/standard-v2-m1-gpu
-          docker image inspect douzero-test:latest --format '{{.Id}}' \
+          printf '%s\n' "${image_id}" \
             > artifacts/standard-v2-m1-gpu/docker-image-id.txt
+          printf 'TARGET_SHA=%s\nIMAGE_TAG=%s\nIMAGE_ID=%s\n' \
+            "${target_sha}" "${image_tag}" "${image_id}" >> "${GITHUB_ENV}"
 
       - name: Run CUDA acceptance tests
         run: |
+          set -euo pipefail
           docker run --rm --gpus all \
             --mount type=bind,src="${PWD}/.git",dst=/workspace/DouZero/.git,readonly \
-            douzero-test:latest python -m pytest -q \
+            "${IMAGE_ID}" python -m pytest -q \
               tests/test_p17_bidding.py \
+              tests/test_p17_joint_belief.py \
               tests/test_standard_v2_contract.py \
               tests/test_v2_throughput.py::test_async_single_gpu_end_to_end_checkpoint_resume_and_shutdown \
             2>&1 | tee artifacts/standard-v2-m1-gpu/cuda-pytest.log
 
-      - name: Measure head, learner, and scalar latency
+      - name: Measure head, learner, and production decision latency
         run: |
+          set -euo pipefail
           docker run --rm --gpus all \
             --mount type=bind,src="${PWD}/.git",dst=/workspace/DouZero/.git,readonly \
             --mount type=bind,src="${PWD}/artifacts/standard-v2-m1-gpu",dst=/artifacts \
-            douzero-test:latest python -m benchmarks.bench_bidding_batch \
+            "${IMAGE_ID}" python -m benchmarks.bench_bidding_batch \
               --device cuda --batch-sizes 1 32 64 128 \
               --warmup 20 --iterations 100 \
               --output /artifacts/bidding-benchmark.json
 
-      - name: Record commit-bound environment and digests
+      - name: Run complete 16-game Standard V2 R1 baseline
         run: |
+          set -euo pipefail
+          docker run --rm --gpus all \
+            --mount type=bind,src="${PWD}/.git",dst=/workspace/DouZero/.git,readonly \
+            --mount type=bind,src="${PWD}/artifacts/standard-v2-m1-gpu",dst=/artifacts \
+            "${IMAGE_ID}" python train_v2.py \
+              --config configs/standard_v2.yaml \
+              --episodes 16 --optimizer_steps 1 --device cuda \
+              --metrics_path /artifacts/training-metrics.json \
+            2>&1 | tee artifacts/standard-v2-m1-gpu/full-baseline.log
+          docker run --rm \
+            --mount type=bind,src="${PWD}/artifacts/standard-v2-m1-gpu",dst=/artifacts \
+            "${IMAGE_ID}" python -m benchmarks.bench_standard_v2 \
+              --training-metrics /artifacts/training-metrics.json \
+              --output /artifacts/standard-v2-r1-single-gpu.json
+
+      - name: Enforce M1 performance and provenance contract
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          artifact_dir = Path("artifacts/standard-v2-m1-gpu")
+          report = json.loads((artifact_dir / "bidding-benchmark.json").read_text())
+          baseline = json.loads(
+              (artifact_dir / "standard-v2-r1-single-gpu.json").read_text()
+          )
+          checked_in = json.loads(
+              Path("benchmarks/baselines/standard_v2_r1_single_gpu.json").read_text()
+          )
+          target_sha = os.environ["TARGET_SHA"]
+          image_id = os.environ["IMAGE_ID"]
+
+          if report.get("source_git_sha") != target_sha:
+              raise SystemExit("microbenchmark source_git_sha is not the PR head")
+          if report.get("device") != "cuda":
+              raise SystemExit("microbenchmark did not run on CUDA")
+          rows = {row["batch_size"]: row for row in report.get("results", [])}
+          if 32 not in rows:
+              raise SystemExit("microbenchmark is missing batch size 32")
+          gate = rows[32]["head_forward_backward"]
+          for metric in ("mean_ms", "p95_ms"):
+              if not isinstance(gate.get(metric), (int, float)) or gate[metric] > 1.5:
+                  raise SystemExit(f"B=32 {metric} exceeds 1.5 ms: {gate.get(metric)!r}")
+
+          for field in (
+              "schema_version", "contract_version", "config_hash",
+              "training_semantics_hash", "benchmark_workload_hash",
+              "reference_digest", "coverage",
+          ):
+              if baseline.get(field) != checked_in.get(field):
+                  raise SystemExit(f"generated R1 baseline disagrees on {field}")
+          performance = baseline.get("performance", {})
+          if performance.get("counts") != checked_in["performance"]["counts"]:
+              raise SystemExit("generated R1 baseline has a different fixed workload")
+          measurement = performance.get("measurement", {})
+          if measurement.get("device_type") != "cuda":
+              raise SystemExit("R1 baseline did not run on CUDA")
+          if measurement.get("parameter_update_observed") is not True:
+              raise SystemExit("R1 baseline did not observe a parameter update")
+
+          recorded_image = (artifact_dir / "docker-image-id.txt").read_text().strip()
+          if recorded_image != image_id:
+              raise SystemExit("recorded Docker image ID changed during the run")
+          manifest = {
+              "schema_version": "standard-v2-m1-gpu-evidence-v1",
+              "source_git_sha": target_sha,
+              "workflow_sha": os.environ.get("WORKFLOW_SHA", ""),
+              "workflow_ref": os.environ.get("WORKFLOW_REF", ""),
+              "docker_image_id": image_id,
+              "b32_head_forward_backward": gate,
+          }
+          (artifact_dir / "evidence-manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+          )
+          PY
+
+      - name: Record environment and artifact digests
+        run: |
+          set -euo pipefail
           docker run --rm --gpus all \
             --mount type=bind,src="${PWD}/artifacts/standard-v2-m1-gpu",dst=/artifacts \
-            douzero-test:latest python tools/gpu_validation_probe.py \
+            "${IMAGE_ID}" python tools/gpu_validation_probe.py \
               --output /artifacts/environment.json
-          printf '%s\n' \
-            "source_git_sha=${GITHUB_SHA}" \
-            "docker_image=$(cat artifacts/standard-v2-m1-gpu/docker-image-id.txt)" \
-            "workflow=${GITHUB_WORKFLOW}" \
-            "run_id=${GITHUB_RUN_ID}" \
-            > artifacts/standard-v2-m1-gpu/metadata.txt
           cd artifacts/standard-v2-m1-gpu
-          sha256sum bidding-benchmark.json cuda-pytest.log environment.json \
-            docker-image-id.txt metadata.txt > SHA256SUMS
+          sha256sum bidding-benchmark.json cuda-pytest.log docker-image-id.txt \
+            environment.json evidence-manifest.json full-baseline.log \
+            standard-v2-r1-single-gpu.json training-metrics.json > SHA256SUMS
 
       - name: Upload exact-head evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: standard-v2-m1-gpu-${{ github.sha }}
+          name: standard-v2-m1-gpu-${{ github.event.pull_request.head.sha || github.sha }}
           path: artifacts/standard-v2-m1-gpu/
           if-no-files-found: error
           retention-days: 30
+
+      - name: Remove run-specific image tag
+        if: always()
+        run: |
+          if [ -n "${IMAGE_TAG:-}" ]; then
+            docker image rm "${IMAGE_TAG}" || true
+          fi

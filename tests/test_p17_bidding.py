@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from benchmarks.bench_bidding_batch import run_benchmark
+from benchmarks.bench_bidding_batch import _summary, run_benchmark
 from douzero.checkpoint import (
     CheckpointCompatibilityError,
     load_v2_checkpoint,
@@ -488,7 +488,11 @@ def test_batched_bidding_contract_rejects_empty_and_illegal_rows():
 
 def test_bidding_batch_controls_inherit_and_validate_independently():
     inherited = TrainerConfig(batch_size=7, optimizer_steps=0)
-    assert inherited.bidding_batch_size == 7
+    assert inherited.bidding_batch_size is None
+    assert inherited.resolved_bidding_batch_size == 7
+    resized = replace(inherited, batch_size=11)
+    assert resized.bidding_batch_size is None
+    assert resized.resolved_bidding_batch_size == 11
     explicit = TrainerConfig(
         batch_size=7,
         bidding_batch_size=3,
@@ -496,6 +500,7 @@ def test_bidding_batch_controls_inherit_and_validate_independently():
         optimizer_steps=0,
     )
     assert explicit.bidding_batch_size == 3
+    assert explicit.resolved_bidding_batch_size == 3
     assert explicit.bidding_update_interval == 2
     with pytest.raises(ValueError, match="bidding_batch_size"):
         TrainerConfig(bidding_batch_size=0)
@@ -503,21 +508,52 @@ def test_bidding_batch_controls_inherit_and_validate_independently():
         TrainerConfig(bidding_update_interval=0)
 
 
+def test_pure_bidding_loss_rejects_interval_gaps_without_a_value_objective():
+    with pytest.raises(
+        ValueError, match="requires at least one non-bidding value/strategy loss"
+    ):
+        V2Trainer(
+            ModelV2(build_v2_schema(), _tiny_config()),
+            ruleset=RuleSet.standard(),
+            loss_config=LossConfig(
+                lambda_win=0.0,
+                lambda_score=0.0,
+                lambda_uncertainty=0.0,
+                lambda_bid_policy=1.0,
+            ),
+            bidding_policy_config=BiddingPolicyConfig(policy="max"),
+            config=TrainerConfig(
+                max_episodes=0,
+                optimizer_steps=3,
+                batch_size=1,
+                bidding_update_interval=2,
+            ),
+        )
+
+
 def test_bidding_benchmark_covers_head_learner_and_scalar_paths():
     report = run_benchmark(
         device="cpu", batch_sizes=(1,), warmup=0, iterations=1
     )
-    assert report["schema_version"] == "standard-v2-bidding-microbenchmark-v2"
+    assert report["schema_version"] == "standard-v2-bidding-microbenchmark-v3"
     assert set(report["results"][0]) == {
         "batch_size",
         "head_forward_backward",
         "learner_step_wall",
     }
     assert set(report["scalar_inference"]) == {
-        "fast_path_wall",
-        "batched_wrapper_wall",
+        "fast_forward_wall",
+        "fast_decision_wall",
+        "batched_wrapper_forward_wall",
+        "batched_wrapper_decision_wall",
     }
+    assert report["inference_mode"] == "eval_inference_mode_fp32"
     assert report["results"][0]["learner_step_wall"]["mean_ms"] > 0
+
+
+def test_bidding_benchmark_p95_uses_nearest_rank():
+    summary = _summary([float(value) for value in range(1, 101)], 100)
+    assert summary["p95_ms"] == 95.0
 
 
 def test_masked_bid_loss_uses_actor_return_and_landlord_value_gradients():

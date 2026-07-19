@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import time
 from pathlib import Path
@@ -48,10 +49,12 @@ def _wall_elapsed_ms(device: torch.device, operation) -> float:
 
 def _summary(samples: list[float], iterations: int) -> dict:
     ordered = sorted(samples)
+    # Nearest-rank percentile: p95 is the 95th ordered sample for n=100.
+    p95_index = max(0, math.ceil(0.95 * len(ordered)) - 1)
     return {
         "mean_ms": statistics.fmean(samples),
         "p50_ms": statistics.median(samples),
-        "p95_ms": ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))],
+        "p95_ms": ordered[p95_index],
         "iterations": iterations,
     }
 
@@ -203,27 +206,67 @@ def run_benchmark(
             "learner_step_wall": _summary(learner_samples, iterations),
         })
 
+    model.eval()
     scalar_observation = _bidding_observations_and_minibatch(1)[0][0]
 
-    def scalar_fast() -> None:
-        model.forward_bidding(scalar_observation)
+    def scalar_fast_forward() -> None:
+        with torch.inference_mode(), torch.autocast(
+            device_type=target.type, enabled=False
+        ):
+            model.forward_bidding(scalar_observation)
 
-    def scalar_batched_reference() -> None:
-        model.forward_bidding_batched(
-            bidding_observations_to_model_input((scalar_observation,))
-        ).select(0)
+    def scalar_fast_decision() -> None:
+        with torch.inference_mode(), torch.autocast(
+            device_type=target.type, enabled=False
+        ):
+            model.forward_bidding(scalar_observation).argmax_bid()
+
+    def scalar_batched_forward() -> None:
+        with torch.inference_mode(), torch.autocast(
+            device_type=target.type, enabled=False
+        ):
+            model.forward_bidding_batched(
+                bidding_observations_to_model_input((scalar_observation,))
+            ).select(0)
+
+    def scalar_batched_decision() -> None:
+        with torch.inference_mode(), torch.autocast(
+            device_type=target.type, enabled=False
+        ):
+            model.forward_bidding_batched(
+                bidding_observations_to_model_input((scalar_observation,))
+            ).select(0).argmax_bid()
 
     for _ in range(warmup):
-        scalar_fast()
-        scalar_batched_reference()
+        scalar_fast_forward()
+        scalar_fast_decision()
+        scalar_batched_forward()
+        scalar_batched_decision()
     scalar_inference = {
-        "fast_path_wall": _summary(
-            [_wall_elapsed_ms(target, scalar_fast) for _ in range(iterations)],
+        "fast_forward_wall": _summary(
+            [
+                _wall_elapsed_ms(target, scalar_fast_forward)
+                for _ in range(iterations)
+            ],
             iterations,
         ),
-        "batched_wrapper_wall": _summary(
+        "fast_decision_wall": _summary(
             [
-                _wall_elapsed_ms(target, scalar_batched_reference)
+                _wall_elapsed_ms(target, scalar_fast_decision)
+                for _ in range(iterations)
+            ],
+            iterations,
+        ),
+        "batched_wrapper_forward_wall": _summary(
+            [
+                _wall_elapsed_ms(target, scalar_batched_forward)
+                for _ in range(iterations)
+            ],
+            iterations,
+        ),
+        "batched_wrapper_decision_wall": _summary(
+            [
+                _wall_elapsed_ms(target, scalar_batched_decision)
                 for _ in range(iterations)
             ],
             iterations,
@@ -239,12 +282,13 @@ def run_benchmark(
             "compute_capability": f"{properties.major}.{properties.minor}",
         }
     return {
-        "schema_version": "standard-v2-bidding-microbenchmark-v2",
+        "schema_version": "standard-v2-bidding-microbenchmark-v3",
         "source_git_sha": git_sha(),
         "device": str(target),
         "device_metadata": device_metadata,
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
+        "inference_mode": "eval_inference_mode_fp32",
         "batch_sizes": list(batch_sizes),
         "results": results,
         "scalar_inference": scalar_inference,
