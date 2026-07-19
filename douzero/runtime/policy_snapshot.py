@@ -41,10 +41,40 @@ class VersionedPolicyPool(Generic[T]):
         self._active_slot = mp_context.Value("i", 0, lock=False)
         self._version = mp_context.Value("q", 0, lock=False)
         self._readers = mp_context.Array("i", len(self.models), lock=False)
+        self._writers = mp_context.Array("i", len(self.models), lock=False)
         self._owner_slots = mp_context.Array("i", max_owners, lock=False)
         self._owner_generations = mp_context.Array("q", max_owners, lock=False)
         for owner in range(max_owners):
             self._owner_slots[owner] = -1
+        self._target_states = []
+        for target in self.models:
+            role_models = (
+                target.get_models()
+                if hasattr(target, "get_models")
+                else target.models
+            )
+            self._target_states.append({
+                position: target.get_model(position).state_dict(keep_vars=True)
+                for position in role_models
+            })
+
+    def _copy_state(self, slot: int,
+                    source_models: dict[str, torch.nn.Module]) -> None:
+        """Copy pre-paired state tensors without rebuilding/loading a state_dict."""
+        target_roles = self._target_states[slot]
+        with torch.no_grad():
+            for position, source in source_models.items():
+                source_state = source.state_dict(keep_vars=True)
+                target_state = target_roles[position]
+                if source_state.keys() != target_state.keys():
+                    raise ValueError(f"policy state keys changed for {position}")
+                for key, target_tensor in target_state.items():
+                    source_tensor = source_state[key]
+                    if target_tensor.shape != source_tensor.shape:
+                        raise ValueError(
+                            f"policy state shape changed for {position}.{key}"
+                        )
+                    target_tensor.copy_(source_tensor)
 
     @property
     def version(self) -> int:
@@ -118,10 +148,9 @@ class VersionedPolicyPool(Generic[T]):
 
     def initialize(self, source_models: dict[str, torch.nn.Module]) -> None:
         """Copy the initial learner state into every slot before actors start."""
-        with self._lock, torch.no_grad():
-            for target in self.models:
-                for position, source in source_models.items():
-                    target.get_model(position).load_state_dict(source.state_dict())
+        with self._lock:
+            for slot in range(len(self.models)):
+                self._copy_state(slot, source_models)
 
     def publish(
         self,
@@ -139,18 +168,33 @@ class VersionedPolicyPool(Generic[T]):
             active = int(self._active_slot.value)
             writable = next(
                 (slot for slot in range(len(self.models))
-                 if slot != active and self._readers[slot] == 0),
+                 if slot != active and self._readers[slot] == 0
+                 and self._writers[slot] == 0),
                 None,
             )
             if writable is None:
                 return False
-            target = self.models[writable]
-            with torch.no_grad():
-                for position, source in source_models.items():
-                    target.get_model(position).load_state_dict(source.state_dict())
+            self._writers[writable] = 1
+
+        # The expensive device/host copies happen outside the lease lock. The
+        # slot is inactive and writer-reserved, so actors cannot observe it.
+        try:
+            self._copy_state(writable, source_models)
+        except BaseException:
+            with self._lock:
+                self._writers[writable] = 0
+            raise
+
+        with self._lock:
+            if version <= self._version.value:
+                self._writers[writable] = 0
+                raise ValueError(
+                    f"policy version {version} was superseded during publication"
+                )
             self._active_slot.value = writable
             self._version.value = version
-            return True
+            self._writers[writable] = 0
+        return True
 
     def reader_counts(self) -> tuple[int, ...]:
         """Return per-slot lease counts for diagnostics and tests."""

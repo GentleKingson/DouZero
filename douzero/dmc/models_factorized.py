@@ -327,6 +327,37 @@ class _LegacyFactorizedBase(nn.Module):
             action = torch.argmax(values, dim=0)[0]
         return dict(action=action)
 
+    def select_actions_packed(self, z_batch, x_state_batch, x_action,
+                              action_counts):
+        """Score a microbatch of decisions packed by role and return argmaxes."""
+        if z_batch.ndim != 3 or x_state_batch.ndim != 2 or x_action.ndim != 2:
+            raise ValueError("invalid packed factorized input ranks")
+        if len(action_counts) != z_batch.shape[0] or z_batch.shape[0] < 1:
+            raise ValueError("action_counts must match the decision batch")
+        if any(count < 1 for count in action_counts):
+            raise ValueError("every packed decision requires a legal action")
+        if sum(action_counts) != x_action.shape[0]:
+            raise ValueError("packed action rows do not match action_counts")
+        lstm_out, _ = self.lstm(z_batch)
+        h_lstm = lstm_out[:, -1, :]
+        repeats = torch.as_tensor(
+            action_counts, dtype=torch.long, device=z_batch.device
+        )
+        h = torch.cat([
+            torch.repeat_interleave(h_lstm, repeats, dim=0),
+            torch.repeat_interleave(x_state_batch, repeats, dim=0),
+            x_action,
+        ], dim=-1)
+        h = torch.relu(self.dense1(h))
+        h = torch.relu(self.dense2(h))
+        h = torch.relu(self.dense3(h))
+        h = torch.relu(self.dense4(h))
+        h = torch.relu(self.dense5(h))
+        values = self.dense6(h).squeeze(-1)
+        return torch.stack([
+            chunk.argmax() for chunk in values.split(list(action_counts))
+        ])
+
 
 class LegacyFactorizedLandlordModel(_LegacyFactorizedBase):
     """Factorized landlord model — loads legacy landlord checkpoints unchanged.

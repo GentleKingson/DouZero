@@ -1,4 +1,5 @@
 from collections import Counter
+import time
 import numpy as np
 
 from douzero.env.game import GameEnv, IllegalActionError, IllegalPhaseError
@@ -28,7 +29,8 @@ class Env:
     """
     Doudizhu multi-agent wrapper
     """
-    def __init__(self, objective, ruleset=None):
+    def __init__(self, objective, ruleset=None, *, observation_backend="legacy",
+                 profile_timing=False):
         """
         Objective is wp/adp/logadp. It indicates whether considers
         bomb in reward calculation. Here, we use dummy agents.
@@ -54,6 +56,13 @@ class Env:
         """
         self.objective = objective
         self.ruleset = ruleset
+        if observation_backend not in {"legacy", "factorized"}:
+            raise ValueError("observation_backend must be 'legacy' or 'factorized'")
+        if ruleset is not None and observation_backend != "legacy":
+            raise ValueError("factorized observations support legacy rules only")
+        self.observation_backend = observation_backend
+        self.profile_timing = bool(profile_timing)
+        self.last_observation_ns = 0
 
         # Initialize players
         # We use three dummy player for the target position
@@ -63,6 +72,7 @@ class Env:
 
         # Initialize the internal environment
         self._env = GameEnv(self.players, ruleset=ruleset)
+        self._env.profile_timing = self.profile_timing
 
         self.infoset = None
         # Standard-mode: the current bidding observation (None in legacy).
@@ -154,7 +164,7 @@ class Env:
         self._env.card_play_init(card_play_data)
         self.infoset = self._game_infoset
 
-        return get_obs(self.infoset)
+        return self._get_play_observation()
 
     def redeal(self):
         """Re-deal a new deck for the same game session (after all-pass redeal).
@@ -222,7 +232,7 @@ class Env:
             # purely additive.
             info = self._attach_team_perspective_labels(info)
         else:
-            obs = get_obs(self.infoset)
+            obs = self._get_play_observation()
         return obs, reward, done, info
 
     def _step_bidding(self, bid_value):
@@ -251,7 +261,7 @@ class Env:
                 self._env._reveal_bottom_cards()
                 self.bidding_obs = None
                 self.infoset = self._game_infoset
-                return get_obs(self.infoset), 0.0, False, {
+                return self._get_play_observation(), 0.0, False, {
                     'bidding_complete': True,
                     'max_redeals_exceeded': True,
                 }
@@ -266,7 +276,19 @@ class Env:
         # Bidding complete; transitioned to PLAYING.
         self.bidding_obs = None
         self.infoset = self._game_infoset
-        return get_obs(self.infoset), 0.0, False, {'bidding_complete': True}
+        return self._get_play_observation(), 0.0, False, {'bidding_complete': True}
+
+    def _get_play_observation(self):
+        started_ns = time.perf_counter_ns() if self.profile_timing else 0
+        encoder = (
+            get_obs_factorized
+            if self.observation_backend == "factorized"
+            else get_obs
+        )
+        observation = encoder(self.infoset)
+        if self.profile_timing:
+            self.last_observation_ns = time.perf_counter_ns() - started_ns
+        return observation
 
     def _get_reward(self):
         """

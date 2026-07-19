@@ -58,6 +58,9 @@ testpaths = ["tests"]
 # runners (no hard timeout is set in addopts here to avoid surprises when
 # running on slower local hardware).
 addopts = "-ra -q"
+markers = [
+    "cuda: requires an NVIDIA CUDA runtime and is run explicitly in GPU validation",
+]
 filterwarnings = [
     "error::DeprecationWarning:douzero.*",
 ]

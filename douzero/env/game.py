@@ -1,4 +1,5 @@
 from copy import deepcopy
+import time
 from . import move_detector as md, move_selector as ms
 from .move_generator import MovesGener
 from .rules import (
@@ -37,6 +38,8 @@ class GameEnv(object):
         self.player_utility_dict = None
 
         self.players = players
+        self.profile_timing = False
+        self.last_legal_actions_ns = 0
 
         self.last_move_dict = {'landlord': [],
                                'landlord_up': [],
@@ -379,9 +382,13 @@ class GameEnv(object):
         self.info_sets[
             self.acting_player_position].last_pid = self.last_pid
 
+        if self.profile_timing:
+            legal_started_ns = time.perf_counter_ns()
         self.info_sets[
             self.acting_player_position].legal_actions = \
             self.get_legal_card_play_actions()
+        if self.profile_timing:
+            self.last_legal_actions_ns = time.perf_counter_ns() - legal_started_ns
 
         self.info_sets[
             self.acting_player_position].bomb_num = self.bomb_num

@@ -1,0 +1,271 @@
+{
+  "actor_timing_mean_ms": {
+    "env_step": 0.1924809296518451,
+    "free_queue_wait": 0.00015186301995044984,
+    "full_queue_put": 0.00029334528621723826,
+    "inference": 0.5036636084235232,
+    "legal_actions": 0.022383943734515584,
+    "observation": 0.08779481523014734,
+    "rollout_write": 0.004278928869474508
+  },
+  "config": {
+    "actor_device_cpu": true,
+    "actor_torch_threads": 1,
+    "alpha": 0.99,
+    "amp_dtype": "float16",
+    "amp_enabled": true,
+    "amp_fallback_on_nonfinite": true,
+    "batch_size": 32,
+    "benchmark_warmup_frames": 6400,
+    "bidding_batch_size": null,
+    "bidding_update_interval": 1,
+    "compile_actor": false,
+    "compile_learner": false,
+    "compile_model": false,
+    "config": "benchmarks/configs/legacy_a2_cpu_factorized_amp.yaml",
+    "ddp_backend": "auto",
+    "ddp_enabled": false,
+    "deterministic": false,
+    "disable_checkpoint": true,
+    "epsilon": 1e-05,
+    "exp_epsilon": 0.01,
+    "feature_version": "legacy",
+    "gpu_devices": "0",
+    "grad_clip_foreach": false,
+    "learning_rate": 0.0001,
+    "legacy_actor_backend": "factorized",
+    "legacy_bulk_rollout": true,
+    "legacy_contiguous_buffers": true,
+    "legacy_flush_ge": true,
+    "legacy_log_interval_seconds": 5.0,
+    "legacy_metrics_path": "/output/legacy_a2_cpu_factorized_amp-r3.json",
+    "legacy_monitor_interval_seconds": 1.0,
+    "legacy_profile": true,
+    "legacy_profile_sample_interval": 1,
+    "legacy_reusable_pinned_staging": true,
+    "load_model": false,
+    "max_grad_norm": 40.0,
+    "model_version": "legacy",
+    "momentum": 0,
+    "num_actor_devices": 1,
+    "num_actors": 12,
+    "num_buffers": 64,
+    "num_threads": 1,
+    "objective": "adp",
+    "pin_memory": true,
+    "policy_snapshot_slots": 3,
+    "rmsprop_foreach": false,
+    "ruleset": "legacy",
+    "save_interval": 30,
+    "savedir": "/output/run-logs",
+    "seed": 0,
+    "sync_interval_updates": 16,
+    "total_frames": 25600,
+    "training_device": "0",
+    "unroll_length": 100,
+    "xpid": "legacy_a2_cpu_factorized_amp-r3"
+  },
+  "counts": {
+    "actor": {
+      "decisions": 15338,
+      "env_step_ns": 2952272499,
+      "free_queue_wait_ns": 2329275,
+      "full_queue_put_ns": 4499330,
+      "games": 236,
+      "inference_ns": 7725192426,
+      "legal_actions_ns": 343324929,
+      "observation_ns": 1346596876,
+      "rollout_write_ns": 65630211,
+      "single_legal_actions": 4766,
+      "transitions": 15500
+    },
+    "learner": {
+      "backward_ns": 85493019,
+      "batch_assembly_ns": 93845526,
+      "batch_wait_ns": 4173854563,
+      "forward_ns": 179394491,
+      "frames": 22400,
+      "grad_clip_ns": 40925337,
+      "h2d_ns": 10836606,
+      "log_write_ns": 0,
+      "log_writes": 0,
+      "optimizer_ns": 41627932,
+      "pin_memory_ns": 0,
+      "profile_samples": 7,
+      "snapshot_publish_ns": 0,
+      "snapshot_publishes": 0,
+      "snapshot_skips": 0,
+      "updates": 7
+    }
+  },
+  "cuda": {
+    "available": true,
+    "peak_allocated_mib": 434.10595703125,
+    "peak_reserved_mib": 532.0
+  },
+  "frames_total": 28800,
+  "learner_timing_mean_ms": {
+    "backward": 12.21328842857143,
+    "batch_assembly": 13.406503714285714,
+    "batch_wait": 596.2649375714285,
+    "forward": 25.627784428571427,
+    "grad_clip": 5.846476714285714,
+    "h2d": 1.5480865714285714,
+    "log_write": null,
+    "optimizer": 5.946847428571428,
+    "pin_memory": 0.0,
+    "snapshot_publish": null
+  },
+  "learner_updates_total": 9,
+  "legal_actions": {
+    "max": 367,
+    "overflow_count": 0,
+    "p50": 2,
+    "p95": 21,
+    "single_ratio": 0.31073151649497976
+  },
+  "measurement_seconds": 1.354000532,
+  "position_frames": {
+    "landlord": 9600,
+    "landlord_down": 9600,
+    "landlord_up": 9600
+  },
+  "queue_starvation_mean_ms": {
+    "landlord": 410.29785,
+    "landlord_down": 832.705249,
+    "landlord_up": 427.571558
+  },
+  "rates": {
+    "decisions_per_second": 11327.912831277972,
+    "frames_per_second": 16543.568093664533,
+    "games_per_second": 174.29830670110846,
+    "learner_updates_per_second": 5.1698650292701664,
+    "transitions_per_second": 11447.558279098224
+  },
+  "schema_version": "legacy-training-metrics-v1",
+  "stats": {
+    "amp_fallbacks_landlord": 0.0,
+    "amp_fallbacks_landlord_down": 0.0,
+    "amp_fallbacks_landlord_up": 0.0,
+    "loss_landlord": 1.9871963262557983,
+    "loss_landlord_down": 1.9808144569396973,
+    "loss_landlord_up": 1.9588656425476074,
+    "mean_episode_return_landlord": -0.2887881398200989,
+    "mean_episode_return_landlord_down": 0.28428512811660767,
+    "mean_episode_return_landlord_up": 0.2858348488807678,
+    "policy_lag_landlord": 0.0,
+    "policy_lag_landlord_down": 0.0,
+    "policy_lag_landlord_up": 0.0
+  },
+  "status": "completed",
+  "system": {
+    "cpu_percent": {
+      "max": null,
+      "median": null,
+      "p95": null
+    },
+    "gpu_percent": {
+      "max": 2.0,
+      "median": 2.0,
+      "p95": 2.0
+    },
+    "rss_growth_mib": 0.0,
+    "rss_mib": {
+      "max": 8566.45703125,
+      "median": 8566.45703125,
+      "p95": 8566.45703125
+    },
+    "samples": [
+      {
+        "cpu_percent": null,
+        "elapsed_seconds": 85800.134726769,
+        "gpu_percent": 2.0,
+        "rss_mib": 8566.45703125,
+        "vram_mib": 1054.0
+      }
+    ],
+    "vram_growth_mib": 0.0,
+    "vram_mib": {
+      "max": 1054.0,
+      "median": 1054.0,
+      "p95": 1054.0
+    }
+  },
+  "workers": {
+    "actors": [
+      {
+        "actor_id": 0,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 1,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 2,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 3,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 4,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 5,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 6,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 7,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 8,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 9,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 10,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      },
+      {
+        "actor_id": 11,
+        "alive": false,
+        "device": "cpu",
+        "exitcode": 0
+      }
+    ],
+    "learner_threads_alive": 0
+  }
+}

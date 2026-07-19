@@ -1,0 +1,215 @@
+{
+  "aggregate": {
+    "legacy_b1_gpu_factorized": {
+      "amp_fallbacks": {
+        "max": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "p95": 0.0,
+        "relative_range": null
+      },
+      "cpu_utilization_median": {
+        "max": 200.9536109495175,
+        "median": 200.14444758413708,
+        "min": 200.11081450184113,
+        "p95": 200.9536109495175,
+        "relative_range": 0.004210940937155237
+      },
+      "decisions_per_second": {
+        "max": 2668.0572753385386,
+        "median": 2655.5518256080486,
+        "min": 2652.9923094191345,
+        "p95": 2668.0572753385386,
+        "relative_range": 0.0056730076868127645
+      },
+      "frames_per_second": {
+        "max": 2922.401167002145,
+        "median": 2917.4731911138497,
+        "min": 2904.5724614883,
+        "p95": 2922.401167002145,
+        "relative_range": 0.006111009200752281
+      },
+      "games_per_second": {
+        "max": 50.57068124912665,
+        "median": 45.5855186111539,
+        "min": 44.74926786972034,
+        "p95": 50.57068124912665,
+        "relative_range": 0.12770312934384212
+      },
+      "gpu_utilization_median": {
+        "max": 91.0,
+        "median": 90.5,
+        "min": 90.0,
+        "p95": 91.0,
+        "relative_range": 0.011049723756906077
+      },
+      "gpu_utilization_p95": {
+        "max": 92.0,
+        "median": 92.0,
+        "min": 91.0,
+        "p95": 92.0,
+        "relative_range": 0.010869565217391304
+      },
+      "learner_updates_per_second": {
+        "max": 0.9132503646881703,
+        "median": 0.911710372223078,
+        "min": 0.9076788942150937,
+        "p95": 0.9132503646881703,
+        "relative_range": 0.006111009200752373
+      },
+      "legal_actions_max": {
+        "max": 378.0,
+        "median": 374.0,
+        "min": 373.0,
+        "p95": 378.0,
+        "relative_range": 0.013368983957219251
+      },
+      "legal_actions_p50": {
+        "max": 2.0,
+        "median": 2.0,
+        "min": 2.0,
+        "p95": 2.0,
+        "relative_range": 0.0
+      },
+      "legal_actions_p95": {
+        "max": 23.0,
+        "median": 21.0,
+        "min": 19.0,
+        "p95": 23.0,
+        "relative_range": 0.19047619047619047
+      },
+      "policy_lag_max": {
+        "max": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "p95": 0.0,
+        "relative_range": null
+      },
+      "repeat": {
+        "max": 3.0,
+        "median": 2.0,
+        "min": 1.0,
+        "p95": 3.0,
+        "relative_range": 1.0
+      },
+      "repeats": 3,
+      "rss_mib_max": {
+        "max": 3456.06640625,
+        "median": 3440.9609375,
+        "min": 3440.62890625,
+        "p95": 3456.06640625,
+        "relative_range": 0.004486392109762216
+      },
+      "single_legal_ratio": {
+        "max": 0.3411255832037325,
+        "median": 0.3344940899504635,
+        "min": 0.3287435456110155,
+        "p95": 0.3411255832037325,
+        "relative_range": 0.03701720886772828
+      },
+      "transitions_per_second": {
+        "max": 2687.5653589394724,
+        "median": 2683.0333811136297,
+        "min": 2645.2356345697017,
+        "p95": 2687.5653589394724,
+        "relative_range": 0.01577681614687968
+      },
+      "vram_mib_max": {
+        "max": 2024.0,
+        "median": 2004.0,
+        "min": 2004.0,
+        "p95": 2024.0,
+        "relative_range": 0.00998003992015968
+      },
+      "wall_seconds": {
+        "max": 14.111069891005172,
+        "median": 14.110554425002192,
+        "min": 14.107827902000281,
+        "p95": 14.111069891005172,
+        "relative_range": 0.00022975631624700402
+      }
+    }
+  },
+  "environment": {
+    "cuda_available": true,
+    "cudnn": 92000,
+    "git_sha": "ce6c4237fd18207b9dd8c3c15b94e9cdaa8fdac5",
+    "gpu": "NVIDIA GeForce RTX 5070, 595.71.05, 12227",
+    "platform": "Linux-7.0.0-28-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "torch": "2.12.1+cu132",
+    "torch_cuda": "13.2"
+  },
+  "protocol": {
+    "checkpoint_disabled": true,
+    "measure_frames": 19200,
+    "repeats": 3,
+    "warmup_frames": 6400
+  },
+  "raw_runs": [
+    {
+      "amp_fallbacks": 0.0,
+      "configuration": "legacy_b1_gpu_factorized",
+      "cpu_utilization_median": 200.11081450184113,
+      "decisions_per_second": 2668.0572753385386,
+      "frames_per_second": 2904.5724614883,
+      "games_per_second": 50.57068124912665,
+      "gpu_utilization_median": 90.0,
+      "gpu_utilization_p95": 91.0,
+      "learner_updates_per_second": 0.9076788942150937,
+      "legal_actions_max": 373,
+      "legal_actions_p50": 2,
+      "legal_actions_p95": 23,
+      "policy_lag_max": 0.0,
+      "repeat": 1,
+      "rss_mib_max": 3456.06640625,
+      "single_legal_ratio": 0.3411255832037325,
+      "transitions_per_second": 2645.2356345697017,
+      "vram_mib_max": 2004.0,
+      "wall_seconds": 14.111069891005172
+    },
+    {
+      "amp_fallbacks": 0.0,
+      "configuration": "legacy_b1_gpu_factorized",
+      "cpu_utilization_median": 200.9536109495175,
+      "decisions_per_second": 2655.5518256080486,
+      "frames_per_second": 2917.4731911138497,
+      "games_per_second": 45.5855186111539,
+      "gpu_utilization_median": 91.0,
+      "gpu_utilization_p95": 92.0,
+      "learner_updates_per_second": 0.911710372223078,
+      "legal_actions_max": 374,
+      "legal_actions_p50": 2,
+      "legal_actions_p95": 21,
+      "policy_lag_max": 0.0,
+      "repeat": 2,
+      "rss_mib_max": 3440.9609375,
+      "single_legal_ratio": 0.3344940899504635,
+      "transitions_per_second": 2683.0333811136297,
+      "vram_mib_max": 2004.0,
+      "wall_seconds": 14.110554425002192
+    },
+    {
+      "amp_fallbacks": 0.0,
+      "configuration": "legacy_b1_gpu_factorized",
+      "cpu_utilization_median": 200.14444758413708,
+      "decisions_per_second": 2652.9923094191345,
+      "frames_per_second": 2922.401167002145,
+      "games_per_second": 44.74926786972034,
+      "gpu_utilization_median": 90.5,
+      "gpu_utilization_p95": 92.0,
+      "learner_updates_per_second": 0.9132503646881703,
+      "legal_actions_max": 378,
+      "legal_actions_p50": 2,
+      "legal_actions_p95": 19,
+      "policy_lag_max": 0.0,
+      "repeat": 3,
+      "rss_mib_max": 3440.62890625,
+      "single_legal_ratio": 0.3287435456110155,
+      "transitions_per_second": 2687.5653589394724,
+      "vram_mib_max": 2024.0,
+      "wall_seconds": 14.107827902000281
+    }
+  ],
+  "schema_version": "legacy-training-benchmark-v1"
+}

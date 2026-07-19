@@ -1,0 +1,21 @@
+{
+  "bundles": {
+    "a1_fp32": {
+      "backend": "legacy_factorized",
+      "checkpoints": {
+        "landlord": "/output/paired-a1/landlord_weights_1030400.ckpt",
+        "landlord_up": "/output/paired-a1/landlord_up_weights_1030400.ckpt",
+        "landlord_down": "/output/paired-a1/landlord_down_weights_1030400.ckpt"
+      }
+    },
+    "a2_bf16": {
+      "backend": "legacy_factorized",
+      "checkpoints": {
+        "landlord": "/output/paired-bf16/landlord_weights_1030400.ckpt",
+        "landlord_up": "/output/paired-bf16/landlord_up_weights_1030400.ckpt",
+        "landlord_down": "/output/paired-bf16/landlord_down_weights_1030400.ckpt"
+      }
+    }
+  },
+  "ablations": {}
+}

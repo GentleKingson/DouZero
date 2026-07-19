@@ -1,0 +1,208 @@
+{
+  "aggregate": {
+    "legacy_a0_cpu_actor_thread1": {
+      "amp_fallbacks": {
+        "max": 0.0,
+        "median": 0.0,
+        "min": 0.0,
+        "p95": 0.0,
+        "relative_range": null
+      },
+      "decisions_per_second": {
+        "max": 5478.9343859799255,
+        "median": 5273.3351498326365,
+        "min": 3954.111297746263,
+        "p95": 5478.9343859799255,
+        "relative_range": 0.2891572496168875
+      },
+      "frames_per_second": {
+        "max": 6575.308344278079,
+        "median": 5570.730942326637,
+        "min": 3051.250918532158,
+        "p95": 6575.308344278079,
+        "relative_range": 0.6326023393034461
+      },
+      "games_per_second": {
+        "max": 108.90354445210568,
+        "median": 89.36380886648979,
+        "min": 80.2145261004743,
+        "p95": 108.90354445210568,
+        "relative_range": 0.3210362082316006
+      },
+      "gpu_utilization_median": {
+        "max": 7.0,
+        "median": 7.0,
+        "min": 0.0,
+        "p95": 7.0,
+        "relative_range": 1.0
+      },
+      "gpu_utilization_p95": {
+        "max": 7.0,
+        "median": 7.0,
+        "min": 0.0,
+        "p95": 7.0,
+        "relative_range": 1.0
+      },
+      "learner_updates_per_second": {
+        "max": 2.0547838575868997,
+        "median": 1.740853419477074,
+        "min": 0.9535159120412994,
+        "p95": 2.0547838575868997,
+        "relative_range": 0.6326023393034462
+      },
+      "legal_actions_max": {
+        "max": 377.0,
+        "median": 374.0,
+        "min": 301.0,
+        "p95": 377.0,
+        "relative_range": 0.20320855614973263
+      },
+      "legal_actions_p50": {
+        "max": 3.0,
+        "median": 3.0,
+        "min": 2.0,
+        "p95": 3.0,
+        "relative_range": 0.3333333333333333
+      },
+      "legal_actions_p95": {
+        "max": 27.0,
+        "median": 23.0,
+        "min": 23.0,
+        "p95": 27.0,
+        "relative_range": 0.17391304347826086
+      },
+      "policy_lag_max": {
+        "max": 3.204687476158142,
+        "median": 3.1728124618530273,
+        "min": 3.059687614440918,
+        "p95": 3.204687476158142,
+        "relative_range": 0.045700735060949495
+      },
+      "repeat": {
+        "max": 3.0,
+        "median": 2.0,
+        "min": 1.0,
+        "p95": 3.0,
+        "relative_range": 1.0
+      },
+      "repeats": 3,
+      "rss_mib_max": {
+        "max": 4074.80859375,
+        "median": 4051.7734375,
+        "min": 4038.31640625,
+        "p95": 4074.80859375,
+        "relative_range": 0.009006472860070919
+      },
+      "single_legal_ratio": {
+        "max": 0.34578087329225826,
+        "median": 0.28588720770288856,
+        "min": 0.25552373775433307,
+        "p95": 0.34578087329225826,
+        "relative_range": 0.3157088988456102
+      },
+      "transitions_per_second": {
+        "max": 5459.854250159476,
+        "median": 5309.602929405076,
+        "min": 3957.091034971392,
+        "p95": 5459.854250159476,
+        "relative_range": 0.28302741940751175
+      },
+      "vram_mib_max": {
+        "max": 1298.0,
+        "median": 1298.0,
+        "min": 1278.0,
+        "p95": 1298.0,
+        "relative_range": 0.015408320493066256
+      },
+      "wall_seconds": {
+        "max": 14.861838690005243,
+        "median": 9.79711801999656,
+        "min": 9.74673713100492,
+        "p95": 14.861838690005243,
+        "relative_range": 0.5221026784162511
+      }
+    }
+  },
+  "environment": {
+    "cuda_available": true,
+    "cudnn": 92000,
+    "git_sha": "ce6c4237fd18207b9dd8c3c15b94e9cdaa8fdac5",
+    "gpu": "NVIDIA GeForce RTX 5070, 595.71.05, 12227",
+    "platform": "Linux-7.0.0-28-generic-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "torch": "2.12.1+cu132",
+    "torch_cuda": "13.2"
+  },
+  "protocol": {
+    "checkpoint_disabled": true,
+    "measure_frames": 19200,
+    "repeats": 3,
+    "warmup_frames": 6400
+  },
+  "raw_runs": [
+    {
+      "amp_fallbacks": 0.0,
+      "configuration": "legacy_a0_cpu_actor_thread1",
+      "cpu_utilization_median": null,
+      "decisions_per_second": 5273.3351498326365,
+      "frames_per_second": 5570.730942326637,
+      "games_per_second": 89.36380886648979,
+      "gpu_utilization_median": 7.0,
+      "gpu_utilization_p95": 7.0,
+      "learner_updates_per_second": 1.740853419477074,
+      "legal_actions_max": 377,
+      "legal_actions_p50": 3,
+      "legal_actions_p95": 23,
+      "policy_lag_max": 3.204687476158142,
+      "repeat": 1,
+      "rss_mib_max": 4051.7734375,
+      "single_legal_ratio": 0.28588720770288856,
+      "transitions_per_second": 5309.602929405076,
+      "vram_mib_max": 1298.0,
+      "wall_seconds": 9.79711801999656
+    },
+    {
+      "amp_fallbacks": 0.0,
+      "configuration": "legacy_a0_cpu_actor_thread1",
+      "cpu_utilization_median": null,
+      "decisions_per_second": 5478.9343859799255,
+      "frames_per_second": 6575.308344278079,
+      "games_per_second": 108.90354445210568,
+      "gpu_utilization_median": 7.0,
+      "gpu_utilization_p95": 7.0,
+      "learner_updates_per_second": 2.0547838575868997,
+      "legal_actions_max": 301,
+      "legal_actions_p50": 2,
+      "legal_actions_p95": 23,
+      "policy_lag_max": 3.059687614440918,
+      "repeat": 2,
+      "rss_mib_max": 4038.31640625,
+      "single_legal_ratio": 0.34578087329225826,
+      "transitions_per_second": 5459.854250159476,
+      "vram_mib_max": 1298.0,
+      "wall_seconds": 9.74673713100492
+    },
+    {
+      "amp_fallbacks": 0.0,
+      "configuration": "legacy_a0_cpu_actor_thread1",
+      "cpu_utilization_median": 250.29835608814514,
+      "decisions_per_second": 3954.111297746263,
+      "frames_per_second": 3051.250918532158,
+      "games_per_second": 80.2145261004743,
+      "gpu_utilization_median": 0.0,
+      "gpu_utilization_p95": 0.0,
+      "learner_updates_per_second": 0.9535159120412994,
+      "legal_actions_max": 374,
+      "legal_actions_p50": 3,
+      "legal_actions_p95": 27,
+      "policy_lag_max": 3.1728124618530273,
+      "repeat": 3,
+      "rss_mib_max": 4074.80859375,
+      "single_legal_ratio": 0.25552373775433307,
+      "transitions_per_second": 3957.091034971392,
+      "vram_mib_max": 1278.0,
+      "wall_seconds": 14.861838690005243
+    }
+  ],
+  "schema_version": "legacy-training-benchmark-v1"
+}

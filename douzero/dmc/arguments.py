@@ -73,6 +73,56 @@ parser.add_argument('--ddp_backend', choices=['auto', 'nccl', 'gloo'],
 parser.add_argument('--compile_model', action=argparse.BooleanOptionalAction,
                     default=False, help='Enable torch.compile after benchmarking')
 
+# Opt-in V1/Legacy performance controls. ``legacy_actor_backend=legacy`` and
+# the disabled data-path/compiler flags preserve the original actor/learner
+# contract. Factorized actors default to one intra-op thread because every
+# actor is its own process; legacy actors keep their historical thread setting.
+parser.add_argument('--legacy_actor_backend',
+                    choices=['legacy', 'factorized', 'centralized_factorized'],
+                    default='legacy', help='V1 actor inference backend')
+parser.add_argument('--actor_torch_threads', default=0, type=int,
+                    help='Actor Torch threads; 0 preserves legacy (factorized defaults to 1)')
+parser.add_argument('--legacy_contiguous_buffers',
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help='Use contiguous [num_buffers,T,...] rollout storage')
+parser.add_argument('--legacy_bulk_rollout',
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help='Copy complete actor unrolls instead of Python timestep writes')
+parser.add_argument('--legacy_flush_ge',
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help='Submit a rollout as soon as exactly T transitions exist')
+parser.add_argument('--legacy_reusable_pinned_staging',
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help='Reuse pinned CPU batch staging for nonblocking H2D')
+parser.add_argument('--legacy_log_interval_seconds', default=0.0, type=float,
+                    help='0 logs every learner step; positive values log from the monitor')
+parser.add_argument('--legacy_monitor_interval_seconds', default=5.0, type=float,
+                    help='Main monitor and throughput reporting cadence')
+parser.add_argument('--legacy_profile', action=argparse.BooleanOptionalAction,
+                    default=False, help='Collect detailed V1 actor/learner timings')
+parser.add_argument('--legacy_profile_sample_interval', default=10, type=int,
+                    help='Profile one learner update per this many updates')
+parser.add_argument('--legacy_metrics_path', default='', type=str,
+                    help='Optional final V1 benchmark/profiler JSON path')
+parser.add_argument('--benchmark_warmup_frames', default=0, type=int,
+                    help='Frames excluded from the metrics measurement window')
+parser.add_argument('--compile_actor', action=argparse.BooleanOptionalAction,
+                    default=False, help='Compile actor only (unsupported for V1 dynamic actions)')
+parser.add_argument('--compile_learner', action=argparse.BooleanOptionalAction,
+                    default=False, help='Compile the fixed-shape V1 learner forward')
+parser.add_argument('--rmsprop_foreach', action=argparse.BooleanOptionalAction,
+                    default=False, help='Use the RMSprop foreach implementation')
+parser.add_argument('--grad_clip_foreach', action=argparse.BooleanOptionalAction,
+                    default=False, help='Use foreach gradient clipping')
+parser.add_argument('--central_actor_max_actions', default=512, type=int,
+                    help='Per-request action capacity for centralized V1 inference')
+parser.add_argument('--central_actor_microbatch', default=4, type=int,
+                    help='Target centralized V1 inference microbatch')
+parser.add_argument('--central_actor_max_delay_ms', default=2.0, type=float,
+                    help='Maximum centralized inference queue delay')
+parser.add_argument('--central_actor_timeout_seconds', default=30.0, type=float,
+                    help='Actor timeout while waiting for centralized inference')
+
 # Optimizer settings
 parser.add_argument('--learning_rate', default=0.0001, type=float,
                     help='Learning rate')

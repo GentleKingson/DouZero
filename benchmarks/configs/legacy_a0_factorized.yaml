@@ -1,0 +1,17 @@
+xpid: legacy-a0-factorized
+actor_device_cpu: true
+training_device: "0"
+num_actors: 12
+num_threads: 1
+batch_size: 32
+unroll_length: 100
+num_buffers: 50
+sync_interval_updates: 16
+policy_snapshot_slots: 3
+amp_enabled: false
+disable_checkpoint: true
+legacy_actor_backend: factorized
+actor_torch_threads: 1
+legacy_log_interval_seconds: 5.0
+legacy_profile: true
+legacy_profile_sample_interval: 10

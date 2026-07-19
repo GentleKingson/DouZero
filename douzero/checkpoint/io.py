@@ -61,6 +61,7 @@ def save_checkpoint(
     flags: argparse.Namespace | dict[str, Any] | None,
     frames: int,
     position_frames: dict[str, int],
+    runtime_state: dict[str, Any] | None = None,
 ) -> CheckpointManifest:
     """Save a model.tar with the legacy six keys PLUS a manifest.
 
@@ -80,6 +81,8 @@ def save_checkpoint(
         "position_frames": position_frames,
         "manifest": manifest.to_dict(),
     }
+    if runtime_state is not None:
+        bundle["runtime_state"] = runtime_state
     torch.save(bundle, path)
     return manifest
 
