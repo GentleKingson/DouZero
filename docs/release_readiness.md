@@ -14,13 +14,11 @@
   `{repository, head_sha, merge_sha, workflow_run_ids, image_digest,
   artifact_digest, attestation_identity}`. This document records the required
   gates and commands, not a moving copy of that tuple.
-- `.github/workflows/pr-evidence.yml` enforces the stable PR claim contract on
-  every open, synchronize, reopen, edit, and ready-for-review event. It rejects
-  a closure/release-ready title, literal object IDs, final-head language, fixed
-  test counts, and unbound audit claims. Its uploaded JSON binds the PR head,
-  tested merge commit, workflow commit, run identity, title hash, and body hash.
-  A later push necessarily creates a different head-bound check and artifact.
-- PR evidence is engineering evidence only. It is not a protected evaluator
+- `.github/workflows/ci.yml` records the PR head and tested merge identity in
+  the test environment and commit-bound baseline artifact. GitHub Actions run
+  records remain the authority for workflow identity, job results, and review
+  state; PR wording is descriptive metadata rather than release evidence.
+- CI evidence is engineering evidence only. It is not a protected evaluator
   result, an OIDC/Sigstore release attestation, or model-strength evidence.
 - The formal workflow implements request-v2 protected checkpoint roots,
   step-scoped protected paths, image-owned checkpoint snapshots, disjoint
@@ -86,9 +84,9 @@ production, or private-data validation.
 | P12 coach curriculum | Complete | `douzero/coach/`, P12 tests |
 | P13 search | Complete | `douzero/search/`, P13 tests |
 | P14 AMP/DDP runtime | Partial | CPU BF16/Gloo legacy tests pass; CUDA AMP/NCCL are untested and standard learned-bidding DDP is not implemented |
-| P15 paired evaluation | Partial | `p15-paired-result-v3` defines full traces, strict result integrity, real-checkout identity, nanosecond timing, and isolated protected-input snapshots. Commit-bound CI is read from the external PR evidence tuple; a protected formal run remains pending. |
+| P15 paired evaluation | Partial | `p15-paired-result-v3` defines full traces, strict result integrity, real-checkout identity, nanosecond timing, and isolated protected-input snapshots. Commit-bound CI is read from GitHub workflow records and artifacts; a protected formal run remains pending. |
 | P16 deployment package | Complete (current format) | format-2 strict package/checksum/access/identity, loaded bidding/card-play inference, self-contained belief/search, rollback, and explicit format-1 rejection diagnostics pass; no RC exists |
-| P17 readiness infrastructure | Partial | Replay, attestation, snapshot isolation, synthetic engineering smoke, and commit-bound PR evidence contracts are implemented. A protected formal run, standard/joint DDP, and external empirical gates remain open. |
+| P17 readiness infrastructure | Partial | Replay, attestation, snapshot isolation, synthetic engineering smoke, and commit-bound CI artifacts are implemented. A protected formal run, standard/joint DDP, and external empirical gates remain open. |
 
 ## 4. Release Gates
 
@@ -263,7 +261,7 @@ Formal model-release evidence: pending
 
 The tracked report defines stable gates and validation methods. It does not
 self-assert a moving PR head or CI result; those commit-bound facts must be read
-from the external evidence tuple and the PR evidence artifact. Passing code CI
+from the external evidence tuple and GitHub workflow artifacts. Passing code CI
 or the public synthetic workflow is not a model-release claim and does not
 substitute for a protected attested replay. This infrastructure status does not
 override unresolved repository-wide provenance work.
