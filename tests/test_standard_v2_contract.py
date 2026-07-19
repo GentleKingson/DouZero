@@ -682,7 +682,5 @@ def test_async_checkpoint_v5_binds_protocol_and_loads_v4(tmp_path):
     v5_bundle["async_protocol_version"] = 999
     bad_path = tmp_path / "async-bad-protocol.pt"
     torch.save(v5_bundle, bad_path)
-    from douzero.checkpoint.io import CheckpointCompatibilityError
-
     with pytest.raises(CheckpointCompatibilityError, match="async_protocol_version"):
         restored.load_training_checkpoint(str(bad_path))
