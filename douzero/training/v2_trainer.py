@@ -50,7 +50,7 @@ import hashlib
 import json
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 import numpy as np
@@ -282,6 +282,8 @@ class TrainerStats:
     abandoned_bidding_transitions: int = 0
     learner_cardplay_samples: int = 0
     learner_bidding_samples: int = 0
+    metrics_history_complete: bool = True
+    metrics_history_source: str = "native"
     redeals: int = 0
     max_redeals_exceeded: int = 0
     belief_phase: str = "frozen"
@@ -1849,6 +1851,108 @@ class V2Trainer:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return payload, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
+    def _restore_checkpoint_stats(
+        self, payload: object, *, checkpoint_version: int
+    ) -> TrainerStats:
+        if not isinstance(payload, dict):
+            raise ValueError("checkpoint stats must be an object")
+        field_names = {item.name for item in fields(TrainerStats)}
+        unknown = set(payload) - field_names
+        if unknown:
+            raise ValueError(
+                "checkpoint stats contain unknown fields: "
+                + ", ".join(sorted(unknown))
+            )
+
+        new_counters = {
+            "games_collected",
+            "bidding_decisions_collected",
+            "abandoned_bidding_transitions",
+            "learner_cardplay_samples",
+            "learner_bidding_samples",
+        }
+        history_fields = {
+            "metrics_history_complete",
+            "metrics_history_source",
+        }
+        present_new = new_counters & set(payload)
+        if present_new and present_new != new_counters:
+            raise ValueError(
+                "checkpoint stats contain a partial benchmark counter set"
+            )
+        if checkpoint_version in {4, 5}:
+            required = field_names - new_counters - history_fields
+            missing = required - set(payload)
+            if missing:
+                raise ValueError(
+                    "checkpoint stats are missing required fields: "
+                    + ", ".join(sorted(missing))
+                )
+        if checkpoint_version == 5 and not present_new:
+            raise ValueError("format 5 checkpoint is missing benchmark counters")
+
+        migrated = asdict(TrainerStats())
+        migrated.update(payload)
+        if not present_new:
+            optimizer_steps = int(migrated["optimizer_steps"])
+            batch_samples = optimizer_steps * int(self.config.batch_size)
+            migrated.update({
+                "games_collected": int(migrated["episodes_completed"]),
+                "bidding_decisions_collected": int(
+                    migrated["bidding_transitions_collected"]
+                ),
+                "abandoned_bidding_transitions": 0,
+                "learner_cardplay_samples": batch_samples,
+                "learner_bidding_samples": (
+                    batch_samples if self.bidding_loss_weight > 0 else 0
+                ),
+            })
+            if checkpoint_version == 4:
+                if migrated["bidding_transitions_collected"] != 0:
+                    raise ValueError(
+                        "format 4 async checkpoint cannot contain bidding samples"
+                    )
+                migrated["metrics_history_complete"] = True
+                migrated["metrics_history_source"] = "migrated_v4_exact"
+            else:
+                migrated["metrics_history_complete"] = False
+                migrated["metrics_history_source"] = "migrated_v3_partial"
+        else:
+            migrated.setdefault("metrics_history_complete", True)
+            migrated.setdefault("metrics_history_source", "native")
+
+        if not isinstance(migrated["metrics_history_complete"], bool):
+            raise ValueError("metrics_history_complete must be bool")
+        source = migrated["metrics_history_source"]
+        if not isinstance(source, str) or not source:
+            raise ValueError("metrics_history_source must be non-empty text")
+        for name in (
+            "episodes_completed",
+            "games_collected",
+            "transitions_collected",
+            "decisions_collected",
+            "optimizer_steps",
+            "bidding_transitions_collected",
+            "bidding_decisions_collected",
+            "abandoned_bidding_transitions",
+            "learner_cardplay_samples",
+            "learner_bidding_samples",
+        ):
+            value = migrated[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"checkpoint stat {name} must be non-negative int")
+        if migrated["games_collected"] < migrated["episodes_completed"]:
+            raise ValueError("games_collected cannot be below episodes_completed")
+        if (
+            migrated["bidding_decisions_collected"]
+            != migrated["bidding_transitions_collected"]
+            + migrated["abandoned_bidding_transitions"]
+        ):
+            raise ValueError(
+                "bidding decision counters do not reconcile with transitions"
+            )
+        return TrainerStats(**migrated)
+
     def _require_single_process_checkpoint_io(self, operation: str) -> None:
         """Reject distributed trainer save/resume before touching the path."""
         if self.distributed.enabled or self.distributed.world_size != 1:
@@ -2202,7 +2306,9 @@ class V2Trainer:
                 "belief-disabled trainer checkpoint carries belief state"
             )
         try:
-            restored_stats = TrainerStats(**bundle["stats"])
+            restored_stats = self._restore_checkpoint_stats(
+                bundle["stats"], checkpoint_version=checkpoint_version
+            )
             rng = bundle["rng"]
             if not isinstance(rng, dict) or set(rng) != {
                 "trainer", "python", "numpy", "torch", "cuda"
@@ -2637,6 +2743,31 @@ class V2Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             self._restore_belief_trainability()
 
+    def _parameter_update_watch(self) -> list[torch.nn.Parameter]:
+        watched = [next(self.model.parameters())]
+        if self.model.bidding_heads is not None:
+            watched.append(next(self.model.bidding_heads.parameters()))
+        if self.belief_model is not None and self.belief_training_mode != "frozen":
+            watched.append(next(self.belief_model.parameters()))
+        return watched
+
+    def _parameter_update_snapshot(self) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            parameter.detach().clone()
+            for parameter in self._parameter_update_watch()
+        )
+
+    def _parameters_changed_since(
+        self, snapshots: tuple[torch.Tensor, ...]
+    ) -> bool:
+        watched = self._parameter_update_watch()
+        if len(snapshots) != len(watched):
+            raise ValueError("parameter update snapshot shape changed")
+        return any(
+            not torch.equal(snapshot, parameter.detach())
+            for snapshot, parameter in zip(snapshots, watched)
+        )
+
     def train(self) -> TrainerStats:
         """Run the configured number of episodes + optimizer steps.
 
@@ -2649,12 +2780,7 @@ class V2Trainer:
         # Watch each independently-trainable path. In particular, a bid-only
         # run must not be reported unchanged merely because the first card
         # encoder parameter correctly received no gradient.
-        watched = [next(self.model.parameters())]
-        if self.model.bidding_heads is not None:
-            watched.append(next(self.model.bidding_heads.parameters()))
-        if self.belief_model is not None and self.belief_training_mode != "frozen":
-            watched.append(next(self.belief_model.parameters()))
-        before = [parameter.detach().clone() for parameter in watched]
+        before = self._parameter_update_snapshot()
         collection_started = time.perf_counter()
         self.collect_episodes()
         self._last_collection_seconds = time.perf_counter() - collection_started
@@ -2667,10 +2793,7 @@ class V2Trainer:
         self._last_optimization_seconds = (
             time.perf_counter() - optimization_started
         )
-        self.stats_last_run_changed = any(
-            not torch.equal(snapshot, parameter.detach())
-            for snapshot, parameter in zip(before, watched)
-        )
+        self.stats_last_run_changed = self._parameters_changed_since(before)
         if self.config.optimizer_steps > 0 and steps_taken < self.config.optimizer_steps:
             raise RuntimeError(
                 f"requested {self.config.optimizer_steps} optimizer steps but "

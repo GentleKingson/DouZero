@@ -48,6 +48,10 @@
         "enabled": false,
         "world_size": 1
       },
+      "metrics_history": {
+        "complete": true,
+        "source": "native"
+      },
       "parameter_update_observed": true,
       "phase_wall_seconds": {
         "collection": 1.81268,

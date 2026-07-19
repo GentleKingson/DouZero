@@ -15,6 +15,9 @@ from typing import Any, Mapping
 STANDARD_V2_R1_CONTRACT_VERSION = "standard-v2-r1-contract-v1"
 STANDARD_V2_REFERENCE_SCHEMA_VERSION = "standard-v2-r1-reference-v1"
 STANDARD_V2_BENCHMARK_SCHEMA_VERSION = "standard-v2-r1-benchmark-v1"
+STANDARD_V2_R1_REFERENCE_DIGEST = (
+    "097cd1c4c91604b925134fe4477e81ada29629efa31a122c4f432eee8389e258"
+)
 
 # The currently implemented base async path.  These values are written into
 # async checkpoints so protocol changes cannot be mistaken for exact resume.
@@ -138,6 +141,122 @@ def standard_v2_r1_config_identity(config: Any) -> dict[str, Any]:
     }
 
 
+def resolved_standard_v2_config_identity(
+    *,
+    trainer_config: Any,
+    model_config: Any,
+    loss_config: Any,
+    decision_config: Any,
+    bidding_config: Any | None,
+    ruleset: str,
+    feature_version: str,
+    model_version: str,
+    deterministic: bool,
+    ddp_enabled: bool,
+    ddp_backend: str,
+    compile_model: bool,
+    bidding_enabled: bool,
+) -> dict[str, Any]:
+    """Build the R1 identity shape from the values the trainer will use."""
+
+    bidding_policy = bidding_config
+    return {
+        "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
+        "runtime": {
+            "ruleset": str(ruleset),
+            "feature_version": str(feature_version),
+            "model_version": str(model_version),
+            "seed": int(trainer_config.seed),
+            "deterministic": bool(deterministic),
+            "batch_size": int(trainer_config.batch_size),
+            "exp_epsilon": float(trainer_config.exp_epsilon),
+            "max_grad_norm": float(trainer_config.max_grad_norm),
+            "amp_enabled": bool(trainer_config.amp_enabled),
+            "amp_dtype": str(trainer_config.amp_dtype),
+            "amp_fallback_on_nonfinite": bool(
+                trainer_config.amp_fallback_on_nonfinite
+            ),
+            "ddp_enabled": bool(ddp_enabled),
+            "ddp_backend": str(ddp_backend),
+            "compile_model": bool(compile_model),
+            "first_bidder_mode": str(trainer_config.first_bidder_mode),
+        },
+        "optimizer": {
+            "learning_rate": float(trainer_config.learning_rate),
+            "alpha": float(trainer_config.rmsprop_alpha),
+            "momentum": float(trainer_config.rmsprop_momentum),
+            "epsilon": float(trainer_config.rmsprop_epsilon),
+        },
+        "model": {
+            "version": str(model_version),
+            "hidden_size": int(model_config.hidden_size),
+            "history_encoder": str(model_config.history_encoder),
+            "history_layers": int(model_config.history_layers),
+            "history_heads": int(model_config.history_heads),
+            "role_embedding_dim": int(model_config.role_embedding_dim),
+            "belief_enabled": bool(model_config.belief_enabled),
+            "human_prior_enabled": bool(model_config.human_prior_enabled),
+            "style_enabled": bool(model_config.style_enabled),
+            "strategy_features_enabled": bool(
+                model_config.strategy_features_enabled
+            ),
+            "strategy_aux_enabled": bool(model_config.strategy_aux_enabled),
+            "bidding_enabled": bool(model_config.bidding_enabled),
+            "bidding_hidden_size": int(model_config.bidding_hidden_size),
+            "bidding_uncertainty_enabled": bool(
+                model_config.bidding_uncertainty_enabled
+            ),
+        },
+        "loss": {
+            name: getattr(loss_config, name)
+            for name in (
+                "lambda_win",
+                "lambda_score",
+                "lambda_uncertainty",
+                "lambda_bc",
+                "lambda_min_turns",
+                "lambda_regain_initiative",
+                "lambda_teammate_finish",
+                "lambda_spring",
+                "lambda_structure",
+                "lambda_bid_policy",
+                "lambda_bid_win",
+                "lambda_bid_score",
+                "lambda_bid_regret",
+                "score_delta",
+                "score_target_transform",
+                "score_clamp",
+            )
+        },
+        "decision_policy": {
+            name: getattr(decision_config, name)
+            for name in (
+                "mode",
+                "abs_tol",
+                "rel_tol",
+                "risk_penalty",
+                "prior_alpha",
+            )
+        },
+        "bidding": {
+            "enabled": bool(bidding_enabled),
+            "policy": (
+                str(bidding_policy.policy) if bidding_policy is not None else "rule"
+            ),
+            "warm_start_policy": (
+                str(bidding_policy.warm_start_policy)
+                if bidding_policy is not None
+                else "rule"
+            ),
+            "learned_probability": (
+                float(bidding_policy.learned_probability)
+                if bidding_policy is not None
+                else 0.0
+            ),
+        },
+    }
+
+
 STANDARD_V2_R1_EXPECTED_CONFIG: dict[str, Any] = {
     "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
     "runtime": {
@@ -227,6 +346,24 @@ def validate_standard_v2_r1_config(config: Any) -> dict[str, Any]:
             f"expected={STANDARD_V2_R1_CONFIG_HASH}"
         )
     return identity
+
+
+def standard_v2_benchmark_identity(
+    config_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Classify an actual resolved config without relabelling non-R1 runs."""
+
+    actual_hash = stable_identity_hash(config_identity)
+    is_r1 = dict(config_identity) == STANDARD_V2_R1_EXPECTED_CONFIG
+    return {
+        "schema_version": STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
+        "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
+        "config_hash": actual_hash,
+        "reference_digest": (
+            STANDARD_V2_R1_REFERENCE_DIGEST if is_r1 else None
+        ),
+        "qualification": "r1" if is_r1 else "non_r1",
+    }
 
 
 def standard_v2_version_contract() -> dict[str, Any]:

@@ -75,6 +75,9 @@ from douzero.human_data.synthetic import generate_synthetic_records
 from douzero.models_v2 import ModelV2, ModelV2Config
 from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.search import SearchConfig
+from douzero.training.standard_v2_contract import (
+    STANDARD_V2_R1_EXPECTED_CONFIG,
+)
 import tools.gpu_validation_probe as gpu_validation_probe
 import tools.rebuild_human_dataset as rebuild_human_dataset_tool
 from tools.gpu_validation_probe import probe_environment
@@ -580,17 +583,15 @@ def test_training_metrics_are_measured_and_amp_fallback_is_exercised():
         belief_supervised_steps = 0
         amp_fallbacks = 1
 
+    config_identity = copy.deepcopy(STANDARD_V2_R1_EXPECTED_CONFIG)
+    config_identity["runtime"]["amp_enabled"] = True
     report = _build_training_metrics(
         Stats(),
+        config_identity=config_identity,
         training_wall_seconds=2.0,
         device_type="cuda",
         peak_memory_bytes=2 * 1024 * 1024,
         peak_reserved_memory_bytes=3 * 1024 * 1024,
-        amp_enabled=True,
-        amp_dtype="float16",
-        amp_fallback_on_nonfinite=True,
-        compile_enabled=False,
-        ddp_enabled=False,
         world_size=1,
         parameters_changed=True,
     )

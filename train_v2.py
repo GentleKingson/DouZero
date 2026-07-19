@@ -45,14 +45,16 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Mapping
 
 from douzero.config import load_config
 from douzero.runtime import maybe_set_global_deterministic, set_global_seed
 from douzero.runtime.cleanup import run_cleanup_steps
 from douzero.training.standard_v2_contract import (
     STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
-    STANDARD_V2_R1_CONFIG_HASH,
     STANDARD_V2_R1_CONTRACT_VERSION,
+    resolved_standard_v2_config_identity,
+    standard_v2_benchmark_identity,
 )
 
 
@@ -610,29 +612,30 @@ def _validate_ddp_features(
 def _build_training_metrics(
     stats,
     *,
+    config_identity: Mapping[str, object],
     training_wall_seconds: float,
     device_type: str,
     peak_memory_bytes: int | None,
     peak_reserved_memory_bytes: int | None,
-    amp_enabled: bool,
-    amp_dtype: str,
-    amp_fallback_on_nonfinite: bool,
-    compile_enabled: bool,
-    ddp_enabled: bool,
     world_size: int,
     parameters_changed: bool | None,
     runtime_metrics: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build finite, sanitized P17 throughput and memory diagnostics."""
+    benchmark_identity = standard_v2_benchmark_identity(config_identity)
+    runtime_identity = config_identity.get("runtime")
+    if not isinstance(runtime_identity, Mapping):
+        raise ValueError("resolved config identity is missing runtime fields")
     elapsed = max(float(training_wall_seconds), 1.0e-12)
     cardplay = int(stats.transitions_collected)
     bidding = int(stats.bidding_transitions_collected)
-    decisions = cardplay + bidding
     games = int(getattr(stats, "games_collected", stats.episodes_completed))
     cardplay_decisions = int(getattr(stats, "decisions_collected", cardplay))
     bidding_decisions = int(getattr(
         stats, "bidding_decisions_collected", bidding
     ))
+    decisions = cardplay_decisions + bidding_decisions
+    trainable_samples = cardplay + bidding
     abandoned_bids = int(getattr(
         stats, "abandoned_bidding_transitions", 0
     ))
@@ -672,7 +675,11 @@ def _build_training_metrics(
             return None
         return round(float(value) / (1024.0 * 1024.0), 3)
 
-    return {
+    metrics_history = {
+        "complete": bool(getattr(stats, "metrics_history_complete", True)),
+        "source": str(getattr(stats, "metrics_history_source", "native")),
+    }
+    report: dict[str, object] = {
         "schema_version": "p17-gpu-run-v1",
         "status": "passed",
         "device_type": str(device_type),
@@ -680,7 +687,7 @@ def _build_training_metrics(
         "counts": {
             "episodes": int(stats.episodes_completed),
             "cardplay_transitions": cardplay,
-            "bidding_decisions": bidding,
+            "bidding_decisions": bidding_decisions,
             "total_decisions": decisions,
             "learner_steps": int(stats.optimizer_steps),
             "redeals": int(stats.redeals),
@@ -691,16 +698,38 @@ def _build_training_metrics(
             "peak_memory_mib": mib(peak_memory_bytes),
             "peak_reserved_memory_mib": mib(peak_reserved_memory_bytes),
             "cardplay_transitions_per_second": per_second(cardplay),
-            "bidding_decisions_per_second": per_second(bidding),
+            "bidding_decisions_per_second": per_second(bidding_decisions),
             # Samples are replay transitions; decisions include card play and bids.
-            "samples_per_second": per_second(decisions),
+            "samples_per_second": per_second(trainable_samples),
             "decisions_per_second": per_second(decisions),
             "learner_steps_per_second": per_second(int(stats.optimizer_steps)),
         },
-        "standard_v2": {
+        "benchmark_identity": benchmark_identity,
+        "metrics_history": metrics_history,
+        "amp": {
+            "enabled": bool(runtime_identity["amp_enabled"]),
+            "dtype": str(runtime_identity["amp_dtype"]),
+            "fallback_on_nonfinite": bool(
+                runtime_identity["amp_fallback_on_nonfinite"]
+            ),
+            "fallback_count": int(stats.amp_fallbacks),
+            "fallback_exercised": bool(stats.amp_fallbacks),
+        },
+        "compile": {"enabled": bool(runtime_identity["compile_model"])},
+        "distributed": {
+            "enabled": bool(runtime_identity["ddp_enabled"]),
+            "world_size": int(world_size),
+        },
+        "parameter_update_observed": parameters_changed,
+        "privacy": "sanitized_no_host_or_device_identifiers",
+    }
+    if benchmark_identity["qualification"] == "r1":
+        report["standard_v2"] = {
             "schema_version": STANDARD_V2_BENCHMARK_SCHEMA_VERSION,
             "contract_version": STANDARD_V2_R1_CONTRACT_VERSION,
-            "config_hash": STANDARD_V2_R1_CONFIG_HASH,
+            "config_hash": benchmark_identity["config_hash"],
+            "reference_digest": benchmark_identity["reference_digest"],
+            "qualification": "r1",
             "wall_seconds": {
                 "total": round(elapsed, 6),
                 "collection": round(collection_elapsed, 6),
@@ -749,22 +778,8 @@ def _build_training_metrics(
             },
             "staging_seconds": staging_seconds,
             "peak_vram_mib": mib(peak_memory_bytes),
-        },
-        "amp": {
-            "enabled": bool(amp_enabled),
-            "dtype": str(amp_dtype),
-            "fallback_on_nonfinite": bool(amp_fallback_on_nonfinite),
-            "fallback_count": int(stats.amp_fallbacks),
-            "fallback_exercised": bool(stats.amp_fallbacks),
-        },
-        "compile": {"enabled": bool(compile_enabled)},
-        "distributed": {
-            "enabled": bool(ddp_enabled),
-            "world_size": int(world_size),
-        },
-        "parameter_update_observed": parameters_changed,
-        "privacy": "sanitized_no_host_or_device_identifiers",
-    }
+        }
+    return report
 
 
 def _write_metrics_atomic(path: str, payload: dict[str, object]) -> None:
@@ -1223,6 +1238,26 @@ def main() -> None:
                 yaml_bidding.learned_probability,
             ),
         )
+    resolved_config_identity = resolved_standard_v2_config_identity(
+        trainer_config=trainer_cfg,
+        model_config=model_cfg,
+        loss_config=loss_cfg,
+        decision_config=decision_cfg,
+        bidding_config=bidding_policy_cfg,
+        ruleset=(ruleset.ruleset_id if ruleset is not None else "legacy"),
+        feature_version=(yaml_cfg.feature_version if yaml_cfg else "v2"),
+        model_version=(yaml_cfg.model_version if yaml_cfg else "v2"),
+        deterministic=deterministic,
+        ddp_enabled=distributed.enabled,
+        ddp_backend=ddp_backend,
+        compile_model=compile_enabled,
+        bidding_enabled=bool(
+            yaml_cfg.bidding.enabled if yaml_cfg is not None else False
+        ),
+    )
+    benchmark_identity = standard_v2_benchmark_identity(
+        resolved_config_identity
+    )
     opening_sampler, coach_label_store, policy_version, policy_step = (
         _build_curriculum(yaml_cfg)
     )
@@ -1586,6 +1621,22 @@ def main() -> None:
                 evaluator=evaluator,
                 metric_sink=emit_cycle,
                 peak_memory=peak_memory,
+                benchmark_identity=benchmark_identity,
+                measurement_context={
+                    "device_type": learner_device.type,
+                    "amp": {
+                        "enabled": trainer_cfg.amp_enabled,
+                        "dtype": trainer_cfg.amp_dtype,
+                        "fallback_on_nonfinite": (
+                            trainer_cfg.amp_fallback_on_nonfinite
+                        ),
+                    },
+                    "compile": {"enabled": compile_enabled},
+                    "distributed": {
+                        "enabled": distributed.enabled,
+                        "world_size": distributed.world_size,
+                    },
+                },
             )
             try:
                 final_state, stop_reason, _records = runner.run()
@@ -1637,17 +1688,11 @@ def main() -> None:
                 metrics_path,
                 _build_training_metrics(
                     stats,
+                    config_identity=resolved_config_identity,
                     training_wall_seconds=training_wall_seconds,
                     device_type=learner_device.type,
                     peak_memory_bytes=peak_memory_bytes,
                     peak_reserved_memory_bytes=peak_reserved_memory_bytes,
-                    amp_enabled=trainer_cfg.amp_enabled,
-                    amp_dtype=trainer_cfg.amp_dtype,
-                    amp_fallback_on_nonfinite=(
-                        trainer_cfg.amp_fallback_on_nonfinite
-                    ),
-                    compile_enabled=compile_enabled,
-                    ddp_enabled=distributed.enabled,
                     world_size=distributed.world_size,
                     parameters_changed=changed,
                     runtime_metrics=runtime_metrics,

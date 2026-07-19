@@ -33,6 +33,7 @@ from douzero.training.standard_v2_contract import (
 
 
 _RUN_STATE_VERSION = 3
+_CYCLE_METRICS_SCHEMA_VERSION = "v2-long-running-cycle-v2"
 _PRE_INTERLEAVED_REQUEST_ORDERING = "policy_bucket_fifo_post_first_window_v2"
 
 
@@ -776,6 +777,8 @@ class LongRunningTrainer:
         clock: Callable[[], float] = time.monotonic,
         peak_memory: Callable[[], int | None] | None = None,
         collect_records: bool = False,
+        benchmark_identity: dict | None = None,
+        measurement_context: dict | None = None,
     ) -> None:
         self.trainer = trainer
         self.lifecycle = _TrainerLifecycle(trainer)
@@ -787,6 +790,10 @@ class LongRunningTrainer:
         self.clock = clock
         self.peak_memory = peak_memory or (lambda: None)
         self.collect_records = collect_records
+        self.benchmark_identity = (
+            dict(benchmark_identity) if benchmark_identity is not None else None
+        )
+        self.measurement_context = dict(measurement_context or {})
         self.last_stop_reason = ""
         self.state = state or LongRunningState(
             total_episodes=int(trainer.stats.episodes_completed),
@@ -948,8 +955,30 @@ class LongRunningTrainer:
                         except Exception as exc:
                             checkpoint_error = type(exc).__name__
                         record = {
-                            "schema_version": "v2-long-running-cycle-v1",
+                            "schema_version": _CYCLE_METRICS_SCHEMA_VERSION,
                             "event": "late_stop_checkpoint",
+                            "benchmark_identity": self.benchmark_identity,
+                            "metrics_history": {
+                                "complete": bool(getattr(
+                                    self.trainer.stats,
+                                    "metrics_history_complete",
+                                    True,
+                                )),
+                                "source": str(getattr(
+                                    self.trainer.stats,
+                                    "metrics_history_source",
+                                    "native",
+                                )),
+                            },
+                            "device_type": self.measurement_context.get(
+                                "device_type"
+                            ),
+                            "amp": self.measurement_context.get("amp"),
+                            "compile": self.measurement_context.get("compile"),
+                            "distributed": self.measurement_context.get(
+                                "distributed"
+                            ),
+                            "parameter_update_observed": None,
                             "cycle": self.state.cycle,
                             "total_episodes": self.state.total_episodes,
                             "total_transitions": self.state.total_transitions,
@@ -1043,6 +1072,12 @@ class LongRunningTrainer:
                 collection_started = self.clock()
                 self.trainer.collect_episodes(episodes)
                 collection_seconds = self.clock() - collection_started
+                snapshot_method = getattr(
+                    self.trainer, "_parameter_update_snapshot", None
+                )
+                parameter_snapshot = (
+                    snapshot_method() if steps and snapshot_method is not None else None
+                )
                 optimization_started = self.clock()
                 steps_taken = 0
                 for _ in range(steps):
@@ -1053,6 +1088,14 @@ class LongRunningTrainer:
                         f"requested {steps} optimizer steps in cycle but took {steps_taken}"
                     )
                 optimization_seconds = self.clock() - optimization_started
+                changed_method = getattr(
+                    self.trainer, "_parameters_changed_since", None
+                )
+                parameter_update_observed = (
+                    changed_method(parameter_snapshot)
+                    if parameter_snapshot is not None and changed_method is not None
+                    else (False if steps_taken == 0 else None)
+                )
                 quiesce_started = self.clock()
                 boundary_status = self.lifecycle.quiesce_cycle_boundary() or {}
                 quiesce_seconds = self.clock() - quiesce_started
@@ -1194,8 +1237,22 @@ class LongRunningTrainer:
                 optimization_denominator = max(optimization_seconds, 1e-12)
 
                 record = {
-                    "schema_version": "v2-long-running-cycle-v1",
+                    "schema_version": _CYCLE_METRICS_SCHEMA_VERSION,
                     "event": "cycle",
+                    "benchmark_identity": self.benchmark_identity,
+                    "metrics_history": {
+                        "complete": bool(getattr(
+                            self.trainer.stats, "metrics_history_complete", True
+                        )),
+                        "source": str(getattr(
+                            self.trainer.stats, "metrics_history_source", "native"
+                        )),
+                    },
+                    "device_type": self.measurement_context.get("device_type"),
+                    "amp": self.measurement_context.get("amp"),
+                    "compile": self.measurement_context.get("compile"),
+                    "distributed": self.measurement_context.get("distributed"),
+                    "parameter_update_observed": parameter_update_observed,
                     "cycle": self.state.cycle,
                     "total_episodes": self.state.total_episodes,
                     "total_transitions": self.state.total_transitions,
@@ -1213,6 +1270,7 @@ class LongRunningTrainer:
                     ),
                     "cycle_learner_bidding_samples": cycle_learner_bidding_samples,
                     "cycle_learner_samples": cycle_learner_samples,
+                    "cycle_learner_steps": steps_taken,
                     "cycle_wall_seconds": round(self.clock() - cycle_started, 6),
                     "collection_seconds": round(collection_seconds, 6),
                     "optimization_seconds": round(optimization_seconds, 6),

@@ -13,6 +13,7 @@ from douzero.env.rules import RuleSet
 from douzero.training.standard_v2_contract import (
     STANDARD_V2_R1_CONFIG_HASH,
     STANDARD_V2_R1_CONTRACT_VERSION,
+    STANDARD_V2_R1_REFERENCE_DIGEST,
     STANDARD_V2_REFERENCE_SCHEMA_VERSION,
     stable_identity_hash,
     standard_v2_version_contract,
@@ -325,5 +326,12 @@ def build_standard_v2_reference() -> dict[str, Any]:
         "coverage": coverage,
         "scenarios": scenarios,
     }
-    payload["reference_digest"] = stable_identity_hash(payload)
+    reference_digest = stable_identity_hash(payload)
+    if reference_digest != STANDARD_V2_R1_REFERENCE_DIGEST:
+        raise RuntimeError(
+            "Standard V2 R1 reference drifted from its frozen digest: "
+            f"actual={reference_digest}, "
+            f"expected={STANDARD_V2_R1_REFERENCE_DIGEST}"
+        )
+    payload["reference_digest"] = reference_digest
     return payload
