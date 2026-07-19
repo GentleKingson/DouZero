@@ -842,8 +842,12 @@ def test_standard_training_step_and_strict_resume(tmp_path):
     assert stats.learner_cardplay_samples == 1
     assert stats.learner_bidding_samples == 2
     assert stats.bidding_transitions_collected >= 1
+    assert {
+        transition.obs.current_seat
+        for transition in trainer.bidding_buffer._transitions
+    } == {"0", "1"}
     assert all(
-        transition.obs.current_seat == "0" and transition.actor_role == "landlord"
+        transition.actor_role == "landlord"
         for transition in trainer.bidding_buffer._transitions
     )
     assert all(
