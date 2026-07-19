@@ -115,9 +115,9 @@ flowchart LR
 
 当前 base async 身份固定为 protocol `1`、bidding replay schema `0`、task semantics `actor_local_task_queue_v1`、commit semantics `cardplay_count_reconciled_v1`。目标 Standard async 身份预留为 protocol `2`、bidding replay schema `1`、task semantics `global_episode_domain_rng_v2`、commit semantics `atomic_bid_play_terminal_v2`、snapshot semantics `cycle_quiescent_atomic_standard_bundle_v2`。
 
-新 checkpoint 统一升级为 format `6`，使用 trainer identity v2 绑定完整 `TrainerConfig`；format 3/4/5 仅作为同 source SHA 下的旧字段形状兼容，不承诺跨提交恢复。缺少 M1 字段的 checkpoint 只允许默认等价的 bidding batch/cadence，未知 protocol/schema/semantics 和跨拓扑恢复均失败关闭。
+新 checkpoint 统一升级为 format `7`，使用 trainer identity v2 绑定完整 `TrainerConfig`，并持久化 bidding eligible-step cadence；format 3/4/5/6 仅作为同 source SHA 下的旧字段形状兼容，不承诺跨提交恢复。缺少 M1 字段的 checkpoint 只允许默认等价的 bidding batch/cadence，未知 protocol/schema/semantics 和跨拓扑恢复均失败关闭。
 
-本次 16 局 FP32 Standard V2 单 GPU 短基准完成 1 次参数更新：6.459 games/s、368.990 play transitions/s、12.919 bid transitions/s、241.305 learner samples/s，peak allocated VRAM 269.424 MiB。采样吞吐使用 collection wall time，learner 吞吐使用 optimization wall time。单进程路径没有推理队列和 staging 阶段，对应字段明确记录为 `null`，由 M2/M5 的 async 基准填充。
+M0 曾使用旧 seed/workload 记录 6.459 games/s；该结果不是当前 R1 canonical baseline，不用于 M1 对比。当前 frozen R1 的唯一 canonical 数值记录在 `benchmarks/baselines/standard_v2_r1_single_gpu.json`，其摘要见下方 M1 实施结果。采样吞吐使用 collection wall time，learner 吞吐使用 optimization wall time。单进程路径没有推理队列和 staging 阶段，对应字段明确记录为 `null`，由 M2/M5 的 async 基准填充。
 
 ### M1：向量化 Bidding Learner
 
@@ -127,7 +127,7 @@ flowchart LR
 - [x] **SV2-102** 新增 `BatchedBiddingOutput`，包含 `[B, 4]` logits、landlord win、expected score 和 optional uncertainty。
 - [x] **SV2-103** 实现 `ModelV2.forward_bidding_batched()`；标量 `forward_bidding()` 保留轻量路径并共享 bidding head 运算。
 - [x] **SV2-104** 重写 `bidding_loss()`，直接消费批量输出和批量 targets，不再 stack Python output objects。
-- [x] **SV2-105** 移除 bidding output/mask 上逐样本检查；公共 model/loss 合同只使用公开 Torch API，集中式兼容层在可用且签名兼容时选择 `_assert_async`，否则同步回退。
+- [x] **SV2-105** 移除 bidding output/mask 上逐样本检查；公共 model/loss 合同使用同步标量读取并抛出约定的 Python 异常，绝不以 CUDA device-side assert 处理可恢复输入错误。
 - [x] **SV2-106** 增加独立的 `bidding_batch_size`，默认保持与旧 `batch_size` 相同以兼容旧配置。
 - [x] **SV2-107** 增加 `bidding_update_interval`，使 play/bid 数据率不再强制一一同步。
 - [x] **SV2-108** 增加标量/批量 output、loss、gradient、illegal-mask 和 mixed-source-policy 对照测试。
@@ -142,8 +142,8 @@ flowchart LR
 - 新增 dense bidding tensor contract 与单次批量 forward；训练热路径不再逐样本构造 `BiddingModelOutput` 或 stack Python outputs。
 - `bidding_loss()` 直接消费 `BatchedBiddingOutput` 和 `BatchedBiddingTargets`，并保留旧 scalar-list API wrapper；mask/action 合法性使用公开 Torch 运算的一次批量检查，零 credit batch 保持有限零梯度。
 - `bidding_batch_size=None` 保留为声明式继承并由 `resolved_bidding_batch_size` 动态解析，`dataclasses.replace()` 修改 play batch 后不会遗留旧值。`bidding_update_interval` 默认 1；两个字段进入 CLI、YAML、TrainerConfig、checkpoint trainer identity 和 R1 evidence identity。
-- cadence 按全部已完成 optimizer steps 推进，但只在 value/joint phase 到期；strict belief-only phase 不读取 bidding replay、不计算 bidding loss，也不增加 bidding learner samples。纯 bidding loss 与 interval 跳步的无梯度组合在构造时失败关闭。
-- bidding 模型参数和 `state_dict` key 未改变；新 format 6 完整绑定 TrainerConfig，旧 format 3/4/5 只在同 source SHA 和默认等价的新字段下加载。
+- cadence 只按已完成的 eligible value/joint optimizer steps 推进；strict belief-only phase 不读取 bidding replay、不计算 bidding loss，也不增加 cadence 或 bidding learner samples。纯 bidding loss 与 interval 跳步的无梯度组合不依赖一次性 optimizer step 数量，在构造时始终失败关闭；保证为正的 BC 与 joint-belief 目标可合法支撑 gap。
+- bidding 模型参数和 `state_dict` key 未改变；新 format 7 完整绑定 TrainerConfig 并持久化 eligible cadence，旧 format 3/4/5/6 只在同 source SHA 和兼容字段下加载。
 - 基准脚本同时报告 head forward/backward、包含 observation tensorization、targets、实际 loss、optimizer 和 diagnostics 的 learner wall time；scalar fast path 与 batched wrapper 均分开报告 eval + inference-mode FP32 的 forward-only 和完整 argmax/host-result 决策延迟，p95 使用 nearest-rank 定义。
 - R1 seed 固定为非零值 `20260719`。旧的 16 局随机 workload 数字不再作为 M0/M1 可比证据；更新后的 CUDA artifact 必须绑定精确 head、镜像、环境、命令和完整 JSON。
 - 固定 seed 的 16 局 FP32 baseline 为 7.897 games/s、379.048 play transitions/s、21.716 bid transitions/s、262.393 learner samples/s，peak allocated VRAM 266.845 MiB。该结果只描述当前 head，不与旧 seed/workload 的 M0 数字计算 uplift；端到端提升结论必须在同一硬件、镜像构建环境、seed 和 workload 下成对运行 base/head。

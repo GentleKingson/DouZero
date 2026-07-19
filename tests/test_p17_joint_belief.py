@@ -378,7 +378,7 @@ def test_alternating_belief_skips_bidding_cadence_and_resumes_exactly(tmp_path):
                 max_steps_per_episode=400,
                 batch_size=1,
                 bidding_batch_size=1,
-                bidding_update_interval=2,
+                bidding_update_interval=3,
                 buffer_capacity=128,
                 optimizer_steps=1,
                 learning_rate=1e-3,
@@ -392,6 +392,7 @@ def test_alternating_belief_skips_bidding_cadence_and_resumes_exactly(tmp_path):
     trainer.collect_episodes()
     assert trainer.step() is not None
     assert trainer.stats.belief_phase == "value"
+    assert trainer.stats.bidding_eligible_steps == 1
     assert trainer.stats.learner_bidding_samples == 1
 
     checkpoint = tmp_path / "alternating-bidding-cadence.pt"
@@ -408,6 +409,7 @@ def test_alternating_belief_skips_bidding_cadence_and_resumes_exactly(tmp_path):
     assert restored.step() is not None
     assert restored.stats.optimizer_steps == 2
     assert restored.stats.belief_phase == "belief"
+    assert restored.stats.bidding_eligible_steps == 1
     assert restored.stats.learner_bidding_samples == 1
     assert "loss_bid_policy" not in restored.stats.last_loss
     assert all(
@@ -415,13 +417,22 @@ def test_alternating_belief_skips_bidding_cadence_and_resumes_exactly(tmp_path):
         for name, tensor in restored.model.bidding_heads.state_dict().items()
     )
 
-    # Cadence advances on every optimizer step. Step 2 is a value phase and
-    # therefore requires bidding replay again because 2 % interval == 0.
-    assert restored.step() is None
+    # Cadence counts only eligible value/joint phases. An odd interval cannot
+    # alias with the alternating belief phase and silently double its period.
+    assert restored.step() is not None  # value, eligible index 1
+    assert restored.stats.bidding_eligible_steps == 2
+    assert "loss_bid_policy" not in restored.stats.last_loss
+    assert restored.step() is not None  # belief
+    assert restored.step() is not None  # value, eligible index 2
+    assert restored.stats.bidding_eligible_steps == 3
+    assert "loss_bid_policy" not in restored.stats.last_loss
+    assert restored.step() is not None  # belief
+    assert restored.step() is None  # value, eligible index 3 is due
     restored.collect_episodes()
     assert restored.step() is not None
-    assert restored.stats.optimizer_steps == 3
+    assert restored.stats.optimizer_steps == 7
     assert restored.stats.belief_phase == "value"
+    assert restored.stats.bidding_eligible_steps == 4
     assert restored.stats.learner_bidding_samples == 2
     assert "loss_bid_policy" in restored.stats.last_loss
 
@@ -469,7 +480,7 @@ def test_joint_trainer_checkpoint_resume_restores_both_and_continues(tmp_path):
     saved_belief = {name: tensor.detach().clone() for name, tensor in belief.state_dict().items()}
     path = str(tmp_path / "trainer_joint.pt")
     identity = trainer.save_training_checkpoint(path)
-    assert identity["checkpoint_version"] == 6
+    assert identity["checkpoint_version"] == 7
     assert identity["trainer_config_identity_version"] == 2
     assert identity["training_topology"] == "single_process"
     assert identity["training_world_size"] == 1

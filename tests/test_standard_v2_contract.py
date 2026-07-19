@@ -12,7 +12,10 @@ import pytest
 import torch
 import yaml
 
-from benchmarks.bench_standard_v2 import build_unified_benchmark
+from benchmarks.bench_standard_v2 import (
+    build_unified_benchmark,
+    validate_unified_benchmark_output,
+)
 from benchmarks.standard_v2_reference import build_standard_v2_reference
 from douzero.checkpoint.io import CheckpointCompatibilityError
 from douzero.config import load_config
@@ -564,6 +567,7 @@ def test_unified_benchmark_rejects_inconsistent_cycle_evidence(mutation):
 
 def test_checked_in_gpu_baseline_is_bound_to_the_golden_reference():
     baseline = json.loads(GPU_BASELINE_PATH.read_text(encoding="utf-8"))
+    assert validate_unified_benchmark_output(baseline) == baseline
     reference = build_standard_v2_reference()
     assert baseline["schema_version"] == "standard-v2-r1-benchmark-v1"
     assert baseline["config_hash"] == STANDARD_V2_R1_CONFIG_HASH
@@ -577,6 +581,21 @@ def test_checked_in_gpu_baseline_is_bound_to_the_golden_reference():
     assert baseline["performance"]["status"] == "measured"
     assert baseline["performance"]["counts"]["games"] > 0
     assert baseline["performance"]["peak_vram_mib"] > 0
+
+
+@pytest.mark.parametrize("mutation", ("count", "rate", "wall"))
+def test_final_unified_benchmark_validator_rejects_checked_in_drift(mutation):
+    baseline = json.loads(GPU_BASELINE_PATH.read_text(encoding="utf-8"))
+    if mutation == "count":
+        baseline["performance"]["counts"]["learner_samples"] += 1
+    elif mutation == "rate":
+        baseline["performance"]["rates"]["games_per_second"] += 0.000001
+    else:
+        baseline["performance"]["measurement"]["phase_wall_seconds"][
+            "collection"
+        ] += 0.5
+    with pytest.raises(ValueError):
+        validate_unified_benchmark_output(baseline)
 
 
 def test_historical_v3_stats_are_marked_as_partial_metrics_history():
@@ -593,6 +612,7 @@ def test_historical_v3_stats_are_marked_as_partial_metrics_history():
         "learner_bidding_samples",
         "metrics_history_complete",
         "metrics_history_source",
+        "bidding_eligible_steps",
     ):
         stats.pop(name)
     restored = trainer._restore_checkpoint_stats(stats, checkpoint_version=3)
@@ -603,7 +623,7 @@ def test_historical_v3_stats_are_marked_as_partial_metrics_history():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_async_checkpoint_v6_binds_protocol_and_loads_v4(tmp_path):
+def test_async_checkpoint_v7_binds_protocol_and_loads_v4(tmp_path):
     config = TrainerConfig(
         max_episodes=0,
         optimizer_steps=0,
@@ -615,9 +635,9 @@ def test_async_checkpoint_v6_binds_protocol_and_loads_v4(tmp_path):
         device="cuda",
     )
     trainer = V2Trainer(_tiny_model(), config=config)
-    checkpoint = tmp_path / "async-v6.pt"
+    checkpoint = tmp_path / "async-v7.pt"
     identity = trainer.save_training_checkpoint(str(checkpoint))
-    assert identity["checkpoint_version"] == 6
+    assert identity["checkpoint_version"] == 7
     assert identity["trainer_config_identity_version"] == 2
     assert identity["async_protocol_version"] == BASE_ASYNC_PROTOCOL_VERSION
     assert identity["compact_bidding_replay_schema_version"] == 0
@@ -629,6 +649,7 @@ def test_async_checkpoint_v6_binds_protocol_and_loads_v4(tmp_path):
     pre_m1_config, pre_m1_hash = trainer._pre_m1_v5_trainer_config_identity()
     pre_m1["trainer_config"] = pre_m1_config
     pre_m1["trainer_config_hash"] = pre_m1_hash
+    pre_m1["stats"].pop("bidding_eligible_steps")
     pre_m1_path = tmp_path / "async-v5-pre-m1.pt"
     torch.save(pre_m1, pre_m1_path)
     pre_m1_restored = V2Trainer(_tiny_model(), config=config)
@@ -663,6 +684,7 @@ def test_async_checkpoint_v6_binds_protocol_and_loads_v4(tmp_path):
         "learner_bidding_samples",
         "metrics_history_complete",
         "metrics_history_source",
+        "bidding_eligible_steps",
     ):
         bundle["stats"].pop(name)
     for name in (
@@ -682,9 +704,9 @@ def test_async_checkpoint_v6_binds_protocol_and_loads_v4(tmp_path):
     assert restored.stats.metrics_history_complete is True
     assert restored.stats.metrics_history_source == "migrated_v4_exact"
 
-    v6_bundle = torch.load(checkpoint, map_location="cuda", weights_only=True)
-    v6_bundle["async_protocol_version"] = 999
+    v7_bundle = torch.load(checkpoint, map_location="cuda", weights_only=True)
+    v7_bundle["async_protocol_version"] = 999
     bad_path = tmp_path / "async-bad-protocol.pt"
-    torch.save(v6_bundle, bad_path)
+    torch.save(v7_bundle, bad_path)
     with pytest.raises(CheckpointCompatibilityError, match="async_protocol_version"):
         restored.load_training_checkpoint(str(bad_path))

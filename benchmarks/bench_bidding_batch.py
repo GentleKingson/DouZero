@@ -139,10 +139,16 @@ def run_benchmark(
         ),
     ).to(target)
     model.train()
+    initial_state = {
+        name: tensor.detach().clone()
+        for name, tensor in model.state_dict().items()
+    }
     width = model.bidding_schema.input_width
     schema_hash = model.bidding_schema.stable_hash()
     results = []
     for batch_size in batch_sizes:
+        model.load_state_dict(initial_state, strict=True)
+        model.train()
         generator = torch.Generator(device=target).manual_seed(batch_size)
         inputs = BatchedBiddingInput(
             features=torch.randn(
@@ -206,6 +212,7 @@ def run_benchmark(
             "learner_step_wall": _summary(learner_samples, iterations),
         })
 
+    model.load_state_dict(initial_state, strict=True)
     model.eval()
     scalar_observation = _bidding_observations_and_minibatch(1)[0][0]
 

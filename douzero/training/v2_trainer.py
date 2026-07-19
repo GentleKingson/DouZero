@@ -96,11 +96,12 @@ from douzero.training.standard_v2_contract import (
 
 # Format 3 is the legacy single-process topology contract, format 4 introduced
 # the base async topology, format 5 binds async protocol/task/commit identities,
-# and format 6 gives both topologies one complete TrainerConfig identity. Formats
-# 1/2 predated explicit topology and remain intentionally rejected.
-_TRAINER_CHECKPOINT_VERSION = 6
+# and format 6 gives both topologies one complete TrainerConfig identity. Format
+# 7 persists the eligible bidding-step cadence counter. Formats 1/2 predated
+# explicit topology and remain intentionally rejected.
+_TRAINER_CHECKPOINT_VERSION = 7
 _TRAINER_CONFIG_IDENTITY_VERSION = 2
-_COMPATIBLE_TRAINER_CHECKPOINT_VERSIONS = frozenset({3, 4, 5, 6})
+_COMPATIBLE_TRAINER_CHECKPOINT_VERSIONS = frozenset({3, 4, 5, 6, 7})
 _SINGLE_PROCESS_TOPOLOGY = "single_process"
 _ASYNC_SINGLE_GPU_TOPOLOGY = "async_single_gpu"
 _ASYNC_UNSUPPORTED_DECISION_MODES = frozenset({
@@ -302,6 +303,7 @@ class TrainerStats:
     transitions_collected: int = 0
     decisions_collected: int = 0
     optimizer_steps: int = 0
+    bidding_eligible_steps: int = 0
     last_loss: dict[str, float] = field(default_factory=dict)
     grad_norm_last_step: float = 0.0
     p_win_mean: float = float("nan")
@@ -321,6 +323,35 @@ class TrainerStats:
     max_redeals_exceeded: int = 0
     belief_phase: str = "frozen"
     belief_supervised_steps: int = 0
+
+
+def has_guaranteed_non_bidding_objective(
+    loss_config: LossConfig,
+    *,
+    strategy_aux_weight: float,
+    bc_schedule: object,
+    belief_training_mode: str,
+    belief_supervised_weight: float,
+) -> bool:
+    """Return whether every bidding-eligible gap retains a gradient graph."""
+
+    value_or_strategy = (
+        loss_config.lambda_win
+        + loss_config.lambda_score
+        + loss_config.lambda_uncertainty
+        + strategy_aux_weight
+    ) > 0
+    base_lambda = float(getattr(bc_schedule, "base_lambda", 0.0))
+    schedule = getattr(bc_schedule, "schedule", "constant")
+    schedule_steps = int(getattr(bc_schedule, "schedule_steps", 0))
+    schedule_floor = float(getattr(bc_schedule, "schedule_floor", 0.0))
+    bc_is_guaranteed = base_lambda > 0 and (
+        schedule == "constant" or schedule_steps <= 0 or schedule_floor > 0
+    )
+    joint_belief_is_guaranteed = (
+        belief_training_mode == "joint" and belief_supervised_weight > 0
+    )
+    return value_or_strategy or bc_is_guaranteed or joint_belief_is_guaranteed
 
 
 def _validate_training_ruleset(ruleset: RuleSet | None) -> None:
@@ -643,11 +674,12 @@ class V2Trainer:
             loss_cfg.lambda_bid_policy + loss_cfg.lambda_bid_win
             + loss_cfg.lambda_bid_score + loss_cfg.lambda_bid_regret
         )
-        non_bidding_loss_weight = (
-            loss_cfg.lambda_win
-            + loss_cfg.lambda_score
-            + loss_cfg.lambda_uncertainty
-            + self.strategy_aux_weight
+        guaranteed_non_bidding_objective = has_guaranteed_non_bidding_objective(
+            loss_cfg,
+            strategy_aux_weight=self.strategy_aux_weight,
+            bc_schedule=self.bc_schedule,
+            belief_training_mode=self.belief_training_mode,
+            belief_supervised_weight=self.belief_supervised_weight,
         )
         if not self.standard_mode and self.bidding_loss_weight > 0:
             raise ValueError("bidding loss weights require standard rules")
@@ -660,7 +692,12 @@ class V2Trainer:
                 "standard learned-bidding training requires at least one non-zero "
                 "lambda_bid_policy/lambda_bid_win/lambda_bid_score weight"
             )
-        if self.config.optimizer_steps > 0 and active_loss == 0:
+        has_any_training_objective = (
+            active_loss > 0
+            or self.bc_schedule.base_lambda > 0
+            or self.belief_supervised_weight > 0
+        )
+        if self.config.optimizer_steps > 0 and not has_any_training_objective:
             raise ValueError(
                 f"optimizer_steps > 0 requires at least one non-zero loss "
                 f"weight (lambda_win/lambda_score/lambda_uncertainty); got "
@@ -668,15 +705,14 @@ class V2Trainer:
                 f"no parameter change."
             )
         if (
-            self.config.optimizer_steps > 0
-            and self.bidding_loss_weight > 0
+            self.bidding_loss_weight > 0
             and self.config.bidding_update_interval > 1
-            and non_bidding_loss_weight == 0
+            and not guaranteed_non_bidding_objective
         ):
             raise ValueError(
                 "bidding_update_interval > 1 requires at least one non-bidding "
-                "value/strategy loss; otherwise skipped bidding steps have no "
-                "differentiable objective"
+                "value/strategy, guaranteed BC, or joint-belief objective; "
+                "otherwise skipped bidding steps have no differentiable objective"
             )
         if self.config.optimizer_steps > 0 and self.config.buffer_capacity < self.config.batch_size:
             raise ValueError(
@@ -1741,6 +1777,16 @@ class V2Trainer:
         block = self.stats.optimizer_steps // self.config.belief_alternating_interval
         return "value" if block % 2 == 0 else "belief"
 
+    def _bidding_eligible_steps_before(self, optimizer_steps: int) -> int:
+        """Count completed value/joint steps before an optimizer-step index."""
+
+        if self.belief_training_mode != "alternating":
+            return optimizer_steps
+        interval = self.config.belief_alternating_interval
+        full_blocks, remainder = divmod(optimizer_steps, interval)
+        value_blocks = (full_blocks + 1) // 2
+        return value_blocks * interval + (remainder if full_blocks % 2 == 0 else 0)
+
     def _configure_belief_phase(self, phase: str) -> None:
         """Select exactly the parameters owned by this optimizer phase."""
         value_trainable = phase != "belief"
@@ -1948,22 +1994,27 @@ class V2Trainer:
             "metrics_history_complete",
             "metrics_history_source",
         }
+        cadence_fields = {"bidding_eligible_steps"}
         present_new = new_counters & set(payload)
         if present_new and present_new != new_counters:
             raise ValueError(
                 "checkpoint stats contain a partial benchmark counter set"
             )
-        if checkpoint_version in {4, 5, 6}:
-            required = field_names - new_counters - history_fields
+        if checkpoint_version in {4, 5, 6, 7}:
+            required = field_names - new_counters - history_fields - cadence_fields
             missing = required - set(payload)
             if missing:
                 raise ValueError(
                     "checkpoint stats are missing required fields: "
                     + ", ".join(sorted(missing))
                 )
-        if checkpoint_version in {5, 6} and not present_new:
+        if checkpoint_version in {5, 6, 7} and not present_new:
             raise ValueError(
                 f"format {checkpoint_version} checkpoint is missing benchmark counters"
+            )
+        if checkpoint_version >= 7 and not cadence_fields.issubset(payload):
+            raise ValueError(
+                "format 7 checkpoint is missing the bidding cadence counter"
             )
 
         migrated = asdict(TrainerStats())
@@ -1996,6 +2047,11 @@ class V2Trainer:
             migrated.setdefault("metrics_history_complete", True)
             migrated.setdefault("metrics_history_source", "native")
 
+        if "bidding_eligible_steps" not in payload:
+            migrated["bidding_eligible_steps"] = (
+                self._bidding_eligible_steps_before(int(migrated["optimizer_steps"]))
+            )
+
         if not isinstance(migrated["metrics_history_complete"], bool):
             raise ValueError("metrics_history_complete must be bool")
         source = migrated["metrics_history_source"]
@@ -2007,6 +2063,7 @@ class V2Trainer:
             "transitions_collected",
             "decisions_collected",
             "optimizer_steps",
+            "bidding_eligible_steps",
             "bidding_transitions_collected",
             "bidding_decisions_collected",
             "abandoned_bidding_transitions",
@@ -2016,6 +2073,13 @@ class V2Trainer:
             value = migrated[name]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"checkpoint stat {name} must be non-negative int")
+        expected_eligible_steps = self._bidding_eligible_steps_before(
+            migrated["optimizer_steps"]
+        )
+        if migrated["bidding_eligible_steps"] != expected_eligible_steps:
+            raise ValueError(
+                "bidding_eligible_steps disagrees with optimizer/belief cadence"
+            )
         if migrated["games_collected"] < migrated["episodes_completed"]:
             raise ValueError("games_collected cannot be below episodes_completed")
         if (
@@ -2534,7 +2598,9 @@ class V2Trainer:
         bidding_update_due = (
             self.bidding_loss_weight > 0
             and belief_phase != "belief"
-            and self.stats.optimizer_steps % self.config.bidding_update_interval == 0
+            and self.stats.bidding_eligible_steps
+            % self.config.bidding_update_interval
+            == 0
         )
         if bidding_update_due:
             local_batch_ready = (
@@ -2813,6 +2879,8 @@ class V2Trainer:
             grad_norm = step_result.grad_norm
             self.stats.amp_fallbacks = self.mixed_precision.fallback_count
             self.stats.optimizer_steps += 1
+            if belief_phase != "belief":
+                self.stats.bidding_eligible_steps += 1
             self.stats.learner_cardplay_samples += batch.batch_size
             if bidding_batch is not None:
                 self.stats.learner_bidding_samples += bidding_batch.batch_size

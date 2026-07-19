@@ -98,7 +98,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bidding_update_interval", type=int, default=argparse.SUPPRESS,
-        help="Apply bidding loss every N optimizer steps (default: 1).",
+        help=(
+            "Apply bidding loss every N eligible value/joint optimizer steps "
+            "(default: 1)."
+        ),
     )
     parser.add_argument("--buffer_capacity", type=int, default=argparse.SUPPRESS)
     parser.add_argument(

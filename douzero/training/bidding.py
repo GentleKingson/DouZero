@@ -457,10 +457,15 @@ def bidding_loss(
         + float(lambda_landlord_win) * win
         + float(lambda_landlord_score) * score
     )
+    # Copy all component diagnostics in one host synchronization.  The total
+    # remains attached to the graph for backward and is logged after the step.
+    diagnostics = torch.stack(
+        (policy.detach(), win.detach(), score.detach(), regret.detach())
+    ).float().cpu().tolist()
     return BiddingLossComponents(
         total=total,
-        policy=float(policy.detach().item()),
-        landlord_win=float(win.detach().item()),
-        landlord_score=float(score.detach().item()),
-        regret=float(regret.detach().item()),
+        policy=float(diagnostics[0]),
+        landlord_win=float(diagnostics[1]),
+        landlord_score=float(diagnostics[2]),
+        regret=float(diagnostics[3]),
     )

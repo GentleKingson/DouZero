@@ -123,8 +123,9 @@ unknown or different source SHA before restoring model/optimizer state; a
 wheel or source archive without Git metadata must set `DOUZERO_GIT_SHA` to the
 exact build commit. Standard and joint trainer checkpoint save/resume remains
 single-process only and fails closed when DDP is enabled. New single-process
-and async checkpoints use format 6 with trainer identity version 2 and the
-complete `TrainerConfig`. Legacy formats 3/4/5 are accepted only under the same
+and async checkpoints use format 7 with trainer identity version 2, the
+complete `TrainerConfig`, and the persisted bidding-eligible-step counter.
+Legacy formats 3/4/5/6 are accepted only under the same
 exact source Git SHA; they are shape compatibility paths, not cross-commit
 migrations. A legacy identity without M1 bidding controls additionally requires
 the default-equivalent batch size and update cadence. Formats 1/2, unknown
