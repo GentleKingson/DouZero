@@ -877,7 +877,7 @@ def test_standard_training_step_and_strict_resume(tmp_path):
         torch.equal(value, restored.model.state_dict()[name])
         for name, value in trainer.model.state_dict().items()
     )
-    restored.collect_episodes(1)
+    restored.collect_episodes(2)
     assert restored.step() is not None
     assert restored.stats.optimizer_steps == 2
 
