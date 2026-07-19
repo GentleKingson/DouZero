@@ -1,0 +1,86 @@
+{
+  "benchmark_workload_hash": "b8ce1193e5b810d6e0d9582071b6b54d85b97c611b96f805e2a254ffb6f69f4d",
+  "config_hash": "fa704d56c7affca5889cf60af3c9efcb6a8fa152ef4a43ebf9097206dc2fa1ef",
+  "contract_version": "standard-v2-r1-contract-v2",
+  "coverage": {
+    "all_pass": true,
+    "anti_spring": true,
+    "bomb_or_rocket": true,
+    "first_bidders": [
+      "0",
+      "1",
+      "2"
+    ],
+    "max_redeal_guard": true,
+    "normal_auction": true,
+    "redeal": true,
+    "spring": true
+  },
+  "performance": {
+    "counts": {
+      "abandoned_bidding_transitions": 0,
+      "bid_transitions": 44,
+      "bidding_decisions": 44,
+      "cardplay_decisions": 1105,
+      "games": 16,
+      "learner_bidding_samples": 32,
+      "learner_cardplay_samples": 32,
+      "learner_samples": 64,
+      "learner_steps": 1,
+      "play_transitions": 768
+    },
+    "gpu_seconds": {
+      "inference": null,
+      "learner": 0.24345504760742187
+    },
+    "measurement": {
+      "amp": {
+        "dtype": "float16",
+        "enabled": false,
+        "fallback_count": 0,
+        "fallback_exercised": false,
+        "fallback_on_nonfinite": true
+      },
+      "compile": {
+        "enabled": false
+      },
+      "device_type": "cuda",
+      "distributed": {
+        "enabled": false,
+        "world_size": 1
+      },
+      "metrics_history": {
+        "complete": true,
+        "source": "native"
+      },
+      "parameter_update_observed": true,
+      "phase_wall_seconds": {
+        "collection": 1.997539,
+        "optimization": 0.244318,
+        "total": 2.242239
+      },
+      "source_schema_version": "p17-gpu-run-v1",
+      "training_wall_seconds": 2.242239
+    },
+    "peak_vram_mib": 266.845,
+    "queue_latency_ms": {
+      "p50": null,
+      "p95": null
+    },
+    "rates": {
+      "bid_transitions_per_second": 22.027104,
+      "bidding_decisions_per_second": 22.027104,
+      "cardplay_decisions_per_second": 553.180689,
+      "games_per_second": 8.009856,
+      "learner_samples_per_second": 261.953683,
+      "learner_steps_per_second": 4.093026,
+      "play_transitions_per_second": 384.473094
+    },
+    "staging_seconds": null,
+    "status": "measured"
+  },
+  "privacy": "sanitized_no_host_or_device_identifiers",
+  "reference_digest": "a177bc8a30e0f9d88072a3373e178d89ff4eddf2eb74334029f4bf1e0213a3bb",
+  "schema_version": "standard-v2-r1-benchmark-v1",
+  "training_semantics_hash": "717f608dbd96091d578869bef967ab5a57a55efb1aa465a5beb3e3bcfe3dd1cf"
+}

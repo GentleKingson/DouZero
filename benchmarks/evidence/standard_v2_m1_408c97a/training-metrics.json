@@ -1,0 +1,106 @@
+{
+  "amp": {
+    "dtype": "float16",
+    "enabled": false,
+    "fallback_count": 0,
+    "fallback_exercised": false,
+    "fallback_on_nonfinite": true
+  },
+  "benchmark_identity": {
+    "benchmark_workload_hash": "b8ce1193e5b810d6e0d9582071b6b54d85b97c611b96f805e2a254ffb6f69f4d",
+    "config_hash": "fa704d56c7affca5889cf60af3c9efcb6a8fa152ef4a43ebf9097206dc2fa1ef",
+    "contract_version": "standard-v2-r1-contract-v2",
+    "qualification": "r1",
+    "reference_digest": "a177bc8a30e0f9d88072a3373e178d89ff4eddf2eb74334029f4bf1e0213a3bb",
+    "schema_version": "standard-v2-r1-benchmark-v1",
+    "training_semantics_hash": "717f608dbd96091d578869bef967ab5a57a55efb1aa465a5beb3e3bcfe3dd1cf"
+  },
+  "compile": {
+    "enabled": false
+  },
+  "counts": {
+    "abandoned_bidding_transitions": 0,
+    "belief_supervised_steps": 0,
+    "bidding_decisions": 44,
+    "bidding_transitions": 44,
+    "cardplay_decisions": 1105,
+    "cardplay_transitions": 768,
+    "episodes": 16,
+    "games": 16,
+    "learner_bidding_samples": 32,
+    "learner_cardplay_samples": 32,
+    "learner_samples": 64,
+    "learner_steps": 1,
+    "max_redeals_exceeded": 0,
+    "redeals": 0,
+    "total_decisions": 1149
+  },
+  "device_type": "cuda",
+  "distributed": {
+    "enabled": false,
+    "world_size": 1
+  },
+  "metrics": {
+    "bidding_decisions_per_second": 19.623243,
+    "cardplay_transitions_per_second": 342.514781,
+    "decisions_per_second": 512.434223,
+    "learner_steps_per_second": 0.445983,
+    "peak_memory_mib": 266.845,
+    "peak_reserved_memory_mib": 318.0,
+    "samples_per_second": 362.138024
+  },
+  "metrics_history": {
+    "complete": true,
+    "source": "native"
+  },
+  "parameter_update_observed": true,
+  "privacy": "sanitized_no_host_or_device_identifiers",
+  "schema_version": "p17-gpu-run-v1",
+  "standard_v2": {
+    "benchmark_workload_hash": "b8ce1193e5b810d6e0d9582071b6b54d85b97c611b96f805e2a254ffb6f69f4d",
+    "config_hash": "fa704d56c7affca5889cf60af3c9efcb6a8fa152ef4a43ebf9097206dc2fa1ef",
+    "contract_version": "standard-v2-r1-contract-v2",
+    "counts": {
+      "abandoned_bidding_transitions": 0,
+      "bid_transitions": 44,
+      "bidding_decisions": 44,
+      "cardplay_decisions": 1105,
+      "games": 16,
+      "learner_bidding_samples": 32,
+      "learner_cardplay_samples": 32,
+      "learner_samples": 64,
+      "learner_steps": 1,
+      "play_transitions": 768
+    },
+    "gpu_seconds": {
+      "inference": null,
+      "learner": 0.24345504760742187
+    },
+    "peak_vram_mib": 266.845,
+    "qualification": "r1",
+    "queue_latency_ms": {
+      "p50": null,
+      "p95": null
+    },
+    "rates": {
+      "bid_transitions_per_second": 22.027104,
+      "bidding_decisions_per_second": 22.027104,
+      "cardplay_decisions_per_second": 553.180689,
+      "games_per_second": 8.009856,
+      "learner_samples_per_second": 261.953683,
+      "learner_steps_per_second": 4.093026,
+      "play_transitions_per_second": 384.473094
+    },
+    "reference_digest": "a177bc8a30e0f9d88072a3373e178d89ff4eddf2eb74334029f4bf1e0213a3bb",
+    "schema_version": "standard-v2-r1-benchmark-v1",
+    "staging_seconds": null,
+    "training_semantics_hash": "717f608dbd96091d578869bef967ab5a57a55efb1aa465a5beb3e3bcfe3dd1cf",
+    "wall_seconds": {
+      "collection": 1.997539,
+      "optimization": 0.244318,
+      "total": 2.242239
+    }
+  },
+  "status": "passed",
+  "training_wall_seconds": 2.242239
+}

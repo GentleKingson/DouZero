@@ -1,0 +1,107 @@
+{
+  "batch_sizes": [
+    1,
+    32,
+    64,
+    128
+  ],
+  "cuda_version": "13.2",
+  "device": "cuda",
+  "device_metadata": {
+    "compute_capability": "12.0",
+    "name": "NVIDIA GeForce RTX 5070",
+    "total_memory_mib": 11771.875
+  },
+  "inference_mode": "eval_inference_mode_fp32",
+  "results": [
+    {
+      "batch_size": 1,
+      "head_forward_backward": {
+        "iterations": 100,
+        "mean_ms": 0.9688963234424591,
+        "p50_ms": 0.964031994342804,
+        "p95_ms": 1.160256028175354
+      },
+      "learner_step_wall": {
+        "iterations": 100,
+        "mean_ms": 2.0324170295498334,
+        "p50_ms": 2.0340189948910847,
+        "p95_ms": 2.0886550046270713
+      }
+    },
+    {
+      "batch_size": 32,
+      "head_forward_backward": {
+        "iterations": 100,
+        "mean_ms": 1.0555068796873093,
+        "p50_ms": 1.0161759853363037,
+        "p95_ms": 1.1988799571990967
+      },
+      "learner_step_wall": {
+        "iterations": 100,
+        "mean_ms": 1.9417084007000085,
+        "p50_ms": 1.9629175003501587,
+        "p95_ms": 2.008618990657851
+      }
+    },
+    {
+      "batch_size": 64,
+      "head_forward_backward": {
+        "iterations": 100,
+        "mean_ms": 0.97124576151371,
+        "p50_ms": 0.989439994096756,
+        "p95_ms": 1.0683200359344482
+      },
+      "learner_step_wall": {
+        "iterations": 100,
+        "mean_ms": 2.0461034499749076,
+        "p50_ms": 2.01748499966925,
+        "p95_ms": 2.197686000727117
+      }
+    },
+    {
+      "batch_size": 128,
+      "head_forward_backward": {
+        "iterations": 100,
+        "mean_ms": 1.0409638446569442,
+        "p50_ms": 1.01118403673172,
+        "p95_ms": 1.1992319822311401
+      },
+      "learner_step_wall": {
+        "iterations": 100,
+        "mean_ms": 2.201837820466608,
+        "p50_ms": 2.2335670073516667,
+        "p95_ms": 2.268846001243219
+      }
+    }
+  ],
+  "scalar_inference": {
+    "batched_wrapper_decision_wall": {
+      "iterations": 100,
+      "mean_ms": 0.31794472903129645,
+      "p50_ms": 0.31729499460197985,
+      "p95_ms": 0.32451598963234574
+    },
+    "batched_wrapper_forward_wall": {
+      "iterations": 100,
+      "mean_ms": 0.2850834401033353,
+      "p50_ms": 0.28427500365069136,
+      "p95_ms": 0.29684699256904423
+    },
+    "fast_decision_wall": {
+      "iterations": 100,
+      "mean_ms": 0.25449062028201297,
+      "p50_ms": 0.25379999715369195,
+      "p95_ms": 0.26055300259031355
+    },
+    "fast_forward_wall": {
+      "iterations": 100,
+      "mean_ms": 0.22110731952125207,
+      "p50_ms": 0.219820998609066,
+      "p95_ms": 0.2306139940628782
+    }
+  },
+  "schema_version": "standard-v2-bidding-microbenchmark-v3",
+  "source_git_sha": "408c97a25088451d884d9836ce6f6fbf32d810c6",
+  "torch_version": "2.12.1+cu132"
+}
