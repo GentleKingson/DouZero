@@ -17,7 +17,7 @@ STANDARD_V2_R1_CONTRACT_VERSION = "standard-v2-r1-contract-v2"
 STANDARD_V2_REFERENCE_SCHEMA_VERSION = "standard-v2-r1-reference-v1"
 STANDARD_V2_BENCHMARK_SCHEMA_VERSION = "standard-v2-r1-benchmark-v1"
 STANDARD_V2_R1_REFERENCE_DIGEST = (
-    "8817274e665ad6296e688044326e4c2ad1a682d6e78b6124e61081bf0f3e014e"
+    "bfcefc9ab6f26f3f259c144bdf7adb7d5f1677b5e7c1a20b5024ab56dd05af18"
 )
 
 # The currently implemented base async path.  These values are written into
