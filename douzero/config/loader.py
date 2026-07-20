@@ -304,6 +304,7 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "central_actor_async_policy_copy": bool,
     "central_actor_runtime": str,
     "central_actor_split_dense1": bool,
+    "central_actor_staging_dtype": str,
     "central_actor_timeout_seconds": float,
     "belief_training_mode": str, "belief_supervised_weight": float,
     "belief_alternating_interval": int, "belief_supervised_batch_size": int,
@@ -512,6 +513,8 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         )
     if cfg.central_actor_runtime not in {"process", "thread"}:
         raise ValueError("central_actor_runtime must be process or thread")
+    if cfg.central_actor_staging_dtype not in {"float32", "int8"}:
+        raise ValueError("central_actor_staging_dtype must be float32 or int8")
     if cfg.central_actor_timeout_seconds <= 0:
         raise ValueError("central_actor_timeout_seconds must be positive")
     if cfg.belief_training_mode not in {"frozen", "joint", "alternating"}:
@@ -615,6 +618,7 @@ _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
     "central_actor_async_policy_copy", "central_actor_timeout_seconds",
     "central_actor_runtime",
     "central_actor_split_dense1",
+    "central_actor_staging_dtype",
     "learning_rate", "alpha", "momentum", "epsilon",
     # P01-added argparse dests (optional; default to legacy values if absent).
     "seed", "deterministic", "config",

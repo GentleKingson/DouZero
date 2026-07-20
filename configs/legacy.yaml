@@ -76,6 +76,7 @@ central_actor_use_stream_priority: true
 central_actor_async_policy_copy: true
 central_actor_runtime: thread
 central_actor_split_dense1: false
+central_actor_staging_dtype: float32
 central_actor_timeout_seconds: 30.0
 
 # P01-added knobs (defaults preserve legacy behavior)

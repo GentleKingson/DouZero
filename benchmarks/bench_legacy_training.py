@@ -220,6 +220,7 @@ def _flatten(payload):
         "server_batch_wait_ms": central_timing.get("server_batch_wait"),
         "cpu_packing_ms": central_timing.get("cpu_packing"),
         "h2d_ms": central_timing.get("h2d"),
+        "gpu_cast_ms": central_timing.get("gpu_cast"),
         "forward_ms": central_timing.get("forward"),
         "d2h_response_ms": central_timing.get("d2h_response"),
         "response_consume_ms": central_timing.get("response_consume"),

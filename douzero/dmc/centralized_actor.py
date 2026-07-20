@@ -515,6 +515,7 @@ def centralized_inference_loop(
     queue_pressure=None,
     gpu_snapshots=None,
     split_dense1=False,
+    staging_dtype="float32",
 ):
     """Adaptively batch compatible requests and return correlated responses."""
     try:
@@ -533,16 +534,32 @@ def centralized_inference_loop(
         )
         copy_stream = torch.cuda.Stream(device=cuda_device)
 
+        pinned_type = torch.int8 if staging_dtype == "int8" else torch.float32
         pinned_z = torch.empty(
-            max_microbatch, 5, 162, dtype=torch.float32, pin_memory=True
+            max_microbatch, 5, 162, dtype=pinned_type, pin_memory=True
         )
         pinned_state = torch.empty(
-            max_microbatch, 430, dtype=torch.float32, pin_memory=True
+            max_microbatch, 430, dtype=pinned_type, pin_memory=True
         )
         pinned_action = torch.empty(
             max_microbatch * slots.max_actions, 54,
-            dtype=torch.float32, pin_memory=True,
+            dtype=pinned_type, pin_memory=True,
         )
+        gpu_int8 = None
+        gpu_float = None
+        if staging_dtype == "int8":
+            gpu_int8 = {
+                "z": torch.empty(max_microbatch, 5, 162, dtype=torch.int8,
+                                 device=cuda_device),
+                "state": torch.empty(max_microbatch, 430, dtype=torch.int8,
+                                     device=cuda_device),
+                "action": torch.empty(max_microbatch * slots.max_actions, 54,
+                                      dtype=torch.int8, device=cuda_device),
+            }
+            gpu_float = {
+                key: torch.empty_like(value, dtype=torch.float32)
+                for key, value in gpu_int8.items()
+            }
         pending = []
         accepting = True
         while accepting and not stop_event.is_set():
@@ -656,12 +673,17 @@ def centralized_inference_loop(
                 counts = [request.action_count for request in group]
                 action_total = sum(counts)
                 batch_started_ns = time.perf_counter_ns()
-                for batch_index, request in enumerate(group):
-                    index = slots.index(request.actor_id, request.env_slot)
-                    pinned_z[batch_index].copy_(slots.z[index])
-                    pinned_state[batch_index, :state_width].copy_(
-                        slots.x_state[index, :state_width]
-                    )
+                slot_indices = torch.tensor([
+                    slots.index(request.actor_id, request.env_slot)
+                    for request in group
+                ], dtype=torch.long)
+                torch.index_select(
+                    slots.z, 0, slot_indices, out=pinned_z[:len(group)]
+                )
+                torch.index_select(
+                    slots.x_state[:, :state_width], 0, slot_indices,
+                    out=pinned_state[:len(group), :state_width],
+                )
                 offset = 0
                 for request in group:
                     index = slots.index(request.actor_id, request.env_slot)
@@ -675,18 +697,46 @@ def centralized_inference_loop(
                     timing_events = None
                     if metric_store is not None:
                         timing_events = [
-                            torch.cuda.Event(enable_timing=True) for _ in range(3)
+                            torch.cuda.Event(enable_timing=True) for _ in range(4)
                         ]
                         timing_events[0].record(inference_stream)
-                    z = pinned_z[:len(group)].to(cuda_device, non_blocking=True)
-                    actor_state = pinned_state[:len(group), :state_width].to(
-                        cuda_device, non_blocking=True
-                    )
-                    actions = pinned_action[:action_total].to(
-                        cuda_device, non_blocking=True
-                    )
+                    if staging_dtype == "int8":
+                        gpu_int8["z"][:len(group)].copy_(
+                            pinned_z[:len(group)], non_blocking=True
+                        )
+                        gpu_int8["state"][:len(group), :state_width].copy_(
+                            pinned_state[:len(group), :state_width],
+                            non_blocking=True,
+                        )
+                        gpu_int8["action"][:action_total].copy_(
+                            pinned_action[:action_total], non_blocking=True
+                        )
+                        if timing_events is not None:
+                            timing_events[1].record(inference_stream)
+                        gpu_float["z"][:len(group)].copy_(gpu_int8["z"][:len(group)])
+                        gpu_float["state"][:len(group), :state_width].copy_(
+                            gpu_int8["state"][:len(group), :state_width]
+                        )
+                        gpu_float["action"][:action_total].copy_(
+                            gpu_int8["action"][:action_total]
+                        )
+                        z = gpu_float["z"][:len(group)]
+                        actor_state = gpu_float["state"][:len(group), :state_width]
+                        actions = gpu_float["action"][:action_total]
+                    else:
+                        z = pinned_z[:len(group)].to(
+                            cuda_device, non_blocking=True
+                        )
+                        actor_state = pinned_state[:len(group), :state_width].to(
+                            cuda_device, non_blocking=True
+                        )
+                        actions = pinned_action[:action_total].to(
+                            cuda_device, non_blocking=True
+                        )
+                        if timing_events is not None:
+                            timing_events[1].record(inference_stream)
                     if timing_events is not None:
-                        timing_events[1].record(inference_stream)
+                        timing_events[2].record(inference_stream)
                     with torch.inference_mode():
                         indices = policy.get_model(
                             position
@@ -695,7 +745,7 @@ def centralized_inference_loop(
                             split_dense1=split_dense1,
                         )
                     if timing_events is not None:
-                        timing_events[2].record(inference_stream)
+                        timing_events[3].record(inference_stream)
                     indices_cpu = indices.to("cpu", non_blocking=False).tolist()
                 if copying:
                     # The blocking D2H above proves the inference stream has
@@ -714,6 +764,9 @@ def centralized_inference_loop(
                         timing_events[0].elapsed_time(timing_events[1]) * 1e6
                     )
                     forward_ns = int(
+                        timing_events[2].elapsed_time(timing_events[3]) * 1e6
+                    )
+                    gpu_cast_ns = int(
                         timing_events[1].elapsed_time(timing_events[2]) * 1e6
                     )
                     metric_store.add_central(
@@ -728,10 +781,11 @@ def centralized_inference_loop(
                         ],
                         batching_wait_ns=batch_started_ns - oldest_ns,
                         cpu_packing_ns=packing_done_ns - batch_started_ns,
-                        h2d_ns=h2d_ns, forward_ns=forward_ns,
+                        h2d_ns=h2d_ns, gpu_cast_ns=gpu_cast_ns,
+                        forward_ns=forward_ns,
                         d2h_response_ns=max(
                             0, completed_ns - packing_done_ns
-                            - h2d_ns - forward_ns
+                            - h2d_ns - gpu_cast_ns - forward_ns
                         ),
                         stream_priority_active=priority_active,
                     )

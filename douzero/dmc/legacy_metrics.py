@@ -71,7 +71,7 @@ class LegacyMetricStore:
         self._central_batches = mp_context.Value("q", 0, lock=False)
         self._central_requests = mp_context.Value("q", 0, lock=False)
         self._central_actions = mp_context.Value("q", 0, lock=False)
-        self._central_timing_ns = mp_context.Array("q", 9, lock=False)
+        self._central_timing_ns = mp_context.Array("q", 10, lock=False)
         self._central_batch_hist = mp_context.Array(
             "q", MAX_CENTRAL_MICROBATCH + 1, lock=False
         )
@@ -142,15 +142,16 @@ class LegacyMetricStore:
 
     def add_central(self, *, microbatch_size, legal_actions, ipc_wait_ns,
                     batch_wait_ns, batching_wait_ns, cpu_packing_ns,
-                    h2d_ns, forward_ns, d2h_response_ns,
+                    h2d_ns, gpu_cast_ns, forward_ns, d2h_response_ns,
                     stream_priority_active) -> None:
         with self._lock:
             self._central_batches.value += 1
             self._central_requests.value += int(microbatch_size)
             self._central_actions.value += int(legal_actions)
             for index, value in enumerate((
-                batching_wait_ns, cpu_packing_ns, h2d_ns, forward_ns,
-                d2h_response_ns, sum(ipc_wait_ns), sum(batch_wait_ns), 0, 0,
+                batching_wait_ns, cpu_packing_ns, h2d_ns, gpu_cast_ns,
+                forward_ns, d2h_response_ns, sum(ipc_wait_ns),
+                sum(batch_wait_ns), 0, 0,
             )):
                 self._central_timing_ns[index] += int(value)
             self._central_batch_hist[min(
@@ -168,8 +169,8 @@ class LegacyMetricStore:
     def add_central_actor(self, *, queue_put_block_ns, response_consume_ns,
                           end_to_end_ns) -> None:
         with self._lock:
-            self._central_timing_ns[7] += int(queue_put_block_ns)
-            self._central_timing_ns[8] += int(response_consume_ns)
+            self._central_timing_ns[8] += int(queue_put_block_ns)
+            self._central_timing_ns[9] += int(response_consume_ns)
             # End-to-end is accumulated separately from per-batch timings.
             self._central_timing_ns[0] += 0
             self._central_actor_e2e_ns.value += int(end_to_end_ns)
@@ -391,15 +392,16 @@ class LegacyMetricStore:
                     name: (
                         central_timing[index]
                         / (
-                            central_requests if index in {5, 6}
-                            else central_actor_e2e_count if index in {7, 8}
+                            central_requests if index in {6, 7}
+                            else central_actor_e2e_count if index in {8, 9}
                             else central_batches
                         )
                         / 1e6 if central_batches else None
                     )
                     for index, name in enumerate((
-                        "batching_wait", "cpu_packing", "h2d", "forward",
-                        "d2h_response", "ipc_queue_wait", "server_batch_wait",
+                        "batching_wait", "cpu_packing", "h2d", "gpu_cast",
+                        "forward", "d2h_response", "ipc_queue_wait",
+                        "server_batch_wait",
                         "queue_put_block", "response_consume",
                     ))
                 },
