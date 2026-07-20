@@ -697,13 +697,25 @@ def centralized_inference_loop(
                     slots.index(request.actor_id, request.env_slot)
                     for request in group
                 ], dtype=torch.long)
-                torch.index_select(
-                    slots.z, 0, slot_indices, out=pinned_z[:len(group)]
-                )
-                torch.index_select(
-                    slots.x_state[:, :state_width], 0, slot_indices,
-                    out=pinned_state[:len(group), :state_width],
-                )
+                if staging_dtype == "int8":
+                    torch.index_select(
+                        slots.z, 0, slot_indices, out=pinned_z[:len(group)]
+                    )
+                    torch.index_select(
+                        slots.x_state[:, :state_width], 0, slot_indices,
+                        out=pinned_state[:len(group), :state_width],
+                    )
+                else:
+                    # index_select(out=...) requires identical dtypes. Preserve
+                    # the float32 attribution path by casting during the copy.
+                    pinned_z[:len(group)].copy_(
+                        torch.index_select(slots.z, 0, slot_indices)
+                    )
+                    pinned_state[:len(group), :state_width].copy_(
+                        torch.index_select(
+                            slots.x_state[:, :state_width], 0, slot_indices
+                        )
+                    )
                 if inference_layout == "padded":
                     pinned_action_padded[:len(group), :_bucket].zero_()
                     for batch_index, request in enumerate(group):
