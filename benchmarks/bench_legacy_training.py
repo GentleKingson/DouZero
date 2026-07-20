@@ -183,6 +183,8 @@ def _flatten(payload):
     system = payload.get("system", {})
     legal = payload.get("legal_actions", {})
     central = payload.get("centralized_inference", {})
+    central_timing = central.get("timing_mean_ms", {})
+    throttle = payload.get("learner_throttle", {})
     return {
         **rates,
         "gpu_utilization_median": system.get("gpu_percent", {}).get("median"),
@@ -213,6 +215,19 @@ def _flatten(payload):
         "actor_inference_blocked_ratio": payload.get("actor_inference_blocked_ratio"),
         "learner_data_wait_ratio": payload.get("learner_data_wait_ratio"),
         "learner_throttle_ratio": payload.get("learner_throttle_ratio"),
+        "queue_put_block_ms": central_timing.get("queue_put_block"),
+        "ipc_queue_wait_ms": central_timing.get("ipc_queue_wait"),
+        "server_batch_wait_ms": central_timing.get("server_batch_wait"),
+        "cpu_packing_ms": central_timing.get("cpu_packing"),
+        "h2d_ms": central_timing.get("h2d"),
+        "forward_ms": central_timing.get("forward"),
+        "d2h_response_ms": central_timing.get("d2h_response"),
+        "response_consume_ms": central_timing.get("response_consume"),
+        "end_to_end_inference_ms": central.get(
+            "end_to_end_inference_mean_ms"
+        ),
+        "learner_throttle_count": throttle.get("count"),
+        "learner_throttle_wait_p95_ms": throttle.get("wait_ms_p95"),
     }
 
 
@@ -337,10 +352,13 @@ def main(argv=None):
                 "--legacy_monitor_interval_seconds",
                 str(args.monitor_interval_seconds),
                 "--seed", str(args.seed),
-                "--disable_checkpoint",
                 "--savedir", str(output_dir / "run-logs"),
                 "--xpid", run_name,
             ]
+            command.extend(
+                ["--no-disable_checkpoint", "--no-legacy_profile"]
+                if args.formal else ["--disable_checkpoint"]
+            )
             if args.num_actors is not None:
                 command.extend(["--num_actors", str(args.num_actors)])
             for option in (
@@ -398,7 +416,8 @@ def main(argv=None):
             "warmup_frames": args.warmup_frames,
             "measure_frames": args.measure_frames,
             "repeats": args.repeats,
-            "checkpoint_disabled": True,
+            "checkpoint_disabled": not args.formal,
+            "profiling_disabled": bool(args.formal),
             "seed": args.seed,
             "docker_image_digest": args.docker_image_digest,
             "docker_image_digest_source": "caller_declared",

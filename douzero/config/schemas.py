@@ -564,6 +564,8 @@ class TrainingConfig:
     central_actor_queue_high_watermark: int = 32
     central_actor_inference_deadline_ms: float = 10.0
     central_actor_learner_throttle: bool = False
+    central_actor_learner_throttle_mode: str = "fixed_threshold"
+    central_actor_predicted_drain_target_ms: float = 10.0
     central_actor_use_stream_priority: bool = True
     central_actor_async_policy_copy: bool = True
     central_actor_timeout_seconds: float = 30.0

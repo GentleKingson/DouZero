@@ -31,6 +31,7 @@ from .centralized_actor import (
     CentralQueuePressure,
     CentralizedInferenceSlots,
     centralized_inference_loop,
+    wait_for_learner_admission,
 )
 from douzero.runtime import SafeMixedPrecision, VersionedPolicyPool
 
@@ -495,6 +496,15 @@ def train(flags):
             raise ValueError("central actor high watermark exceeds queue capacity")
         if getattr(flags, 'central_actor_inference_deadline_ms', 10.0) <= 0:
             raise ValueError("central_actor_inference_deadline_ms must be positive")
+        if getattr(flags, 'central_actor_learner_throttle_mode',
+                   'fixed_threshold') not in {
+                       'off', 'fixed_threshold', 'predicted_drain_time'
+                   }:
+            raise ValueError("invalid central_actor_learner_throttle_mode")
+        if getattr(flags, 'central_actor_predicted_drain_target_ms', 10.0) <= 0:
+            raise ValueError(
+                "central_actor_predicted_drain_target_ms must be positive"
+            )
     if not flags.actor_device_cpu or flags.training_device != 'cpu':
         if not torch.cuda.is_available():
             raise AssertionError("CUDA not available. If you have GPUs, please specify the ID after `--gpu_devices`. Otherwise, please train with CPU with `python3 train.py --actor_device_cpu --training_device cpu`")
@@ -740,7 +750,10 @@ def train(flags):
             flags, 'central_actor_max_pending_requests', 128
         ))
         central_response_queues = [ctx.Queue() for _ in range(flags.num_actors)]
-        central_queue_pressure = CentralQueuePressure(ctx)
+        central_queue_pressure = CentralQueuePressure(
+            ctx,
+            flags.num_actors * getattr(flags, 'central_actor_envs_per_actor', 4),
+        )
         central_process = ctx.Process(
             target=centralized_inference_loop,
             name='legacy-centralized-inference',
@@ -780,6 +793,8 @@ def train(flags):
     def stop_workers():
         """Wake blocked workers, reap actors, and join learner threads."""
         stop_event.set()
+        if central_queue_pressure is not None:
+            central_queue_pressure.invalidate()
         if central_response_queues is not None:
             for response_queue in central_response_queues:
                 response_queue.put((
@@ -858,22 +873,24 @@ def train(flags):
                     batch, batch_timings = batch_result, {}
                 if (central_queue_pressure is not None
                         and getattr(flags, 'central_actor_learner_throttle', False)):
-                    throttle_started_ns = time.perf_counter_ns()
-                    while not stop_event.is_set():
-                        depth, oldest_ms = central_queue_pressure.snapshot()
-                        if (depth < getattr(
-                                flags, 'central_actor_queue_high_watermark', 32
-                            ) and oldest_ms < getattr(
-                                flags, 'central_actor_inference_deadline_ms', 10.0
-                            )):
-                            break
-                        stop_event.wait(0.001)
-                    if metric_store is not None:
-                        metric_store.add_learner({
-                            'central_throttle_ns': (
-                                time.perf_counter_ns() - throttle_started_ns
-                            )
-                        })
+                    waited, throttle_ns = wait_for_learner_admission(
+                        central_queue_pressure, stop_event,
+                        getattr(
+                            flags, 'central_actor_learner_throttle_mode',
+                            'fixed_threshold',
+                        ),
+                        high_watermark=getattr(
+                            flags, 'central_actor_queue_high_watermark', 32
+                        ),
+                        deadline_ms=getattr(
+                            flags, 'central_actor_inference_deadline_ms', 10.0
+                        ),
+                        drain_target_ms=getattr(
+                            flags, 'central_actor_predicted_drain_target_ms', 10.0
+                        ),
+                    )
+                    if metric_store is not None and waited:
+                        metric_store.add_throttle(throttle_ns)
                 profile_sequence += 1
                 profile_step = (
                     getattr(flags, 'legacy_profile', False)

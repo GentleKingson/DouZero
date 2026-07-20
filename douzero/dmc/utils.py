@@ -243,11 +243,15 @@ def act_centralized_multi(i, device, free_queue, full_queue, policy_pool,
                 state['explore'] = (
                     flags.exp_epsilon > 0 and np.random.rand() < flags.exp_epsilon
                 )
+                request = scheduler.begin_enqueue(request)
+                storage_slot = central_slots.index(i, env_slot)
+                if central_queue_pressure is not None:
+                    central_queue_pressure.begin_actor_enqueue(
+                        storage_slot, request.actor_enqueue_started_ns
+                    )
                 while not stop_event.is_set():
                     try:
                         central_request_queue.put(request, timeout=0.1)
-                        if central_queue_pressure is not None:
-                            central_queue_pressure.enqueued(request.queued_ns)
                         break
                     except queue.Full:
                         # Bounded blocking provides backpressure while still
@@ -256,7 +260,12 @@ def act_centralized_multi(i, device, free_queue, full_queue, policy_pool,
                 if stop_event.is_set():
                     scheduler.cancel_all()
                     return
-                scheduler.mark_queued(request)
+                enqueued_ns = time.perf_counter_ns()
+                request = scheduler.mark_queued(request, enqueued_ns)
+                if central_queue_pressure is not None:
+                    central_queue_pressure.finish_actor_enqueue(
+                        storage_slot, enqueued_ns
+                    )
                 state['waiting'] = True
 
             if not _flush_actor_rollouts(
@@ -275,6 +284,7 @@ def act_centralized_multi(i, device, free_queue, full_queue, policy_pool,
                 if consumed is None:
                     return
                 request, selected = consumed
+                consumed_ns = time.perf_counter_ns()
                 state = slots[request.env_slot]
                 action_index = (
                     int(torch.randint(request.action_count, (1,))[0].item())
@@ -282,8 +292,20 @@ def act_centralized_multi(i, device, free_queue, full_queue, policy_pool,
                 )
                 advance(
                     request.env_slot, action_index,
-                    time.perf_counter_ns() - request.queued_ns,
+                    consumed_ns - request.actor_prepared_ns,
                 )
+                if metric_store is not None:
+                    metric_store.add_central_actor(
+                        queue_put_block_ns=(
+                            request.actor_enqueued_ns
+                            - request.actor_enqueue_started_ns
+                        ),
+                        response_consume_ns=(
+                            consumed_ns - scheduler.last_response_sent_ns
+                            if scheduler.last_response_sent_ns else 0
+                        ),
+                        end_to_end_ns=consumed_ns - request.actor_prepared_ns,
+                    )
             elif not made_local_progress:
                 stop_event.wait(0.01)
     except BaseException:
@@ -291,6 +313,11 @@ def act_centralized_multi(i, device, free_queue, full_queue, policy_pool,
         raise
     finally:
         scheduler.cancel_all()
+        if central_queue_pressure is not None:
+            central_queue_pressure.cancel([
+                central_slots.index(i, env_slot)
+                for env_slot in range(env_count)
+            ])
         recorder.flush()
         for env_slot, state in enumerate(slots):
             if state.get('lease') is not None:

@@ -139,6 +139,12 @@ parser.add_argument('--central_actor_inference_deadline_ms', default=10.0, type=
 parser.add_argument('--central_actor_learner_throttle',
                     action=argparse.BooleanOptionalAction, default=False,
                     help='Delay new learner updates under C0 inference pressure')
+parser.add_argument('--central_actor_learner_throttle_mode',
+                    choices=['off', 'fixed_threshold', 'predicted_drain_time'],
+                    default='fixed_threshold',
+                    help='C0 learner admission policy when throttling is enabled')
+parser.add_argument('--central_actor_predicted_drain_target_ms', default=10.0,
+                    type=float, help='Predicted C0 backlog drain-time target')
 parser.add_argument('--central_actor_use_stream_priority',
                     action=argparse.BooleanOptionalAction, default=True,
                     help='Request a high-priority CUDA inference stream')

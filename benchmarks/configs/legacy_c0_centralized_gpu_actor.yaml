@@ -33,6 +33,8 @@ central_actor_max_pending_requests: 128
 central_actor_queue_high_watermark: 32
 central_actor_inference_deadline_ms: 10.0
 central_actor_learner_throttle: true
+central_actor_learner_throttle_mode: fixed_threshold
+central_actor_predicted_drain_target_ms: 10.0
 central_actor_use_stream_priority: true
 central_actor_async_policy_copy: true
 central_actor_timeout_seconds: 30.0

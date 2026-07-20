@@ -17,6 +17,8 @@ from douzero.dmc.centralized_actor import (
     PolicyCopyState,
     RequestState,
     _compatible_key,
+    should_throttle,
+    wait_for_learner_admission,
 )
 from douzero.dmc.utils import (
     create_buffers,
@@ -243,13 +245,101 @@ def test_legal_action_buckets_allow_different_packed_counts():
 def test_central_queue_pressure_tracks_depth_without_polling():
     import multiprocessing
 
-    pressure = CentralQueuePressure(multiprocessing.get_context("spawn"))
-    pressure.enqueued(time.perf_counter_ns())
-    pressure.enqueued(time.perf_counter_ns())
-    assert pressure.snapshot()[0] == 2
-    pressure.dequeued()
-    pressure.dequeued()
-    assert pressure.snapshot() == (0, 0.0)
+    pressure = CentralQueuePressure(
+        multiprocessing.get_context("spawn"), request_slots=3
+    )
+    now = time.perf_counter_ns()
+    pressure.begin_actor_enqueue(0, now)
+    pressure.finish_actor_enqueue(0, now + 10)
+    pressure.begin_actor_enqueue(1, now + 20)
+    pressure.finish_actor_enqueue(1, now + 30)
+    snapshot = pressure.snapshot()
+    assert snapshot["ingress_queue_depth"] == 2
+    assert snapshot["oldest_actor_enqueue_ns"] == now + 10
+    pressure.server_received(0, now + 40)
+    assert pressure.snapshot()["local_pending_depth"] == 1
+    pressure.executing([0])
+    assert pressure.snapshot()["executing_requests"] == 1
+    assert pressure.snapshot()["total_backlog"] == 2
+    pressure.completed([0], now + 50)
+    snapshot = pressure.snapshot()
+    assert snapshot["total_backlog"] == 1
+    assert snapshot["oldest_actor_enqueue_ns"] == now + 30
+    pressure.cancel([1])
+    assert pressure.snapshot()["total_backlog"] == 0
+
+
+def test_pressure_preserves_actor_enqueue_and_server_receive_timestamps():
+    import multiprocessing
+
+    pressure = CentralQueuePressure(
+        multiprocessing.get_context("spawn"), request_slots=1
+    )
+    pressure.begin_actor_enqueue(0, 100)
+    pressure.finish_actor_enqueue(0, 200)
+    pressure.server_received(0, 700)
+    assert pressure.timestamps(0) == (200, 700)
+    snapshot = pressure.snapshot()
+    assert snapshot["oldest_actor_enqueue_ns"] == 200
+    assert snapshot["oldest_server_receive_ns"] == 700
+
+
+@pytest.mark.parametrize("mode", ["fixed_threshold", "predicted_drain_time"])
+def test_learner_throttle_modes_exit_when_backlog_drains(mode):
+    import multiprocessing
+
+    context = multiprocessing.get_context("spawn")
+    pressure = CentralQueuePressure(context, request_slots=1)
+    pressure.begin_actor_enqueue(0, time.perf_counter_ns())
+    pressure.finish_actor_enqueue(0, time.perf_counter_ns())
+    result = []
+    worker = threading.Thread(target=lambda: result.append(
+        wait_for_learner_admission(
+            pressure, threading.Event(), mode, high_watermark=1,
+            deadline_ms=0.001, drain_target_ms=0.001,
+        )
+    ))
+    worker.start()
+    time.sleep(0.02)
+    pressure.cancel([0])
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert result[0][0] is True
+
+
+def test_stop_event_bounds_throttle_wait():
+    import multiprocessing
+
+    context = multiprocessing.get_context("spawn")
+    pressure = CentralQueuePressure(context, request_slots=1)
+    pressure.begin_actor_enqueue(0, time.perf_counter_ns())
+    pressure.finish_actor_enqueue(0, time.perf_counter_ns())
+    stop = threading.Event()
+    worker = threading.Thread(target=wait_for_learner_admission, args=(
+        pressure, stop, "fixed_threshold",
+    ), kwargs={
+        "high_watermark": 1, "deadline_ms": 1,
+        "drain_target_ms": 1,
+    })
+    worker.start()
+    stop.set()
+    worker.join(timeout=0.2)
+    assert not worker.is_alive()
+
+
+def test_predicted_throttle_uses_total_backlog_and_service_rate():
+    snapshot = {
+        "valid": True, "total_backlog": 10,
+        "recent_requests_per_ms": 2.0, "oldest_actor_age_ms": 0.0,
+    }
+    assert should_throttle(
+        snapshot, "predicted_drain_time", high_watermark=100,
+        deadline_ms=100, drain_target_ms=4.9,
+    )
+    assert not should_throttle(
+        snapshot, "predicted_drain_time", high_watermark=100,
+        deadline_ms=100, drain_target_ms=5.1,
+    )
 
 
 def test_centralized_response_timeout_abort_and_shutdown():

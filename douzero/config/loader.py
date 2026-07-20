@@ -298,6 +298,8 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "central_actor_queue_high_watermark": int,
     "central_actor_inference_deadline_ms": float,
     "central_actor_learner_throttle": bool,
+    "central_actor_learner_throttle_mode": str,
+    "central_actor_predicted_drain_target_ms": float,
     "central_actor_use_stream_priority": bool,
     "central_actor_async_policy_copy": bool,
     "central_actor_timeout_seconds": float,
@@ -498,6 +500,14 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         )
     if cfg.central_actor_inference_deadline_ms <= 0:
         raise ValueError("central_actor_inference_deadline_ms must be positive")
+    if cfg.central_actor_learner_throttle_mode not in {
+        "off", "fixed_threshold", "predicted_drain_time"
+    }:
+        raise ValueError("invalid central_actor_learner_throttle_mode")
+    if cfg.central_actor_predicted_drain_target_ms <= 0:
+        raise ValueError(
+            "central_actor_predicted_drain_target_ms must be positive"
+        )
     if cfg.central_actor_timeout_seconds <= 0:
         raise ValueError("central_actor_timeout_seconds must be positive")
     if cfg.belief_training_mode not in {"frozen", "joint", "alternating"}:
@@ -596,6 +606,8 @@ _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
     "central_actor_max_delay_ms", "central_actor_max_pending_requests",
     "central_actor_queue_high_watermark", "central_actor_inference_deadline_ms",
     "central_actor_learner_throttle", "central_actor_use_stream_priority",
+    "central_actor_learner_throttle_mode",
+    "central_actor_predicted_drain_target_ms",
     "central_actor_async_policy_copy", "central_actor_timeout_seconds",
     "learning_rate", "alpha", "momentum", "epsilon",
     # P01-added argparse dests (optional; default to legacy values if absent).
