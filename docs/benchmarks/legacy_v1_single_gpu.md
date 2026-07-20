@@ -185,14 +185,16 @@ names and shapes:
 
 ```yaml
 central_actor_split_dense1: true
-central_actor_staging_dtype: int8
+central_actor_staging_dtype: float32
 central_actor_inference_layout: packed
 ```
 
 Split dense1 computes the history/state projection once per decision and the
 action projection per legal action using views of the existing `dense1`
 weight. Int8 staging transfers observations in their source dtype, casts into
-reused FP32 GPU buffers on the inference stream, and reports cast time.
+reused FP32 GPU buffers on the inference stream, and reports cast time. It
+remains opt-in because the formal ablation did not improve end-to-end frames/s
+over float32 staging.
 Bucketed padded inference is an opt-in attribution path that replaces segmented
 Python argmax with a tensor mask and reports padding, effective-FLOPs, and
 compatible-group fragmentation. The supplied candidate stays packed because
