@@ -1,3 +1,4 @@
+# Experimental centralized CUDA inference topology. A1 remains recommended.
 xpid: legacy-c0-centralized-gpu-actor
 actor_device_cpu: true
 training_device: "0"

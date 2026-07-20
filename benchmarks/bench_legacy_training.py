@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Repeatable end-to-end V1 single-GPU training benchmark orchestrator."""
+"""Repeatable end-to-end V1 single-GPU training benchmark orchestrator.
+
+Timeout cleanup reaps the complete training process group on POSIX. Native
+Windows only terminates the direct child; use WSL2/Linux for formal runs.
+"""
 
 from __future__ import annotations
 
@@ -21,9 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIGS = (
     "legacy_a0_cpu_actor.yaml",
-    "legacy_b0_gpu_actor.yaml",
     "legacy_a1_cpu_factorized.yaml",
-    "legacy_b1_gpu_factorized.yaml",
 )
 
 
@@ -38,6 +40,18 @@ def _sha256(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _validate_evidence_mode(args):
+    if not args.formal:
+        return
+    if args.allow_dirty:
+        raise ValueError("formal benchmarks cannot use --allow_dirty")
+    if not args.docker_image_digest:
+        raise ValueError(
+            "formal benchmarks require --docker_image_digest or "
+            "DOUZERO_IMAGE_DIGEST"
+        )
 
 
 def _run_training(command, *, log_file, timeout, cwd=ROOT):
@@ -212,7 +226,12 @@ def main(argv=None):
         "--allow_dirty", action="store_true",
         help="Allow exploratory runs from a dirty checkout",
     )
+    parser.add_argument(
+        "--formal", action="store_true",
+        help="Require an immutable image digest and a clean checkout",
+    )
     args = parser.parse_args(argv)
+    _validate_evidence_mode(args)
     if args.repeats < 3:
         raise ValueError("at least three repetitions are required")
     if args.warmup_frames < 0 or args.measure_frames <= 0:
@@ -313,6 +332,7 @@ def main(argv=None):
             "checkpoint_disabled": True,
             "seed": args.seed,
             "docker_image_digest": args.docker_image_digest,
+            "formal": args.formal,
             "config_sha256": {
                 str(config): _sha256(config) for config in configs
             },

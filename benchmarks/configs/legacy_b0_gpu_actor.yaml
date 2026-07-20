@@ -1,3 +1,4 @@
+# Experimental direct-GPU Actor topology. Not recommended for production.
 xpid: legacy-b0-gpu-actor
 actor_device_cpu: false
 training_device: "0"

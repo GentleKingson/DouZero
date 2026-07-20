@@ -7,6 +7,7 @@ import json
 import multiprocessing as mp
 import subprocess
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -44,8 +45,9 @@ def test_update_budget_prevents_concurrent_frame_overshoot():
 
     def reserve_all():
         local = 0
-        while budget.reserve():
+        while (reservation := budget.reserve()) is not None:
             local += 1
+            budget.commit(reservation)
         with result_lock:
             reservations.append(local)
 
@@ -56,6 +58,20 @@ def test_update_budget_prevents_concurrent_frame_overshoot():
         thread.join()
 
     assert sum(reservations) == 60
+
+
+def test_update_budget_cancel_restores_capacity():
+    budget = _UpdateBudget(0, 6_400, 3_200)
+    cancelled = budget.reserve()
+    assert cancelled is not None
+    budget.cancel(cancelled)
+
+    first = budget.reserve()
+    second = budget.reserve()
+    assert first is not None and second is not None
+    assert budget.reserve() is None
+    budget.commit(first)
+    budget.commit(second)
 
 
 def test_training_rejects_partial_update_frame_budget(tmp_path):
@@ -158,6 +174,20 @@ def test_benchmark_timeout_reaps_process_group(monkeypatch):
 
 def test_p95_uses_nearest_rank_boundary():
     assert bench_legacy_training._p95(list(range(20))) == 18
+
+
+def test_formal_benchmark_requires_immutable_image_digest():
+    with pytest.raises(ValueError, match="require --docker_image_digest"):
+        bench_legacy_training._validate_evidence_mode(SimpleNamespace(
+            formal=True, allow_dirty=False, docker_image_digest=None,
+        ))
+    with pytest.raises(ValueError, match="cannot use --allow_dirty"):
+        bench_legacy_training._validate_evidence_mode(SimpleNamespace(
+            formal=True, allow_dirty=True, docker_image_digest="sha256:test",
+        ))
+    bench_legacy_training._validate_evidence_mode(SimpleNamespace(
+        formal=True, allow_dirty=False, docker_image_digest="sha256:test",
+    ))
 
 
 def test_gpu_sampler_maps_logical_device_through_visible_devices(

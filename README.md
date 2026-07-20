@@ -275,6 +275,9 @@ infrastructure, not a released model: **Release candidate: NONE. Release
 status: NOT READY.** V2 AMP, strict checkpoint resume, and DDP boundaries are
 documented in [Windows training](docs/windows_training.md) and
 [the P14 training system](docs/training_system.md).
+For the optimized Legacy V1 single-GPU topology, formal evidence protocol, and
+experimental GPU Actor limitations, see the
+[Legacy V1 benchmark guide](docs/benchmarks/legacy_v1_single_gpu.md).
 For more customized configuration of training, see the following optional arguments:
 ```
 --xpid XPID           Experiment id (default: douzero)

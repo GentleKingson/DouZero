@@ -190,16 +190,36 @@ class _UpdateBudget:
 
     def __init__(self, completed_frames, total_frames, frames_per_update):
         self._lock = threading.Lock()
-        self._reserved = int(completed_frames)
-        self._total = int(total_frames)
-        self._step = int(frames_per_update)
+        remaining_frames = int(total_frames) - int(completed_frames)
+        step = int(frames_per_update)
+        if remaining_frames < 0 or remaining_frames % step:
+            raise ValueError("frame budget must contain complete learner updates")
+        self._available = remaining_frames // step
+        self._next_token = 0
+        self._active = set()
 
     def reserve(self):
         with self._lock:
-            if self._reserved >= self._total:
-                return False
-            self._reserved += self._step
-            return True
+            if self._available == 0:
+                return None
+            token = self._next_token
+            self._next_token += 1
+            self._available -= 1
+            self._active.add(token)
+            return token
+
+    def commit(self, token):
+        with self._lock:
+            if token not in self._active:
+                raise ValueError("unknown or completed update reservation")
+            self._active.remove(token)
+
+    def cancel(self, token):
+        with self._lock:
+            if token not in self._active:
+                raise ValueError("unknown or completed update reservation")
+            self._active.remove(token)
+            self._available += 1
 
 
 def learn(position,
@@ -705,72 +725,81 @@ def train(flags):
         if getattr(flags, 'legacy_reusable_pinned_staging', False):
             stager = PinnedBatchStager(buffers[device][position], flags)
         while not stop_event.is_set():
-            if not update_budget.reserve():
+            reservation = update_budget.reserve()
+            if reservation is None:
                 return
-            batch_result = get_batch(
-                free_queue[device][position], full_queue[device][position],
-                buffers[device][position], flags, local_lock,
-                stager=stager,
-                return_timings=metric_store is not None,
-            )
-            if batch_result is None:
-                return
-            if metric_store is not None:
-                batch, batch_timings = batch_result
-            else:
-                batch, batch_timings = batch_result, {}
-            profile_sequence += 1
-            profile_step = (
-                getattr(flags, 'legacy_profile', False)
-                and profile_sequence
-                % getattr(flags, 'legacy_profile_sample_interval', 10) == 0
-            )
-            _stats, learner_timings = learn(
-                position, models, learner_forward_models[position], batch,
-                optimizers[position], flags, position_lock,
-                amp_controller=amp_controllers[position],
-                learner_updates=current_learner_updates(),
-                profile=profile_step,
-                stager=stager,
-            )
-            publish_snapshot_if_due()
+            try:
+                batch_result = get_batch(
+                    free_queue[device][position], full_queue[device][position],
+                    buffers[device][position], flags, local_lock,
+                    stager=stager,
+                    return_timings=metric_store is not None,
+                )
+                if batch_result is None:
+                    return
+                if metric_store is not None:
+                    batch, batch_timings = batch_result
+                else:
+                    batch, batch_timings = batch_result, {}
+                profile_sequence += 1
+                profile_step = (
+                    getattr(flags, 'legacy_profile', False)
+                    and profile_sequence
+                    % getattr(flags, 'legacy_profile_sample_interval', 10) == 0
+                )
+                _stats, learner_timings = learn(
+                    position, models, learner_forward_models[position], batch,
+                    optimizers[position], flags, position_lock,
+                    amp_controller=amp_controllers[position],
+                    learner_updates=current_learner_updates(),
+                    profile=profile_step,
+                    stager=stager,
+                )
+                publish_snapshot_if_due()
 
-            with training_state_lock:
-                for k in _stats:
-                    stats[k] = _stats[k]
-                log_write_ns = 0
-                if log_interval == 0.0:
-                    to_log = dict(frames=frames)
-                    to_log.update({k: stats[k] for k in stat_keys})
-                    log_started_ns = time.perf_counter_ns()
-                    plogger.log(to_log)
-                    log_write_ns = time.perf_counter_ns() - log_started_ns
-                frames += frames_per_update
-                position_frames[position] += frames_per_update
-                started_now = False
-                if (metric_store is not None and not measurement_started
-                        and frames >= warmup_frames):
-                    metric_store.reset()
-                    measurement_started = True
-                    started_now = True
-                if metric_store is not None and not started_now:
-                    metric_store.add_learner(
-                        {
-                            'updates': 1,
-                            'profile_samples': int(profile_step),
-                            'frames': frames_per_update,
-                            'log_write_ns': log_write_ns,
-                            'log_writes': int(log_interval == 0.0),
-                            **batch_timings,
-                            **learner_timings,
-                        },
-                        position=position,
-                        queue_wait_ns=batch_timings.get('batch_wait_ns', 0),
-                        mean_policy_lag=(
-                            _stats['policy_lag_mean_' + position]
-                        ),
-                        max_policy_lag=_stats['policy_lag_max_' + position],
-                    )
+                with training_state_lock:
+                    for k in _stats:
+                        stats[k] = _stats[k]
+                    log_write_ns = 0
+                    if log_interval == 0.0:
+                        to_log = dict(frames=frames)
+                        to_log.update({k: stats[k] for k in stat_keys})
+                        log_started_ns = time.perf_counter_ns()
+                        plogger.log(to_log)
+                        log_write_ns = time.perf_counter_ns() - log_started_ns
+                    frames += frames_per_update
+                    position_frames[position] += frames_per_update
+                    update_budget.commit(reservation)
+                    reservation = None
+                    started_now = False
+                    if (metric_store is not None and not measurement_started
+                            and frames >= warmup_frames):
+                        metric_store.reset()
+                        measurement_started = True
+                        started_now = True
+                    if metric_store is not None and not started_now:
+                        metric_store.add_learner(
+                            {
+                                'updates': 1,
+                                'profile_samples': int(profile_step),
+                                'frames': frames_per_update,
+                                'log_write_ns': log_write_ns,
+                                'log_writes': int(log_interval == 0.0),
+                                **batch_timings,
+                                **learner_timings,
+                            },
+                            position=position,
+                            queue_wait_ns=batch_timings.get('batch_wait_ns', 0),
+                            mean_policy_lag=(
+                                _stats['policy_lag_mean_' + position]
+                            ),
+                            max_policy_lag=(
+                                _stats['policy_lag_max_' + position]
+                            ),
+                        )
+            finally:
+                if reservation is not None:
+                    update_budget.cancel(reservation)
 
     for device in device_iterator:
         for m in range(flags.num_buffers):
