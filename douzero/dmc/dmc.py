@@ -28,6 +28,7 @@ from .utils import (
 )
 from .legacy_metrics import LegacyMetricStore, write_metrics
 from .centralized_actor import (
+    CentralQueuePressure,
     CentralizedInferenceSlots,
     centralized_inference_loop,
 )
@@ -474,6 +475,26 @@ def train(flags):
             raise ValueError("central_actor_max_actions must be >= 64")
         if getattr(flags, 'central_actor_microbatch', 4) < 1:
             raise ValueError("central_actor_microbatch must be >= 1")
+        envs_per_actor = getattr(flags, 'central_actor_envs_per_actor', 4)
+        minimum = getattr(flags, 'central_actor_min_microbatch', 2)
+        target = getattr(flags, 'central_actor_target_microbatch', 8)
+        maximum = getattr(flags, 'central_actor_max_microbatch', 16)
+        capacity = getattr(flags, 'central_actor_max_pending_requests', 128)
+        high_watermark = getattr(flags, 'central_actor_queue_high_watermark', 32)
+        if envs_per_actor < 1:
+            raise ValueError("central_actor_envs_per_actor must be >= 1")
+        if not (1 <= minimum <= target <= maximum):
+            raise ValueError(
+                "central actor microbatches must satisfy 1 <= min <= target <= max"
+            )
+        if capacity < maximum:
+            raise ValueError(
+                "central_actor_max_pending_requests must be >= max microbatch"
+            )
+        if not 1 <= high_watermark <= capacity:
+            raise ValueError("central actor high watermark exceeds queue capacity")
+        if getattr(flags, 'central_actor_inference_deadline_ms', 10.0) <= 0:
+            raise ValueError("central_actor_inference_deadline_ms must be positive")
     if not flags.actor_device_cpu or flags.training_device != 'cpu':
         if not torch.cuda.is_available():
             raise AssertionError("CUDA not available. If you have GPUs, please specify the ID after `--gpu_devices`. Otherwise, please train with CPU with `python3 train.py --actor_device_cpu --training_device cpu`")
@@ -560,8 +581,11 @@ def train(flags):
             model.share_memory()
             model.eval()
             slots.append(model)
+        owner_count = flags.num_actors
+        if getattr(flags, 'legacy_actor_backend', 'legacy') == 'centralized_factorized':
+            owner_count *= getattr(flags, 'central_actor_envs_per_actor', 4)
         models[device] = VersionedPolicyPool(
-            slots, mp_context=ctx, max_owners=flags.num_actors
+            slots, mp_context=ctx, max_owners=owner_count
         )
 
     # Initialize buffers
@@ -706,12 +730,17 @@ def train(flags):
     central_slots = None
     central_request_queue = None
     central_response_queues = None
+    central_queue_pressure = None
     if getattr(flags, 'legacy_actor_backend', 'legacy') == 'centralized_factorized':
         central_slots = CentralizedInferenceSlots(
-            flags.num_actors, getattr(flags, 'central_actor_max_actions', 512)
+            flags.num_actors, getattr(flags, 'central_actor_max_actions', 512),
+            getattr(flags, 'central_actor_envs_per_actor', 4),
         )
-        central_request_queue = ctx.Queue()
+        central_request_queue = ctx.Queue(maxsize=getattr(
+            flags, 'central_actor_max_pending_requests', 128
+        ))
         central_response_queues = [ctx.Queue() for _ in range(flags.num_actors)]
+        central_queue_pressure = CentralQueuePressure(ctx)
         central_process = ctx.Process(
             target=centralized_inference_loop,
             name='legacy-centralized-inference',
@@ -722,8 +751,15 @@ def train(flags):
                 central_request_queue,
                 central_response_queues,
                 stop_event,
-                getattr(flags, 'central_actor_microbatch', 4),
+                getattr(flags, 'central_actor_min_microbatch', 2),
+                getattr(flags, 'central_actor_target_microbatch', 8),
+                getattr(flags, 'central_actor_max_microbatch', 16),
                 getattr(flags, 'central_actor_max_delay_ms', 2.0),
+                getattr(flags, 'central_actor_max_pending_requests', 128),
+                getattr(flags, 'central_actor_use_stream_priority', True),
+                getattr(flags, 'central_actor_async_policy_copy', True),
+                metric_store,
+                central_queue_pressure,
             ),
         )
         central_process.start()
@@ -736,7 +772,8 @@ def train(flags):
                       models[device], buffers[device], flags, stop_event,
                       metric_store, central_slots, central_request_queue,
                       (central_response_queues[i]
-                       if central_response_queues is not None else None)))
+                       if central_response_queues is not None else None),
+                      central_queue_pressure))
             actor.start()
             actor_processes.append((actor, device, i))
 
@@ -745,8 +782,13 @@ def train(flags):
         stop_event.set()
         if central_response_queues is not None:
             for response_queue in central_response_queues:
-                response_queue.put(('shutdown', 'training is shutting down'))
-            central_request_queue.put(None)
+                response_queue.put((
+                    'shutdown', -1, -1, -1, -1, 'training is shutting down'
+                ))
+            try:
+                central_request_queue.put(None, timeout=1)
+            except queue.Full:
+                pass
         for device in device_iterator:
             for position in ['landlord', 'landlord_up', 'landlord_down']:
                 for _ in range(flags.num_actors):
@@ -763,7 +805,13 @@ def train(flags):
                     'Actor %i on device %s could not be reaped.', actor_id, device
                 )
             else:
-                models[device].recover_owner(actor_id)
+                env_count = (
+                    getattr(flags, 'central_actor_envs_per_actor', 4)
+                    if getattr(flags, 'legacy_actor_backend', 'legacy')
+                    == 'centralized_factorized' else 1
+                )
+                for env_slot in range(env_count):
+                    models[device].recover_owner(actor_id * env_count + env_slot)
         if central_process is not None:
             central_process.join(timeout=5)
             if central_process.is_alive():
@@ -808,6 +856,24 @@ def train(flags):
                     batch, batch_timings = batch_result
                 else:
                     batch, batch_timings = batch_result, {}
+                if (central_queue_pressure is not None
+                        and getattr(flags, 'central_actor_learner_throttle', False)):
+                    throttle_started_ns = time.perf_counter_ns()
+                    while not stop_event.is_set():
+                        depth, oldest_ms = central_queue_pressure.snapshot()
+                        if (depth < getattr(
+                                flags, 'central_actor_queue_high_watermark', 32
+                            ) and oldest_ms < getattr(
+                                flags, 'central_actor_inference_deadline_ms', 10.0
+                            )):
+                            break
+                        stop_event.wait(0.001)
+                    if metric_store is not None:
+                        metric_store.add_learner({
+                            'central_throttle_ns': (
+                                time.perf_counter_ns() - throttle_started_ns
+                            )
+                        })
                 profile_sequence += 1
                 profile_step = (
                     getattr(flags, 'legacy_profile', False)

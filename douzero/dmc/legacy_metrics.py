@@ -11,6 +11,8 @@ from pathlib import Path
 
 POSITIONS = ("landlord", "landlord_up", "landlord_down")
 MAX_LEGAL_ACTIONS = 20000
+MAX_CENTRAL_MICROBATCH = 256
+MAX_CENTRAL_WAIT_US = 100_000
 
 ACTOR_COUNTERS = (
     "decisions",
@@ -43,6 +45,7 @@ LEARNER_COUNTERS = (
     "snapshot_publish_ns",
     "snapshot_publishes",
     "snapshot_skips",
+    "central_throttle_ns",
 )
 
 
@@ -64,6 +67,20 @@ class LegacyMetricStore:
             "q", MAX_LEGAL_ACTIONS + 1, lock=False
         )
         self._legal_max = mp_context.Value("q", 0, lock=False)
+        self._central_batches = mp_context.Value("q", 0, lock=False)
+        self._central_requests = mp_context.Value("q", 0, lock=False)
+        self._central_actions = mp_context.Value("q", 0, lock=False)
+        self._central_timing_ns = mp_context.Array("q", 5, lock=False)
+        self._central_batch_hist = mp_context.Array(
+            "q", MAX_CENTRAL_MICROBATCH + 1, lock=False
+        )
+        self._central_action_hist = mp_context.Array(
+            "q", MAX_LEGAL_ACTIONS + 1, lock=False
+        )
+        self._central_wait_us_hist = mp_context.Array(
+            "q", MAX_CENTRAL_WAIT_US + 1, lock=False
+        )
+        self._central_priority_active = mp_context.Value("i", -1, lock=False)
         self._started_ns = mp_context.Value("q", time.perf_counter_ns(), lock=False)
 
     @property
@@ -81,10 +98,18 @@ class LegacyMetricStore:
                 self._role_mean_lag_sum,
                 self._role_max_lag,
                 self._legal_hist,
+                self._central_timing_ns,
+                self._central_batch_hist,
+                self._central_action_hist,
+                self._central_wait_us_hist,
             ):
                 for index in range(len(values)):
                     values[index] = 0
             self._legal_max.value = 0
+            self._central_batches.value = 0
+            self._central_requests.value = 0
+            self._central_actions.value = 0
+            self._central_priority_active.value = -1
             self._started_ns.value = time.perf_counter_ns()
             self._generation.value += 1
 
@@ -105,6 +130,30 @@ class LegacyMetricStore:
                 self._legal_hist[bucket] += int(frequency)
                 self._legal_max.value = max(self._legal_max.value, int(count))
             return True
+
+    def add_central(self, *, microbatch_size, legal_actions, queue_wait_ns,
+                    batching_wait_ns, h2d_ns, forward_ns, response_ns,
+                    stream_priority_active) -> None:
+        with self._lock:
+            self._central_batches.value += 1
+            self._central_requests.value += int(microbatch_size)
+            self._central_actions.value += int(legal_actions)
+            for index, value in enumerate((
+                batching_wait_ns, h2d_ns, forward_ns, response_ns,
+                sum(queue_wait_ns),
+            )):
+                self._central_timing_ns[index] += int(value)
+            self._central_batch_hist[min(
+                int(microbatch_size), MAX_CENTRAL_MICROBATCH
+            )] += 1
+            self._central_action_hist[min(
+                int(legal_actions), MAX_LEGAL_ACTIONS
+            )] += 1
+            for wait_ns in queue_wait_ns:
+                self._central_wait_us_hist[min(
+                    int(wait_ns) // 1000, MAX_CENTRAL_WAIT_US
+                )] += 1
+            self._central_priority_active.value = int(stream_priority_active)
 
     def add_learner(
         self,
@@ -168,12 +217,27 @@ class LegacyMetricStore:
             }
             histogram = [int(value) for value in self._legal_hist]
             legal_max = int(self._legal_max.value)
+            central_batches = int(self._central_batches.value)
+            central_requests = int(self._central_requests.value)
+            central_actions = int(self._central_actions.value)
+            central_timing = [int(value) for value in self._central_timing_ns]
+            central_batch_hist = [int(value) for value in self._central_batch_hist]
+            central_action_hist = [int(value) for value in self._central_action_hist]
+            central_wait_hist = [int(value) for value in self._central_wait_us_hist]
+            central_priority = int(self._central_priority_active.value)
             elapsed_ns = max(1, time.perf_counter_ns() - int(self._started_ns.value))
 
         elapsed_s = elapsed_ns / 1e9
         decisions = actor["decisions"]
         updates = learner["updates"]
         frames = learner["frames"]
+        actor_work_ns = sum(
+            actor[name] for name in ACTOR_COUNTERS if name.endswith("_ns")
+        )
+        learner_work_ns = sum(
+            learner[name] for name in LEARNER_COUNTERS
+            if name.endswith("_ns") and name != "log_write_ns"
+        )
 
         def mean_ms(total_name: str, count: int, source: dict) -> float | None:
             return (
@@ -190,12 +254,24 @@ class LegacyMetricStore:
                 "games_per_second": actor["games"] / elapsed_s,
                 "decisions_per_second": decisions / elapsed_s,
                 "transitions_per_second": actor["transitions"] / elapsed_s,
+                "environment_steps_per_second": decisions / elapsed_s,
             },
             "counts": {"actor": actor, "learner": learner},
             "actor_timing_mean_ms": {
                 name.removesuffix("_ns"): mean_ms(name, decisions, actor)
                 for name in ACTOR_COUNTERS if name.endswith("_ns")
             },
+            "actor_inference_blocked_ratio": (
+                actor["inference_ns"] / actor_work_ns if actor_work_ns else None
+            ),
+            "learner_data_wait_ratio": (
+                learner["batch_wait_ns"] / learner_work_ns
+                if learner_work_ns else None
+            ),
+            "learner_throttle_ratio": (
+                learner["central_throttle_ns"] / learner_work_ns
+                if learner_work_ns else None
+            ),
             "learner_timing_mean_ms": {
                 name.removesuffix("_ns"): mean_ms(
                     name,
@@ -239,6 +315,43 @@ class LegacyMetricStore:
                 "p95": self._percentile(histogram, 0.95),
                 "max": legal_max if decisions else None,
                 "overflow_count": histogram[-1],
+            },
+            "centralized_inference": {
+                "batches": central_batches,
+                "requests": central_requests,
+                "microbatch_mean": (
+                    central_requests / central_batches if central_batches else None
+                ),
+                "microbatch_p50": self._percentile(central_batch_hist, 0.50),
+                "microbatch_p95": self._percentile(central_batch_hist, 0.95),
+                "legal_actions_per_batch_mean": (
+                    central_actions / central_batches if central_batches else None
+                ),
+                "legal_actions_per_batch_p50": self._percentile(
+                    central_action_hist, 0.50
+                ),
+                "legal_actions_per_batch_p95": self._percentile(
+                    central_action_hist, 0.95
+                ),
+                "queue_wait_ms": {
+                    "p50": ((self._percentile(central_wait_hist, 0.50) or 0) / 1000
+                            if central_requests else None),
+                    "p95": ((self._percentile(central_wait_hist, 0.95) or 0) / 1000
+                            if central_requests else None),
+                    "p99": ((self._percentile(central_wait_hist, 0.99) or 0) / 1000
+                            if central_requests else None),
+                },
+                "timing_mean_ms": {
+                    name: (central_timing[index] / central_batches / 1e6
+                           if central_batches else None)
+                    for index, name in enumerate((
+                        "batching_wait", "h2d", "forward", "response",
+                        "request_queue_wait_total",
+                    ))
+                },
+                "stream_priority_active": (
+                    bool(central_priority) if central_priority >= 0 else None
+                ),
             },
         }
 

@@ -93,3 +93,68 @@ cryptographic runtime attestation.
 Timeout cleanup reaps the complete training process tree on POSIX by using a
 dedicated process group. Native Windows only terminates the direct child, so
 formal CUDA benchmarks must run on Linux or WSL2.
+
+## C0 interleaved centralized inference
+
+`legacy_c0_centralized_gpu_actor.yaml` is a production-candidate shape, but C0
+remains experimental until formal evidence beats A1. Each CPU actor owns
+`central_actor_envs_per_actor` independent games (four by default), with
+separate environments, trajectories, request generations, and episode policy
+leases. It submits every runnable game before consuming correlated responses.
+A completed game resets immediately and takes a new policy lease; a policy
+version never changes during a game.
+
+The bounded queue applies backpressure at
+`central_actor_max_pending_requests`. Inference groups compatible requests by
+policy slot/version, role, and a power-of-two legal-action bucket. Different
+action counts stay packed. It waits for `central_actor_min_microbatch`, aims
+for `central_actor_target_microbatch`, and never exceeds
+`central_actor_max_microbatch` or `central_actor_max_delay_ms`. Pinned staging
+is allocated once at maximum capacity, so requests are batched, not truncated.
+
+Inference uses a separate CUDA stream with high priority when supported.
+Policy copies use a copy stream and CUDA event, and become visible atomically
+only after inference observes the complete copy. With
+`central_actor_learner_throttle`, learner threads postpone new updates while
+queue depth exceeds `central_actor_queue_high_watermark` or the oldest request
+exceeds `central_actor_inference_deadline_ms`. Unsupported priority safely
+falls back to a normal stream and is reported in metrics.
+
+```yaml
+central_actor_envs_per_actor: 4
+central_actor_min_microbatch: 2
+central_actor_target_microbatch: 8
+central_actor_max_microbatch: 16
+central_actor_max_delay_ms: 2.0
+central_actor_max_pending_requests: 128
+central_actor_queue_high_watermark: 32
+central_actor_inference_deadline_ms: 10.0
+central_actor_learner_throttle: true
+central_actor_use_stream_priority: true
+central_actor_async_policy_copy: true
+```
+
+These controls are inert for A1 and the original Legacy actor. Old YAML files
+receive schema defaults. Checkpoints retain the Legacy three-role state-dict,
+optimizer, AMP, policy-publication, and progress contract. Resume deliberately
+discards half-finished games and pending inference requests and starts new
+games. C0 needs one CUDA device and shared memory for rollout buffers plus
+`actors * envs_per_actor` request slots; use at least `--shm-size=8g` for the
+supplied benchmark configuration.
+
+Compare A1, PR #26's synchronous C0 shape, and interleaved C0 on the same clean
+commit, immutable image, hardware, warmup, and measured frames:
+
+```bash
+python benchmarks/bench_legacy_training.py --formal --repeats 3 \
+  --config benchmarks/configs/legacy_a1_cpu_factorized.yaml \
+  --config benchmarks/configs/legacy_c0_sync_baseline.yaml \
+  --config benchmarks/configs/legacy_c0_centralized_gpu_actor.yaml \
+  --docker_image_digest "$DOUZERO_IMAGE_DIGEST" \
+  --expected_git_sha "$DOUZERO_EXPECTED_GIT_SHA"
+```
+
+The report includes exact frames, microbatch and queue-wait distributions,
+actor blocking, learner waiting/throttling, utilization, VRAM, policy lag, and
+worker exit status. Do not promote C0 unless three-repeat median frames/s shows
+a stable gain over both old C0 and A1. GPU utilization alone is not evidence.

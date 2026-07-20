@@ -69,6 +69,235 @@ def receive_central_action(response_queue, timeout_seconds):
     return int(response)
 
 
+def _flush_actor_rollouts(completed, sizes, free_queue, full_queue, buffers,
+                          flags, recorder, stop_event):
+    """Flush complete role rollouts assembled by one or more actor envs."""
+    T = flags.unroll_length
+    for position in ('landlord', 'landlord_up', 'landlord_down'):
+        while rollout_ready(
+            sizes[position], T, getattr(flags, "legacy_flush_ge", False)
+        ):
+            queue_started_ns = time.perf_counter_ns()
+            index = free_queue[position].get()
+            free_queue_wait_ns = time.perf_counter_ns() - queue_started_ns
+            if index is None or (stop_event is not None and stop_event.is_set()):
+                return False
+            write_started_ns = time.perf_counter_ns()
+            for key, values in completed[position].items():
+                target = buffers[position][key][index]
+                selected = values[:T]
+                if getattr(flags, "legacy_bulk_rollout", False):
+                    if selected and isinstance(selected[0], torch.Tensor):
+                        source = torch.stack(selected).reshape(target.shape)
+                        source = source.to(device=target.device, dtype=target.dtype)
+                    else:
+                        source = torch.as_tensor(
+                            selected, device=target.device, dtype=target.dtype
+                        ).reshape(target.shape)
+                    target.copy_(source)
+                else:
+                    for t, value in enumerate(selected):
+                        target[t, ...] = value
+            if buffers[position]['done'][index].is_cuda:
+                torch.cuda.synchronize(buffers[position]['done'][index].device)
+            rollout_write_ns = time.perf_counter_ns() - write_started_ns
+            put_started_ns = time.perf_counter_ns()
+            full_queue[position].put(index)
+            recorder.add(
+                transitions=T,
+                rollout_write_ns=rollout_write_ns,
+                free_queue_wait_ns=free_queue_wait_ns,
+                full_queue_put_ns=time.perf_counter_ns() - put_started_ns,
+            )
+            for values in completed[position].values():
+                del values[:T]
+            sizes[position] -= T
+    return True
+
+
+def act_centralized_multi(i, device, free_queue, full_queue, policy_pool,
+                          buffers, flags, stop_event, metric_store,
+                          central_slots, central_request_queue,
+                          central_response_queue, central_queue_pressure):
+    """Run several independent games in one actor with async GPU requests."""
+    from douzero.runtime import (
+        derive_actor_seed, maybe_set_global_deterministic, set_global_seed,
+    )
+    from .centralized_actor import PendingRequestScheduler
+
+    env_count = getattr(flags, 'central_actor_envs_per_actor', 4)
+    actor_threads = getattr(flags, "actor_torch_threads", 0) or 1
+    torch.set_num_threads(actor_threads)
+    set_global_seed(derive_actor_seed(
+        getattr(flags, "seed", 0), device_token=device, actor_id=i
+    ))
+    maybe_set_global_deterministic(getattr(flags, "deterministic", False))
+    recorder = ActorMetricRecorder(metric_store)
+    scheduler = PendingRequestScheduler(i, env_count)
+    positions = ('landlord', 'landlord_up', 'landlord_down')
+    completed = {
+        position: {key: [] for key in (
+            'done', 'episode_return', 'target', 'obs_x_no_action',
+            'obs_action', 'obs_z', 'policy_version',
+        )} for position in positions
+    }
+    completed_sizes = {position: 0 for position in positions}
+    slots = []
+    try:
+        for env_slot in range(env_count):
+            env = Environment(create_env(flags), device)
+            position, obs, env_output = env.initial()
+            lease = policy_pool.acquire(owner_id=i * env_count + env_slot)
+            slots.append({
+                'env': env, 'position': position, 'obs': obs,
+                'env_output': env_output, 'lease': lease,
+                'episode_version': lease.version, 'waiting': False,
+                'explore': False,
+                'episode': {
+                    position: {key: [] for key in (
+                        'obs_x_no_action', 'obs_action', 'obs_z',
+                        'policy_version',
+                    )} for position in positions
+                },
+            })
+
+        def advance(env_slot, action_index, inference_ns):
+            state = slots[env_slot]
+            position, obs, env_output = (
+                state['position'], state['obs'], state['env_output']
+            )
+            episode = state['episode'][position]
+            legal_count = len(obs['legal_actions'])
+            action = obs['legal_actions'][action_index]
+            episode['obs_x_no_action'].append(env_output['obs_x_no_action'])
+            episode['obs_z'].append(env_output['obs_z'])
+            episode['policy_version'].append(state['episode_version'])
+            episode['obs_action'].append(
+                obs['x_action'][action_index].to(dtype=torch.int8)
+            )
+            next_position, next_obs, next_output = state['env'].step(action)
+            timing = next_output.get('timing', {})
+            recorder.add(
+                decisions=1,
+                single_legal_actions=int(legal_count == 1),
+                inference_ns=inference_ns,
+                env_step_ns=timing.get('env_step_ns', 0),
+                legal_actions_ns=timing.get('legal_actions_ns', 0),
+                observation_ns=timing.get('observation_ns', 0),
+            )
+            state.update(position=next_position, obs=next_obs,
+                         env_output=next_output, waiting=False)
+            if not next_output['done']:
+                return
+            recorder.add(games=1)
+            terminal_return = float(next_output['episode_return'].item())
+            for role in positions:
+                role_episode = state['episode'][role]
+                count = len(role_episode['obs_action'])
+                if not count:
+                    continue
+                role_completed = completed[role]
+                for key in ('obs_x_no_action', 'obs_action', 'obs_z',
+                            'policy_version'):
+                    role_completed[key].extend(role_episode[key])
+                role_completed['done'].extend([False] * (count - 1) + [True])
+                reward = terminal_return if role == 'landlord' else -terminal_return
+                role_completed['episode_return'].extend([0.0] * (count - 1) + [reward])
+                role_completed['target'].extend([reward] * count)
+                completed_sizes[role] += count
+                for values in role_episode.values():
+                    values.clear()
+            policy_pool.release(state['lease'])
+            state['lease'] = policy_pool.acquire(owner_id=i * env_count + env_slot)
+            state['episode_version'] = state['lease'].version
+
+        while not stop_event.is_set():
+            made_local_progress = False
+            for env_slot, state in enumerate(slots):
+                if state['waiting']:
+                    continue
+                obs = state['obs']
+                position = state['position']
+                legal_count = len(obs['legal_actions'])
+                recorder.legal_actions(legal_count)
+                started_ns = time.perf_counter_ns()
+                if legal_count == 1:
+                    if flags.exp_epsilon > 0 and np.random.rand() < flags.exp_epsilon:
+                        torch.randint(1, (1,))[0]
+                    advance(env_slot, 0, time.perf_counter_ns() - started_ns)
+                    made_local_progress = True
+                    continue
+                if legal_count > central_slots.max_actions:
+                    raise RuntimeError(
+                        "legal-action count exceeds centralized staging capacity"
+                    )
+                central_slots.write(
+                    i, position, obs['z_single'], obs['x_state_single'],
+                    obs['x_action'], env_slot=env_slot,
+                )
+                request = scheduler.prepare(
+                    env_slot, policy_slot=state['lease'].slot,
+                    policy_version=state['episode_version'], position=position,
+                    action_count=legal_count,
+                )
+                state['explore'] = (
+                    flags.exp_epsilon > 0 and np.random.rand() < flags.exp_epsilon
+                )
+                while not stop_event.is_set():
+                    try:
+                        central_request_queue.put(request, timeout=0.1)
+                        if central_queue_pressure is not None:
+                            central_queue_pressure.enqueued(request.queued_ns)
+                        break
+                    except queue.Full:
+                        # Bounded blocking provides backpressure while still
+                        # observing shutdown promptly.
+                        continue
+                if stop_event.is_set():
+                    scheduler.cancel_all()
+                    return
+                scheduler.mark_queued(request)
+                state['waiting'] = True
+
+            if not _flush_actor_rollouts(
+                completed, completed_sizes, free_queue, full_queue, buffers,
+                flags, recorder, stop_event,
+            ):
+                return
+            if scheduler.pending:
+                try:
+                    response = central_response_queue.get(timeout=getattr(
+                        flags, 'central_actor_timeout_seconds', 30.0
+                    ))
+                except queue.Empty:
+                    raise TimeoutError('centralized actor inference timed out')
+                consumed = scheduler.consume(response)
+                if consumed is None:
+                    return
+                request, selected = consumed
+                state = slots[request.env_slot]
+                action_index = (
+                    int(torch.randint(request.action_count, (1,))[0].item())
+                    if state['explore'] else selected
+                )
+                advance(
+                    request.env_slot, action_index,
+                    time.perf_counter_ns() - request.queued_ns,
+                )
+            elif not made_local_progress:
+                stop_event.wait(0.01)
+    except BaseException:
+        stop_event.set()
+        raise
+    finally:
+        scheduler.cancel_all()
+        recorder.flush()
+        for env_slot, state in enumerate(slots):
+            if state.get('lease') is not None:
+                policy_pool.release(state['lease'])
+            state['env'].close()
+
+
 class PinnedBatchStager:
     """Reusable pinned destination for contiguous CPU rollout buffers."""
 
@@ -228,12 +457,19 @@ def create_buffers(flags, device_iterator):
 
 def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
         stop_event=None, metric_store=None, central_slots=None,
-        central_request_queue=None, central_response_queue=None):
+        central_request_queue=None, central_response_queue=None,
+        central_queue_pressure=None):
     """
     This function will run forever until we stop it. It will generate
     data from the environment and send the data to buffer. It uses
     a free queue and full queue to syncup with the main process.
     """
+    if getattr(flags, "legacy_actor_backend", "legacy") == "centralized_factorized":
+        return act_centralized_multi(
+            i, device, free_queue, full_queue, policy_pool, buffers, flags,
+            stop_event, metric_store, central_slots, central_request_queue,
+            central_response_queue, central_queue_pressure,
+        )
     positions = ['landlord', 'landlord_up', 'landlord_down']
     lease = None
     env = None
@@ -457,6 +693,8 @@ def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
         pass  
     except Exception as e:
         log.error('Exception in worker process %i', i)
+        if stop_event is not None:
+            stop_event.set()
         traceback.print_exc()
         print()
         raise e

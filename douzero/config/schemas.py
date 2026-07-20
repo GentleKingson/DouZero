@@ -555,7 +555,17 @@ class TrainingConfig:
     grad_clip_foreach: bool = False
     central_actor_max_actions: int = 512
     central_actor_microbatch: int = 4
+    central_actor_envs_per_actor: int = 4
+    central_actor_min_microbatch: int = 2
+    central_actor_target_microbatch: int = 8
+    central_actor_max_microbatch: int = 16
     central_actor_max_delay_ms: float = 2.0
+    central_actor_max_pending_requests: int = 128
+    central_actor_queue_high_watermark: int = 32
+    central_actor_inference_deadline_ms: float = 10.0
+    central_actor_learner_throttle: bool = False
+    central_actor_use_stream_priority: bool = True
+    central_actor_async_policy_copy: bool = True
     central_actor_timeout_seconds: float = 30.0
 
     # P17 belief/value optimization. ``frozen`` preserves the P07 checkpoint

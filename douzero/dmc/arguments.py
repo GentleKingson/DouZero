@@ -119,9 +119,32 @@ parser.add_argument('--grad_clip_foreach', action=argparse.BooleanOptionalAction
 parser.add_argument('--central_actor_max_actions', default=512, type=int,
                     help='Per-request action capacity for centralized V1 inference')
 parser.add_argument('--central_actor_microbatch', default=4, type=int,
-                    help='Target centralized V1 inference microbatch')
+                    help='Deprecated old-C0 target microbatch compatibility knob')
+parser.add_argument('--central_actor_envs_per_actor', default=4, type=int,
+                    help='Independent C0 games interleaved by each actor')
+parser.add_argument('--central_actor_min_microbatch', default=2, type=int,
+                    help='Minimum C0 microbatch before the delay expires')
+parser.add_argument('--central_actor_target_microbatch', default=8, type=int,
+                    help='Adaptive C0 target microbatch')
+parser.add_argument('--central_actor_max_microbatch', default=16, type=int,
+                    help='Maximum C0 microbatch and reusable staging capacity')
 parser.add_argument('--central_actor_max_delay_ms', default=2.0, type=float,
                     help='Maximum centralized inference queue delay')
+parser.add_argument('--central_actor_max_pending_requests', default=128, type=int,
+                    help='Bounded global C0 inference request queue capacity')
+parser.add_argument('--central_actor_queue_high_watermark', default=32, type=int,
+                    help='Queue depth that throttles new learner updates')
+parser.add_argument('--central_actor_inference_deadline_ms', default=10.0, type=float,
+                    help='Oldest request age that throttles new learner updates')
+parser.add_argument('--central_actor_learner_throttle',
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help='Delay new learner updates under C0 inference pressure')
+parser.add_argument('--central_actor_use_stream_priority',
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help='Request a high-priority CUDA inference stream')
+parser.add_argument('--central_actor_async_policy_copy',
+                    action=argparse.BooleanOptionalAction, default=True,
+                    help='Copy C0 policy snapshots on a separate CUDA stream')
 parser.add_argument('--central_actor_timeout_seconds', default=30.0, type=float,
                     help='Actor timeout while waiting for centralized inference')
 

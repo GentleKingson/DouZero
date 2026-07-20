@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from douzero.dmc.centralized_actor import CentralizedInferenceSlots
+from douzero.dmc.centralized_actor import (
+    CentralQueuePressure,
+    CentralizedInferenceSlots,
+    PendingRequestScheduler,
+    PolicyCopyState,
+    RequestState,
+    _compatible_key,
+)
 from douzero.dmc.utils import (
     create_buffers,
     get_batch,
@@ -149,6 +157,99 @@ def test_centralized_slots_are_actor_isolated_and_capacity_checked():
     assert not torch.equal(slots.z[1], slots.z[0])
     with pytest.raises(ValueError, match="slot capacity"):
         slots.write(1, "landlord", z, state, torch.empty(65, 54))
+
+
+def test_centralized_slots_isolate_actor_environment_pairs():
+    slots = CentralizedInferenceSlots(2, 64, envs_per_actor=4)
+    slots.z.zero_()
+    slots.x_state.zero_()
+    slots.x_action.zero_()
+    for env_slot in range(4):
+        value = env_slot + 1
+        slots.write(
+            1, "landlord", torch.full((1, 5, 162), value),
+            torch.full((1, 319), value), torch.full((2, 54), value),
+            env_slot=env_slot,
+        )
+    assert [int(slots.z[slots.index(1, slot), 0, 0]) for slot in range(4)] == [1, 2, 3, 4]
+    assert torch.count_nonzero(slots.z[:4]) == 0
+
+
+def test_pending_scheduler_rejects_stale_cross_slot_and_duplicate_responses():
+    scheduler = PendingRequestScheduler(actor_id=3, env_slots=2)
+    first = scheduler.prepare(
+        0, policy_slot=1, policy_version=7, position="landlord",
+        action_count=5,
+    )
+    scheduler.mark_queued(first)
+    stale = ("ok", 3, 1, first.generation, first.request_id, 2)
+    with pytest.raises(RuntimeError, match="stale|cross-slot"):
+        scheduler.consume(stale)
+    response = ("ok", 3, 0, first.generation, first.request_id, 2)
+    request, action = scheduler.consume(response)
+    assert request == first and action == 2
+    assert scheduler.state(0) == RequestState.CONSUMED
+    with pytest.raises(RuntimeError, match="duplicate"):
+        scheduler.consume(response)
+    second = scheduler.prepare(
+        0, policy_slot=1, policy_version=8, position="landlord_up",
+        action_count=3,
+    )
+    scheduler.mark_queued(second)
+    with pytest.raises(RuntimeError, match="stale"):
+        scheduler.consume(response)
+
+
+def test_pending_scheduler_cancels_every_outstanding_request():
+    scheduler = PendingRequestScheduler(actor_id=0, env_slots=3)
+    for slot in range(3):
+        request = scheduler.prepare(
+            slot, policy_slot=0, policy_version=1, position="landlord",
+            action_count=2,
+        )
+        scheduler.mark_queued(request)
+    assert scheduler.pending == 3
+    scheduler.cancel_all()
+    assert scheduler.pending == 0
+    assert all(scheduler.state(slot) == RequestState.CANCELLED for slot in range(3))
+
+
+def test_policy_copy_state_publishes_only_matching_complete_version():
+    state = PolicyCopyState()
+    token = object()
+    state.begin(4, token)
+    assert state.loaded_version == -1
+    assert state.loading_version == 4
+    with pytest.raises(RuntimeError, match="version changed"):
+        state.finish(5)
+    state.finish(4)
+    assert state.loaded_version == 4
+    assert state.loading_version is None
+
+
+def test_legal_action_buckets_allow_different_packed_counts():
+    scheduler = PendingRequestScheduler(actor_id=0, env_slots=2)
+    left = scheduler.prepare(
+        0, policy_slot=1, policy_version=2, position="landlord",
+        action_count=17,
+    )
+    right = scheduler.prepare(
+        1, policy_slot=1, policy_version=2, position="landlord",
+        action_count=63,
+    )
+    assert _compatible_key(left, 512) == _compatible_key(right, 512)
+
+
+def test_central_queue_pressure_tracks_depth_without_polling():
+    import multiprocessing
+
+    pressure = CentralQueuePressure(multiprocessing.get_context("spawn"))
+    pressure.enqueued(time.perf_counter_ns())
+    pressure.enqueued(time.perf_counter_ns())
+    assert pressure.snapshot()[0] == 2
+    pressure.dequeued()
+    pressure.dequeued()
+    assert pressure.snapshot() == (0, 0.0)
 
 
 def test_centralized_response_timeout_abort_and_shutdown():

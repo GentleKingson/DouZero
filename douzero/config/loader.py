@@ -289,7 +289,17 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "compile_actor": bool, "compile_learner": bool,
     "rmsprop_foreach": bool, "grad_clip_foreach": bool,
     "central_actor_max_actions": int, "central_actor_microbatch": int,
+    "central_actor_envs_per_actor": int,
+    "central_actor_min_microbatch": int,
+    "central_actor_target_microbatch": int,
+    "central_actor_max_microbatch": int,
     "central_actor_max_delay_ms": float,
+    "central_actor_max_pending_requests": int,
+    "central_actor_queue_high_watermark": int,
+    "central_actor_inference_deadline_ms": float,
+    "central_actor_learner_throttle": bool,
+    "central_actor_use_stream_priority": bool,
+    "central_actor_async_policy_copy": bool,
     "central_actor_timeout_seconds": float,
     "belief_training_mode": str, "belief_supervised_weight": float,
     "belief_alternating_interval": int, "belief_supervised_batch_size": int,
@@ -467,8 +477,27 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         raise ValueError("central_actor_max_actions must be >= 64")
     if cfg.central_actor_microbatch < 1:
         raise ValueError("central_actor_microbatch must be >= 1")
+    if cfg.central_actor_envs_per_actor < 1:
+        raise ValueError("central_actor_envs_per_actor must be >= 1")
+    if not (1 <= cfg.central_actor_min_microbatch
+            <= cfg.central_actor_target_microbatch
+            <= cfg.central_actor_max_microbatch):
+        raise ValueError(
+            "central actor microbatches must satisfy 1 <= min <= target <= max"
+        )
     if cfg.central_actor_max_delay_ms < 0:
         raise ValueError("central_actor_max_delay_ms must be non-negative")
+    if cfg.central_actor_max_pending_requests < cfg.central_actor_max_microbatch:
+        raise ValueError(
+            "central_actor_max_pending_requests must be >= max microbatch"
+        )
+    if not (1 <= cfg.central_actor_queue_high_watermark
+            <= cfg.central_actor_max_pending_requests):
+        raise ValueError(
+            "central_actor_queue_high_watermark must be within queue capacity"
+        )
+    if cfg.central_actor_inference_deadline_ms <= 0:
+        raise ValueError("central_actor_inference_deadline_ms must be positive")
     if cfg.central_actor_timeout_seconds <= 0:
         raise ValueError("central_actor_timeout_seconds must be positive")
     if cfg.belief_training_mode not in {"frozen", "joint", "alternating"}:
@@ -562,7 +591,12 @@ _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
     "benchmark_warmup_frames", "compile_actor", "compile_learner",
     "rmsprop_foreach", "grad_clip_foreach",
     "central_actor_max_actions", "central_actor_microbatch",
-    "central_actor_max_delay_ms", "central_actor_timeout_seconds",
+    "central_actor_envs_per_actor", "central_actor_min_microbatch",
+    "central_actor_target_microbatch", "central_actor_max_microbatch",
+    "central_actor_max_delay_ms", "central_actor_max_pending_requests",
+    "central_actor_queue_high_watermark", "central_actor_inference_deadline_ms",
+    "central_actor_learner_throttle", "central_actor_use_stream_priority",
+    "central_actor_async_policy_copy", "central_actor_timeout_seconds",
     "learning_rate", "alpha", "momentum", "epsilon",
     # P01-added argparse dests (optional; default to legacy values if absent).
     "seed", "deterministic", "config",

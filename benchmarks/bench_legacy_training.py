@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIGS = (
     "legacy_a0_cpu_actor_thread1.yaml",
     "legacy_a1_cpu_factorized.yaml",
+    "legacy_c0_sync_baseline.yaml",
+    "legacy_c0_centralized_gpu_actor.yaml",
 )
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -180,6 +182,7 @@ def _flatten(payload):
     rates = payload["rates"]
     system = payload.get("system", {})
     legal = payload.get("legal_actions", {})
+    central = payload.get("centralized_inference", {})
     return {
         **rates,
         "gpu_utilization_median": system.get("gpu_percent", {}).get("median"),
@@ -199,6 +202,17 @@ def _flatten(payload):
         "legal_actions_p95": legal.get("p95"),
         "legal_actions_max": legal.get("max"),
         "single_legal_ratio": legal.get("single_ratio"),
+        "microbatch_mean": central.get("microbatch_mean"),
+        "microbatch_p95": central.get("microbatch_p95"),
+        "legal_actions_per_batch_mean": central.get("legal_actions_per_batch_mean"),
+        "legal_actions_per_batch_p50": central.get("legal_actions_per_batch_p50"),
+        "legal_actions_per_batch_p95": central.get("legal_actions_per_batch_p95"),
+        "inference_queue_wait_p50_ms": central.get("queue_wait_ms", {}).get("p50"),
+        "inference_queue_wait_p95_ms": central.get("queue_wait_ms", {}).get("p95"),
+        "inference_queue_wait_p99_ms": central.get("queue_wait_ms", {}).get("p99"),
+        "actor_inference_blocked_ratio": payload.get("actor_inference_blocked_ratio"),
+        "learner_data_wait_ratio": payload.get("learner_data_wait_ratio"),
+        "learner_throttle_ratio": payload.get("learner_throttle_ratio"),
     }
 
 
