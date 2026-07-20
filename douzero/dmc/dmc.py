@@ -505,6 +505,10 @@ def train(flags):
             raise ValueError(
                 "central_actor_predicted_drain_target_ms must be positive"
             )
+        if getattr(flags, 'central_actor_runtime', 'thread') not in {
+            'process', 'thread'
+        }:
+            raise ValueError("central_actor_runtime must be process or thread")
     if not flags.actor_device_cpu or flags.training_device != 'cpu':
         if not torch.cuda.is_available():
             raise AssertionError("CUDA not available. If you have GPUs, please specify the ID after `--gpu_devices`. Otherwise, please train with CPU with `python3 train.py --actor_device_cpu --training_device cpu`")
@@ -692,7 +696,7 @@ def train(flags):
 
     for device in device_iterator:
         models[device].initialize(
-            learner_model.get_models(), version=resumed_learner_updates
+            learner_model.get_models(), version=resumed_learner_updates,
         )
 
     positions = ('landlord', 'landlord_up', 'landlord_down')
@@ -737,6 +741,8 @@ def train(flags):
     stop_event = ctx.Event()
     learner_supervisor = _LearnerThreadSupervisor(stop_event)
     central_process = None
+    central_thread = None
+    central_thread_errors = queue.Queue()
     central_slots = None
     central_request_queue = None
     central_response_queues = None
@@ -754,10 +760,7 @@ def train(flags):
             ctx,
             flags.num_actors * getattr(flags, 'central_actor_envs_per_actor', 4),
         )
-        central_process = ctx.Process(
-            target=centralized_inference_loop,
-            name='legacy-centralized-inference',
-            args=(
+        central_args = (
                 flags.training_device,
                 models['cpu'],
                 central_slots,
@@ -773,9 +776,28 @@ def train(flags):
                 getattr(flags, 'central_actor_async_policy_copy', True),
                 metric_store,
                 central_queue_pressure,
-            ),
-        )
-        central_process.start()
+            )
+        if getattr(flags, 'central_actor_runtime', 'thread') == 'process':
+            central_process = ctx.Process(
+                target=centralized_inference_loop,
+                name='legacy-centralized-inference',
+                args=central_args,
+            )
+            central_process.start()
+        else:
+            def run_central_thread():
+                try:
+                    centralized_inference_loop(*central_args)
+                except BaseException as exc:
+                    central_thread_errors.put((exc, exc.__traceback__))
+                    stop_event.set()
+
+            central_thread = threading.Thread(
+                target=run_central_thread,
+                name='legacy-centralized-inference',
+                daemon=False,
+            )
+            central_thread.start()
     for device in device_iterator:
         num_actors = flags.num_actors
         for i in range(flags.num_actors):
@@ -834,6 +856,10 @@ def train(flags):
                 central_process.join(timeout=5)
             if central_process.is_alive():
                 log.error('Centralized inference process could not be reaped.')
+        if central_thread is not None:
+            central_thread.join(timeout=5)
+            if central_thread.is_alive():
+                log.error('Centralized inference thread could not be joined.')
         learner_join_deadline = time.monotonic() + 5
         for thread in threads:
             thread.join(
@@ -1062,10 +1088,21 @@ def train(flags):
                 ],
                 'learner_threads_alive': sum(thread.is_alive() for thread in threads),
                 'centralized_inference': (
-                    None if central_process is None else {
+                    {
+                        'runtime': 'process',
                         'exitcode': central_process.exitcode,
                         'alive': central_process.is_alive(),
-                    }
+                    } if central_process is not None else {
+                        'runtime': 'thread',
+                        'exitcode': (
+                            None if central_thread is not None
+                            and central_thread.is_alive() else 0
+                        ),
+                        'alive': (
+                            central_thread.is_alive()
+                            if central_thread is not None else False
+                        ),
+                    } if central_thread is not None else None
                 ),
             },
         })
@@ -1088,6 +1125,12 @@ def train(flags):
                     'Centralized inference process exited with code '
                     f'{central_process.exitcode}'
                 )
+            try:
+                central_exc, central_traceback = central_thread_errors.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                raise central_exc.with_traceback(central_traceback)
             start_frames = frames
             position_start_frames = {k: position_frames[k] for k in position_frames}
             start_time = timer()

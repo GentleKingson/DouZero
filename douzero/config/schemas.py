@@ -568,6 +568,7 @@ class TrainingConfig:
     central_actor_predicted_drain_target_ms: float = 10.0
     central_actor_use_stream_priority: bool = True
     central_actor_async_policy_copy: bool = True
+    central_actor_runtime: str = "thread"
     central_actor_timeout_seconds: float = 30.0
 
     # P17 belief/value optimization. ``frozen`` preserves the P07 checkpoint

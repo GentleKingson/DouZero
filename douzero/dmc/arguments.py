@@ -151,6 +151,9 @@ parser.add_argument('--central_actor_use_stream_priority',
 parser.add_argument('--central_actor_async_policy_copy',
                     action=argparse.BooleanOptionalAction, default=True,
                     help='Copy C0 policy snapshots on a separate CUDA stream')
+parser.add_argument('--central_actor_runtime', choices=['process', 'thread'],
+                    default='thread',
+                    help='Run centralized inference in a CUDA process or main-process thread')
 parser.add_argument('--central_actor_timeout_seconds', default=30.0, type=float,
                     help='Actor timeout while waiting for centralized inference')
 

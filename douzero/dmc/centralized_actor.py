@@ -571,6 +571,9 @@ def centralized_inference_loop(
                     except BaseException:
                         state.fail()
                         raise
+                    policy = policies[policy_slot]
+                else:
+                    policy = policies[policy_slot]
 
                 state_width = 319 if position == "landlord" else 430
                 counts = [request.action_count for request in group]
@@ -608,7 +611,7 @@ def centralized_inference_loop(
                     if timing_events is not None:
                         timing_events[1].record(inference_stream)
                     with torch.inference_mode():
-                        indices = policies[policy_slot].get_model(
+                        indices = policy.get_model(
                             position
                         ).select_actions_packed(z, actor_state, actions, counts)
                     if timing_events is not None:
@@ -619,12 +622,13 @@ def centralized_inference_loop(
                     # observed the complete copy before version publication.
                     state.finish(policy_version)
                 completed_ns = time.perf_counter_ns()
-                for request, action_index in zip(group, indices_cpu):
-                    _put_response(response_queues, request, "ok", (
-                        int(action_index), completed_ns
-                    ))
                 if queue_pressure is not None:
                     queue_pressure.completed(executing_slots, completed_ns)
+                for request, action_index in zip(group, indices_cpu):
+                    response_sent_ns = time.perf_counter_ns()
+                    _put_response(response_queues, request, "ok", (
+                        int(action_index), response_sent_ns
+                    ))
                 if metric_store is not None:
                     h2d_ns = int(
                         timing_events[0].elapsed_time(timing_events[1]) * 1e6
