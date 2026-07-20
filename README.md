@@ -289,11 +289,15 @@ python train.py \
 The complete Docker command, shared-memory requirements, formal evidence
 protocol, and experimental GPU Actor limitations are in the
 [Legacy V1 single-GPU guide](docs/benchmarks/legacy_v1_single_gpu.md).
+Legacy training commits complete learner updates, so `total_frames` must be a
+multiple of `unroll_length * batch_size` (3,200 with the supplied A1 config).
 For more customized configuration of training, see the following optional arguments:
 ```
 --xpid XPID           Experiment id (default: douzero)
 --save_interval SAVE_INTERVAL
                       Time interval (in minutes) at which to save the model
+--checkpoint_sidecar_retention CHECKPOINT_SIDECAR_RETENTION
+                      Per-role eval sidecars to retain: 0 disables, -1 keeps all
 --objective {adp,wp,logadp}
                       Use ADP, WP, or log-ADP as reward (default: ADP)
 --actor_device_cpu    Use CPU as actor device
@@ -310,7 +314,7 @@ For more customized configuration of training, see the following optional argume
 --disable_checkpoint  Disable saving checkpoint
 --savedir SAVEDIR     Root dir where experiment data will be saved
 --total_frames TOTAL_FRAMES
-                      Total environment frames to train for
+                      Total frames; must be divisible by unroll_length * batch_size
 --exp_epsilon EXP_EPSILON
                       The probability for exploration
 --batch_size BATCH_SIZE

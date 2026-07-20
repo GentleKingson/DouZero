@@ -23,7 +23,9 @@ Two checkpoint formats coexist:
    | `manifest` | (P01) serialized `CheckpointManifest` |
 
 2. **Per-position eval sidecars `{position}_weights_{frames}.ckpt`** — bare
-   `state_dict` files consumed by `DeepAgent`. **Unchanged in P01.** Their
+   `state_dict` files consumed by `DeepAgent`. Training writes them atomically
+   and retains the newest two per role by default; set
+   `checkpoint_sidecar_retention` to `0` to disable or `-1` to keep all. Their
    permissive key filtering (`{k:v for k,v in pretrained.items() if k in
    model_state_dict}`) is the legacy behavior; it is **not** behind an explicit
    opt-in at the `DeepAgent` call site (the filter runs unconditionally in the

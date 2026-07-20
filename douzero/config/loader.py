@@ -264,7 +264,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
 # numbers; strings must be str. This catches wrong-type YAML values that a
 # frozen dataclass would otherwise silently accept.
 _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
-    "xpid": str, "save_interval": int, "objective": str,
+    "xpid": str, "save_interval": int, "checkpoint_sidecar_retention": int,
+    "objective": str,
     "actor_device_cpu": bool, "gpu_devices": str, "num_actor_devices": int,
     "num_actors": int, "games_per_actor": int,
     "training_device": str, "load_model": bool,
@@ -438,6 +439,8 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         )
     if cfg.num_actors < 1 or cfg.games_per_actor < 1:
         raise ValueError("num_actors and games_per_actor must be >= 1")
+    if cfg.checkpoint_sidecar_retention < -1:
+        raise ValueError("checkpoint_sidecar_retention must be -1 or greater")
     if cfg.sync_interval_updates < 1:
         raise ValueError("sync_interval_updates must be >= 1")
     if cfg.policy_snapshot_slots < 2:
@@ -542,7 +545,7 @@ def serialize(cfg: TrainingConfig) -> dict:
 # The set of attribute names train(flags) reads off the Namespace. These are
 # the EXACT argparse dests from douzero/dmc/arguments.py.
 _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
-    "xpid", "save_interval", "objective",
+    "xpid", "save_interval", "checkpoint_sidecar_retention", "objective",
     "actor_device_cpu", "gpu_devices", "num_actor_devices", "num_actors",
     "training_device", "load_model", "disable_checkpoint", "savedir",
     "total_frames", "exp_epsilon", "batch_size", "bidding_batch_size",

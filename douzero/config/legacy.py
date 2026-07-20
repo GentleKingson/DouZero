@@ -18,6 +18,7 @@ from douzero.config.schemas import (
 LEGACY_TRAINING_DEFAULTS = TrainingConfig(
     xpid="douzero",
     save_interval=30,
+    checkpoint_sidecar_retention=2,
     objective="adp",
     actor_device_cpu=False,
     gpu_devices="0",

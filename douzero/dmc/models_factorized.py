@@ -459,7 +459,7 @@ class LegacyFactorizedModel:
 
     def forward(self, position, z, x, training=False, flags=None):
         model = self.models[position]
-        return model.forward(z, x, return_value=not training, flags=flags)
+        return model.forward(z, x, return_value=training, flags=flags)
 
     def share_memory(self):
         self.models['landlord'].share_memory()

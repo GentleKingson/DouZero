@@ -11,6 +11,7 @@
 # General
 xpid: douzero
 save_interval: 30
+checkpoint_sidecar_retention: 2
 objective: adp
 
 # Training settings

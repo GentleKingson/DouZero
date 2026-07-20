@@ -7,6 +7,8 @@ parser.add_argument('--xpid', default='douzero',
                     help='Experiment id (default: douzero)')
 parser.add_argument('--save_interval', default=30, type=int,
                     help='Time interval (in minutes) at which to save the model')
+parser.add_argument('--checkpoint_sidecar_retention', default=2, type=int,
+                    help='Per-role eval sidecars to retain: 0 disables, -1 keeps all')
 parser.add_argument('--objective', default='adp', type=str, choices=['adp', 'wp', 'logadp'],
                     help='Use ADP or WP as reward (default: ADP)')
 
@@ -37,7 +39,7 @@ parser.add_argument('--savedir', default='douzero_checkpoints',
 
 # Hyperparameters
 parser.add_argument('--total_frames', default=100000000000, type=int,
-                    help='Total environment frames to train for')
+                    help='Total frames; must be divisible by unroll_length * batch_size')
 parser.add_argument('--exp_epsilon', default=0.01, type=float,
                     help='The probability for exploration')
 parser.add_argument('--batch_size', default=32, type=int,

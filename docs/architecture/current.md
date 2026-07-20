@@ -183,6 +183,8 @@ train(flags)
 1. **Eval weights** `{savedir}/{xpid}/{position}_weights_{frames}.ckpt` — a bare
    `state_dict`. `DeepAgent._load_model` loads it with permissive key filtering:
    `pretrained = {k:v for k,v in pretrained.items() if k in model_state_dict}`.
+   Legacy training saves these atomically and retains the newest two per role by
+   default (`checkpoint_sidecar_retention=0` disables them; `-1` keeps all).
    > P16 will replace this permissive filter with a strict manifest check.
 2. **Training bundle** `{savedir}/{xpid}/model.tar` — dict with keys
    `model_state_dict` (per-role), `optimizer_state_dict` (per-role), `stats`,

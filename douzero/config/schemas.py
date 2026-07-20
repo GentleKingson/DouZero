@@ -491,13 +491,14 @@ class ModelConfig:
 
 
 # --------------------------------------------------------------------------- #
-# Training -- mirrors douzero/dmc/arguments.py exactly (all 23 args)
+# Training -- mirrors douzero/dmc/arguments.py.
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class TrainingConfig:
     # General
     xpid: str = "douzero"
     save_interval: int = 30
+    checkpoint_sidecar_retention: int = 2
     objective: str = "adp"
 
     # Training settings

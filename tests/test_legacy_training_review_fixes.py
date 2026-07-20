@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import json
 import multiprocessing as mp
@@ -19,10 +20,11 @@ from douzero.dmc.dmc import (
     _TrainingTransactions,
     _UpdateBudget,
     _physical_gpu_identifier,
+    _save_legacy_sidecars,
     compute_policy_lag,
 )
 from douzero.dmc.file_writer import FileWriter
-from douzero.dmc.legacy_metrics import LegacyMetricStore
+from douzero.dmc.legacy_metrics import ActorMetricRecorder, LegacyMetricStore
 from douzero.runtime import VersionedPolicyPool
 
 
@@ -168,7 +170,7 @@ def test_checkpoint_waits_for_optimizer_and_progress_transaction():
 
 
 def test_training_rejects_partial_update_frame_budget(tmp_path):
-    from douzero.dmc.arguments import parse_args
+    from douzero.dmc.arguments import parse_args, parser
     from douzero.dmc.dmc import train
 
     flags = parse_args([
@@ -182,6 +184,9 @@ def test_training_rejects_partial_update_frame_budget(tmp_path):
     ])
     with pytest.raises(ValueError, match="total_frames must be divisible"):
         train(flags)
+
+    help_text = " ".join(parser.format_help().split())
+    assert "must be divisible by unroll_length * batch_size" in help_text
 
 
 def test_policy_lag_separates_batch_mean_from_oldest_transition():
@@ -203,6 +208,35 @@ def test_metric_store_reports_integer_transition_max_lag():
     lag = store.snapshot()["policy_lag"]["landlord"]
     assert lag == {"mean_updates": 1.25, "max_updates": 7}
     assert isinstance(lag["max_updates"], int)
+
+
+def test_actor_metric_flush_drops_pre_reset_generation():
+    store = LegacyMetricStore(mp.get_context("spawn"))
+    recorder = ActorMetricRecorder(store, flush_every=1_000)
+    recorder.add(decisions=17, games=2)
+    add_actor_entered = threading.Event()
+    allow_add_actor = threading.Event()
+    original_add_actor = store.add_actor
+
+    def delayed_add_actor(counters, legal_hist, *, generation=None):
+        add_actor_entered.set()
+        assert allow_add_actor.wait(timeout=2)
+        return original_add_actor(
+            counters, legal_hist, generation=generation
+        )
+
+    store.add_actor = delayed_add_actor
+    flush_thread = threading.Thread(target=recorder.flush)
+    flush_thread.start()
+    assert add_actor_entered.wait(timeout=2)
+    store.reset()
+    allow_add_actor.set()
+    flush_thread.join(timeout=2)
+
+    assert not flush_thread.is_alive()
+    actor = store.snapshot()["counts"]["actor"]
+    assert actor["decisions"] == 0
+    assert actor["games"] == 0
 
 
 def test_policy_pool_resume_initializes_version_continuity():
@@ -227,6 +261,69 @@ def test_failed_file_writer_close_marks_metadata_unsuccessful(tmp_path):
     )
     assert metadata["successful"] is False
     assert metadata["date_end"] is not None
+
+
+def test_file_writer_concurrent_logs_are_complete(tmp_path):
+    writer = FileWriter(xpid="concurrent-run", rootdir=str(tmp_path))
+    barrier = threading.Barrier(len(POSITIONS))
+    errors = []
+    writes_per_role = 100
+
+    def write_role(position):
+        try:
+            barrier.wait(timeout=2)
+            for index in range(writes_per_role):
+                writer.log({
+                    "position": position,
+                    "iteration": index,
+                    f"loss_{position}": index / 10,
+                })
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=write_role, args=(position,))
+        for position in POSITIONS
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    writer.close()
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    base = tmp_path / "concurrent-run"
+    with (base / "fields.csv").open(newline="") as handle:
+        fieldnames = next(csv.reader(handle))
+    assert len(fieldnames) == len(set(fieldnames))
+    with (base / "logs.csv").open(newline="") as handle:
+        data_lines = [line for line in handle if not line.startswith("#")]
+    rows = list(csv.DictReader(data_lines, fieldnames=fieldnames))
+    ticks = [int(row["_tick"]) for row in rows]
+    assert len(rows) == len(POSITIONS) * writes_per_role
+    assert sorted(ticks) == list(range(len(rows)))
+
+
+def test_legacy_sidecars_are_atomic_and_retained(tmp_path):
+    learner = _TinyPolicy()
+    for frames in (3_200, 6_400, 9_600):
+        _save_legacy_sidecars(learner, str(tmp_path), frames, retention=2)
+
+    expected_frames = {6_400, 9_600}
+    for position in POSITIONS:
+        names = sorted(tmp_path.glob(f"{position}_weights_*.ckpt"))
+        assert {
+            int(path.stem.removeprefix(f"{position}_weights_"))
+            for path in names
+        } == expected_frames
+        assert torch.load(names[-1], map_location="cpu", weights_only=True)
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_legacy_sidecars_can_be_disabled(tmp_path):
+    _save_legacy_sidecars(_TinyPolicy(), str(tmp_path), 3_200, retention=0)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_benchmark_timeout_reaps_process_group(monkeypatch):
@@ -339,6 +436,7 @@ def test_production_a1_config_keeps_checkpointing_safe_defaults():
     assert flags.actor_device_cpu is True
     assert flags.training_device == "0"
     assert flags.disable_checkpoint is False
+    assert flags.checkpoint_sidecar_retention == 2
     assert flags.legacy_profile is False
     assert flags.legacy_metrics_path == ""
     assert bench_legacy_training.DEFAULT_CONFIGS[0] == (

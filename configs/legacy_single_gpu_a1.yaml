@@ -7,6 +7,7 @@
 xpid: douzero-a1
 savedir: douzero_checkpoints
 save_interval: 30
+checkpoint_sidecar_retention: 2
 total_frames: 100000000000
 
 actor_device_cpu: true

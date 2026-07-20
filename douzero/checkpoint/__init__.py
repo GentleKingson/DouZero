@@ -29,6 +29,7 @@ from douzero.checkpoint.io import (
     CheckpointCompatibilityError,
     load_checkpoint,
     save_checkpoint,
+    save_legacy_position_weights,
 )
 from douzero.checkpoint.manifest import (
     CHECKPOINT_KINDS,
@@ -61,6 +62,7 @@ __all__ = [
     "load_legacy_position_ckpt",
     "load_position_state_dict_strict",
     "save_checkpoint",
+    "save_legacy_position_weights",
     # P05: Model V2 checkpoint helpers.
     "build_v2_manifest",
     "load_v2_checkpoint",

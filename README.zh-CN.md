@@ -267,12 +267,16 @@ python train.py \
 
 完整 Docker 命令、共享内存要求、正式证据协议和实验性 GPU Actor 限制见
 [Legacy V1 单 GPU 指南](docs/benchmarks/legacy_v1_single_gpu.md)。
+Legacy 训练按完整 learner update 提交进度，因此 `total_frames` 必须能被
+`unroll_length * batch_size` 整除（随附 A1 配置中为 3,200）。
 
 其他定制化的训练配置可以参考以下可选项：
 ```
 --xpid XPID           实验id（默认值：douzero）
 --save_interval SAVE_INTERVAL
                       保存模型的时间间隔（以分钟为单位）
+--checkpoint_sidecar_retention CHECKPOINT_SIDECAR_RETENTION
+                      每个角色保留的评测 sidecar 数量；0 禁用，-1 全部保留
 --objective {adp,wp,logadp}
                       使用 ADP、WP 或 log-ADP 作为奖励（默认值：ADP）
 --actor_device_cpu    用CPU进行模拟
@@ -288,7 +292,7 @@ python train.py \
 --disable_checkpoint  禁用保存检查点
 --savedir SAVEDIR     实验数据存储跟路径
 --total_frames TOTAL_FRAMES
-                      Total environment frames to train for
+                      总帧数；必须能被 unroll_length * batch_size 整除
 --exp_epsilon EXP_EPSILON
                       探索概率
 --batch_size BATCH_SIZE

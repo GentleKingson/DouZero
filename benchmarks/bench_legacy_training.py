@@ -272,7 +272,10 @@ def main(argv=None):
     parser.add_argument("--timeout_seconds", type=float, default=1800)
     parser.add_argument(
         "--docker_image_digest", default=os.environ.get("DOUZERO_IMAGE_DIGEST"),
-        help="Immutable image ID/digest recorded in the evidence bundle",
+        help=(
+            "Caller-declared immutable image ID/digest recorded in evidence; "
+            "the runner cannot introspect the outer container runtime"
+        ),
     )
     parser.add_argument(
         "--expected_git_sha", default=os.environ.get("DOUZERO_EXPECTED_GIT_SHA"),
@@ -384,6 +387,8 @@ def main(argv=None):
             "checkpoint_disabled": True,
             "seed": args.seed,
             "docker_image_digest": args.docker_image_digest,
+            "docker_image_digest_source": "caller_declared",
+            "docker_image_identity_verified": False,
             "expected_git_sha": args.expected_git_sha,
             "formal": args.formal,
             "config_sha256": {

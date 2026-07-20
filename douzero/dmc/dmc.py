@@ -36,6 +36,35 @@ from douzero.runtime import SafeMixedPrecision, VersionedPolicyPool
 mean_episode_return_buf = {p:deque(maxlen=100) for p in ['landlord', 'landlord_up', 'landlord_down']}
 
 
+def _save_legacy_sidecars(learner_model, directory, frames, retention):
+    """Atomically save evaluation weights and prune older role snapshots."""
+    if retention == 0:
+        return
+
+    from douzero.checkpoint import save_legacy_position_weights
+
+    os.makedirs(directory, exist_ok=True)
+    for position in ['landlord', 'landlord_up', 'landlord_down']:
+        filename = f'{position}_weights_{frames}.ckpt'
+        save_legacy_position_weights(
+            os.path.join(directory, filename),
+            learner_model.get_model(position).state_dict(),
+        )
+        if retention < 0:
+            continue
+
+        prefix = f'{position}_weights_'
+        candidates = []
+        for name in os.listdir(directory):
+            if not name.startswith(prefix) or not name.endswith('.ckpt'):
+                continue
+            frame_text = name[len(prefix):-len('.ckpt')]
+            if frame_text.isdigit():
+                candidates.append((int(frame_text), name))
+        for _, name in sorted(candidates)[:-retention]:
+            os.remove(os.path.join(directory, name))
+
+
 def _physical_gpu_identifier(logical_device):
     """Map a logical CUDA index through CUDA_VISIBLE_DEVICES for nvidia-smi."""
     visible = os.environ.get('CUDA_VISIBLE_DEVICES')
@@ -422,6 +451,9 @@ def train(flags):
         raise ValueError("benchmark_warmup_frames must be >= 0")
     if getattr(flags, 'benchmark_warmup_frames', 0) >= flags.total_frames:
         raise ValueError("benchmark_warmup_frames must be less than total_frames")
+    sidecar_retention = getattr(flags, 'checkpoint_sidecar_retention', 2)
+    if sidecar_retention < -1:
+        raise ValueError("checkpoint_sidecar_retention must be -1 or greater")
     if getattr(flags, 'legacy_reusable_pinned_staging', False):
         if not flags.actor_device_cpu:
             raise ValueError("reusable pinned staging is for CPU actors only")
@@ -450,7 +482,9 @@ def train(flags):
     frames_per_update = T * B
     if flags.total_frames % frames_per_update:
         raise ValueError(
-            "total_frames must be divisible by unroll_length * batch_size"
+            "total_frames must be divisible by unroll_length * batch_size "
+            f"({flags.unroll_length} * {flags.batch_size} = "
+            f"{frames_per_update}); got {flags.total_frames}"
         )
     benchmark_warmup = getattr(flags, 'benchmark_warmup_frames', 0)
     if getattr(flags, 'legacy_metrics_path', ''):
@@ -903,11 +937,13 @@ def train(flags):
                 },
             )
 
-            # Save the weights for evaluation purpose.
-            for position in ['landlord', 'landlord_up', 'landlord_down']:
-                model_weights_dir = os.path.expandvars(os.path.expanduser(
-                    '%s/%s/%s' % (flags.savedir, flags.xpid, position+'_weights_'+str(checkpoint_frames)+'.ckpt')))
-                torch.save(learner_model.get_model(position).state_dict(), model_weights_dir)
+            # Evaluation sidecars use the same atomic disk protocol as model.tar.
+            _save_legacy_sidecars(
+                learner_model,
+                os.path.dirname(checkpointpath),
+                checkpoint_frames,
+                sidecar_retention,
+            )
 
     fps_log = []
     timer = timeit.default_timer

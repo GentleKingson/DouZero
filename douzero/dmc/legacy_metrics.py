@@ -88,14 +88,23 @@ class LegacyMetricStore:
             self._started_ns.value = time.perf_counter_ns()
             self._generation.value += 1
 
-    def add_actor(self, counters: dict[str, int], legal_hist: dict[int, int]) -> None:
+    def add_actor(
+        self,
+        counters: dict[str, int],
+        legal_hist: dict[int, int],
+        *,
+        generation: int | None = None,
+    ) -> bool:
         with self._lock:
+            if generation is not None and generation != self._generation.value:
+                return False
             for name, value in counters.items():
                 self._actor[ACTOR_COUNTERS.index(name)] += int(value)
             for count, frequency in legal_hist.items():
                 bucket = min(int(count), MAX_LEGAL_ACTIONS)
                 self._legal_hist[bucket] += int(frequency)
                 self._legal_max.value = max(self._legal_max.value, int(count))
+            return True
 
     def add_learner(
         self,
@@ -270,7 +279,11 @@ class ActorMetricRecorder:
             return
         self._check_generation()
         if any(self.counters.values()) or self.legal_hist:
-            self.store.add_actor(self.counters, self.legal_hist)
+            self.store.add_actor(
+                self.counters,
+                self.legal_hist,
+                generation=self.generation,
+            )
         self.counters = {name: 0 for name in ACTOR_COUNTERS}
         self.legal_hist = {}
 

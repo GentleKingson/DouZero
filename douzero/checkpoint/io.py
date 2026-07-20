@@ -91,6 +91,11 @@ def _atomic_torch_save(bundle: dict[str, Any], path: str) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def save_legacy_position_weights(path: str, state_dict: dict[str, Any]) -> None:
+    """Atomically save a bare Legacy role state dict for evaluation."""
+    _atomic_torch_save(state_dict, path)
+
+
 def save_checkpoint(
     path: str,
     learner_models: dict,

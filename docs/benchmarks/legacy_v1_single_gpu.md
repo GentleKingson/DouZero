@@ -16,7 +16,14 @@ python train.py \
 This production configuration saves to `douzero_checkpoints/douzero-a1` every
 30 minutes. Add `--load_model` to resume that experiment. Its checkpoint state
 is transactionally consistent and the main `model.tar` is written through a
-same-directory temporary file followed by atomic replacement.
+same-directory temporary file followed by atomic replacement. Per-role
+evaluation sidecars use the same atomic write protocol and retain the newest
+two snapshots by default. Set `--checkpoint_sidecar_retention 0` to disable
+them or `-1` to preserve every snapshot.
+
+Legacy progress advances by one complete learner update at a time. Therefore
+`total_frames` must be divisible by `unroll_length * batch_size`; the supplied
+A1 values require a multiple of `100 * 32 = 3,200` frames.
 
 The benchmark runner defaults to the thread-limited A0 baseline and A1.
 The unrestricted historical A0, direct-GPU Actor configurations B0/B1, and
@@ -46,8 +53,8 @@ with `num_actors`, `num_buffers`, `batch_size`, and `unroll_length`.
 
 ## Formal evidence
 
-Formal evidence must come from a clean checkout and include an immutable
-Docker image ID or digest plus the exact expected Git head:
+Formal evidence must come from a clean checkout and record an immutable Docker
+image ID or digest plus the exact expected Git head:
 
 ```bash
 IMAGE_ID="$(docker image inspect --format '{{.Id}}' douzero-test:latest)"
@@ -77,6 +84,11 @@ The output records the Git SHA, clean-worktree status, configuration hashes,
 per-run metric hashes, image digest, and an artifact checksum manifest. Keep
 complete raw runs as CI artifacts or release attachments rather than adding
 them to the main repository.
+
+The runner records the caller-supplied image identity but cannot introspect the
+outer container runtime to prove that it launched that image. The documented
+`docker image inspect` step is therefore part of the evidence procedure, not a
+cryptographic runtime attestation.
 
 Timeout cleanup reaps the complete training process tree on POSIX by using a
 dedicated process group. Native Windows only terminates the direct child, so
