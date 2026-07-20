@@ -37,4 +37,5 @@ central_actor_predicted_drain_target_ms: 10.0
 central_actor_use_stream_priority: false
 central_actor_async_policy_copy: false
 central_actor_runtime: process
+central_actor_split_dense1: false
 central_actor_timeout_seconds: 30.0

@@ -64,6 +64,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 # Legacy state widths, imported from the single source of truth (P03 adapter).
 # These are NOT magic numbers: they are derived from the schema constants in
@@ -103,6 +104,21 @@ class _LegacyFactorizedBase(nn.Module):
 
     # Set by subclasses.
     _state_width: int
+
+    def _dense1_split(self, h_lstm, x_state, x_action, repeats=None):
+        shared = torch.cat([h_lstm, x_state], dim=-1)
+        shared_width = _LSTM_HIDDEN_SIZE + self._state_width
+        shared_projection = F.linear(
+            shared, self.dense1.weight[:, :shared_width], self.dense1.bias
+        )
+        if repeats is not None:
+            shared_projection = torch.repeat_interleave(
+                shared_projection, repeats, dim=0
+            )
+        action_projection = F.linear(
+            x_action, self.dense1.weight[:, shared_width:], None
+        )
+        return shared_projection + action_projection
 
     def _validate_legacy_batch(self, z_batch, x_batch):
         """Validate the legacy-batched tensors before slicing.
@@ -328,7 +344,7 @@ class _LegacyFactorizedBase(nn.Module):
         return dict(action=action)
 
     def select_actions_packed(self, z_batch, x_state_batch, x_action,
-                              action_counts):
+                              action_counts, split_dense1=False):
         """Score a microbatch of decisions packed by role and return argmaxes."""
         if z_batch.ndim != 3 or x_state_batch.ndim != 2 or x_action.ndim != 2:
             raise ValueError("invalid packed factorized input ranks")
@@ -343,12 +359,18 @@ class _LegacyFactorizedBase(nn.Module):
         repeats = torch.as_tensor(
             action_counts, dtype=torch.long, device=z_batch.device
         )
-        h = torch.cat([
-            torch.repeat_interleave(h_lstm, repeats, dim=0),
-            torch.repeat_interleave(x_state_batch, repeats, dim=0),
-            x_action,
-        ], dim=-1)
-        h = torch.relu(self.dense1(h))
+        if split_dense1:
+            h = self._dense1_split(
+                h_lstm, x_state_batch, x_action, repeats=repeats
+            )
+        else:
+            h = torch.cat([
+                torch.repeat_interleave(h_lstm, repeats, dim=0),
+                torch.repeat_interleave(x_state_batch, repeats, dim=0),
+                x_action,
+            ], dim=-1)
+            h = self.dense1(h)
+        h = torch.relu(h)
         h = torch.relu(self.dense2(h))
         h = torch.relu(self.dense3(h))
         h = torch.relu(self.dense4(h))

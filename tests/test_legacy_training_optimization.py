@@ -140,6 +140,39 @@ def test_packed_factorized_selection_matches_individual_decisions(seed_factory):
     assert torch.equal(packed, individual)
 
 
+@pytest.mark.parametrize("position,state_width", [
+    ("landlord", 319), ("landlord_up", 430), ("landlord_down", 430),
+])
+def test_split_dense1_packed_values_and_actions_match(position, state_width):
+    from douzero.dmc.models_factorized import LegacyFactorizedModel
+
+    torch.manual_seed(20260720)
+    model = LegacyFactorizedModel(device="cpu").get_model(position).eval()
+    counts = [1, 3, 7]
+    z = torch.randn(3, 5, 162)
+    state = torch.randn(3, state_width)
+    actions = torch.randn(sum(counts), 54)
+    with torch.inference_mode():
+        old = model.select_actions_packed(
+            z, state, actions, counts, split_dense1=False
+        )
+        new = model.select_actions_packed(
+            z, state, actions, counts, split_dense1=True
+        )
+        lstm, _ = model.lstm(z)
+        repeats = torch.tensor(counts)
+        legacy_input = torch.cat([
+            torch.repeat_interleave(lstm[:, -1], repeats, dim=0),
+            torch.repeat_interleave(state, repeats, dim=0), actions,
+        ], dim=-1)
+        legacy_dense = model.dense1(legacy_input)
+        split_dense = model._dense1_split(
+            lstm[:, -1], state, actions, repeats=repeats
+        )
+    assert torch.allclose(split_dense, legacy_dense, rtol=1e-6, atol=1e-6)
+    assert torch.equal(new, old)
+
+
 def test_centralized_slots_are_actor_isolated_and_capacity_checked():
     slots = CentralizedInferenceSlots(num_actors=2, max_actions=64)
     slots.z.zero_()

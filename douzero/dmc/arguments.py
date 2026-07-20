@@ -154,6 +154,9 @@ parser.add_argument('--central_actor_async_policy_copy',
 parser.add_argument('--central_actor_runtime', choices=['process', 'thread'],
                     default='thread',
                     help='Run centralized inference in a CUDA process or main-process thread')
+parser.add_argument('--central_actor_split_dense1',
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help='Split shared/action dense1 projection for C0 inference')
 parser.add_argument('--central_actor_timeout_seconds', default=30.0, type=float,
                     help='Actor timeout while waiting for centralized inference')
 

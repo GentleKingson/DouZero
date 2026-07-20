@@ -803,6 +803,7 @@ def train(flags):
                 metric_store,
                 central_queue_pressure,
                 gpu_inference_snapshots,
+                getattr(flags, 'central_actor_split_dense1', False),
             )
         if getattr(flags, 'central_actor_runtime', 'thread') == 'process':
             central_process = ctx.Process(

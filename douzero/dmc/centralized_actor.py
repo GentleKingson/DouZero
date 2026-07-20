@@ -514,6 +514,7 @@ def centralized_inference_loop(
     async_policy_copy=True, metric_store=None,
     queue_pressure=None,
     gpu_snapshots=None,
+    split_dense1=False,
 ):
     """Adaptively batch compatible requests and return correlated responses."""
     try:
@@ -689,7 +690,10 @@ def centralized_inference_loop(
                     with torch.inference_mode():
                         indices = policy.get_model(
                             position
-                        ).select_actions_packed(z, actor_state, actions, counts)
+                        ).select_actions_packed(
+                            z, actor_state, actions, counts,
+                            split_dense1=split_dense1,
+                        )
                     if timing_events is not None:
                         timing_events[2].record(inference_stream)
                     indices_cpu = indices.to("cpu", non_blocking=False).tolist()
