@@ -401,6 +401,74 @@ class PolicyCopyState:
         self.ready_event = None
 
 
+class GPUInferenceSnapshots:
+    """Immutable same-device inference snapshots for threaded C0."""
+
+    def __init__(self, device, slot_count: int, *, async_copy: bool = True):
+        self.device = torch.device("cuda:" + str(device))
+        self.models = [LegacyFactorizedModel(device=device)
+                       for _ in range(slot_count)]
+        for model in self.models:
+            model.eval()
+        self.states = [PolicyCopyState() for _ in range(slot_count)]
+        self.copy_stream = torch.cuda.Stream(device=self.device)
+        self.async_copy = async_copy
+        self._lock = __import__("threading").RLock()
+
+    def publish(self, slot: int, source_models, version: int) -> None:
+        with self._lock:
+            state = self.states[slot]
+            if state.loading_version is not None:
+                state.ready_event.synchronize()
+                state.finish(state.loading_version)
+            event = torch.cuda.Event()
+            state.begin(version, event)
+            try:
+                stream = (
+                    self.copy_stream if self.async_copy
+                    else torch.cuda.current_stream(self.device)
+                )
+                with torch.cuda.stream(stream), torch.no_grad():
+                    target_model = self.models[slot]
+                    for position in POSITIONS:
+                        target = target_model.get_model(position).state_dict(
+                            keep_vars=True
+                        )
+                        source = source_models[position].state_dict(keep_vars=True)
+                        if target.keys() != source.keys():
+                            raise RuntimeError(
+                                f"GPU snapshot keys changed for {position}"
+                            )
+                        for key, tensor in target.items():
+                            if tensor.shape != source[key].shape:
+                                raise RuntimeError(
+                                    f"GPU snapshot shape changed for {position}.{key}"
+                                )
+                            tensor.copy_(source[key], non_blocking=True)
+                    event.record(stream)
+            except BaseException:
+                state.fail()
+                raise
+
+    def initialize(self, source_models, version: int) -> None:
+        for slot in range(len(self.models)):
+            self.publish(slot, source_models, version)
+
+    def get(self, slot: int, version: int, inference_stream):
+        with self._lock:
+            state = self.states[slot]
+            if ((state.loaded_version != version
+                 and state.loading_version != version)
+                    or state.ready_event is None):
+                raise RuntimeError(
+                    f"GPU inference snapshot {slot} version {version} is unavailable"
+                )
+            inference_stream.wait_event(state.ready_event)
+            if state.loading_version == version:
+                state.finish(version)
+            return self.models[slot]
+
+
 def _copy_policy_slot(gpu_policy, policy_pool, policy_slot):
     source = policy_pool.models[policy_slot]
     with torch.no_grad():
@@ -445,13 +513,17 @@ def centralized_inference_loop(
     max_queued_requests=128, use_stream_priority=True,
     async_policy_copy=True, metric_store=None,
     queue_pressure=None,
+    gpu_snapshots=None,
 ):
     """Adaptively batch compatible requests and return correlated responses."""
     try:
         torch.set_num_threads(1)
         cuda_device = torch.device("cuda:" + str(device))
         torch.cuda.set_device(cuda_device)
-        policies = [LegacyFactorizedModel(device=device) for _ in policy_pool.models]
+        policies = (
+            gpu_snapshots.models if gpu_snapshots is not None
+            else [LegacyFactorizedModel(device=device) for _ in policy_pool.models]
+        )
         states = [PolicyCopyState() for _ in policies]
         for policy in policies:
             policy.eval()
@@ -558,7 +630,11 @@ def centralized_inference_loop(
             for (policy_slot, policy_version, position, _bucket), group in groups.items():
                 state = states[policy_slot]
                 copying = False
-                if state.loaded_version != policy_version:
+                if gpu_snapshots is not None:
+                    policy = gpu_snapshots.get(
+                        policy_slot, policy_version, inference_stream
+                    )
+                elif state.loaded_version != policy_version:
                     try:
                         event = torch.cuda.Event()
                         state.begin(policy_version, event)

@@ -30,6 +30,7 @@ from .legacy_metrics import LegacyMetricStore, write_metrics
 from .centralized_actor import (
     CentralQueuePressure,
     CentralizedInferenceSlots,
+    GPUInferenceSnapshots,
     centralized_inference_loop,
     wait_for_learner_admission,
 )
@@ -694,9 +695,25 @@ def train(flags):
         position_frames = checkpoint_states["position_frames"]
         log.info(f"Resuming preempted job, current stats:\n{stats}")
 
+    threaded_c0 = (
+        getattr(flags, 'legacy_actor_backend', 'legacy') == 'centralized_factorized'
+        and getattr(flags, 'central_actor_runtime', 'thread') == 'thread'
+    )
+    gpu_inference_snapshots = None
+    if threaded_c0:
+        gpu_inference_snapshots = GPUInferenceSnapshots(
+            flags.training_device,
+            getattr(flags, 'policy_snapshot_slots', 2),
+            async_copy=getattr(flags, 'central_actor_async_policy_copy', True),
+        )
+        gpu_inference_snapshots.initialize(
+            learner_model.get_models(), resumed_learner_updates
+        )
+
     for device in device_iterator:
         models[device].initialize(
             learner_model.get_models(), version=resumed_learner_updates,
+            copy_state=not threaded_c0,
         )
 
     positions = ('landlord', 'landlord_up', 'landlord_down')
@@ -726,7 +743,16 @@ def train(flags):
                 source = learner_model.get_models()
                 for pool in models.values():
                     publish_started_ns = time.perf_counter_ns()
-                    published = pool.publish(source, version=snapshot_version)
+                    published = pool.publish(
+                        source, version=snapshot_version,
+                        copy_state=not threaded_c0,
+                        slot_writer=(
+                            (lambda slot, source_models, version:
+                             gpu_inference_snapshots.publish(
+                                 slot, source_models, version
+                             )) if threaded_c0 else None
+                        ),
+                    )
                     if metric_store is not None:
                         metric_store.add_learner({
                             'snapshot_publish_ns': (
@@ -776,6 +802,7 @@ def train(flags):
                 getattr(flags, 'central_actor_async_policy_copy', True),
                 metric_store,
                 central_queue_pressure,
+                gpu_inference_snapshots,
             )
         if getattr(flags, 'central_actor_runtime', 'thread') == 'process':
             central_process = ctx.Process(

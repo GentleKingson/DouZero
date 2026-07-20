@@ -161,13 +161,15 @@ class VersionedPolicyPool(Generic[T]):
         source_models: dict[str, torch.nn.Module],
         *,
         version: int = 0,
+        copy_state: bool = True,
     ) -> None:
         """Copy the initial learner state into every slot before actors start."""
         if version < 0:
             raise ValueError("initial policy version must be non-negative")
         with self._lock:
             for slot in range(len(self.models)):
-                self._copy_state(slot, source_models)
+                if copy_state:
+                    self._copy_state(slot, source_models)
             self._active_slot.value = 0
             self._version.value = version
 
@@ -176,6 +178,8 @@ class VersionedPolicyPool(Generic[T]):
         source_models: dict[str, torch.nn.Module],
         *,
         version: int,
+        copy_state: bool = True,
+        slot_writer=None,
     ) -> bool:
         """Publish a complete snapshot, or return ``False`` if no slot is free."""
         with self._lock:
@@ -198,7 +202,10 @@ class VersionedPolicyPool(Generic[T]):
         # The expensive device/host copies happen outside the lease lock. The
         # slot is inactive and writer-reserved, so actors cannot observe it.
         try:
-            self._copy_state(writable, source_models)
+            if copy_state:
+                self._copy_state(writable, source_models)
+            if slot_writer is not None:
+                slot_writer(writable, source_models, version)
         except BaseException:
             with self._lock:
                 self._writers[writable] = 0
