@@ -7,7 +7,7 @@ import timeit
 import pprint
 import statistics
 import subprocess
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from collections import deque
 import numpy as np
 
@@ -220,6 +220,37 @@ class _UpdateBudget:
                 raise ValueError("unknown or completed update reservation")
             self._active.remove(token)
             self._available += 1
+
+
+class _TrainingTransactions:
+    """Coordinate atomic learner updates and checkpoint snapshots."""
+
+    def __init__(self, positions):
+        self.positions = tuple(positions)
+        # learn() already takes this lock around optimizer.step(). RLock lets
+        # the caller extend the same critical section through progress commit.
+        self.position_locks = {
+            position: threading.RLock() for position in self.positions
+        }
+        self.state_lock = threading.Lock()
+
+    def update(self, position):
+        return self.position_locks[position]
+
+    @contextmanager
+    def freeze_updates(self):
+        with ExitStack() as stack:
+            for position in self.positions:
+                stack.enter_context(self.position_locks[position])
+            yield
+
+    @contextmanager
+    def snapshot(self):
+        # Every path acquires role locks before state_lock. Keeping that order
+        # fixed prevents checkpoint/publication deadlocks.
+        with self.freeze_updates():
+            with self.state_lock:
+                yield
 
 
 def learn(position,
@@ -596,33 +627,34 @@ def train(flags):
             learner_model.get_models(), version=resumed_learner_updates
         )
 
-    position_locks = {
-        'landlord': threading.Lock(),
-        'landlord_up': threading.Lock(),
-        'landlord_down': threading.Lock(),
-    }
+    positions = ('landlord', 'landlord_up', 'landlord_down')
+    transactions = _TrainingTransactions(positions)
+    position_locks = transactions.position_locks
+    training_state_lock = transactions.state_lock
     publish_lock = threading.Lock()
     learner_updates = resumed_learner_updates
+    last_published_version = resumed_learner_updates
 
     def current_learner_updates():
-        with publish_lock:
+        with training_state_lock:
             return learner_updates
 
-    def publish_snapshot_if_due():
-        nonlocal learner_updates
+    def publish_snapshot_if_due(committed_version):
+        nonlocal last_published_version
+        interval = getattr(flags, 'sync_interval_updates', 1)
+        if committed_version % interval:
+            return
         with publish_lock:
-            learner_updates += 1
-            interval = getattr(flags, 'sync_interval_updates', 1)
-            if learner_updates % interval:
-                return
             # Freeze all role learners while copying a coherent snapshot.
-            with ExitStack() as stack:
-                for position in ['landlord', 'landlord_up', 'landlord_down']:
-                    stack.enter_context(position_locks[position])
+            with transactions.freeze_updates():
+                with training_state_lock:
+                    snapshot_version = learner_updates
+                if snapshot_version <= last_published_version:
+                    return
                 source = learner_model.get_models()
                 for pool in models.values():
                     publish_started_ns = time.perf_counter_ns()
-                    published = pool.publish(source, version=learner_updates)
+                    published = pool.publish(source, version=snapshot_version)
                     if metric_store is not None:
                         metric_store.add_learner({
                             'snapshot_publish_ns': (
@@ -631,6 +663,7 @@ def train(flags):
                             'snapshot_publishes': int(published),
                             'snapshot_skips': int(not published),
                         })
+                last_published_version = snapshot_version
 
     # Starting actor processes
     stop_event = ctx.Event()
@@ -714,12 +747,12 @@ def train(flags):
                     'Learner thread %s did not stop within 5 seconds.', thread.name
                 )
 
-    training_state_lock = threading.Lock()
     update_budget = _UpdateBudget(frames, flags.total_frames, frames_per_update)
 
     def batch_and_learn(i, device, position, local_lock, position_lock):
         """Thread target for the learning process."""
         nonlocal frames, position_frames, stats, measurement_started
+        nonlocal learner_updates
         profile_sequence = 0
         stager = None
         if getattr(flags, 'legacy_reusable_pinned_staging', False):
@@ -747,56 +780,65 @@ def train(flags):
                     and profile_sequence
                     % getattr(flags, 'legacy_profile_sample_interval', 10) == 0
                 )
-                _stats, learner_timings = learn(
-                    position, models, learner_forward_models[position], batch,
-                    optimizers[position], flags, position_lock,
-                    amp_controller=amp_controllers[position],
-                    learner_updates=current_learner_updates(),
-                    profile=profile_step,
-                    stager=stager,
-                )
-                publish_snapshot_if_due()
+                with transactions.update(position):
+                    _stats, learner_timings = learn(
+                        position, models, learner_forward_models[position], batch,
+                        optimizers[position], flags, position_lock,
+                        amp_controller=amp_controllers[position],
+                        learner_updates=current_learner_updates(),
+                        profile=profile_step,
+                        stager=stager,
+                    )
 
-                with training_state_lock:
-                    for k in _stats:
-                        stats[k] = _stats[k]
-                    log_write_ns = 0
-                    if log_interval == 0.0:
-                        to_log = dict(frames=frames)
-                        to_log.update({k: stats[k] for k in stat_keys})
-                        log_started_ns = time.perf_counter_ns()
-                        plogger.log(to_log)
-                        log_write_ns = time.perf_counter_ns() - log_started_ns
-                    frames += frames_per_update
-                    position_frames[position] += frames_per_update
-                    update_budget.commit(reservation)
-                    reservation = None
-                    started_now = False
-                    if (metric_store is not None and not measurement_started
-                            and frames >= warmup_frames):
-                        metric_store.reset()
-                        measurement_started = True
-                        started_now = True
-                    if metric_store is not None and not started_now:
-                        metric_store.add_learner(
-                            {
-                                'updates': 1,
-                                'profile_samples': int(profile_step),
-                                'frames': frames_per_update,
-                                'log_write_ns': log_write_ns,
-                                'log_writes': int(log_interval == 0.0),
-                                **batch_timings,
-                                **learner_timings,
-                            },
-                            position=position,
-                            queue_wait_ns=batch_timings.get('batch_wait_ns', 0),
-                            mean_policy_lag=(
-                                _stats['policy_lag_mean_' + position]
-                            ),
-                            max_policy_lag=(
-                                _stats['policy_lag_max_' + position]
-                            ),
-                        )
+                    # The model/optimizer step and all persisted progress fields
+                    # are one role transaction relative to checkpoint().
+                    with training_state_lock:
+                        frames += frames_per_update
+                        position_frames[position] += frames_per_update
+                        learner_updates += 1
+                        committed_version = learner_updates
+                        for k in _stats:
+                            stats[k] = _stats[k]
+                        update_budget.commit(reservation)
+                        reservation = None
+                        started_now = False
+                        if (metric_store is not None and not measurement_started
+                                and frames >= warmup_frames):
+                            metric_store.reset()
+                            measurement_started = True
+                            started_now = True
+                        to_log = None
+                        if log_interval == 0.0:
+                            to_log = dict(frames=frames)
+                            to_log.update({k: stats[k] for k in stat_keys})
+
+                log_write_ns = 0
+                if to_log is not None:
+                    log_started_ns = time.perf_counter_ns()
+                    plogger.log(to_log)
+                    log_write_ns = time.perf_counter_ns() - log_started_ns
+
+                publish_snapshot_if_due(committed_version)
+                if metric_store is not None and not started_now:
+                    metric_store.add_learner(
+                        {
+                            'updates': 1,
+                            'profile_samples': int(profile_step),
+                            'frames': frames_per_update,
+                            'log_write_ns': log_write_ns,
+                            'log_writes': int(log_interval == 0.0),
+                            **batch_timings,
+                            **learner_timings,
+                        },
+                        position=position,
+                        queue_wait_ns=batch_timings.get('batch_wait_ns', 0),
+                        mean_policy_lag=(
+                            _stats['policy_lag_mean_' + position]
+                        ),
+                        max_policy_lag=(
+                            _stats['policy_lag_max_' + position]
+                        ),
+                    )
             finally:
                 if reservation is not None:
                     update_budget.cancel(reservation)
@@ -828,38 +870,43 @@ def train(flags):
                 thread.start()
                 threads.append(thread)
 
-    def checkpoint(frames):
+    def checkpoint():
         if flags.disable_checkpoint:
             return
         from douzero.checkpoint import save_checkpoint
 
         log.info('Saving checkpoint to %s', checkpointpath)
-        with ExitStack() as stack:
-            for position in ['landlord', 'landlord_up', 'landlord_down']:
-                stack.enter_context(position_locks[position])
-            stack.enter_context(training_state_lock)
+        with transactions.snapshot():
+            # If a learner failed after mutating an optimizer but before its
+            # progress commit, preserve the last good checkpoint instead of
+            # serializing that failed in-flight generation.
+            learner_supervisor.raise_if_failed()
+            checkpoint_frames = frames
+            checkpoint_position_frames = dict(position_frames)
+            checkpoint_stats = dict(stats)
+            checkpoint_learner_updates = learner_updates
             _models = learner_model.get_models()
             save_checkpoint(
                 checkpointpath,
                 learner_models=_models,
                 optimizers=optimizers,
-                stats=stats,
+                stats=checkpoint_stats,
                 flags=flags,
-                frames=frames,
-                position_frames=position_frames,
+                frames=checkpoint_frames,
+                position_frames=checkpoint_position_frames,
                 runtime_state={
                     'amp_controllers': {
                         position: controller.state_dict()
                         for position, controller in amp_controllers.items()
                     },
-                    'learner_updates': learner_updates,
+                    'learner_updates': checkpoint_learner_updates,
                 },
             )
 
             # Save the weights for evaluation purpose.
             for position in ['landlord', 'landlord_up', 'landlord_down']:
                 model_weights_dir = os.path.expandvars(os.path.expanduser(
-                    '%s/%s/%s' % (flags.savedir, flags.xpid, position+'_weights_'+str(frames)+'.ckpt')))
+                    '%s/%s/%s' % (flags.savedir, flags.xpid, position+'_weights_'+str(checkpoint_frames)+'.ckpt')))
                 torch.save(learner_model.get_model(position).state_dict(), model_weights_dir)
 
     fps_log = []
@@ -952,7 +999,7 @@ def train(flags):
                 last_periodic_log = timer()
 
             if timer() - last_checkpoint_time > flags.save_interval * 60:  
-                checkpoint(frames)
+                checkpoint()
                 last_checkpoint_time = timer()
             end_time = timer()
 
@@ -990,6 +1037,6 @@ def train(flags):
         stop_workers()
         log.info('Learning finished after %d frames.', frames)
 
-    checkpoint(frames)
+    checkpoint()
     final_metrics('completed')
     plogger.close(successful=True)

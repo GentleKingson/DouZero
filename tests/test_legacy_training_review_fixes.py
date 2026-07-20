@@ -16,6 +16,7 @@ from torch import nn
 from benchmarks import bench_legacy_training
 from douzero.dmc.dmc import (
     _SystemSampler,
+    _TrainingTransactions,
     _UpdateBudget,
     _physical_gpu_identifier,
     compute_policy_lag,
@@ -72,6 +73,98 @@ def test_update_budget_cancel_restores_capacity():
     assert budget.reserve() is None
     budget.commit(first)
     budget.commit(second)
+
+
+def test_checkpoint_waits_for_optimizer_and_progress_transaction():
+    transactions = _TrainingTransactions(POSITIONS)
+    model = nn.Linear(1, 1, bias=False)
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=0.1)
+    progress = {
+        "frames": 0,
+        "position_frames": {position: 0 for position in POSITIONS},
+        "learner_updates": 0,
+    }
+    optimizer_stepped = threading.Event()
+    checkpoint_started = threading.Event()
+    allow_progress_commit = threading.Event()
+    checkpoint_done = threading.Event()
+    checkpoint_payload = []
+    errors = []
+
+    def learner_update():
+        try:
+            with transactions.update("landlord"):
+                optimizer.zero_grad()
+                loss = (model(torch.ones(1, 1)) - 1.0).square().mean()
+                loss.backward()
+                optimizer.step()
+                optimizer_stepped.set()
+                if not allow_progress_commit.wait(timeout=2):
+                    raise TimeoutError("test did not release progress commit")
+                with transactions.state_lock:
+                    progress["frames"] += 3_200
+                    progress["position_frames"]["landlord"] += 3_200
+                    progress["learner_updates"] += 1
+        except BaseException as exc:
+            errors.append(exc)
+
+    def save_checkpoint():
+        try:
+            if not optimizer_stepped.wait(timeout=2):
+                raise TimeoutError("optimizer step was not reached")
+            checkpoint_started.set()
+            with transactions.snapshot():
+                buffer = io.BytesIO()
+                torch.save(
+                    {
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "frames": progress["frames"],
+                        "position_frames": dict(progress["position_frames"]),
+                        "learner_updates": progress["learner_updates"],
+                    },
+                    buffer,
+                )
+                checkpoint_payload.append(buffer.getvalue())
+            checkpoint_done.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    learner = threading.Thread(target=learner_update)
+    checkpoint = threading.Thread(target=save_checkpoint)
+    learner.start()
+    assert optimizer_stepped.wait(timeout=2)
+    checkpoint.start()
+    assert checkpoint_started.wait(timeout=2)
+
+    # The model and optimizer have advanced, but checkpoint cannot observe
+    # them until the matching frame/update counters are committed.
+    assert progress["frames"] == 0
+    assert not checkpoint_done.wait(timeout=0.1)
+    allow_progress_commit.set()
+    learner.join(timeout=2)
+    checkpoint.join(timeout=2)
+
+    assert not learner.is_alive()
+    assert not checkpoint.is_alive()
+    assert errors == []
+    restored = torch.load(
+        io.BytesIO(checkpoint_payload[0]), map_location="cpu", weights_only=True
+    )
+    assert restored["frames"] == 3_200
+    assert restored["position_frames"] == {
+        "landlord": 3_200,
+        "landlord_up": 0,
+        "landlord_down": 0,
+    }
+    assert restored["learner_updates"] == 1
+    restored_model = nn.Linear(1, 1, bias=False)
+    restored_model.load_state_dict(restored["model"])
+    assert torch.equal(restored_model.weight, model.weight)
+    restored_optimizer = torch.optim.RMSprop(restored_model.parameters(), lr=0.1)
+    restored_optimizer.load_state_dict(restored["optimizer"])
+    optimizer_state = next(iter(restored_optimizer.state.values()))
+    assert int(optimizer_state["step"].item()) == 1
 
 
 def test_training_rejects_partial_update_frame_budget(tmp_path):
