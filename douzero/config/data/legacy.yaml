@@ -11,6 +11,7 @@
 # General
 xpid: douzero
 save_interval: 30
+checkpoint_sidecar_retention: 2
 objective: adp
 
 # Training settings
@@ -32,6 +33,7 @@ num_buffers: 50
 num_threads: 4
 max_grad_norm: 40.0
 
+# P14 system controls. Optional accelerators are disabled by default.
 sync_interval_updates: 1
 policy_snapshot_slots: 2
 amp_enabled: false
@@ -41,6 +43,26 @@ pin_memory: false
 ddp_enabled: false
 ddp_backend: auto
 compile_model: false
+legacy_actor_backend: legacy
+actor_torch_threads: 0
+legacy_contiguous_buffers: false
+legacy_bulk_rollout: false
+legacy_flush_ge: false
+legacy_reusable_pinned_staging: false
+legacy_log_interval_seconds: 0.0
+legacy_monitor_interval_seconds: 5.0
+legacy_profile: false
+legacy_profile_sample_interval: 10
+legacy_metrics_path: ""
+benchmark_warmup_frames: 0
+compile_actor: false
+compile_learner: false
+rmsprop_foreach: false
+grad_clip_foreach: false
+central_actor_max_actions: 512
+central_actor_microbatch: 4
+central_actor_max_delay_ms: 2.0
+central_actor_timeout_seconds: 30.0
 
 # P01-added knobs (defaults preserve legacy behavior)
 seed: 0
@@ -59,7 +81,9 @@ optimizer:
 
 # P06 multi-objective loss + decision policy. All weights are 0 here so the
 # legacy single-target MSE training path (douzero.dmc.compute_loss) is
-# unchanged.
+# unchanged. The V2 trainer (train_v2.py) reads these and builds a
+# multi-objective LossConfig; enabling any lambda > 0 in this file does NOT
+# affect the legacy train.py entry point.
 loss:
   lambda_win: 0.0
   lambda_score: 0.0

@@ -27,8 +27,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class _TinyPolicy:
-    def __init__(self) -> None:
-        self.models = {position: nn.Linear(1, 1, bias=False) for position in POSITIONS}
+    def __init__(self, device=None) -> None:
+        self.models = {
+            position: nn.Linear(1, 1, bias=False, device=device)
+            for position in POSITIONS
+        }
 
     def get_model(self, position):
         return self.models[position]
@@ -42,6 +45,30 @@ def _set_all(policy: _TinyPolicy, value: float) -> None:
     with torch.no_grad():
         for model in policy.models.values():
             model.weight.fill_(value)
+
+
+def _cuda_snapshot_reader(pool, ready, stop, result_queue):
+    torch.cuda.set_device(0)
+    reads = 0
+    error = None
+    ready.set()
+    try:
+        while not stop.is_set():
+            lease = pool.acquire(owner_id=0)
+            try:
+                values = [
+                    lease.model.get_model(position).weight.item()
+                    for position in POSITIONS
+                ]
+                if any(value != float(lease.version) for value in values):
+                    error = (lease.version, values)
+                    break
+                reads += 1
+            finally:
+                pool.release(lease)
+    except BaseException as exc:
+        error = repr(exc)
+    result_queue.put((reads, error))
 
 
 def _free_port() -> int:
@@ -318,6 +345,39 @@ def test_policy_snapshot_parent_recovers_crashed_actor_lease():
     assert not pool.recover_owner(7)
     assert pool.reader_counts() == (0, 0)
     assert pool.publish(source.models, version=1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cuda_policy_snapshot_never_exposes_mixed_parameter_versions():
+    ctx = mp.get_context("spawn")
+    slots = [_TinyPolicy("cuda:0") for _ in range(3)]
+    source = _TinyPolicy("cuda:0")
+    _set_all(source, 0.0)
+    pool = VersionedPolicyPool(slots, mp_context=ctx, max_owners=1)
+    pool.initialize(source.models, version=0)
+    ready = ctx.Event()
+    stop = ctx.Event()
+    result_queue = ctx.Queue()
+    reader = ctx.Process(
+        target=_cuda_snapshot_reader,
+        args=(pool, ready, stop, result_queue),
+    )
+    reader.start()
+    assert ready.wait(timeout=30)
+    try:
+        for version in range(1, 101):
+            _set_all(source, float(version))
+            assert pool.publish(source.models, version=version)
+    finally:
+        stop.set()
+        reader.join(timeout=30)
+        if reader.is_alive():
+            reader.terminate()
+            reader.join(timeout=5)
+    assert reader.exitcode == 0
+    reads, error = result_queue.get(timeout=5)
+    assert reads > 0
+    assert error is None
 
 
 def test_amp_cpu_bfloat16_optimizer_step_changes_parameters():

@@ -264,7 +264,8 @@ def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
 # numbers; strings must be str. This catches wrong-type YAML values that a
 # frozen dataclass would otherwise silently accept.
 _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
-    "xpid": str, "save_interval": int, "objective": str,
+    "xpid": str, "save_interval": int, "checkpoint_sidecar_retention": int,
+    "objective": str,
     "actor_device_cpu": bool, "gpu_devices": str, "num_actor_devices": int,
     "num_actors": int, "games_per_actor": int,
     "training_device": str, "load_model": bool,
@@ -278,6 +279,18 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "amp_enabled": bool, "amp_dtype": str,
     "amp_fallback_on_nonfinite": bool, "pin_memory": bool,
     "ddp_enabled": bool, "ddp_backend": str, "compile_model": bool,
+    "legacy_actor_backend": str, "actor_torch_threads": int,
+    "legacy_contiguous_buffers": bool, "legacy_bulk_rollout": bool,
+    "legacy_flush_ge": bool, "legacy_reusable_pinned_staging": bool,
+    "legacy_log_interval_seconds": float,
+    "legacy_monitor_interval_seconds": float,
+    "legacy_profile": bool, "legacy_profile_sample_interval": int,
+    "legacy_metrics_path": str, "benchmark_warmup_frames": int,
+    "compile_actor": bool, "compile_learner": bool,
+    "rmsprop_foreach": bool, "grad_clip_foreach": bool,
+    "central_actor_max_actions": int, "central_actor_microbatch": int,
+    "central_actor_max_delay_ms": float,
+    "central_actor_timeout_seconds": float,
     "belief_training_mode": str, "belief_supervised_weight": float,
     "belief_alternating_interval": int, "belief_supervised_batch_size": int,
     "belief_supervised_episodes": int,
@@ -426,6 +439,8 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         )
     if cfg.num_actors < 1 or cfg.games_per_actor < 1:
         raise ValueError("num_actors and games_per_actor must be >= 1")
+    if cfg.checkpoint_sidecar_retention < -1:
+        raise ValueError("checkpoint_sidecar_retention must be -1 or greater")
     if cfg.sync_interval_updates < 1:
         raise ValueError("sync_interval_updates must be >= 1")
     if cfg.policy_snapshot_slots < 2:
@@ -434,6 +449,28 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         raise ValueError("amp_dtype must be 'float16' or 'bfloat16'")
     if cfg.ddp_backend not in {"auto", "nccl", "gloo"}:
         raise ValueError("ddp_backend must be 'auto', 'nccl', or 'gloo'")
+    if cfg.legacy_actor_backend not in {
+        "legacy", "factorized", "centralized_factorized"
+    }:
+        raise ValueError("legacy_actor_backend is unsupported")
+    if cfg.actor_torch_threads < 0:
+        raise ValueError("actor_torch_threads must be >= 0")
+    if cfg.legacy_log_interval_seconds < 0:
+        raise ValueError("legacy_log_interval_seconds must be non-negative")
+    if cfg.legacy_monitor_interval_seconds <= 0:
+        raise ValueError("legacy_monitor_interval_seconds must be positive")
+    if cfg.legacy_profile_sample_interval < 1:
+        raise ValueError("legacy_profile_sample_interval must be >= 1")
+    if cfg.benchmark_warmup_frames < 0:
+        raise ValueError("benchmark_warmup_frames must be non-negative")
+    if cfg.central_actor_max_actions < 64:
+        raise ValueError("central_actor_max_actions must be >= 64")
+    if cfg.central_actor_microbatch < 1:
+        raise ValueError("central_actor_microbatch must be >= 1")
+    if cfg.central_actor_max_delay_ms < 0:
+        raise ValueError("central_actor_max_delay_ms must be non-negative")
+    if cfg.central_actor_timeout_seconds <= 0:
+        raise ValueError("central_actor_timeout_seconds must be positive")
     if cfg.belief_training_mode not in {"frozen", "joint", "alternating"}:
         raise ValueError(
             "belief_training_mode must be 'frozen', 'joint', or 'alternating'"
@@ -508,7 +545,7 @@ def serialize(cfg: TrainingConfig) -> dict:
 # The set of attribute names train(flags) reads off the Namespace. These are
 # the EXACT argparse dests from douzero/dmc/arguments.py.
 _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
-    "xpid", "save_interval", "objective",
+    "xpid", "save_interval", "checkpoint_sidecar_retention", "objective",
     "actor_device_cpu", "gpu_devices", "num_actor_devices", "num_actors",
     "training_device", "load_model", "disable_checkpoint", "savedir",
     "total_frames", "exp_epsilon", "batch_size", "bidding_batch_size",
@@ -517,6 +554,15 @@ _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
     "sync_interval_updates", "policy_snapshot_slots", "amp_enabled",
     "amp_dtype", "amp_fallback_on_nonfinite", "pin_memory",
     "ddp_enabled", "ddp_backend", "compile_model",
+    "legacy_actor_backend", "actor_torch_threads",
+    "legacy_contiguous_buffers", "legacy_bulk_rollout", "legacy_flush_ge",
+    "legacy_reusable_pinned_staging", "legacy_log_interval_seconds",
+    "legacy_monitor_interval_seconds", "legacy_profile",
+    "legacy_profile_sample_interval", "legacy_metrics_path",
+    "benchmark_warmup_frames", "compile_actor", "compile_learner",
+    "rmsprop_foreach", "grad_clip_foreach",
+    "central_actor_max_actions", "central_actor_microbatch",
+    "central_actor_max_delay_ms", "central_actor_timeout_seconds",
     "learning_rate", "alpha", "momentum", "epsilon",
     # P01-added argparse dests (optional; default to legacy values if absent).
     "seed", "deterministic", "config",

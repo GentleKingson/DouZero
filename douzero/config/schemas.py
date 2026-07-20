@@ -491,13 +491,14 @@ class ModelConfig:
 
 
 # --------------------------------------------------------------------------- #
-# Training -- mirrors douzero/dmc/arguments.py exactly (all 23 args)
+# Training -- mirrors douzero/dmc/arguments.py.
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class TrainingConfig:
     # General
     xpid: str = "douzero"
     save_interval: int = 30
+    checkpoint_sidecar_retention: int = 2
     objective: str = "adp"
 
     # Training settings
@@ -536,6 +537,26 @@ class TrainingConfig:
     ddp_enabled: bool = False
     ddp_backend: str = "auto"
     compile_model: bool = False
+    legacy_actor_backend: str = "legacy"
+    actor_torch_threads: int = 0
+    legacy_contiguous_buffers: bool = False
+    legacy_bulk_rollout: bool = False
+    legacy_flush_ge: bool = False
+    legacy_reusable_pinned_staging: bool = False
+    legacy_log_interval_seconds: float = 0.0
+    legacy_monitor_interval_seconds: float = 5.0
+    legacy_profile: bool = False
+    legacy_profile_sample_interval: int = 10
+    legacy_metrics_path: str = ""
+    benchmark_warmup_frames: int = 0
+    compile_actor: bool = False
+    compile_learner: bool = False
+    rmsprop_foreach: bool = False
+    grad_clip_foreach: bool = False
+    central_actor_max_actions: int = 512
+    central_actor_microbatch: int = 4
+    central_actor_max_delay_ms: float = 2.0
+    central_actor_timeout_seconds: float = 30.0
 
     # P17 belief/value optimization. ``frozen`` preserves the P07 checkpoint
     # and numerical path. Joint and alternating are explicit opt-ins.

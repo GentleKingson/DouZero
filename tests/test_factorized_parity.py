@@ -27,12 +27,8 @@ These tests pin:
     backend='legacy' under identical weights and infoset;
   * finite outputs and determinism (same input -> same output twice).
 
-CPU-only. Numerical and argmax parity are TESTED on CPU. GPU numerical and
-argmax parity are NOT measured: mathematical equivalence does not imply
-bitwise or universal argmax identity across CPU/GPU (different kernels,
-reduction order, and cuDNN RNN non-determinism can change results). GPU
-parity must be measured empirically before it is asserted; that measurement
-is deferred to P14.
+CPU parity is always tested. A CUDA-marked test also measures numerical and
+epsilon=0 action-index parity on target hardware when CUDA is available.
 """
 
 from __future__ import annotations
@@ -104,6 +100,37 @@ def _build_paired_models(position: str, seed: int = 555):
     legacy.eval()
     factorized.eval()
     return legacy, factorized
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("position", POSITIONS)
+def test_cuda_factorized_values_and_action_selection_parity(position, seed_factory):
+    """Measure V1 factorized value and epsilon=0 argmax parity on CUDA."""
+    from douzero.env.env import get_obs_factorized
+
+    seed_factory(9050 + POSITIONS.index(position))
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+    legacy_obs = get_obs(infoset)
+    split_obs = get_obs_factorized(infoset)
+    legacy, factorized = _build_paired_models(position, seed=9050)
+    legacy = legacy.cuda()
+    factorized = factorized.cuda()
+    z = torch.from_numpy(legacy_obs["z_batch"]).float().cuda()
+    x = torch.from_numpy(legacy_obs["x_batch"]).float().cuda()
+    z_single = torch.from_numpy(split_obs["z_single"]).cuda()
+    x_state = torch.from_numpy(split_obs["x_state_single"]).cuda()
+    x_action = torch.from_numpy(split_obs["x_action"]).cuda()
+    with torch.inference_mode():
+        legacy_values = legacy(z, x, return_value=True)["values"]
+        factorized_values = factorized.forward_factorized(
+            z_single, x_state, x_action, return_value=True
+        )["values"]
+    assert torch.allclose(
+        legacy_values, factorized_values, atol=2e-5, rtol=2e-5
+    ), (legacy_values - factorized_values).abs().max().item()
+    assert int(legacy_values.argmax().item()) == int(factorized_values.argmax().item())
 
 
 # --------------------------------------------------------------------------- #
@@ -466,8 +493,8 @@ def test_factorized_wrapper_holds_three_roles():
     assert isinstance(wrapper.get_model("landlord_down"), LegacyFactorizedFarmerModel)
 
 
-def test_factorized_wrapper_forward_matches_role_model(seed_factory):
-    """LegacyFactorizedModel.forward(position, z, x) must delegate to the role."""
+def test_factorized_wrapper_forward_matches_legacy_training_contract(seed_factory):
+    """Wrapper training=True returns values; inference returns an action."""
     seed_factory(991)
     env = Env("adp")
     infoset = _drive_to_position(env, "landlord")
@@ -484,9 +511,20 @@ def test_factorized_wrapper_forward_matches_role_model(seed_factory):
     wrapper.get_model("landlord").load_state_dict(legacy.state_dict())
 
     with torch.no_grad():
-        via_wrapper = wrapper.forward("landlord", z, x, training=False)["values"]
-        via_role = wrapper.get_model("landlord")(z, x, return_value=True)["values"]
-    assert torch.allclose(via_wrapper, via_role, atol=ATOL, rtol=RTOL)
+        wrapper_values = wrapper.forward(
+            "landlord", z, x, training=True
+        )["values"]
+        role_values = wrapper.get_model("landlord")(
+            z, x, return_value=True
+        )["values"]
+        wrapper_action = wrapper.forward(
+            "landlord", z, x, training=False
+        )["action"]
+        role_action = wrapper.get_model("landlord")(
+            z, x, return_value=False
+        )["action"]
+    assert torch.allclose(wrapper_values, role_values, atol=ATOL, rtol=RTOL)
+    assert torch.equal(wrapper_action, role_action)
 
 
 # --------------------------------------------------------------------------- #

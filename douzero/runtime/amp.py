@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import time
 from typing import Callable, Iterable
 
 import torch
@@ -18,6 +19,41 @@ class OptimizerStepResult:
     grad_norm: torch.Tensor
     amp_used: bool
     fell_back: bool
+    timings_ns: dict[str, int] | None = None
+
+
+class _StageClock:
+    def __init__(self, device: torch.device, enabled: bool) -> None:
+        self.device = device
+        self.enabled = enabled
+        self.records = []
+
+    def run(self, name: str, function):
+        if not self.enabled:
+            return function()
+        if self.device.type == "cuda":
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            result = function()
+            end.record()
+            self.records.append((name, start, end))
+            return result
+        started_ns = time.perf_counter_ns()
+        result = function()
+        self.records.append((name, time.perf_counter_ns() - started_ns))
+        return result
+
+    def finish(self) -> dict[str, int] | None:
+        if not self.enabled:
+            return None
+        if self.device.type == "cuda" and self.records:
+            self.records[-1][2].synchronize()
+            return {
+                name: int(start.elapsed_time(end) * 1e6)
+                for name, start, end in self.records
+            }
+        return {name: elapsed_ns for name, elapsed_ns in self.records}
 
 
 class SafeMixedPrecision:
@@ -88,6 +124,7 @@ class SafeMixedPrecision:
         synchronize_abandoned_backward: bool = False,
         capture_retry_state: Callable[[], object] | None = None,
         restore_retry_state: Callable[[object], None] | None = None,
+        profile: bool = False,
     ) -> OptimizerStepResult:
         """Take one finite optimizer step, retrying once in float32 after AMP."""
         if (capture_retry_state is None) != (restore_retry_state is None):
@@ -107,7 +144,7 @@ class SafeMixedPrecision:
             return self._attempt(loss_closure, optimizer, params,
                                  max_grad_norm, attempted_amp, clip_grad_norm,
                                  collective_all_true,
-                                 synchronize_abandoned_backward)
+                                 synchronize_abandoned_backward, profile)
         except FloatingPointError:
             if not attempted_amp or not self.fallback_on_nonfinite:
                 raise
@@ -119,15 +156,20 @@ class SafeMixedPrecision:
             result = self._attempt(loss_closure, optimizer, params,
                                    max_grad_norm, False, clip_grad_norm,
                                    collective_all_true,
-                                   synchronize_abandoned_backward)
-            return OptimizerStepResult(result.loss, result.grad_norm, False, True)
+                                   synchronize_abandoned_backward, profile)
+            return OptimizerStepResult(
+                result.loss, result.grad_norm, False, True, result.timings_ns
+            )
 
     def _attempt(self, closure, optimizer, params, max_grad_norm, use_amp,
                  clip_grad_norm, collective_all_true,
-                 synchronize_abandoned_backward):
+                 synchronize_abandoned_backward, profile):
+        clock = _StageClock(self.device, profile)
         optimizer.zero_grad(set_to_none=True)
-        with self.autocast(enabled=use_amp):
-            loss = closure()
+        def forward():
+            with self.autocast(enabled=use_amp):
+                return closure()
+        loss = clock.run("forward", forward)
         local_loss_finite = bool(torch.isfinite(loss.detach()).all().item())
         loss_finite = (
             collective_all_true(local_loss_finite)
@@ -152,12 +194,17 @@ class SafeMixedPrecision:
             )
             raise FloatingPointError(detail)
         if self._scaler.is_enabled() and use_amp:
-            self._scaler.scale(loss).backward()
-            self._scaler.unscale_(optimizer)
+            def backward():
+                self._scaler.scale(loss).backward()
+                self._scaler.unscale_(optimizer)
+            clock.run("backward", backward)
         else:
-            loss.backward()
+            clock.run("backward", loss.backward)
         clip = clip_grad_norm or nn.utils.clip_grad_norm_
-        grad_norm = clip(params, max_grad_norm, error_if_nonfinite=False)
+        grad_norm = clock.run(
+            "grad_clip",
+            lambda: clip(params, max_grad_norm, error_if_nonfinite=False),
+        )
         local_grad_finite = bool(torch.isfinite(grad_norm.detach()).all().item())
         grad_finite = (
             collective_all_true(local_grad_finite)
@@ -171,8 +218,12 @@ class SafeMixedPrecision:
             )
             raise FloatingPointError(detail)
         if self._scaler.is_enabled() and use_amp:
-            self._scaler.step(optimizer)
-            self._scaler.update()
+            def optimizer_step():
+                self._scaler.step(optimizer)
+                self._scaler.update()
+            clock.run("optimizer", optimizer_step)
         else:
-            optimizer.step()
-        return OptimizerStepResult(loss.detach(), grad_norm.detach(), use_amp, False)
+            clock.run("optimizer", optimizer.step)
+        return OptimizerStepResult(
+            loss.detach(), grad_norm.detach(), use_amp, False, clock.finish()
+        )

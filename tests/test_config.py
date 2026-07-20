@@ -81,7 +81,8 @@ def test_namespace_has_all_legacy_dests_train_reads():
     from douzero.dmc.arguments import parser
 
     expected_dests = {
-        "xpid", "save_interval", "objective", "actor_device_cpu", "gpu_devices",
+        "xpid", "save_interval", "checkpoint_sidecar_retention", "objective",
+        "actor_device_cpu", "gpu_devices",
         "num_actor_devices", "num_actors", "training_device", "load_model",
         "disable_checkpoint", "savedir", "total_frames", "exp_epsilon",
         "batch_size", "unroll_length", "num_buffers", "num_threads",

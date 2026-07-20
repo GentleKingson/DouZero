@@ -19,6 +19,7 @@ import csv
 import json
 import logging
 import os
+import threading
 import time
 from typing import Dict
 
@@ -96,13 +97,20 @@ class FileWriter:
     def __init__(self,
                  xpid: str = None,
                  xp_args: dict = None,
-                 rootdir: str = '~/palaas'):
+                 rootdir: str = '~/palaas',
+                 flush_interval_seconds: float = 0.0):
         if not xpid:
             # make unique id
             xpid = '{proc}_{unixtime}'.format(
                 proc=os.getpid(), unixtime=int(time.time()))
         self.xpid = xpid
         self._tick = 0
+        self._flush_interval_seconds = max(0.0, float(flush_interval_seconds))
+        self._reuse_logs_handle = self._flush_interval_seconds > 0.0
+        self._last_flush = time.monotonic()
+        self._logs_handle = None
+        self._lock = threading.RLock()
+        self._closed = False
 
         # metadata gathering
         if xp_args is None:
@@ -171,50 +179,74 @@ class FileWriter:
         if os.path.exists(self.paths['logs']):
             self._logger.warning('Path to log file already exists. '
                                  'New data will be appended.')
-            with open(self.paths['fields'], 'r') as csvfile:
-                reader = csv.reader(csvfile)
-                self.fieldnames = list(reader)[0]
+            if os.path.exists(self.paths['fields']):
+                with open(self.paths['fields'], 'r') as csvfile:
+                    reader = csv.reader(csvfile)
+                    rows = list(reader)
+                    self.fieldnames = rows[0] if rows else ['_tick', '_time']
+            else:
+                self.fieldnames = ['_tick', '_time']
         else:
             self.fieldnames = ['_tick', '_time']
 
+        if self._reuse_logs_handle:
+            self._logs_handle = open(self.paths['logs'], 'a', newline='')
+
     def log(self, to_log: Dict, tick: int = None,
             verbose: bool = False) -> None:
-        if tick is not None:
-            raise NotImplementedError
-        else:
-            to_log['_tick'] = self._tick
-            self._tick += 1
-        to_log['_time'] = time.time()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError('Cannot log to a closed FileWriter')
+            if tick is not None:
+                raise NotImplementedError
+            else:
+                to_log['_tick'] = self._tick
+                self._tick += 1
+            to_log['_time'] = time.time()
 
-        old_len = len(self.fieldnames)
-        for k in to_log:
-            if k not in self.fieldnames:
-                self.fieldnames.append(k)
-        if old_len != len(self.fieldnames):
-            with open(self.paths['fields'], 'w') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(self.fieldnames)
-            self._logger.info('Updated log fields: %s', self.fieldnames)
+            old_len = len(self.fieldnames)
+            for k in to_log:
+                if k not in self.fieldnames:
+                    self.fieldnames.append(k)
+            if old_len != len(self.fieldnames):
+                with open(self.paths['fields'], 'w') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(self.fieldnames)
+                self._logger.info('Updated log fields: %s', self.fieldnames)
 
-        if to_log['_tick'] == 0:
-            # print("\ncreating logs file ")
-            with open(self.paths['logs'], 'a') as f:
-                f.write('# %s\n' % ','.join(self.fieldnames))
+            if verbose:
+                self._logger.info('LOG | %s', ', '.join(
+                    ['{}: {}'.format(k, to_log[k]) for k in sorted(to_log)]))
 
-        if verbose:
-            self._logger.info('LOG | %s', ', '.join(
-                ['{}: {}'.format(k, to_log[k]) for k in sorted(to_log)]))
+            def write_row(handle):
+                if to_log['_tick'] == 0:
+                    handle.write('# %s\n' % ','.join(self.fieldnames))
+                csv.DictWriter(handle, fieldnames=self.fieldnames).writerow(to_log)
 
-        with open(self.paths['logs'], 'a') as f:
-            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-            writer.writerow(to_log)
-            # print("\nadded to log file")
+            if self._reuse_logs_handle:
+                write_row(self._logs_handle)
+                if (time.monotonic() - self._last_flush
+                        >= self._flush_interval_seconds):
+                    self._logs_handle.flush()
+                    self._last_flush = time.monotonic()
+            else:
+                # Preserve the original open/write/close behavior by default.
+                with open(self.paths['logs'], 'a', newline='') as handle:
+                    write_row(handle)
 
     def close(self, successful: bool = True) -> None:
-        self.metadata['date_end'] = datetime.datetime.now().strftime(
-            '%Y-%m-%d %H:%M:%S.%f')
-        self.metadata['successful'] = successful
-        self._save_metadata()
+        with self._lock:
+            if self._closed:
+                return
+            if self._logs_handle is not None:
+                self._logs_handle.flush()
+                self._logs_handle.close()
+                self._logs_handle = None
+            self.metadata['date_end'] = datetime.datetime.now().strftime(
+                '%Y-%m-%d %H:%M:%S.%f')
+            self.metadata['successful'] = successful
+            self._save_metadata()
+            self._closed = True
 
     def _save_metadata(self) -> None:
         with open(self.paths['meta'], 'w') as jsonfile:

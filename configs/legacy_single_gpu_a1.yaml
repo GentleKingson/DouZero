@@ -1,0 +1,36 @@
+# Production-safe Legacy V1 single-GPU topology.
+#
+# CPU actors use the factorized inference path while the learner runs on CUDA
+# device 0. Unlike benchmarks/configs/legacy_a1_cpu_factorized.yaml, this file
+# keeps checkpointing enabled and profiling disabled for long-running jobs.
+
+xpid: douzero-a1
+savedir: douzero_checkpoints
+save_interval: 30
+checkpoint_sidecar_retention: 2
+total_frames: 100000000000
+
+actor_device_cpu: true
+training_device: "0"
+num_actor_devices: 1
+num_actors: 12
+num_threads: 1
+batch_size: 32
+unroll_length: 100
+num_buffers: 64
+
+sync_interval_updates: 16
+policy_snapshot_slots: 3
+amp_enabled: false
+pin_memory: true
+disable_checkpoint: false
+
+legacy_actor_backend: factorized
+actor_torch_threads: 1
+legacy_contiguous_buffers: true
+legacy_bulk_rollout: true
+legacy_flush_ge: true
+legacy_reusable_pinned_staging: true
+legacy_log_interval_seconds: 5.0
+legacy_profile: false
+legacy_metrics_path: ""

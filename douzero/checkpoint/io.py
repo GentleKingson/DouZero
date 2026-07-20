@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -53,6 +56,46 @@ class CheckpointCompatibilityError(Exception):
     """
 
 
+def _atomic_torch_save(bundle: dict[str, Any], path: str) -> None:
+    """Durably write beside the destination, then atomically replace it."""
+    destination = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            torch.save(bundle, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+
+        # Persist the directory entry where the platform supports directory
+        # fsync. The checkpoint is already atomically visible if this fails.
+        directory_fd = None
+        try:
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            os.fsync(directory_fd)
+        except OSError:
+            pass
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def save_legacy_position_weights(path: str, state_dict: dict[str, Any]) -> None:
+    """Atomically save a bare Legacy role state dict for evaluation."""
+    _atomic_torch_save(state_dict, path)
+
+
 def save_checkpoint(
     path: str,
     learner_models: dict,
@@ -61,6 +104,7 @@ def save_checkpoint(
     flags: argparse.Namespace | dict[str, Any] | None,
     frames: int,
     position_frames: dict[str, int],
+    runtime_state: dict[str, Any] | None = None,
 ) -> CheckpointManifest:
     """Save a model.tar with the legacy six keys PLUS a manifest.
 
@@ -80,7 +124,9 @@ def save_checkpoint(
         "position_frames": position_frames,
         "manifest": manifest.to_dict(),
     }
-    torch.save(bundle, path)
+    if runtime_state is not None:
+        bundle["runtime_state"] = runtime_state
+    _atomic_torch_save(bundle, path)
     return manifest
 
 

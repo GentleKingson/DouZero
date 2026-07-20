@@ -30,6 +30,7 @@ from douzero.checkpoint import (
     load_legacy_position_ckpt,
     load_position_state_dict_strict,
     save_checkpoint,
+    save_legacy_position_weights,
 )
 from douzero.dmc.models import Model, model_dict
 
@@ -116,6 +117,50 @@ def test_save_load_roundtrip_preserves_tensors_and_manifest(tmp_path, seed_facto
         reloaded.get_model(p).load_state_dict(bundle["model_state_dict"][p])
         for a, b in zip(learner.get_model(p).parameters(), reloaded.get_model(p).parameters()):
             assert torch.equal(a, b)
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["model.tar"]
+
+
+def test_failed_atomic_checkpoint_write_preserves_previous_file(
+    tmp_path, seed_factory, monkeypatch,
+):
+    seed_factory(9011)
+    learner, optimizers = _make_models_and_optimizers()
+    path = tmp_path / "model.tar"
+    previous = b"previous-valid-checkpoint"
+    path.write_bytes(previous)
+
+    def fail_after_partial_write(_bundle, handle):
+        handle.write(b"partial-new-checkpoint")
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(torch, "save", fail_after_partial_write)
+    with pytest.raises(OSError, match="simulated disk failure"):
+        save_checkpoint(
+            str(path), learner.get_models(), optimizers, {}, _ns(), 0,
+            {"landlord": 0, "landlord_up": 0, "landlord_down": 0},
+        )
+
+    assert path.read_bytes() == previous
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["model.tar"]
+
+
+def test_failed_atomic_sidecar_write_preserves_previous_file(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "landlord_weights_3200.ckpt"
+    previous = b"previous-valid-sidecar"
+    path.write_bytes(previous)
+
+    def fail_after_partial_write(_state_dict, handle):
+        handle.write(b"partial-new-sidecar")
+        raise OSError("simulated sidecar disk failure")
+
+    monkeypatch.setattr(torch, "save", fail_after_partial_write)
+    with pytest.raises(OSError, match="simulated sidecar disk failure"):
+        save_legacy_position_weights(str(path), {"weight": torch.ones(1)})
+
+    assert path.read_bytes() == previous
+    assert sorted(item.name for item in tmp_path.iterdir()) == [path.name]
 
 
 # --------------------------------------------------------------------------- #
