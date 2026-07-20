@@ -22,7 +22,7 @@ legacy_reusable_pinned_staging: true
 legacy_log_interval_seconds: 5.0
 legacy_profile: true
 legacy_profile_sample_interval: 10
-central_actor_max_actions: 512
+central_actor_max_actions: 4096
 central_actor_envs_per_actor: 1
 central_actor_min_microbatch: 1
 central_actor_target_microbatch: 4
