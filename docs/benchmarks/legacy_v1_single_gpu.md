@@ -96,8 +96,8 @@ formal CUDA benchmarks must run on Linux or WSL2.
 
 ## C0 interleaved centralized inference
 
-`legacy_c0_centralized_gpu_actor.yaml` is a production-candidate shape, but C0
-remains experimental until formal evidence beats A1. Each CPU actor owns
+`legacy_c0_centralized_gpu_actor.yaml` is a benchmark-candidate shape. C0 is
+experimental and is not a production candidate. Each CPU actor owns
 `central_actor_envs_per_actor` independent games (four by default), with
 separate environments, trajectories, request generations, and episode policy
 leases. It submits every runnable game before consuming correlated responses.
@@ -207,3 +207,40 @@ lower forward latency as insufficient when fragmentation or padding reduces
 end-to-end frames/s. Compile and CUDA Graph experiments should only be enabled
 after a stable eager padded configuration covers most traffic; neither is a
 production dependency.
+
+## C0 decision record
+
+The final formal comparison on `211a3cebe92bc53cfba8a43f12ea8b62e42bc6d6`
+used image
+`sha256:6f57b50161e8a4c4147fda854b76b255bdf643a2703c7da464b89277da01f953`,
+checkpointing enabled, profiling disabled, 64,000 warmup frames, 256,000
+measured frames, and three repeats:
+
+| topology | median frames/s | min-max frames/s |
+|---|---:|---:|
+| A1 CPU factorized | 16,755 | 16,736-16,793 |
+| synchronous C0 baseline | 4,825 | 4,824-4,932 |
+| optimized centralized C0 | 7,717 | 7,328-7,930 |
+
+Optimized C0 is about 59.9% faster than synchronous C0, but remains about
+53.9% slower than A1. Its mean end-to-end inference latency was 8.92 ms:
+6.26 ms IPC wait, 1.77 ms server batching, 0.35 ms forward, and 0.032 ms H2D.
+The actor inference-blocked ratio was 96.68%, the mean microbatch was 2.84,
+and selected requests were only 30.7% of those available. Communication,
+scheduling, and compatible-group fragmentation therefore dominate the small
+Legacy V1 model; eliminating forward time cannot close the A1 gap.
+
+A 3,986-second run completed exactly 27,200,000 frames and 8,500 updates with
+six checkpoint saves. Resume advanced the same run exactly to 27,520,000
+frames and 8,600 updates; all actors, learner threads, and the inference thread
+exited cleanly. These results establish the current disposition:
+
+- A1 remains the production default for Legacy V1 single-GPU training.
+- C0 remains opt-in and experimental, primarily for larger compatible models
+  and architecture research.
+- Float32 packed split-dense1 is the retained C0 configuration. Int8 staging
+  and padded inference remain attribution experiments because neither improved
+  formal end-to-end throughput.
+- Compile, CUDA Graph, MPS, custom kernels, GPU-resident replay, and a GPU game
+  environment are outside the retained V1 C0 path. Reconsider them only if a
+  larger model materially changes the compute-to-communication ratio.
