@@ -473,7 +473,7 @@ def train(flags):
             raise ValueError("centralized_factorized requires CPU actors")
         if flags.training_device == 'cpu':
             raise ValueError("centralized_factorized requires a CUDA training device")
-        if getattr(flags, 'central_actor_max_actions', 512) < 64:
+        if getattr(flags, 'central_actor_max_actions', 4096) < 64:
             raise ValueError("central_actor_max_actions must be >= 64")
         if getattr(flags, 'central_actor_microbatch', 4) < 1:
             raise ValueError("central_actor_microbatch must be >= 1")
@@ -775,7 +775,7 @@ def train(flags):
     central_queue_pressure = None
     if getattr(flags, 'legacy_actor_backend', 'legacy') == 'centralized_factorized':
         central_slots = CentralizedInferenceSlots(
-            flags.num_actors, getattr(flags, 'central_actor_max_actions', 512),
+            flags.num_actors, getattr(flags, 'central_actor_max_actions', 4096),
             getattr(flags, 'central_actor_envs_per_actor', 4),
         )
         central_request_queue = ctx.Queue(maxsize=getattr(

@@ -122,6 +122,7 @@ falls back to a normal stream and is reported in metrics.
 
 ```yaml
 central_actor_envs_per_actor: 4
+central_actor_max_actions: 4096
 central_actor_min_microbatch: 2
 central_actor_target_microbatch: 8
 central_actor_max_microbatch: 16
@@ -185,16 +186,19 @@ names and shapes:
 ```yaml
 central_actor_split_dense1: true
 central_actor_staging_dtype: int8
-central_actor_inference_layout: padded
+central_actor_inference_layout: packed
 ```
 
 Split dense1 computes the history/state projection once per decision and the
 action projection per legal action using views of the existing `dense1`
 weight. Int8 staging transfers observations in their source dtype, casts into
 reused FP32 GPU buffers on the inference stream, and reports cast time.
-Bucketed padded inference replaces segmented Python argmax with a tensor mask
-and reports padding, effective-FLOPs, and compatible-group fragmentation.
-Packed, float32-staging, and unsplit paths remain selectable for attribution.
+Bucketed padded inference is an opt-in attribution path that replaces segmented
+Python argmax with a tensor mask and reports padding, effective-FLOPs, and
+compatible-group fragmentation. The supplied candidate stays packed because
+the padded smoke run fragmented compatible requests and did not clear the
+end-to-end retention gate. Float32 staging and unsplit paths also remain
+selectable for attribution.
 
 Padded bucket specialization can reduce compatible microbatch size. Treat a
 lower forward latency as insufficient when fragmentation or padding reduces

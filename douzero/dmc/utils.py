@@ -229,7 +229,9 @@ def act_centralized_multi(i, device, free_queue, full_queue, policy_pool,
                     continue
                 if legal_count > central_slots.max_actions:
                     raise RuntimeError(
-                        "legal-action count exceeds centralized staging capacity"
+                        "legal-action count "
+                        f"{legal_count} exceeds centralized staging capacity "
+                        f"{central_slots.max_actions}"
                     )
                 central_slots.write(
                     i, position, obs['z_single'], obs['x_state_single'],

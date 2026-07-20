@@ -22,7 +22,7 @@ legacy_reusable_pinned_staging: true
 legacy_log_interval_seconds: 5.0
 legacy_profile: true
 legacy_profile_sample_interval: 10
-central_actor_max_actions: 512
+central_actor_max_actions: 4096
 central_actor_microbatch: 4
 central_actor_envs_per_actor: 4
 central_actor_min_microbatch: 2
@@ -40,5 +40,5 @@ central_actor_async_policy_copy: true
 central_actor_runtime: thread
 central_actor_split_dense1: true
 central_actor_staging_dtype: int8
-central_actor_inference_layout: padded
+central_actor_inference_layout: packed
 central_actor_timeout_seconds: 30.0
