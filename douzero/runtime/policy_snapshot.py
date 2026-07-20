@@ -62,6 +62,7 @@ class VersionedPolicyPool(Generic[T]):
                     source_models: dict[str, torch.nn.Module]) -> None:
         """Copy pre-paired state tensors without rebuilding/loading a state_dict."""
         target_roles = self._target_states[slot]
+        cuda_devices: set[torch.device] = set()
         with torch.no_grad():
             for position, source in source_models.items():
                 source_state = source.state_dict(keep_vars=True)
@@ -75,6 +76,15 @@ class VersionedPolicyPool(Generic[T]):
                             f"policy state shape changed for {position}.{key}"
                         )
                     target_tensor.copy_(source_tensor)
+                    if target_tensor.device.type == "cuda":
+                        cuda_devices.add(target_tensor.device)
+
+        # CUDA copies are stream-ordered. Publication is visible to actor
+        # processes through CPU synchronization primitives, which do not create
+        # a dependency on this process's CUDA stream. Complete every target
+        # device copy before exposing the slot/version pair.
+        for device in cuda_devices:
+            torch.cuda.synchronize(device)
 
     @property
     def version(self) -> int:
@@ -146,11 +156,20 @@ class VersionedPolicyPool(Generic[T]):
             self._readers[slot] -= 1
             return True
 
-    def initialize(self, source_models: dict[str, torch.nn.Module]) -> None:
+    def initialize(
+        self,
+        source_models: dict[str, torch.nn.Module],
+        *,
+        version: int = 0,
+    ) -> None:
         """Copy the initial learner state into every slot before actors start."""
+        if version < 0:
+            raise ValueError("initial policy version must be non-negative")
         with self._lock:
             for slot in range(len(self.models)):
                 self._copy_state(slot, source_models)
+            self._active_slot.value = 0
+            self._version.value = version
 
     def publish(
         self,

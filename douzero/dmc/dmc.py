@@ -1,5 +1,6 @@
 import os
 import queue
+import math
 import threading
 import time
 import timeit
@@ -35,13 +36,26 @@ from douzero.runtime import SafeMixedPrecision, VersionedPolicyPool
 mean_episode_return_buf = {p:deque(maxlen=100) for p in ['landlord', 'landlord_up', 'landlord_down']}
 
 
+def _physical_gpu_identifier(logical_device):
+    """Map a logical CUDA index through CUDA_VISIBLE_DEVICES for nvidia-smi."""
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible is None:
+        return str(logical_device)
+    devices = [item.strip() for item in visible.split(',') if item.strip()]
+    try:
+        return devices[int(logical_device)]
+    except (IndexError, TypeError, ValueError):
+        return str(logical_device)
+
+
 class _SystemSampler:
     """Portable best-effort process/GPU sampling for benchmark reports."""
 
-    def __init__(self):
+    def __init__(self, gpu_identifier='0'):
         self.samples = []
         self._last_time = None
         self._last_ticks = None
+        self._gpu_identifier = str(gpu_identifier)
 
     @staticmethod
     def _process_stats(pids):
@@ -59,8 +73,7 @@ class _SystemSampler:
                 continue
         return ticks, rss_bytes
 
-    @staticmethod
-    def _gpu_stats():
+    def _gpu_stats(self):
         if not torch.cuda.is_available():
             return None, None
         try:
@@ -69,7 +82,7 @@ class _SystemSampler:
                     'nvidia-smi',
                     '--query-gpu=utilization.gpu,memory.used',
                     '--format=csv,noheader,nounits',
-                    '-i', '0',
+                    '-i', self._gpu_identifier,
                 ],
                 text=True,
                 timeout=2,
@@ -106,7 +119,7 @@ class _SystemSampler:
         if not values:
             return {'median': None, 'p95': None, 'max': None}
         ordered = sorted(values)
-        p95 = ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
+        p95 = ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
         return {
             'median': statistics.median(ordered),
             'p95': p95,
@@ -158,6 +171,37 @@ def compute_loss(logits, targets):
     loss = ((logits.squeeze(-1) - targets)**2).mean()
     return loss
 
+
+def compute_policy_lag(learner_updates, versions):
+    """Return transition-weighted mean lag and the oldest transition lag."""
+    if versions is None or versions.numel() == 0:
+        return 0.0, 0
+    reference = int(learner_updates)
+    mean_lag = max(
+        0.0,
+        float(reference) - float(versions.to(torch.float64).mean().item()),
+    )
+    max_lag = max(0, reference - int(versions.min().item()))
+    return mean_lag, max_lag
+
+
+class _UpdateBudget:
+    """Atomically reserve complete learner updates against a frame limit."""
+
+    def __init__(self, completed_frames, total_frames, frames_per_update):
+        self._lock = threading.Lock()
+        self._reserved = int(completed_frames)
+        self._total = int(total_frames)
+        self._step = int(frames_per_update)
+
+    def reserve(self):
+        with self._lock:
+            if self._reserved >= self._total:
+                return False
+            self._reserved += self._step
+            return True
+
+
 def learn(position,
           actor_models,
           model,
@@ -166,7 +210,7 @@ def learn(position,
           flags,
           lock,
           amp_controller=None,
-          published_version=0,
+          learner_updates=0,
           profile=False,
           stager=None):
     """Performs a learning (optimization) step."""
@@ -230,13 +274,9 @@ def learn(position,
             profile=profile,
         )
         loss = step_result.loss
-        versions = batch.get('policy_version')
-        policy_lag = 0.0
-        if versions is not None:
-            policy_lag = max(
-                0.0,
-                float(published_version) - float(versions.float().mean().item()),
-            )
+        policy_lag_mean, policy_lag_max = compute_policy_lag(
+            learner_updates, batch.get('policy_version')
+        )
         stats = {
             'mean_episode_return_'+position: (
                 torch.mean(torch.stack([
@@ -245,7 +285,8 @@ def learn(position,
                 if mean_episode_return_buf[position] else 0.0
             ),
             'loss_'+position: loss.item(),
-            'policy_lag_'+position: policy_lag,
+            'policy_lag_mean_'+position: policy_lag_mean,
+            'policy_lag_max_'+position: policy_lag_max,
             'amp_fallbacks_'+position: float(amp_controller.fallback_count),
         }
         timings = {'h2d_ns': h2d_ns}
@@ -353,6 +394,25 @@ def train(flags):
     if not flags.actor_device_cpu or flags.training_device != 'cpu':
         if not torch.cuda.is_available():
             raise AssertionError("CUDA not available. If you have GPUs, please specify the ID after `--gpu_devices`. Otherwise, please train with CPU with `python3 train.py --actor_device_cpu --training_device cpu`")
+    T = flags.unroll_length
+    B = flags.batch_size
+    frames_per_update = T * B
+    if flags.total_frames % frames_per_update:
+        raise ValueError(
+            "total_frames must be divisible by unroll_length * batch_size"
+        )
+    benchmark_warmup = getattr(flags, 'benchmark_warmup_frames', 0)
+    if getattr(flags, 'legacy_metrics_path', ''):
+        if benchmark_warmup % frames_per_update:
+            raise ValueError(
+                "benchmark_warmup_frames must be divisible by "
+                "unroll_length * batch_size"
+            )
+        if (flags.total_frames - benchmark_warmup) % frames_per_update:
+            raise ValueError(
+                "benchmark measurement frames must be divisible by "
+                "unroll_length * batch_size"
+            )
     log_interval = getattr(flags, 'legacy_log_interval_seconds', 0.0)
     plogger = FileWriter(
         xpid=flags.xpid,
@@ -362,9 +422,6 @@ def train(flags):
     )
     checkpointpath = os.path.expandvars(
         os.path.expanduser('%s/%s/%s' % (flags.savedir, flags.xpid, 'model.tar')))
-
-    T = flags.unroll_length
-    B = flags.batch_size
 
     if flags.actor_device_cpu:
         device_iterator = ['cpu']
@@ -381,7 +438,10 @@ def train(flags):
     )
     warmup_frames = getattr(flags, 'benchmark_warmup_frames', 0)
     measurement_started = warmup_frames == 0
-    system_sampler = _SystemSampler() if metric_store is not None else None
+    system_sampler = (
+        _SystemSampler(_physical_gpu_identifier(flags.training_device))
+        if metric_store is not None else None
+    )
     if metric_store is not None and measurement_started:
         metric_store.reset()
 
@@ -469,9 +529,12 @@ def train(flags):
         'loss_landlord_up',
         'mean_episode_return_landlord_down',
         'loss_landlord_down',
-        'policy_lag_landlord',
-        'policy_lag_landlord_up',
-        'policy_lag_landlord_down',
+        'policy_lag_mean_landlord',
+        'policy_lag_mean_landlord_up',
+        'policy_lag_mean_landlord_down',
+        'policy_lag_max_landlord',
+        'policy_lag_max_landlord_up',
+        'policy_lag_max_landlord_down',
         'amp_fallbacks_landlord',
         'amp_fallbacks_landlord_up',
         'amp_fallbacks_landlord_down',
@@ -509,7 +572,9 @@ def train(flags):
         log.info(f"Resuming preempted job, current stats:\n{stats}")
 
     for device in device_iterator:
-        models[device].initialize(learner_model.get_models())
+        models[device].initialize(
+            learner_model.get_models(), version=resumed_learner_updates
+        )
 
     position_locks = {
         'landlord': threading.Lock(),
@@ -518,6 +583,10 @@ def train(flags):
     }
     publish_lock = threading.Lock()
     learner_updates = resumed_learner_updates
+
+    def current_learner_updates():
+        with publish_lock:
+            return learner_updates
 
     def publish_snapshot_if_due():
         nonlocal learner_updates
@@ -626,6 +695,7 @@ def train(flags):
                 )
 
     training_state_lock = threading.Lock()
+    update_budget = _UpdateBudget(frames, flags.total_frames, frames_per_update)
 
     def batch_and_learn(i, device, position, local_lock, position_lock):
         """Thread target for the learning process."""
@@ -634,7 +704,9 @@ def train(flags):
         stager = None
         if getattr(flags, 'legacy_reusable_pinned_staging', False):
             stager = PinnedBatchStager(buffers[device][position], flags)
-        while not stop_event.is_set() and frames < flags.total_frames:
+        while not stop_event.is_set():
+            if not update_budget.reserve():
+                return
             batch_result = get_batch(
                 free_queue[device][position], full_queue[device][position],
                 buffers[device][position], flags, local_lock,
@@ -657,7 +729,7 @@ def train(flags):
                 position, models, learner_forward_models[position], batch,
                 optimizers[position], flags, position_lock,
                 amp_controller=amp_controllers[position],
-                published_version=models[device].version,
+                learner_updates=current_learner_updates(),
                 profile=profile_step,
                 stager=stager,
             )
@@ -673,8 +745,8 @@ def train(flags):
                     log_started_ns = time.perf_counter_ns()
                     plogger.log(to_log)
                     log_write_ns = time.perf_counter_ns() - log_started_ns
-                frames += T * B
-                position_frames[position] += T * B
+                frames += frames_per_update
+                position_frames[position] += frames_per_update
                 started_now = False
                 if (metric_store is not None and not measurement_started
                         and frames >= warmup_frames):
@@ -686,7 +758,7 @@ def train(flags):
                         {
                             'updates': 1,
                             'profile_samples': int(profile_step),
-                            'frames': T * B,
+                            'frames': frames_per_update,
                             'log_write_ns': log_write_ns,
                             'log_writes': int(log_interval == 0.0),
                             **batch_timings,
@@ -694,7 +766,10 @@ def train(flags):
                         },
                         position=position,
                         queue_wait_ns=batch_timings.get('batch_wait_ns', 0),
-                        policy_lag=_stats['policy_lag_' + position],
+                        mean_policy_lag=(
+                            _stats['policy_lag_mean_' + position]
+                        ),
+                        max_policy_lag=_stats['policy_lag_max_' + position],
                     )
 
     for device in device_iterator:
@@ -875,12 +950,12 @@ def train(flags):
     except KeyboardInterrupt:
         stop_workers()
         final_metrics('interrupted')
-        plogger.close()
+        plogger.close(successful=False)
         return 
     except BaseException:
         stop_workers()
         final_metrics('failed')
-        plogger.close()
+        plogger.close(successful=False)
         raise
     else:
         stop_workers()
@@ -888,4 +963,4 @@ def train(flags):
 
     checkpoint(frames)
     final_metrics('completed')
-    plogger.close()
+    plogger.close(successful=True)

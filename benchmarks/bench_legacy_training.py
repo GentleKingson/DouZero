@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import math
 import os
 import platform
+import signal
 import statistics
 import subprocess
 import sys
@@ -26,7 +29,45 @@ DEFAULT_CONFIGS = (
 
 def _p95(values):
     ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
+    return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _run_training(command, *, log_file, timeout, cwd=ROOT):
+    """Run one benchmark in its own process group and reap it on timeout."""
+    use_process_group = os.name == "posix"
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=use_process_group,
+    )
+    try:
+        return process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        if use_process_group:
+            os.killpg(process.pid, signal.SIGTERM)
+        else:
+            process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            if use_process_group:
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+            process.wait(timeout=10)
+        raise TimeoutError(
+            f"benchmark timed out after {timeout} seconds; process group reaped"
+        ) from exc
 
 
 def _environment():
@@ -36,9 +77,8 @@ def _environment():
         gpu = subprocess.check_output(
             [
                 "nvidia-smi",
-                "--query-gpu=name,driver_version,memory.total",
+                "--query-gpu=index,uuid,name,driver_version,memory.total",
                 "--format=csv,noheader,nounits",
-                "-i", "0",
             ],
             text=True,
             timeout=5,
@@ -51,8 +91,15 @@ def _environment():
         ).strip()
     except subprocess.SubprocessError:
         git = os.environ.get("DOUZERO_GIT_SHA")
+    try:
+        git_status = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=ROOT, text=True
+        ).splitlines()
+    except subprocess.SubprocessError:
+        git_status = None
     return {
         "git_sha": git,
+        "git_status_porcelain": git_status,
         "python": platform.python_version(),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
@@ -157,6 +204,14 @@ def main(argv=None):
     parser.add_argument("--sync_interval_updates", type=int)
     parser.add_argument("--output_dir", default="artifacts/legacy-training")
     parser.add_argument("--timeout_seconds", type=float, default=1800)
+    parser.add_argument(
+        "--docker_image_digest", default=os.environ.get("DOUZERO_IMAGE_DIGEST"),
+        help="Immutable image ID/digest recorded in the evidence bundle",
+    )
+    parser.add_argument(
+        "--allow_dirty", action="store_true",
+        help="Allow exploratory runs from a dirty checkout",
+    )
     args = parser.parse_args(argv)
     if args.repeats < 3:
         raise ValueError("at least three repetitions are required")
@@ -166,6 +221,12 @@ def main(argv=None):
     configs = [Path(item) for item in args.config]
     if not configs:
         configs = [ROOT / "benchmarks" / "configs" / name for name in DEFAULT_CONFIGS]
+    environment = _environment()
+    if environment["git_status_porcelain"] and not args.allow_dirty:
+        raise RuntimeError(
+            "refusing to produce benchmark evidence from a dirty checkout; "
+            "use --allow_dirty only for exploratory runs"
+        )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_rows = []
@@ -203,25 +264,36 @@ def main(argv=None):
                     command.extend([f"--{option}", str(value)])
             started = time.monotonic()
             with log_path.open("w", encoding="utf-8") as log_file:
-                completed = subprocess.run(
-                    command,
-                    cwd=ROOT,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
+                returncode = _run_training(
+                    command, log_file=log_file,
                     timeout=args.timeout_seconds,
-                    check=False,
                 )
             wall_seconds = time.monotonic() - started
-            if completed.returncode != 0:
+            if returncode != 0:
                 raise RuntimeError(
-                    f"{run_name} failed with exit code {completed.returncode}; "
+                    f"{run_name} failed with exit code {returncode}; "
                     f"inspect {log_path}"
                 )
             payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+            measured_frames = payload["counts"]["learner"]["frames"]
+            expected_total = args.warmup_frames + args.measure_frames
+            if payload["frames_total"] != expected_total:
+                raise RuntimeError(
+                    f"{run_name} completed {payload['frames_total']} frames; "
+                    f"expected exactly {expected_total}"
+                )
+            if measured_frames != args.measure_frames:
+                raise RuntimeError(
+                    f"{run_name} measured {measured_frames} learner frames; "
+                    f"expected exactly {args.measure_frames}"
+                )
             row = {
                 "configuration": config.stem,
                 "repeat": repeat,
                 "wall_seconds": wall_seconds,
+                "frames_total": payload["frames_total"],
+                "measurement_frames": measured_frames,
+                "metrics_sha256": _sha256(metrics_path),
                 **_flatten(payload),
             }
             raw_rows.append(row)
@@ -232,14 +304,18 @@ def main(argv=None):
         }
 
     bundle = {
-        "schema_version": "legacy-training-benchmark-v1",
-        "environment": _environment(),
+        "schema_version": "legacy-training-benchmark-v2",
+        "environment": environment,
         "protocol": {
             "warmup_frames": args.warmup_frames,
             "measure_frames": args.measure_frames,
             "repeats": args.repeats,
             "checkpoint_disabled": True,
             "seed": args.seed,
+            "docker_image_digest": args.docker_image_digest,
+            "config_sha256": {
+                str(config): _sha256(config) for config in configs
+            },
         },
         "raw_runs": raw_rows,
         "aggregate": aggregate,
@@ -258,6 +334,18 @@ def main(argv=None):
             )
             writer.writeheader()
             writer.writerows(raw_rows)
+    artifact_paths = [
+        path for path in output_dir.iterdir()
+        if path.is_file() and path.name != "sha256sums.json"
+    ]
+    (output_dir / "sha256sums.json").write_text(
+        json.dumps(
+            {path.name: _sha256(path) for path in sorted(artifact_paths)},
+            indent=2,
+            sort_keys=True,
+        ) + "\n",
+        encoding="utf-8",
+    )
     print(_markdown(bundle))
 
 

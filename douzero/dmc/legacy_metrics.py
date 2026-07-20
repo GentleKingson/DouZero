@@ -56,8 +56,10 @@ class LegacyMetricStore:
         self._learner = mp_context.Array("q", len(LEARNER_COUNTERS), lock=False)
         self._role_wait_ns = mp_context.Array("q", len(POSITIONS), lock=False)
         self._role_updates = mp_context.Array("q", len(POSITIONS), lock=False)
-        self._role_lag_sum = mp_context.Array("d", len(POSITIONS), lock=False)
-        self._role_lag_max = mp_context.Array("d", len(POSITIONS), lock=False)
+        self._role_mean_lag_sum = mp_context.Array(
+            "d", len(POSITIONS), lock=False
+        )
+        self._role_max_lag = mp_context.Array("q", len(POSITIONS), lock=False)
         self._legal_hist = mp_context.Array(
             "q", MAX_LEGAL_ACTIONS + 1, lock=False
         )
@@ -76,8 +78,8 @@ class LegacyMetricStore:
                 self._learner,
                 self._role_wait_ns,
                 self._role_updates,
-                self._role_lag_sum,
-                self._role_lag_max,
+                self._role_mean_lag_sum,
+                self._role_max_lag,
                 self._legal_hist,
             ):
                 for index in range(len(values)):
@@ -101,7 +103,8 @@ class LegacyMetricStore:
         *,
         position: str | None = None,
         queue_wait_ns: int = 0,
-        policy_lag: float = 0.0,
+        mean_policy_lag: float = 0.0,
+        max_policy_lag: int = 0,
     ) -> None:
         with self._lock:
             for name, value in counters.items():
@@ -110,9 +113,9 @@ class LegacyMetricStore:
                 role = POSITIONS.index(position)
                 self._role_wait_ns[role] += int(queue_wait_ns)
                 self._role_updates[role] += 1
-                self._role_lag_sum[role] += float(policy_lag)
-                self._role_lag_max[role] = max(
-                    self._role_lag_max[role], float(policy_lag)
+                self._role_mean_lag_sum[role] += float(mean_policy_lag)
+                self._role_max_lag[role] = max(
+                    self._role_max_lag[role], int(max_policy_lag)
                 )
 
     @staticmethod
@@ -146,12 +149,12 @@ class LegacyMetricStore:
                 position: int(self._role_updates[index])
                 for index, position in enumerate(POSITIONS)
             }
-            role_lag_sum = {
-                position: float(self._role_lag_sum[index])
+            role_mean_lag_sum = {
+                position: float(self._role_mean_lag_sum[index])
                 for index, position in enumerate(POSITIONS)
             }
-            role_lag_max = {
-                position: float(self._role_lag_max[index])
+            role_max_lag = {
+                position: int(self._role_max_lag[index])
                 for index, position in enumerate(POSITIONS)
             }
             histogram = [int(value) for value in self._legal_hist]
@@ -170,7 +173,7 @@ class LegacyMetricStore:
             )
 
         return {
-            "schema_version": "legacy-training-metrics-v1",
+            "schema_version": "legacy-training-metrics-v2",
             "measurement_seconds": elapsed_s,
             "rates": {
                 "frames_per_second": frames / elapsed_s,
@@ -212,10 +215,10 @@ class LegacyMetricStore:
             "policy_lag": {
                 position: {
                     "mean_updates": (
-                        role_lag_sum[position] / role_updates[position]
+                        role_mean_lag_sum[position] / role_updates[position]
                         if role_updates[position] else None
                     ),
-                    "max_updates": role_lag_max[position],
+                    "max_updates": role_max_lag[position],
                 }
                 for position in POSITIONS
             },
