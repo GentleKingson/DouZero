@@ -71,6 +71,9 @@ class LegacyMetricStore:
         self._central_batches = mp_context.Value("q", 0, lock=False)
         self._central_requests = mp_context.Value("q", 0, lock=False)
         self._central_actions = mp_context.Value("q", 0, lock=False)
+        self._central_padded_actions = mp_context.Value("q", 0, lock=False)
+        self._central_available = mp_context.Value("q", 0, lock=False)
+        self._central_largest_group = mp_context.Value("q", 0, lock=False)
         self._central_timing_ns = mp_context.Array("q", 10, lock=False)
         self._central_batch_hist = mp_context.Array(
             "q", MAX_CENTRAL_MICROBATCH + 1, lock=False
@@ -116,6 +119,9 @@ class LegacyMetricStore:
             self._central_batches.value = 0
             self._central_requests.value = 0
             self._central_actions.value = 0
+            self._central_padded_actions.value = 0
+            self._central_available.value = 0
+            self._central_largest_group.value = 0
             self._central_priority_active.value = -1
             self._central_actor_e2e_ns.value = 0
             self._central_actor_e2e_count.value = 0
@@ -143,11 +149,15 @@ class LegacyMetricStore:
     def add_central(self, *, microbatch_size, legal_actions, ipc_wait_ns,
                     batch_wait_ns, batching_wait_ns, cpu_packing_ns,
                     h2d_ns, gpu_cast_ns, forward_ns, d2h_response_ns,
+                    padded_actions, total_available, largest_compatible_group,
                     stream_priority_active) -> None:
         with self._lock:
             self._central_batches.value += 1
             self._central_requests.value += int(microbatch_size)
             self._central_actions.value += int(legal_actions)
+            self._central_padded_actions.value += int(padded_actions)
+            self._central_available.value += int(total_available)
+            self._central_largest_group.value += int(largest_compatible_group)
             for index, value in enumerate((
                 batching_wait_ns, cpu_packing_ns, h2d_ns, gpu_cast_ns,
                 forward_ns, d2h_response_ns, sum(ipc_wait_ns),
@@ -251,6 +261,9 @@ class LegacyMetricStore:
             central_batches = int(self._central_batches.value)
             central_requests = int(self._central_requests.value)
             central_actions = int(self._central_actions.value)
+            central_padded_actions = int(self._central_padded_actions.value)
+            central_available = int(self._central_available.value)
+            central_largest_group = int(self._central_largest_group.value)
             central_timing = [int(value) for value in self._central_timing_ns]
             central_batch_hist = [int(value) for value in self._central_batch_hist]
             central_action_hist = [int(value) for value in self._central_action_hist]
@@ -380,6 +393,24 @@ class LegacyMetricStore:
                 "legal_actions_per_batch_p95": self._percentile(
                     central_action_hist, 0.95
                 ),
+                "padding_ratio": (
+                    1.0 - central_actions / central_padded_actions
+                    if central_padded_actions else 0.0
+                ),
+                "effective_flops_ratio": (
+                    central_actions / central_padded_actions
+                    if central_padded_actions else 1.0
+                ),
+                "fragmentation": {
+                    "largest_compatible_over_available": (
+                        central_largest_group / central_available
+                        if central_available else None
+                    ),
+                    "selected_over_available": (
+                        central_requests / central_available
+                        if central_available else None
+                    ),
+                },
                 "queue_wait_ms": {
                     "p50": ((self._percentile(central_wait_hist, 0.50) or 0) / 1000
                             if central_requests else None),

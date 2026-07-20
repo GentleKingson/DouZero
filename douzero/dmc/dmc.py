@@ -805,6 +805,7 @@ def train(flags):
                 gpu_inference_snapshots,
                 getattr(flags, 'central_actor_split_dense1', False),
                 getattr(flags, 'central_actor_staging_dtype', 'float32'),
+                getattr(flags, 'central_actor_inference_layout', 'packed'),
             )
         if getattr(flags, 'central_actor_runtime', 'thread') == 'process':
             central_process = ctx.Process(

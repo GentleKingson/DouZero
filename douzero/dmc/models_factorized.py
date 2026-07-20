@@ -380,6 +380,44 @@ class _LegacyFactorizedBase(nn.Module):
             chunk.argmax() for chunk in values.split(list(action_counts))
         ])
 
+    def select_actions_padded(self, z_batch, x_state_batch, x_action, mask,
+                              split_dense1=False):
+        """Tensor-only bucketed action selection without segmented Python."""
+        if x_action.ndim != 3 or mask.shape != x_action.shape[:2]:
+            raise ValueError("invalid padded factorized action tensor or mask")
+        if z_batch.shape[0] != x_action.shape[0]:
+            raise ValueError("padded decision batch sizes do not match")
+        lstm_out, _ = self.lstm(z_batch)
+        h_lstm = lstm_out[:, -1, :]
+        batch, bucket = x_action.shape[:2]
+        if split_dense1:
+            shared = torch.cat([h_lstm, x_state_batch], dim=-1)
+            shared_width = _LSTM_HIDDEN_SIZE + self._state_width
+            shared_projection = F.linear(
+                shared, self.dense1.weight[:, :shared_width], self.dense1.bias
+            ).unsqueeze(1)
+            action_projection = F.linear(
+                x_action, self.dense1.weight[:, shared_width:], None
+            )
+            h = shared_projection + action_projection
+        else:
+            h = torch.cat([
+                h_lstm[:, None, :].expand(batch, bucket, _LSTM_HIDDEN_SIZE),
+                x_state_batch[:, None, :].expand(
+                    batch, bucket, self._state_width
+                ),
+                x_action,
+            ], dim=-1)
+            h = self.dense1(h)
+        h = torch.relu(h)
+        h = torch.relu(self.dense2(h))
+        h = torch.relu(self.dense3(h))
+        h = torch.relu(self.dense4(h))
+        h = torch.relu(self.dense5(h))
+        values = self.dense6(h).squeeze(-1)
+        values = values.masked_fill(~mask, -torch.inf)
+        return values.argmax(dim=1)
+
 
 class LegacyFactorizedLandlordModel(_LegacyFactorizedBase):
     """Factorized landlord model — loads legacy landlord checkpoints unchanged.

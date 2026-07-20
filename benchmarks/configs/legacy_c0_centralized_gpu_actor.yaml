@@ -40,4 +40,5 @@ central_actor_async_policy_copy: true
 central_actor_runtime: thread
 central_actor_split_dense1: true
 central_actor_staging_dtype: int8
+central_actor_inference_layout: padded
 central_actor_timeout_seconds: 30.0

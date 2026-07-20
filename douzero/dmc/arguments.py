@@ -159,6 +159,8 @@ parser.add_argument('--central_actor_split_dense1',
                     help='Split shared/action dense1 projection for C0 inference')
 parser.add_argument('--central_actor_staging_dtype', choices=['float32', 'int8'],
                     default='float32', help='Pinned C0 request staging dtype')
+parser.add_argument('--central_actor_inference_layout', choices=['packed', 'padded'],
+                    default='packed', help='C0 packed or bucket-padded inference')
 parser.add_argument('--central_actor_timeout_seconds', default=30.0, type=float,
                     help='Actor timeout while waiting for centralized inference')
 

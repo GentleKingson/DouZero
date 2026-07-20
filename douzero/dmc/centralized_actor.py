@@ -503,7 +503,7 @@ def _put_response(response_queues, request, status, payload):
 def _compatible_key(request, max_actions):
     # Broad power-of-two buckets bound packed staging variance without requiring
     # equal legal-action counts.
-    bucket = min(max_actions, max(64, 2 ** math.ceil(math.log2(request.action_count))))
+    bucket = min(max_actions, max(8, 2 ** math.ceil(math.log2(request.action_count))))
     return (request.policy_slot, request.policy_version, request.position, bucket)
 
 
@@ -516,6 +516,7 @@ def centralized_inference_loop(
     gpu_snapshots=None,
     split_dense1=False,
     staging_dtype="float32",
+    inference_layout="packed",
 ):
     """Adaptively batch compatible requests and return correlated responses."""
     try:
@@ -545,6 +546,13 @@ def centralized_inference_loop(
             max_microbatch * slots.max_actions, 54,
             dtype=pinned_type, pin_memory=True,
         )
+        pinned_action_padded = torch.empty(
+            max_microbatch, slots.max_actions, 54,
+            dtype=pinned_type, pin_memory=True,
+        )
+        pinned_counts = torch.empty(
+            max_microbatch, dtype=torch.int64, pin_memory=True
+        )
         gpu_int8 = None
         gpu_float = None
         if staging_dtype == "int8":
@@ -560,6 +568,16 @@ def centralized_inference_loop(
                 key: torch.empty_like(value, dtype=torch.float32)
                 for key, value in gpu_int8.items()
             }
+        gpu_counts = torch.empty(
+            max_microbatch, dtype=torch.int64, device=cuda_device
+        )
+        gpu_mask = torch.empty(
+            max_microbatch, slots.max_actions,
+            dtype=torch.bool, device=cuda_device,
+        )
+        gpu_action_range = torch.arange(
+            slots.max_actions, device=cuda_device
+        )
         pending = []
         accepting = True
         while accepting and not stop_event.is_set():
@@ -635,6 +653,8 @@ def centralized_inference_loop(
                 selected_key = _compatible_key(oldest_request, slots.max_actions)
                 selected_group = groups[selected_key]
             requests = selected_group[:max_microbatch]
+            total_available = len(pending)
+            largest_compatible_group = max(len(group) for group in groups.values())
             selected_ids = {id(request) for request in requests}
             pending = [request for request in pending if id(request) not in selected_ids]
             groups = {selected_key: requests}
@@ -684,14 +704,23 @@ def centralized_inference_loop(
                     slots.x_state[:, :state_width], 0, slot_indices,
                     out=pinned_state[:len(group), :state_width],
                 )
-                offset = 0
-                for request in group:
-                    index = slots.index(request.actor_id, request.env_slot)
-                    count = request.action_count
-                    pinned_action[offset:offset + count].copy_(
-                        slots.x_action[index, :count]
-                    )
-                    offset += count
+                if inference_layout == "padded":
+                    pinned_action_padded[:len(group), :_bucket].zero_()
+                    for batch_index, request in enumerate(group):
+                        index = slots.index(request.actor_id, request.env_slot)
+                        pinned_action_padded[
+                            batch_index, :request.action_count
+                        ].copy_(slots.x_action[index, :request.action_count])
+                    pinned_counts[:len(group)].copy_(torch.tensor(counts))
+                else:
+                    offset = 0
+                    for request in group:
+                        index = slots.index(request.actor_id, request.env_slot)
+                        count = request.action_count
+                        pinned_action[offset:offset + count].copy_(
+                            slots.x_action[index, :count]
+                        )
+                        offset += count
                 packing_done_ns = time.perf_counter_ns()
                 with torch.cuda.stream(inference_stream):
                     timing_events = None
@@ -708,21 +737,47 @@ def centralized_inference_loop(
                             pinned_state[:len(group), :state_width],
                             non_blocking=True,
                         )
-                        gpu_int8["action"][:action_total].copy_(
-                            pinned_action[:action_total], non_blocking=True
-                        )
+                        if inference_layout == "padded":
+                            gpu_int8["action"].view(
+                                max_microbatch, slots.max_actions, 54
+                            )[:len(group), :_bucket].copy_(
+                                pinned_action_padded[:len(group), :_bucket],
+                                non_blocking=True,
+                            )
+                            gpu_counts[:len(group)].copy_(
+                                pinned_counts[:len(group)], non_blocking=True
+                            )
+                        else:
+                            gpu_int8["action"][:action_total].copy_(
+                                pinned_action[:action_total], non_blocking=True
+                            )
                         if timing_events is not None:
                             timing_events[1].record(inference_stream)
                         gpu_float["z"][:len(group)].copy_(gpu_int8["z"][:len(group)])
                         gpu_float["state"][:len(group), :state_width].copy_(
                             gpu_int8["state"][:len(group), :state_width]
                         )
-                        gpu_float["action"][:action_total].copy_(
-                            gpu_int8["action"][:action_total]
-                        )
+                        if inference_layout == "padded":
+                            gpu_float["action"].view(
+                                max_microbatch, slots.max_actions, 54
+                            )[:len(group), :_bucket].copy_(
+                                gpu_int8["action"].view(
+                                    max_microbatch, slots.max_actions, 54
+                                )[:len(group), :_bucket]
+                            )
+                        else:
+                            gpu_float["action"][:action_total].copy_(
+                                gpu_int8["action"][:action_total]
+                            )
                         z = gpu_float["z"][:len(group)]
                         actor_state = gpu_float["state"][:len(group), :state_width]
-                        actions = gpu_float["action"][:action_total]
+                        actions = (
+                            gpu_float["action"].view(
+                                max_microbatch, slots.max_actions, 54
+                            )[:len(group), :_bucket]
+                            if inference_layout == "padded"
+                            else gpu_float["action"][:action_total]
+                        )
                     else:
                         z = pinned_z[:len(group)].to(
                             cuda_device, non_blocking=True
@@ -730,20 +785,40 @@ def centralized_inference_loop(
                         actor_state = pinned_state[:len(group), :state_width].to(
                             cuda_device, non_blocking=True
                         )
-                        actions = pinned_action[:action_total].to(
-                            cuda_device, non_blocking=True
+                        actions = (
+                            pinned_action_padded[:len(group), :_bucket].to(
+                                cuda_device, non_blocking=True
+                            ) if inference_layout == "padded" else
+                            pinned_action[:action_total].to(
+                                cuda_device, non_blocking=True
+                            )
                         )
+                        if inference_layout == "padded":
+                            gpu_counts[:len(group)].copy_(
+                                pinned_counts[:len(group)], non_blocking=True
+                            )
                         if timing_events is not None:
                             timing_events[1].record(inference_stream)
                     if timing_events is not None:
                         timing_events[2].record(inference_stream)
                     with torch.inference_mode():
-                        indices = policy.get_model(
-                            position
-                        ).select_actions_packed(
-                            z, actor_state, actions, counts,
-                            split_dense1=split_dense1,
-                        )
+                        role_model = policy.get_model(position)
+                        if inference_layout == "padded":
+                            torch.lt(
+                                gpu_action_range[:_bucket].unsqueeze(0),
+                                gpu_counts[:len(group)].unsqueeze(1),
+                                out=gpu_mask[:len(group), :_bucket],
+                            )
+                            indices = role_model.select_actions_padded(
+                                z, actor_state, actions,
+                                gpu_mask[:len(group), :_bucket],
+                                split_dense1=split_dense1,
+                            )
+                        else:
+                            indices = role_model.select_actions_packed(
+                                z, actor_state, actions, counts,
+                                split_dense1=split_dense1,
+                            )
                     if timing_events is not None:
                         timing_events[3].record(inference_stream)
                     indices_cpu = indices.to("cpu", non_blocking=False).tolist()
@@ -787,6 +862,12 @@ def centralized_inference_loop(
                             0, completed_ns - packing_done_ns
                             - h2d_ns - gpu_cast_ns - forward_ns
                         ),
+                        padded_actions=(
+                            len(group) * _bucket
+                            if inference_layout == "padded" else action_total
+                        ),
+                        total_available=total_available,
+                        largest_compatible_group=largest_compatible_group,
                         stream_priority_active=priority_active,
                     )
         for request in pending:

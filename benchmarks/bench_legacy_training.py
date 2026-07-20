@@ -185,6 +185,7 @@ def _flatten(payload):
     central = payload.get("centralized_inference", {})
     central_timing = central.get("timing_mean_ms", {})
     throttle = payload.get("learner_throttle", {})
+    fragmentation = central.get("fragmentation", {})
     return {
         **rates,
         "gpu_utilization_median": system.get("gpu_percent", {}).get("median"),
@@ -229,6 +230,14 @@ def _flatten(payload):
         ),
         "learner_throttle_count": throttle.get("count"),
         "learner_throttle_wait_p95_ms": throttle.get("wait_ms_p95"),
+        "padding_ratio": central.get("padding_ratio"),
+        "effective_flops_ratio": central.get("effective_flops_ratio"),
+        "largest_compatible_over_available": fragmentation.get(
+            "largest_compatible_over_available"
+        ),
+        "selected_over_available": fragmentation.get(
+            "selected_over_available"
+        ),
     }
 
 

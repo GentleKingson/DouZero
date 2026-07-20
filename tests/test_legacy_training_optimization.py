@@ -173,6 +173,36 @@ def test_split_dense1_packed_values_and_actions_match(position, state_width):
     assert torch.equal(new, old)
 
 
+@pytest.mark.parametrize("position,state_width", [
+    ("landlord", 319), ("landlord_up", 430), ("landlord_down", 430),
+])
+def test_bucketed_padded_selection_matches_packed(position, state_width):
+    from douzero.dmc.models_factorized import LegacyFactorizedModel
+
+    torch.manual_seed(731)
+    model = LegacyFactorizedModel(device="cpu").get_model(position).eval()
+    counts = [1, 5, 11]
+    bucket = 16
+    z = torch.randn(3, 5, 162)
+    state = torch.randn(3, state_width)
+    padded = torch.zeros(3, bucket, 54)
+    mask = torch.arange(bucket)[None, :] < torch.tensor(counts)[:, None]
+    packed_rows = []
+    for index, count in enumerate(counts):
+        padded[index, :count] = torch.randn(count, 54)
+        packed_rows.append(padded[index, :count])
+    packed_actions = torch.cat(packed_rows)
+    with torch.inference_mode():
+        packed = model.select_actions_packed(
+            z, state, packed_actions, counts, split_dense1=True
+        )
+        bucketed = model.select_actions_padded(
+            z, state, padded, mask, split_dense1=True
+        )
+    assert torch.equal(bucketed, packed)
+    assert torch.all(bucketed < torch.tensor(counts))
+
+
 def test_centralized_slots_are_actor_isolated_and_capacity_checked():
     slots = CentralizedInferenceSlots(num_actors=2, max_actions=64)
     slots.z.zero_()
@@ -270,7 +300,7 @@ def test_legal_action_buckets_allow_different_packed_counts():
     )
     right = scheduler.prepare(
         1, policy_slot=1, policy_version=2, position="landlord",
-        action_count=63,
+        action_count=31,
     )
     assert _compatible_key(left, 512) == _compatible_key(right, 512)
 
