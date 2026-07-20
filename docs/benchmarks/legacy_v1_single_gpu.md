@@ -158,3 +158,46 @@ The report includes exact frames, microbatch and queue-wait distributions,
 actor blocking, learner waiting/throttling, utilization, VRAM, policy lag, and
 worker exit status. Do not promote C0 unless three-repeat median frames/s shows
 a stable gain over both old C0 and A1. GPU utilization alone is not evidence.
+
+### Optimized C0 runtime
+
+The current experimental configuration uses `central_actor_runtime: thread`.
+Actors remain CPU-only processes, while inference, learner work, policy copies,
+and checkpoint coordination share the training process's single CUDA context.
+Set the runtime to `process` only to reproduce the older dual-CUDA-process C0
+baseline.
+
+The inference backlog snapshot accounts separately for ingress, server-local,
+and executing requests. Fixed-threshold and predicted-drain learner admission
+are available through `central_actor_learner_throttle_mode`; waits use the
+shared condition and record count, duration, and distribution. Latency metrics
+separate queue-put blocking, IPC, server batching, CPU packing, H2D, GPU cast,
+forward, response, response consumption, and end-to-end actor latency.
+
+Threaded C0 publishes learner parameters directly into immutable same-device
+GPU inference slots. A CUDA event gates visibility before the corresponding
+metadata policy slot becomes active. Temporary GPU snapshots are reconstructed
+from the learner after resume and are not part of the checkpoint contract.
+
+The following inference experiments retain checkpoint-compatible parameter
+names and shapes:
+
+```yaml
+central_actor_split_dense1: true
+central_actor_staging_dtype: int8
+central_actor_inference_layout: padded
+```
+
+Split dense1 computes the history/state projection once per decision and the
+action projection per legal action using views of the existing `dense1`
+weight. Int8 staging transfers observations in their source dtype, casts into
+reused FP32 GPU buffers on the inference stream, and reports cast time.
+Bucketed padded inference replaces segmented Python argmax with a tensor mask
+and reports padding, effective-FLOPs, and compatible-group fragmentation.
+Packed, float32-staging, and unsplit paths remain selectable for attribution.
+
+Padded bucket specialization can reduce compatible microbatch size. Treat a
+lower forward latency as insufficient when fragmentation or padding reduces
+end-to-end frames/s. Compile and CUDA Graph experiments should only be enabled
+after a stable eager padded configuration covers most traffic; neither is a
+production dependency.
