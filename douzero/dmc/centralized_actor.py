@@ -210,7 +210,9 @@ class CentralQueuePressure:
     def finish_actor_enqueue(self, storage_slot: int, enqueued_ns: int) -> None:
         with self._condition:
             if self._states[storage_slot] == self.FREE:
-                raise RuntimeError("central request completed before enqueue")
+                # A fast inference thread can consume and complete a request
+                # before multiprocessing.Queue.put() returns to the actor.
+                return
             self._actor_enqueue_ns[storage_slot] = enqueued_ns
             self._refresh_locked()
             self._condition.notify_all()

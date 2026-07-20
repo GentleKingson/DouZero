@@ -332,6 +332,21 @@ def test_central_queue_pressure_tracks_depth_without_polling():
     assert pressure.snapshot()["total_backlog"] == 0
 
 
+def test_pressure_accepts_completion_before_actor_put_returns():
+    import multiprocessing
+
+    pressure = CentralQueuePressure(
+        multiprocessing.get_context("spawn"), request_slots=1
+    )
+    now = time.perf_counter_ns()
+    pressure.begin_actor_enqueue(0, now)
+    pressure.server_received(0, now + 1)
+    pressure.executing([0])
+    pressure.completed([0], now + 2)
+    pressure.finish_actor_enqueue(0, now + 3)
+    assert pressure.snapshot()["total_backlog"] == 0
+
+
 def test_pressure_preserves_actor_enqueue_and_server_receive_timestamps():
     import multiprocessing
 
