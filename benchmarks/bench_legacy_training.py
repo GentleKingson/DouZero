@@ -14,6 +14,7 @@ import json
 import math
 import os
 import platform
+import re
 import signal
 import statistics
 import subprocess
@@ -24,9 +25,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIGS = (
-    "legacy_a0_cpu_actor.yaml",
+    "legacy_a0_cpu_actor_thread1.yaml",
     "legacy_a1_cpu_factorized.yaml",
 )
+DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+GIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _p95(values):
@@ -51,6 +54,55 @@ def _validate_evidence_mode(args):
         raise ValueError(
             "formal benchmarks require --docker_image_digest or "
             "DOUZERO_IMAGE_DIGEST"
+        )
+    if not DIGEST_PATTERN.fullmatch(args.docker_image_digest):
+        raise ValueError(
+            "formal benchmarks require a sha256 digest with 64 lowercase "
+            "hexadecimal characters"
+        )
+    if not args.expected_git_sha:
+        raise ValueError(
+            "formal benchmarks require --expected_git_sha or "
+            "DOUZERO_EXPECTED_GIT_SHA"
+        )
+    if not GIT_SHA_PATTERN.fullmatch(args.expected_git_sha):
+        raise ValueError(
+            "formal benchmarks require a full 40-character lowercase Git SHA"
+        )
+
+
+def _validate_provenance(args, environment):
+    git_sha = environment["git_sha"]
+    git_status = environment["git_status_porcelain"]
+    if args.formal:
+        if (
+            not isinstance(git_sha, str)
+            or not GIT_SHA_PATTERN.fullmatch(git_sha)
+        ):
+            raise RuntimeError("formal benchmark could not verify the Git SHA")
+        if git_status is None:
+            raise RuntimeError(
+                "formal benchmark could not verify the Git worktree status"
+            )
+        if git_status:
+            raise RuntimeError(
+                "formal benchmark requires a clean Git worktree"
+            )
+        if git_sha != args.expected_git_sha:
+            raise RuntimeError(
+                "formal benchmark Git SHA mismatch: expected "
+                f"{args.expected_git_sha}, found {git_sha}"
+            )
+        return
+    if git_status is None and not args.allow_dirty:
+        raise RuntimeError(
+            "could not verify Git worktree status; use --allow_dirty only "
+            "for exploratory runs"
+        )
+    if git_status and not args.allow_dirty:
+        raise RuntimeError(
+            "refusing to produce benchmark evidence from a dirty checkout; "
+            "use --allow_dirty only for exploratory runs"
         )
 
 
@@ -103,13 +155,13 @@ def _environment():
         git = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip()
-    except subprocess.SubprocessError:
+    except (OSError, subprocess.SubprocessError):
         git = os.environ.get("DOUZERO_GIT_SHA")
     try:
         git_status = subprocess.check_output(
             ["git", "status", "--porcelain"], cwd=ROOT, text=True
         ).splitlines()
-    except subprocess.SubprocessError:
+    except (OSError, subprocess.SubprocessError):
         git_status = None
     return {
         "git_sha": git,
@@ -223,6 +275,10 @@ def main(argv=None):
         help="Immutable image ID/digest recorded in the evidence bundle",
     )
     parser.add_argument(
+        "--expected_git_sha", default=os.environ.get("DOUZERO_EXPECTED_GIT_SHA"),
+        help="Exact full Git SHA required for a formal evidence run",
+    )
+    parser.add_argument(
         "--allow_dirty", action="store_true",
         help="Allow exploratory runs from a dirty checkout",
     )
@@ -241,11 +297,7 @@ def main(argv=None):
     if not configs:
         configs = [ROOT / "benchmarks" / "configs" / name for name in DEFAULT_CONFIGS]
     environment = _environment()
-    if environment["git_status_porcelain"] and not args.allow_dirty:
-        raise RuntimeError(
-            "refusing to produce benchmark evidence from a dirty checkout; "
-            "use --allow_dirty only for exploratory runs"
-        )
+    _validate_provenance(args, environment)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_rows = []
@@ -332,6 +384,7 @@ def main(argv=None):
             "checkpoint_disabled": True,
             "seed": args.seed,
             "docker_image_digest": args.docker_image_digest,
+            "expected_git_sha": args.expected_git_sha,
             "formal": args.formal,
             "config_sha256": {
                 str(config): _sha256(config) for config in configs

@@ -1,3 +1,5 @@
+# Benchmark-only A1 workload. Use configs/legacy_single_gpu_a1.yaml for
+# checkpoint-enabled long-running training.
 xpid: legacy-a1-cpu-factorized
 actor_device_cpu: true
 training_device: "0"

@@ -275,9 +275,20 @@ infrastructure, not a released model: **Release candidate: NONE. Release
 status: NOT READY.** V2 AMP, strict checkpoint resume, and DDP boundaries are
 documented in [Windows training](docs/windows_training.md) and
 [the P14 training system](docs/training_system.md).
-For the optimized Legacy V1 single-GPU topology, formal evidence protocol, and
-experimental GPU Actor limitations, see the
-[Legacy V1 benchmark guide](docs/benchmarks/legacy_v1_single_gpu.md).
+For long-running optimized Legacy V1 single-GPU training, use the
+checkpoint-enabled production configuration (benchmark configurations disable
+checkpointing and are not training defaults):
+
+```bash
+python train.py \
+  --config configs/legacy_single_gpu_a1.yaml \
+  --xpid douzero-a1 \
+  --total_frames 100000000000
+```
+
+The complete Docker command, shared-memory requirements, formal evidence
+protocol, and experimental GPU Actor limitations are in the
+[Legacy V1 single-GPU guide](docs/benchmarks/legacy_v1_single_gpu.md).
 For more customized configuration of training, see the following optional arguments:
 ```
 --xpid XPID           Experiment id (default: douzero)

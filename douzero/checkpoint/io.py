@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -51,6 +54,41 @@ class CheckpointCompatibilityError(Exception):
     The message includes the offending field and expected/actual values so the
     failure is actionable. We never fall back to a permissive partial load.
     """
+
+
+def _atomic_torch_save(bundle: dict[str, Any], path: str) -> None:
+    """Durably write beside the destination, then atomically replace it."""
+    destination = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            torch.save(bundle, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+
+        # Persist the directory entry where the platform supports directory
+        # fsync. The checkpoint is already atomically visible if this fails.
+        directory_fd = None
+        try:
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            os.fsync(directory_fd)
+        except OSError:
+            pass
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def save_checkpoint(
@@ -83,7 +121,7 @@ def save_checkpoint(
     }
     if runtime_state is not None:
         bundle["runtime_state"] = runtime_state
-    torch.save(bundle, path)
+    _atomic_torch_save(bundle, path)
     return manifest
 
 

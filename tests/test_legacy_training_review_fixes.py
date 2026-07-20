@@ -270,17 +270,85 @@ def test_p95_uses_nearest_rank_boundary():
 
 
 def test_formal_benchmark_requires_immutable_image_digest():
+    digest = "sha256:" + "a" * 64
+    git_sha = "b" * 40
     with pytest.raises(ValueError, match="require --docker_image_digest"):
         bench_legacy_training._validate_evidence_mode(SimpleNamespace(
             formal=True, allow_dirty=False, docker_image_digest=None,
+            expected_git_sha=git_sha,
         ))
     with pytest.raises(ValueError, match="cannot use --allow_dirty"):
         bench_legacy_training._validate_evidence_mode(SimpleNamespace(
-            formal=True, allow_dirty=True, docker_image_digest="sha256:test",
+            formal=True, allow_dirty=True, docker_image_digest=digest,
+            expected_git_sha=git_sha,
+        ))
+    for invalid_digest in ("anything", "sha256:test", "sha256:" + "A" * 64):
+        with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+            bench_legacy_training._validate_evidence_mode(SimpleNamespace(
+                formal=True, allow_dirty=False,
+                docker_image_digest=invalid_digest,
+                expected_git_sha=git_sha,
+            ))
+    with pytest.raises(ValueError, match="require --expected_git_sha"):
+        bench_legacy_training._validate_evidence_mode(SimpleNamespace(
+            formal=True, allow_dirty=False, docker_image_digest=digest,
+            expected_git_sha=None,
+        ))
+    with pytest.raises(ValueError, match="full 40-character lowercase"):
+        bench_legacy_training._validate_evidence_mode(SimpleNamespace(
+            formal=True, allow_dirty=False, docker_image_digest=digest,
+            expected_git_sha="deadbeef",
         ))
     bench_legacy_training._validate_evidence_mode(SimpleNamespace(
-        formal=True, allow_dirty=False, docker_image_digest="sha256:test",
+        formal=True, allow_dirty=False, docker_image_digest=digest,
+        expected_git_sha=git_sha,
     ))
+
+
+def test_formal_benchmark_provenance_fails_closed():
+    git_sha = "b" * 40
+    args = SimpleNamespace(
+        formal=True, allow_dirty=False, expected_git_sha=git_sha,
+    )
+    with pytest.raises(RuntimeError, match="verify the Git SHA"):
+        bench_legacy_training._validate_provenance(args, {
+            "git_sha": None, "git_status_porcelain": [],
+        })
+    with pytest.raises(RuntimeError, match="worktree status"):
+        bench_legacy_training._validate_provenance(args, {
+            "git_sha": git_sha, "git_status_porcelain": None,
+        })
+    with pytest.raises(RuntimeError, match="clean Git worktree"):
+        bench_legacy_training._validate_provenance(args, {
+            "git_sha": git_sha, "git_status_porcelain": [" M train.py"],
+        })
+    with pytest.raises(RuntimeError, match="Git SHA mismatch"):
+        bench_legacy_training._validate_provenance(args, {
+            "git_sha": "c" * 40, "git_status_porcelain": [],
+        })
+    bench_legacy_training._validate_provenance(args, {
+        "git_sha": git_sha, "git_status_porcelain": [],
+    })
+
+
+def test_production_a1_config_keeps_checkpointing_safe_defaults():
+    from douzero.dmc.arguments import parse_args
+
+    flags = parse_args(["--config", "configs/legacy_single_gpu_a1.yaml"])
+    assert flags.legacy_actor_backend == "factorized"
+    assert flags.actor_device_cpu is True
+    assert flags.training_device == "0"
+    assert flags.disable_checkpoint is False
+    assert flags.legacy_profile is False
+    assert flags.legacy_metrics_path == ""
+    assert bench_legacy_training.DEFAULT_CONFIGS[0] == (
+        "legacy_a0_cpu_actor_thread1.yaml"
+    )
+    baseline = parse_args([
+        "--config", "benchmarks/configs/legacy_a0_cpu_actor_thread1.yaml",
+    ])
+    assert baseline.legacy_actor_backend == "legacy"
+    assert baseline.actor_torch_threads == 1
 
 
 def test_gpu_sampler_maps_logical_device_through_visible_devices(
