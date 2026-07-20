@@ -116,7 +116,7 @@ parser.add_argument('--rmsprop_foreach', action=argparse.BooleanOptionalAction,
                     default=False, help='Use the RMSprop foreach implementation')
 parser.add_argument('--grad_clip_foreach', action=argparse.BooleanOptionalAction,
                     default=False, help='Use foreach gradient clipping')
-parser.add_argument('--central_actor_max_actions', default=4096, type=int,
+parser.add_argument('--central_actor_max_actions', default=512, type=int,
                     help='Per-request action capacity for centralized V1 inference')
 parser.add_argument('--central_actor_microbatch', default=4, type=int,
                     help='Deprecated old-C0 target microbatch compatibility knob')
