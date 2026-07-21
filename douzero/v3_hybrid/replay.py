@@ -10,8 +10,19 @@ from typing import ClassVar, Iterable, Mapping
 
 import torch
 
-from douzero.models_v2.batch import ModelInputBundle, observation_to_model_inputs
+from douzero.models_v2.batch import (
+    ModelInputBundle,
+    _is_card_vector_field,
+    observation_to_model_inputs,
+)
 from douzero.observation.encode_v2 import ObservationV2
+from douzero.observation.schema import (
+    action_width,
+    build_v2_schema,
+    context_width,
+    history_token_width,
+    state_width,
+)
 from douzero.runtime.policy_snapshot import PolicyLease
 
 from .config import DMC_TARGET_RAW, DMC_TARGET_SIGNED_LOG
@@ -22,14 +33,8 @@ V3_H2_REPLAY_SEMANTICS = "selected_action_actor_snapshot_q_old_ruleset_v2"
 
 _TRANSFORMS = frozenset({DMC_TARGET_RAW, DMC_TARGET_SIGNED_LOG})
 _RULESET_IDENTITY_KEYS = frozenset({"ruleset_id", "ruleset_version", "ruleset_hash"})
-_TENSOR_FIELDS = (
-    "state_context_flat",
-    "context_flat",
-    "history_tokens",
-    "history_key_padding_mask",
-    "action_features",
-    "action_mask",
-)
+_FEATURE_SCHEMA = build_v2_schema()
+_FEATURE_SCHEMA_HASH = _FEATURE_SCHEMA.stable_hash()
 
 
 def _normalize_ruleset_identity(identity: Mapping[str, object]) -> dict[str, str]:
@@ -74,15 +79,89 @@ def _validate_bundle(bundle: ModelInputBundle, expected_schema_hash: str) -> Non
         raise TypeError("V3 replay model_inputs must be a ModelInputBundle")
     if bundle.feature_schema_hash != expected_schema_hash:
         raise ValueError("V3 replay feature schema hash mismatch")
+    if expected_schema_hash != _FEATURE_SCHEMA_HASH:
+        raise ValueError("V3 replay requires the frozen Observation V2 schema")
     if bundle.acting_role not in V3_HYBRID_ROLES:
         raise ValueError("V3 replay contains an unsupported acting role")
     if bundle.strategy_features is not None or bundle.style_features is not None:
         raise ValueError("H2 replay cannot contain later-stage feature tensors")
+    if not isinstance(bundle.state_card_vectors, tuple) or not isinstance(
+        bundle.context_card_vectors, tuple
+    ):
+        raise TypeError("V3 replay card-vector groups must be tuples")
+    schema = _FEATURE_SCHEMA
+
+    def is_card(spec) -> bool:
+        return _is_card_vector_field(
+            spec.name, tuple(spec.shape), schema.card_vector_dim
+        )
+
+    expected_state_cards = sum(is_card(spec) for spec in schema.state_fields)
+    expected_context_cards = sum(is_card(spec) for spec in schema.context_fields)
+    if len(bundle.state_card_vectors) != expected_state_cards:
+        raise ValueError("V3 replay state card-vector count mismatch")
+    if len(bundle.context_card_vectors) != expected_context_cards:
+        raise ValueError("V3 replay context card-vector count mismatch")
+
+    card_vectors = (*bundle.state_card_vectors, *bundle.context_card_vectors)
+    if any(
+        not isinstance(value, torch.Tensor)
+        or value.shape != (schema.card_vector_dim,)
+        or value.dtype != torch.float32
+        for value in card_vectors
+    ):
+        raise ValueError("V3 replay card-vector shape or dtype mismatch")
+    expected_shapes = {
+        "state_context_flat": (
+            state_width(schema) - expected_state_cards * schema.card_vector_dim,
+        ),
+        "context_flat": (
+            context_width(schema) - expected_context_cards * schema.card_vector_dim,
+        ),
+        "history_tokens": (
+            schema.max_history_len,
+            history_token_width(schema),
+        ),
+    }
+    for name, shape in expected_shapes.items():
+        value = getattr(bundle, name)
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.shape != shape
+            or value.dtype != torch.float32
+        ):
+            raise ValueError(f"V3 replay {name} shape or dtype mismatch")
+    if (
+        not isinstance(bundle.history_key_padding_mask, torch.Tensor)
+        or bundle.history_key_padding_mask.shape != (schema.max_history_len,)
+        or bundle.history_key_padding_mask.dtype != torch.bool
+    ):
+        raise ValueError("V3 replay history padding mask shape or dtype mismatch")
+    if (
+        not isinstance(bundle.action_features, torch.Tensor)
+        or bundle.action_features.ndim != 2
+        or bundle.action_features.shape[0] < 1
+        or bundle.action_features.shape[1] != action_width(schema)
+        or bundle.action_features.dtype != torch.float32
+    ):
+        raise ValueError("V3 replay action feature shape or dtype mismatch")
+    count = int(bundle.action_features.shape[0])
+    if (
+        not isinstance(bundle.action_mask, torch.Tensor)
+        or bundle.action_mask.shape != (count,)
+        or bundle.action_mask.dtype != torch.bool
+        or not bool(bundle.action_mask.all())
+    ):
+        raise ValueError("V3 replay action mask shape, dtype, or validity mismatch")
+
     tensors = (
-        *bundle.state_card_vectors,
+        *card_vectors,
         bundle.state_context_flat,
-        *bundle.context_card_vectors,
-        *(getattr(bundle, name) for name in _TENSOR_FIELDS[1:]),
+        bundle.context_flat,
+        bundle.history_tokens,
+        bundle.history_key_padding_mask,
+        bundle.action_features,
+        bundle.action_mask,
     )
     for value in tensors:
         if not isinstance(value, torch.Tensor):
@@ -91,13 +170,6 @@ def _validate_bundle(bundle: ModelInputBundle, expected_schema_hash: str) -> Non
             raise ValueError("V3 replay public inputs must remain on CPU")
         if value.is_floating_point() and not bool(torch.isfinite(value).all()):
             raise ValueError("V3 replay public inputs must be finite")
-    count = int(bundle.action_features.shape[0])
-    if count < 1 or bundle.action_features.ndim != 2:
-        raise ValueError("V3 replay must contain a non-empty legal-action matrix")
-    if bundle.action_mask.shape != (count,) or bundle.action_mask.dtype != torch.bool:
-        raise ValueError("V3 replay action mask shape or dtype is invalid")
-    if not bool(bundle.action_mask.any()):
-        raise ValueError("V3 replay must contain at least one valid action")
 
 
 @dataclass(frozen=True)

@@ -330,6 +330,56 @@ def test_replay_modes_serialization_and_old_schema_fail_closed():
     with pytest.raises(ValueError, match="exceed the declared capacity"):
         V3ReplayBuffer.from_state_dict(oversized)
 
+    shape_corruptions = []
+    extra_card = copy.deepcopy(ordinary.state_dict())
+    state_cards = extra_card["records"][0]["model_inputs"]["state_card_vectors"]
+    extra_card["records"][0]["model_inputs"]["state_card_vectors"] = (
+        *state_cards,
+        torch.zeros_like(state_cards[0]),
+    )
+    shape_corruptions.append(extra_card)
+    wrong_card_width = copy.deepcopy(ordinary.state_dict())
+    state_cards = wrong_card_width["records"][0]["model_inputs"][
+        "state_card_vectors"
+    ]
+    wrong_card_width["records"][0]["model_inputs"]["state_card_vectors"] = (
+        state_cards[0][:-1],
+        *state_cards[1:],
+    )
+    shape_corruptions.append(wrong_card_width)
+    wrong_flat_width = copy.deepcopy(ordinary.state_dict())
+    flat = wrong_flat_width["records"][0]["model_inputs"]["state_context_flat"]
+    wrong_flat_width["records"][0]["model_inputs"]["state_context_flat"] = (
+        torch.zeros(flat.numel() + 1)
+    )
+    shape_corruptions.append(wrong_flat_width)
+    wrong_history = copy.deepcopy(ordinary.state_dict())
+    history = wrong_history["records"][0]["model_inputs"]["history_tokens"]
+    wrong_history["records"][0]["model_inputs"]["history_tokens"] = torch.zeros(
+        history.shape[0], history.shape[1] + 1
+    )
+    shape_corruptions.append(wrong_history)
+    wrong_history_mask = copy.deepcopy(ordinary.state_dict())
+    mask = wrong_history_mask["records"][0]["model_inputs"][
+        "history_key_padding_mask"
+    ]
+    wrong_history_mask["records"][0]["model_inputs"][
+        "history_key_padding_mask"
+    ] = mask.float()
+    shape_corruptions.append(wrong_history_mask)
+    wrong_action_width = copy.deepcopy(ordinary.state_dict())
+    actions = wrong_action_width["records"][0]["model_inputs"]["action_features"]
+    wrong_action_width["records"][0]["model_inputs"]["action_features"] = (
+        torch.zeros(actions.shape[0], actions.shape[1] + 1)
+    )
+    shape_corruptions.append(wrong_action_width)
+    padded_scalar_action = copy.deepcopy(ordinary.state_dict())
+    padded_scalar_action["records"][0]["model_inputs"]["action_mask"][-1] = False
+    shape_corruptions.append(padded_scalar_action)
+    for corrupted in shape_corruptions:
+        with pytest.raises(ValueError, match="V3 replay"):
+            V3ReplayBuffer.from_state_dict(corrupted)
+
     old = ordinary.state_dict()
     old["schema_version"] = 2
     with pytest.raises(ValueError, match="unsupported"):
@@ -476,6 +526,28 @@ def test_lambda_dmc_zero_is_an_exact_noop_without_replay_dependency():
     assert learner.policy_version == 0
     assert learner.optimizer.state_dict() == optimizer_before
     assert all(torch.equal(before[name], value) for name, value in learner.model.state_dict().items())
+
+
+def test_all_zero_effective_role_weight_batch_is_an_exact_noop():
+    learner = _learner(
+        ADMC_DISABLED,
+        landlord_weight=0.0,
+        landlord_up_weight=1.0,
+        landlord_down_weight=1.0,
+    )
+    before = copy.deepcopy(learner.model.state_dict())
+    optimizer_before = copy.deepcopy(learner.optimizer.state_dict())
+    metrics = learner.train_batch([_plain_transition(339, "landlord")])
+    assert metrics.samples == 0
+    assert learner.learner_updates == 0
+    assert learner.samples_consumed == 0
+    assert learner.policy_version == 0
+    assert learner.statistics.steps == 0
+    assert learner.optimizer.state_dict() == optimizer_before
+    assert all(
+        torch.equal(before[name], value)
+        for name, value in learner.model.state_dict().items()
+    )
 
 
 def test_checkpoint_resume_preserves_schedule_optimizer_policy_rng_and_stats(tmp_path):

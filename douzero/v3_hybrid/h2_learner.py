@@ -617,6 +617,7 @@ class V3H2Learner:
             raise ValueError("H2 batch exceeds the configured batch_size")
         adaptive_required = self.config.adaptive_dmc.mode != ADMC_DISABLED
         max_policy_lag = 0
+        role_weight_values: list[float] = []
         for transition in transitions:
             if not isinstance(transition, V3ReplayTransition):
                 raise TypeError("H2 learner accepts only V3ReplayTransition")
@@ -631,6 +632,11 @@ class V3H2Learner:
                 if version > self.policy_version:
                     raise ValueError("replay policy version is newer than the learner")
                 max_policy_lag = max(max_policy_lag, self.policy_version - version)
+            role_weight_values.append(self.config.role_weights[transition.role])
+
+        effective_weight = math.fsum(role_weight_values)
+        if effective_weight == 0.0:
+            return self._empty_metrics()
 
         chosen = [transition.selected_action_index for transition in transitions]
         inputs = model_input_bundles_to_batch(
@@ -656,14 +662,10 @@ class V3H2Learner:
             learner_update=self.learner_updates,
             q_old=q_old,
         )
-        sample_weights = q_new.new_tensor([
-            self.config.role_weights[transition.role]
-            for transition in transitions
+        normalized_weights = q_new.new_tensor([
+            value / effective_weight for value in role_weight_values
         ])
-        denominator = sample_weights.sum()
-        if not bool(torch.isfinite(denominator)) or float(denominator.item()) <= 0.0:
-            raise ValueError("H2 batch has zero effective role weight")
-        dmc_loss = (result.loss_per_sample * sample_weights).sum() / denominator
+        dmc_loss = (result.loss_per_sample * normalized_weights).sum()
         total = dmc_loss * self.config.lambda_dmc
         if not bool(torch.isfinite(total)):
             raise FloatingPointError("H2 total loss is non-finite")
@@ -689,7 +691,11 @@ class V3H2Learner:
             )
             count = int(mask.sum().item())
             role_samples[role] = count
-            role_weights[role] = float(sample_weights[mask].sum().item())
+            role_weights[role] = math.fsum(
+                weight
+                for transition, weight in zip(transitions, role_weight_values)
+                if transition.role == role
+            )
             role_losses[role] = (
                 float(result.loss_per_sample[mask].mean().detach().item())
                 if count

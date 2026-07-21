@@ -99,7 +99,8 @@ return, target transform, complete ruleset id/version/hash, and immutable
 `PolicyLease` provenance (`q_old`, policy version, slot, owner, and generation).
 Ordinary DMC replay has no `q_old` dependency. Schema, ruleset, and protocol
 version mismatches fail closed at replay-buffer and learner admission; a
-serialized buffer also rejects record counts above its declared capacity.
+serialized buffer also rejects record counts above its declared capacity and
+validates exact schema-derived card, flat, history, mask, and action shapes.
 
 The learner supports three exclusive modes:
 
@@ -116,7 +117,9 @@ duration, epsilon, delta, target transform/clamp, optimizer settings, role
 weights, replay protocol, and reduction semantics are compatibility identity.
 Only gathered real actions enter the loss. Role weights are applied once and
 the weighted loss is normalized by their effective sum; per-role sample,
-weight, and loss metrics make accidental double weighting observable.
+weight, and loss metrics make accidental double weighting observable. A batch
+whose roles all have configured weight zero is an exact learner no-op so role
+ablations can resample without advancing optimizer, policy, or schedule state.
 
 H2 trainer checkpoints strictly persist model, optimizer, learner update,
 clip schedule, policy version, cumulative finite statistics, and Python,
