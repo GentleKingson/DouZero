@@ -14,6 +14,7 @@ from .env_utils import Environment
 from douzero.env import Env
 from douzero.env.env import _cards2array
 from .legacy_metrics import ActorMetricRecorder
+from .profiling import legacy_profile_range
 
 Card2Column = {3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7,
                11: 8, 12: 9, 13: 10, 14: 11, 17: 12}
@@ -117,38 +118,42 @@ def get_batch(free_queue,
     """
     indices = []
     wait_started_ns = time.perf_counter_ns()
-    with lock:
-        for _ in range(flags.batch_size):
-            index = full_queue.get()
-            if index is None:
-                for acquired in indices:
-                    free_queue.put(acquired)
-                return None
-            indices.append(index)
+    profile_ranges = getattr(flags, "legacy_profile", False)
+    with legacy_profile_range(profile_ranges, "learner.batch_wait"):
+        with lock:
+            for _ in range(flags.batch_size):
+                index = full_queue.get()
+                if index is None:
+                    for acquired in indices:
+                        free_queue.put(acquired)
+                    return None
+                indices.append(index)
     batch_wait_ns = time.perf_counter_ns() - wait_started_ns
     assembly_started_ns = time.perf_counter_ns()
-    if stager is not None:
-        batch = stager.stage(buffers, indices)
-    elif all(isinstance(value, torch.Tensor) for value in buffers.values()):
-        first = next(iter(buffers.values()))
-        index_device = first.device if first.is_cuda else torch.device("cpu")
-        index = torch.tensor(indices, dtype=torch.long, device=index_device)
-        batch = {
-            key: value.index_select(0, index).transpose(0, 1)
-            for key, value in buffers.items()
-        }
-    else:
-        batch = {
-            key: torch.stack([buffers[key][m] for m in indices], dim=1)
-            for key in buffers
-        }
+    with legacy_profile_range(profile_ranges, "learner.batch_assembly"):
+        if stager is not None:
+            batch = stager.stage(buffers, indices)
+        elif all(isinstance(value, torch.Tensor) for value in buffers.values()):
+            first = next(iter(buffers.values()))
+            index_device = first.device if first.is_cuda else torch.device("cpu")
+            index = torch.tensor(indices, dtype=torch.long, device=index_device)
+            batch = {
+                key: value.index_select(0, index).transpose(0, 1)
+                for key, value in buffers.items()
+            }
+        else:
+            batch = {
+                key: torch.stack([buffers[key][m] for m in indices], dim=1)
+                for key in buffers
+            }
     batch_assembly_ns = time.perf_counter_ns() - assembly_started_ns
     pin_memory_ns = 0
     if (stager is None and getattr(flags, "pin_memory", False)
             and torch.cuda.is_available()
             and not any(tensor.is_cuda for tensor in batch.values())):
         pin_started_ns = time.perf_counter_ns()
-        batch = {key: tensor.pin_memory() for key, tensor in batch.items()}
+        with legacy_profile_range(profile_ranges, "learner.pin_memory"):
+            batch = {key: tensor.pin_memory() for key, tensor in batch.items()}
         pin_memory_ns = time.perf_counter_ns() - pin_started_ns
     if any(tensor.is_cuda for tensor in batch.values()):
         torch.cuda.synchronize(next(iter(batch.values())).device)
@@ -333,7 +338,10 @@ def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
                             if backend in {"factorized", "centralized_factorized"}
                             else torch.no_grad()
                         )
-                        with inference_context:
+                        with inference_context, legacy_profile_range(
+                            getattr(flags, "legacy_profile", False),
+                            "actor.inference",
+                        ):
                             if backend in {"factorized", "centralized_factorized"}:
                                 role_model = model.get_model(position)
                                 agent_output = role_model.forward_factorized(

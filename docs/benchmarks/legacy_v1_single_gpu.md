@@ -93,3 +93,13 @@ cryptographic runtime attestation.
 Timeout cleanup reaps the complete training process tree on POSIX by using a
 dedicated process group. Native Windows only terminates the direct child, so
 formal CUDA benchmarks must run on Linux or WSL2.
+
+## A1 profiler baseline
+
+With `legacy_profile: true`, A1 emits stable PyTorch profiler/NVTX ranges for
+`actor.inference`, `learner.batch_wait`, `learner.batch_assembly`,
+`learner.pin_memory`, `learner.h2d`, and `learner.optimization_step`. The ranges
+are absent when profiling is disabled, so the production configuration does
+not pay profiler instrumentation overhead. These ranges complement aggregate
+JSON timings and expose CPU packing, transfer, and learner work separately in
+PyTorch Profiler or Nsight Systems.

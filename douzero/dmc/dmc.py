@@ -27,6 +27,7 @@ from .utils import (
     act,
 )
 from .legacy_metrics import LegacyMetricStore, write_metrics
+from .profiling import legacy_profile_range
 from .centralized_actor import (
     CentralizedInferenceSlots,
     centralized_inference_loop,
@@ -310,12 +311,19 @@ def learn(position,
             torch.cuda.Event(enable_timing=True),
         )
         cuda_h2d_events[0].record()
-    obs_x_no_action = batch['obs_x_no_action'].to(device, non_blocking=non_blocking)
-    obs_action = batch['obs_action'].to(device, non_blocking=non_blocking)
-    obs_x = torch.cat((obs_x_no_action, obs_action), dim=2).float()
-    obs_x = torch.flatten(obs_x, 0, 1)
-    obs_z = torch.flatten(batch['obs_z'].to(device, non_blocking=non_blocking), 0, 1).float()
-    target = torch.flatten(batch['target'].to(device, non_blocking=non_blocking), 0, 1)
+    with legacy_profile_range(profile, "learner.h2d"):
+        obs_x_no_action = batch['obs_x_no_action'].to(
+            device, non_blocking=non_blocking
+        )
+        obs_action = batch['obs_action'].to(device, non_blocking=non_blocking)
+        obs_x = torch.cat((obs_x_no_action, obs_action), dim=2).float()
+        obs_x = torch.flatten(obs_x, 0, 1)
+        obs_z = torch.flatten(
+            batch['obs_z'].to(device, non_blocking=non_blocking), 0, 1
+        ).float()
+        target = torch.flatten(
+            batch['target'].to(device, non_blocking=non_blocking), 0, 1
+        )
     if stager is not None:
         stager.mark_h2d(device)
     if cuda_h2d_events is not None:
@@ -338,21 +346,22 @@ def learn(position,
             learner_outputs = model(obs_z, obs_x, return_value=True)
             return compute_loss(learner_outputs['values'], target)
 
-        step_result = amp_controller.step(
-            loss_closure,
-            optimizer,
-            model.parameters(),
-            max_grad_norm=flags.max_grad_norm,
-            clip_grad_norm=(
-                (lambda parameters, max_norm, error_if_nonfinite=False:
-                 torch.nn.utils.clip_grad_norm_(
-                     parameters, max_norm,
-                     error_if_nonfinite=error_if_nonfinite, foreach=True,
-                 ))
-                if getattr(flags, 'grad_clip_foreach', False) else None
-            ),
-            profile=profile,
-        )
+        with legacy_profile_range(profile, "learner.optimization_step"):
+            step_result = amp_controller.step(
+                loss_closure,
+                optimizer,
+                model.parameters(),
+                max_grad_norm=flags.max_grad_norm,
+                clip_grad_norm=(
+                    (lambda parameters, max_norm, error_if_nonfinite=False:
+                     torch.nn.utils.clip_grad_norm_(
+                         parameters, max_norm,
+                         error_if_nonfinite=error_if_nonfinite, foreach=True,
+                     ))
+                    if getattr(flags, 'grad_clip_foreach', False) else None
+                ),
+                profile=profile,
+            )
         loss = step_result.loss
         policy_lag_mean, policy_lag_max = compute_policy_lag(
             learner_updates, batch.get('policy_version')
