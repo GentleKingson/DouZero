@@ -168,7 +168,16 @@ The learner-update schedule has three exact states:
    privileged gate anneal by learner update.
 3. `public_finetune`: guidance, Oracle loss, and privileged gate are exactly
    zero. Privileged samples are rejected and only public DMC/Adaptive-DMC
-   continues.
+   continues for exactly `finetune_updates`. The next learner tick enters an
+   immutable `complete` phase and rejects further training batches.
+
+An enabled schedule advances on every admitted positive-role-weight learner
+batch, including a deliberately zero-loss boundary tick. This prevents a
+zero-weight warmup or fully annealed guided tail from trapping resume at one
+update forever. Such ticks consume real samples and are checkpointed, but do
+not advance the public policy version or either optimizer. Adaptive replay
+provenance may remain attached during Oracle-only phases even though `q_old`
+is not consumed; it becomes mandatory again when Adaptive-DMC is active.
 
 Role weights apply once and all losses normalize over real decisions, never
 padded action rows. H3 checkpoints bind the public H2 identity, Oracle graph,
@@ -178,6 +187,8 @@ separately, both optimizers, learner update, policy version, phase state,
 cumulative metrics, and Python/NumPy/Torch/CUDA RNG. H3 trainer checkpoints
 are privileged training artifacts and the public loader rejects them. Public
 export continues to use the H1 sidecar and serializes only the student.
+Resume also requires public policy version to equal its configured initial
+version plus the persisted number of public optimizer updates.
 
 H3 reports action agreement, chosen-action value error, KL, ranking/value
 losses, optimizer gradient norms, phase, temperature, gate, and role weights.

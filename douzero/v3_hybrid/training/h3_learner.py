@@ -31,7 +31,11 @@ from ..h2_learner import (
 from ..model import V3_HYBRID_ROLES, V3HybridModel
 from ..replay import V3ReplayTransition
 from .guidance_config import OracleGuidanceLossConfig
-from .oracle_schedule import OracleGuidingScheduleConfig, OracleScheduleState
+from .oracle_schedule import (
+    ORACLE_PHASE_COMPLETE,
+    OracleGuidingScheduleConfig,
+    OracleScheduleState,
+)
 
 if TYPE_CHECKING:
     from douzero.distillation.dataset import OfflineDistillationSample
@@ -442,19 +446,25 @@ class V3H3Learner:
         if not transitions or len(transitions) > self.config.public.batch_size:
             raise ValueError("H3 requires a non-empty batch within configured batch_size")
         dmc_enabled = state.public_training and self.config.public.lambda_dmc > 0.0
-        adaptive_required = (
-            dmc_enabled and self.config.public.adaptive_dmc.mode != ADMC_DISABLED
-        )
+        adaptive_configured = self.config.public.adaptive_dmc.mode != ADMC_DISABLED
+        adaptive_consumed = dmc_enabled and adaptive_configured
         for transition in transitions:
             if not isinstance(transition, V3ReplayTransition):
                 raise TypeError("H3 learner accepts only V3ReplayTransition")
+            # Warmup and guidance-only phases preserve actor provenance without
+            # consuming q_old. A disabled Adaptive-DMC configuration still
+            # rejects it, while an active DMC update requires it on every row.
+            adaptive_required = adaptive_consumed or (
+                adaptive_configured
+                and transition.adaptive_provenance is not None
+            )
             transition.validate(
                 expected_schema_hash=self.model.schema.stable_hash(),
                 expected_target_transform=self.model.config.dmc_target_transform,
                 expected_ruleset_identity=self.ruleset.identity(),
                 adaptive_required=adaptive_required,
             )
-            if adaptive_required:
+            if adaptive_consumed:
                 version = transition.adaptive_provenance.policy_version
                 if version > self.policy_version:
                     raise ValueError("H3 replay policy version is newer than learner")
@@ -483,6 +493,8 @@ class V3H3Learner:
         oracle_samples: Sequence["OfflineDistillationSample"] | None = None,
     ) -> V3H3StepMetrics:
         state = self.schedule_state()
+        if state.phase == ORACLE_PHASE_COMPLETE:
+            raise RuntimeError("H3 training schedule is complete")
         role_weights, samples = self._validate_batch(transitions, oracle_samples, state)
         effective_weight = math.fsum(role_weights)
         if effective_weight == 0.0:
@@ -621,7 +633,11 @@ class V3H3Learner:
             oracle_grad = float(norm.detach().cpu().item())
             self.oracle_optimizer.step()
 
-        if not public_updated and not oracle_updated:
+        if (
+            not public_updated
+            and not oracle_updated
+            and not self.config.schedule.enabled
+        ):
             return self._empty_metrics(state)
         count = len(transitions)
         self.learner_updates += 1
@@ -798,16 +814,27 @@ class V3H3Learner:
         }:
             raise CheckpointCompatibilityError("H3 checkpoint counters mismatch")
         try:
-            learner_updates = int(counters["learner_updates"])
-            samples_consumed = int(counters["samples_consumed"])
-            policy_version = int(counters["policy_version"])
-            if min(learner_updates, samples_consumed, policy_version) < 0:
-                raise ValueError("negative H3 counter")
+            learner_updates = counters["learner_updates"]
+            samples_consumed = counters["samples_consumed"]
+            policy_version = counters["policy_version"]
+            for name, value in (
+                ("learner_updates", learner_updates),
+                ("samples_consumed", samples_consumed),
+                ("policy_version", policy_version),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"invalid H3 {name}")
             if bundle["schedule_state"] != self.config.schedule.at(learner_updates).as_dict():
                 raise ValueError("H3 schedule state drift")
             statistics = H3CumulativeStats.from_state_dict(bundle["statistics"])
             if statistics.steps != learner_updates or statistics.decisions != samples_consumed:
                 raise ValueError("H3 statistics/counter drift")
+            expected_policy_version = (
+                self.config.public.initial_policy_version
+                + statistics.public_updates
+            )
+            if policy_version != expected_policy_version:
+                raise ValueError("H3 policy version drift")
         except (TypeError, ValueError) as exc:
             raise CheckpointCompatibilityError(f"H3 checkpoint state mismatch: {exc}") from exc
         student_state = bundle["student_state_dict"]

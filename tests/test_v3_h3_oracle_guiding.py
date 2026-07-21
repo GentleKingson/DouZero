@@ -17,11 +17,13 @@ from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.observation.privileged import PrivilegedObservation
+from douzero.runtime.policy_snapshot import PolicyLease
 from douzero.v3_hybrid import (
     AdaptiveDMCConfig,
     V3H2LearnerConfig,
     V3HybridModel,
     V3HybridModelConfig,
+    capture_adaptive_transition,
     capture_plain_transition,
     load_v3_hybrid_public_checkpoint,
     save_v3_hybrid_public_checkpoint,
@@ -34,6 +36,7 @@ from douzero.v3_hybrid.training.h3_learner import (
 from douzero.v3_hybrid.training.oracle import V3OracleConfig, V3PrivilegedOracle
 from douzero.v3_hybrid.training.oracle_loss import oracle_guidance_loss
 from douzero.v3_hybrid.training.oracle_schedule import (
+    ORACLE_PHASE_COMPLETE,
     ORACLE_PHASE_GUIDED,
     ORACLE_PHASE_PUBLIC_FINETUNE,
     ORACLE_PHASE_WARMUP,
@@ -138,6 +141,7 @@ def test_schedule_is_update_based_and_reaches_exact_public_only_state():
     guided_start = schedule.at(1)
     guided_end = schedule.at(2)
     finetune = schedule.at(3)
+    complete = schedule.at(6)
     assert warmup.phase == ORACLE_PHASE_WARMUP
     assert warmup.public_training is False and warmup.privileged_required is True
     assert guided_start.phase == ORACLE_PHASE_GUIDED
@@ -150,6 +154,8 @@ def test_schedule_is_update_based_and_reaches_exact_public_only_state():
     assert finetune.privileged_required is False
     assert finetune.oracle_weight == 0.0
     assert finetune.guidance_weight == 0.0
+    assert complete.phase == ORACLE_PHASE_COMPLETE
+    assert complete.public_training is False
     assert schedule.stable_hash() != dataclasses.replace(
         schedule, temperature_start=3.0
     ).stable_hash()
@@ -218,7 +224,7 @@ def test_oracle_reuses_p10_action_alignment_and_guidance_tensor_formula():
     assert torch.allclose(loss.kl, expected)
 
 
-def test_disabled_dmc_has_no_q_old_dependency_and_zero_guidance_is_exact_noop():
+def test_disabled_dmc_has_no_q_old_dependency_and_scheduled_noops_advance():
     _, _, transition, _ = _decision()
     public = V3H2LearnerConfig(
         batch_size=2,
@@ -246,9 +252,56 @@ def test_disabled_dmc_has_no_q_old_dependency_and_zero_guidance_is_exact_noop():
     )
     before = _state_copy(no_losses.model)
     no_op = no_losses.train_batch([transition])
-    assert no_op.samples == 0
-    assert no_losses.learner_updates == 0
+    assert no_op.samples == 1
+    assert no_op.public_updated is False and no_op.oracle_updated is False
+    assert no_losses.learner_updates == 1
     assert not _state_changed(before, no_losses.model)
+    for _ in range(4):
+        no_losses.train_batch([transition])
+    assert no_losses.schedule_state().phase == ORACLE_PHASE_COMPLETE
+    with pytest.raises(RuntimeError, match="schedule is complete"):
+        no_losses.train_batch([transition])
+
+
+def test_oracle_warmup_accepts_unconsumed_adaptive_provenance():
+    observation, _, _, sample = _decision()
+    snapshot = _model()
+    lease = PolicyLease(
+        slot=0,
+        version=0,
+        model=snapshot,
+        owner_id=1,
+        generation=1,
+    )
+    transition = capture_adaptive_transition(
+        lease,
+        observation,
+        selected_action_index=0,
+        episode_id="adaptive-warmup",
+        deal_id="adaptive-warmup",
+        target_transform="raw",
+    ).finalize(2.0)
+    learner = _learner(
+        public=V3H2LearnerConfig(
+            batch_size=2,
+            adaptive_dmc=AdaptiveDMCConfig(mode="safe_hybrid"),
+        )
+    )
+    metrics = learner.train_batch([transition], oracle_samples=[sample])
+    assert metrics.phase == ORACLE_PHASE_WARMUP
+    assert metrics.oracle_updated is True and metrics.public_updated is False
+
+    guidance_only = _learner(
+        public=V3H2LearnerConfig(
+            batch_size=2,
+            lambda_dmc=0.0,
+            adaptive_dmc=AdaptiveDMCConfig(mode="safe_hybrid"),
+        ),
+        schedule=dataclasses.replace(_schedule(), warmup_updates=0),
+    )
+    guided = guidance_only.train_batch([transition], oracle_samples=[sample])
+    assert guided.phase == ORACLE_PHASE_GUIDED
+    assert guided.public_updated is True and guided.oracle_updated is True
 
 
 def test_public_student_is_invariant_to_hidden_swap_and_oracle_is_separate():
@@ -300,6 +353,13 @@ def test_three_phase_training_keeps_student_independent_then_finishes_public_onl
     assert not _state_changed(oracle_before_finetune, learner.oracle)
     with pytest.raises(ValueError, match="rejects privileged"):
         learner.train_batch([transition], oracle_samples=[sample])
+    learner.train_batch([transition])
+    learner.train_batch([transition])
+    assert learner.schedule_state().phase == ORACLE_PHASE_COMPLETE
+    final_student = _state_copy(learner.model)
+    with pytest.raises(RuntimeError, match="schedule is complete"):
+        learner.train_batch([transition])
+    assert not _state_changed(final_student, learner.model)
 
 
 def test_h3_checkpoint_resume_preserves_schedule_optimizers_policy_and_rng(tmp_path):
@@ -324,6 +384,14 @@ def test_h3_checkpoint_resume_preserves_schedule_optimizers_policy_and_rng(tmp_p
     )
     with pytest.raises(CheckpointCompatibilityError, match="learner_config"):
         bad.load_checkpoint(path)
+
+    corrupted_path = tmp_path / "h3-policy-drift.pt"
+    corrupted = torch.load(path, map_location="cpu", weights_only=True)
+    corrupted["counters"] = dict(corrupted["counters"])
+    corrupted["counters"]["policy_version"] += 7
+    torch.save(corrupted, corrupted_path)
+    with pytest.raises(CheckpointCompatibilityError, match="policy version drift"):
+        _learner().load_checkpoint(corrupted_path)
 
 
 def test_public_replay_and_export_exclude_oracle_and_public_loader_rejects_trainer(tmp_path):

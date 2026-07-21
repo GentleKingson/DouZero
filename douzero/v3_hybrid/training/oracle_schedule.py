@@ -12,6 +12,7 @@ ORACLE_PHASE_DISABLED = "disabled"
 ORACLE_PHASE_WARMUP = "oracle_warmup"
 ORACLE_PHASE_GUIDED = "guided"
 ORACLE_PHASE_PUBLIC_FINETUNE = "public_finetune"
+ORACLE_PHASE_COMPLETE = "complete"
 
 
 def _finite_nonnegative(name: str, value: float) -> None:
@@ -45,7 +46,7 @@ class OracleGuidingScheduleConfig:
     privileged_gate_start: float = 1.0
     privileged_gate_end: float = 0.0
 
-    IDENTITY_VERSION = 1
+    IDENTITY_VERSION = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -88,7 +89,11 @@ class OracleGuidingScheduleConfig:
             raise ValueError("disabled Oracle schedule must have zero phase lengths")
 
     def compatibility_dict(self) -> dict[str, object]:
-        return {"identity_version": self.IDENTITY_VERSION, **asdict(self)}
+        return {
+            "identity_version": self.IDENTITY_VERSION,
+            "phase_semantics": "bounded_finetune_scheduled_noop_tick_v2",
+            **asdict(self),
+        }
 
     def stable_hash(self) -> str:
         encoded = json.dumps(
@@ -173,15 +178,28 @@ class OracleGuidingScheduleConfig:
                 public_training=True,
                 privileged_required=True,
             )
+        finetune_index = guided_index - self.guided_updates
+        if finetune_index < self.finetune_updates:
+            return OracleScheduleState(
+                learner_update=learner_update,
+                phase=ORACLE_PHASE_PUBLIC_FINETUNE,
+                phase_update=finetune_index,
+                oracle_weight=0.0,
+                guidance_weight=0.0,
+                temperature=float(self.temperature_end),
+                privileged_gate=0.0,
+                public_training=True,
+                privileged_required=False,
+            )
         return OracleScheduleState(
             learner_update=learner_update,
-            phase=ORACLE_PHASE_PUBLIC_FINETUNE,
-            phase_update=guided_index - self.guided_updates,
+            phase=ORACLE_PHASE_COMPLETE,
+            phase_update=finetune_index - self.finetune_updates,
             oracle_weight=0.0,
             guidance_weight=0.0,
             temperature=float(self.temperature_end),
             privileged_gate=0.0,
-            public_training=True,
+            public_training=False,
             privileged_required=False,
         )
 
