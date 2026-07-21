@@ -139,6 +139,28 @@ def test_a1_split_dense1_flag_defaults_off_and_is_opt_in():
     ]).legacy_actor_split_dense1 is True
 
 
+def test_legacy_matmul_precision_defaults_highest_and_accepts_high():
+    from douzero.dmc.arguments import parse_args
+
+    assert parse_args([]).legacy_matmul_precision == "highest"
+    assert parse_args([
+        "--legacy_matmul_precision", "high"
+    ]).legacy_matmul_precision == "high"
+
+
+def test_configure_legacy_matmul_precision(monkeypatch):
+    from types import SimpleNamespace
+
+    from douzero.dmc.dmc import configure_legacy_matmul_precision
+
+    observed = []
+    monkeypatch.setattr(torch, "set_float32_matmul_precision", observed.append)
+    configure_legacy_matmul_precision(
+        SimpleNamespace(legacy_matmul_precision="high")
+    )
+    assert observed == ["high"]
+
+
 def test_factorized_actor_resolves_role_models_once_per_snapshot():
     from unittest.mock import Mock
 

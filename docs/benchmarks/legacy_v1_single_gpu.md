@@ -103,3 +103,9 @@ are absent when profiling is disabled, so the production configuration does
 not pay profiler instrumentation overhead. These ranges complement aggregate
 JSON timings and expose CPU packing, transfer, and learner work separately in
 PyTorch Profiler or Nsight Systems.
+
+`legacy_matmul_precision` isolates float32 matmul precision from AMP. The
+production default is `highest`; `legacy_a5_cpu_factorized_tf32.yaml` measures
+`high`, while `legacy_a6_cpu_factorized_tf32_compile.yaml` combines it with the
+existing fixed-shape learner compile path. Neither changes actor precision or
+the Legacy checkpoint parameter contract.

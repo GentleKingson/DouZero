@@ -552,6 +552,7 @@ class TrainingConfig:
     benchmark_warmup_frames: int = 0
     compile_actor: bool = False
     compile_learner: bool = False
+    legacy_matmul_precision: str = "highest"
     rmsprop_foreach: bool = False
     grad_clip_foreach: bool = False
     central_actor_max_actions: int = 512
