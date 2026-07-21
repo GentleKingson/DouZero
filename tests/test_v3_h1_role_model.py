@@ -17,6 +17,7 @@ from douzero.env.rules import RuleSet
 from douzero.models_v2 import ModelV2, ModelV2Config, observation_to_model_inputs
 from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.v3_hybrid import (
+    CHANNEL_GATE_NONE,
     CHANNEL_GATE_SE,
     V3_HYBRID_MODEL_VERSION,
     V3HybridModel,
@@ -119,6 +120,18 @@ def test_config_rejects_unimplemented_attention_and_unknown_serialized_fields():
     payload = dataclasses.asdict(_config())
     with pytest.raises(ValueError, match="unknown"):
         V3HybridModelConfig.from_dict({**payload, "oracle_enabled": False})
+
+
+def test_gate_reduction_width_only_applies_when_se_gate_is_enabled():
+    config = V3HybridModelConfig(
+        hidden_size=2,
+        farmer_channel_gate=CHANNEL_GATE_NONE,
+        farmer_channel_gate_reduction=4,
+    )
+    model = V3HybridModel(build_v2_schema(), config)
+    assert model.role_adapters["landlord_up"].gate is None
+    with pytest.raises(ValueError, match="must not reduce hidden_size below 1"):
+        dataclasses.replace(config, farmer_channel_gate=CHANNEL_GATE_SE)
 
 
 def test_role_graph_has_required_depth_and_independent_parameters():
@@ -357,7 +370,8 @@ def test_v2_legacy_and_privileged_payloads_fail_closed(tmp_path):
 
 
 def test_public_export_reloads_and_aligns(tmp_path):
-    model = _model().eval()
+    model = _model(adapter_dropout=0.2).train()
+    training_modes = tuple(module.training for module in model.modules())
     observation = _observation(120, "landlord_up")
     bundle = observation_to_model_inputs(observation)
     output = tmp_path / "v3.pt2"
@@ -370,6 +384,7 @@ def test_public_export_reloads_and_aligns(tmp_path):
     )
     assert output.is_file()
     assert error <= 1e-5
+    assert tuple(module.training for module in model.modules()) == training_modes
     probe = (
         "import sys, torch; torch.export.load(sys.argv[1]); "
         "assert 'douzero.observation.privileged' not in sys.modules"

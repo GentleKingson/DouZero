@@ -115,9 +115,13 @@ def export_v3_hybrid_padded(
     os.close(descriptor)
     temporary = Path(temporary_name)
     temporary.unlink()
-    wrapper = ExportableV3HybridModel(model.eval(), acting_role).eval()
     inputs = padded_export_inputs(bundle, max_actions)
+    training_modes = tuple(
+        (module, module.training) for module in model.modules()
+    )
+    wrapper = ExportableV3HybridModel(model, acting_role)
     try:
+        wrapper.eval()
         with torch.inference_mode():
             expected = wrapper(*inputs)
         program = torch.export.export(wrapper, inputs)
@@ -139,4 +143,6 @@ def export_v3_hybrid_padded(
         os.replace(temporary, output)
         return max_error
     finally:
+        for module, training in training_modes:
+            module.training = training
         temporary.unlink(missing_ok=True)

@@ -82,7 +82,10 @@ class V3HybridModelConfig:
                 f"farmer_channel_gate must be one of {sorted(_CHANNEL_GATES)}, "
                 f"got {self.farmer_channel_gate!r}"
             )
-        if self.hidden_size // self.farmer_channel_gate_reduction < 1:
+        if (
+            self.farmer_channel_gate == CHANNEL_GATE_SE
+            and self.hidden_size // self.farmer_channel_gate_reduction < 1
+        ):
             raise ValueError(
                 "farmer_channel_gate_reduction must not reduce hidden_size below 1"
             )
