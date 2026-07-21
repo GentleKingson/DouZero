@@ -1,0 +1,16 @@
+# Isolated GPU-native capability experiment. Not accepted by Legacy train.py.
+feature_version: v2
+ruleset: legacy
+model_version: gpu_v3
+model:
+  version: gpu_v3
+
+actor_device_cpu: true
+training_device: "0"
+num_actor_devices: 1
+num_actors: 8
+num_threads: 1
+batch_size: 64
+unroll_length: 100
+num_buffers: 64
+disable_checkpoint: true
