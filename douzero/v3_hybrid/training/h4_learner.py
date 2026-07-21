@@ -11,7 +11,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Mapping, Protocol, Sequence
 
 import numpy as np
 import torch
@@ -35,6 +35,7 @@ from ..config import BELIEF_FEEDBACK_NONE
 from ..model import V3_HYBRID_ROLES, V3HybridModel
 from ..replay import V3ReplayTransition
 from .belief_config import (
+    BELIEF_MODE_ALTERNATING,
     BELIEF_PHASE_AUXILIARY,
     BELIEF_PHASE_DISABLED,
     BELIEF_PHASE_POLICY,
@@ -49,8 +50,8 @@ from .h3_learner import (
     _same_public_bundle,
 )
 
-V3_H4_TRAINER_CHECKPOINT_FORMAT = "v3-hybrid-h4-joint-belief-trainer-v1"
-V3_H4_TRAINING_CONTRACT = "conservative-belief-detached-policy-feedback-v1"
+V3_H4_TRAINER_CHECKPOINT_FORMAT = "v3-hybrid-h4-joint-belief-trainer-v2"
+V3_H4_TRAINING_CONTRACT = "conservative-belief-detached-policy-feedback-v2"
 
 _CHECKPOINT_KEYS = frozenset({
     "format",
@@ -79,6 +80,80 @@ def _canonical_hash(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
 
+class _Digest(Protocol):
+    def update(self, value: bytes, /) -> None: ...
+
+
+def _update_array_identity(
+    digest: _Digest, name: str, value: np.ndarray | torch.Tensor
+) -> None:
+    array = (
+        value.detach().cpu().contiguous().numpy()
+        if isinstance(value, torch.Tensor)
+        else np.ascontiguousarray(value)
+    )
+    metadata = json.dumps(
+        {"name": name, "dtype": str(array.dtype), "shape": list(array.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    digest.update(metadata.encode("ascii"))
+    digest.update(array.tobytes(order="C"))
+
+
+def _h4_source_state_identity(
+    public_inputs: ModelInputBundle, belief_input: BeliefInput
+) -> str:
+    """Fingerprint both public encodings produced from one observation."""
+
+    digest = hashlib.sha256(b"v3-h4-source-state-binding-v1")
+    for index, value in enumerate(public_inputs.state_card_vectors):
+        _update_array_identity(digest, f"state_card_vectors.{index}", value)
+    _update_array_identity(
+        digest, "state_context_flat", public_inputs.state_context_flat
+    )
+    for index, value in enumerate(public_inputs.context_card_vectors):
+        _update_array_identity(digest, f"context_card_vectors.{index}", value)
+    for name in (
+        "context_flat",
+        "history_tokens",
+        "history_key_padding_mask",
+        "action_features",
+        "action_mask",
+    ):
+        _update_array_identity(digest, name, getattr(public_inputs, name))
+    for name in ("strategy_features", "style_features"):
+        value = getattr(public_inputs, name)
+        if value is None:
+            digest.update(f"{name}=none".encode("ascii"))
+        else:
+            _update_array_identity(digest, name, value)
+    digest.update(public_inputs.acting_role.encode("ascii"))
+    digest.update(public_inputs.feature_schema_hash.encode("ascii"))
+
+    for name in ("feature_vector", "unseen_counts", "style_features"):
+        _update_array_identity(
+            digest, f"belief.{name}", getattr(belief_input, name)
+        )
+    belief_metadata = {
+        "acting_role": belief_input.acting_role,
+        "opponent_a_role": belief_input.opponent_a_role,
+        "opponent_b_role": belief_input.opponent_b_role,
+        "opponent_a_total": belief_input.opponent_a_total,
+        "opponent_b_total": belief_input.opponent_b_total,
+    }
+    digest.update(
+        json.dumps(
+            belief_metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("ascii")
+    )
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True)
 class V3H4LearnerConfig:
     base: V3H3LearnerConfig = field(default_factory=V3H3LearnerConfig)
@@ -86,7 +161,7 @@ class V3H4LearnerConfig:
         default_factory=V3H4BeliefTrainingConfig
     )
 
-    IDENTITY_VERSION = 1
+    IDENTITY_VERSION = 2
 
     def __post_init__(self) -> None:
         if not isinstance(self.base, V3H3LearnerConfig):
@@ -96,6 +171,14 @@ class V3H4LearnerConfig:
         if self.belief.enabled and self.base.schedule.enabled:
             raise ValueError(
                 "H4 belief and H3 Oracle integration is deferred to H6"
+            )
+        if (
+            self.belief.enabled
+            and self.belief.mode == BELIEF_MODE_ALTERNATING
+            and self.base.public.lambda_dmc == 0.0
+        ):
+            raise ValueError(
+                "alternating H4 policy phases require lambda_dmc > 0"
             )
 
     def compatibility_dict(self) -> dict[str, object]:
@@ -129,6 +212,7 @@ class V3H4BeliefSample:
 
     public_inputs: ModelInputBundle
     belief_input: BeliefInput
+    source_state_identity: str
     label: BeliefLabel | None = None
 
     def __post_init__(self) -> None:
@@ -138,6 +222,19 @@ class V3H4BeliefSample:
             raise TypeError("H4 belief_input must be a BeliefInput")
         if self.label is not None and not isinstance(self.label, BeliefLabel):
             raise TypeError("H4 label must be BeliefLabel or None")
+        if (
+            not isinstance(self.source_state_identity, str)
+            or len(self.source_state_identity) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.source_state_identity
+            )
+        ):
+            raise ValueError("H4 source-state identity must be a full SHA-256")
+        if self.source_state_identity != _h4_source_state_identity(
+            self.public_inputs, self.belief_input
+        ):
+            raise ValueError("H4 belief sample source-state identity mismatch")
         if self.public_inputs.acting_role != self.belief_input.acting_role:
             raise ValueError("H4 public and belief acting roles differ")
         if self.label is not None:
@@ -174,9 +271,11 @@ def build_v3_h4_belief_sample(
             num_cards_left=public.num_cards_left,
             bottom_unplayed=public.bottom_cards.unplayed,
         )
+    public_inputs = observation_to_model_inputs(observation)
     return V3H4BeliefSample(
-        public_inputs=observation_to_model_inputs(observation),
+        public_inputs=public_inputs,
         belief_input=binput,
+        source_state_identity=_h4_source_state_identity(public_inputs, binput),
         label=label,
     )
 
@@ -274,7 +373,7 @@ def h4_training_identity(
     config: V3H4LearnerConfig,
 ) -> dict[str, object]:
     return {
-        "identity_version": 1,
+        "identity_version": 2,
         "training_contract": V3_H4_TRAINING_CONTRACT,
         "model_config_hash": model.config.stable_hash(),
         "belief_model_config_hash": (
@@ -287,7 +386,9 @@ def h4_training_identity(
         "policy_posterior": "exact_constrained_and_detached_v1",
         "supervision": "raw_logits_privileged_label_side_channel_v1",
         "shared_encoder": "state_history_context_optional_v1",
-        "replay_protocol": "h2_public_replay_plus_nonserialized_h4_labels_v1",
+        "replay_protocol": (
+            "h2_public_replay_plus_source_bound_nonserialized_h4_labels_v2"
+        ),
         "topology": "single_process_h4_reference_v1",
     }
 
@@ -377,6 +478,10 @@ class V3H4Learner:
                 raise TypeError("H4 belief samples have an invalid type")
             if not _same_public_bundle(sample.public_inputs, transition.model_inputs):
                 raise ValueError("H4 belief/public replay tensors differ")
+            if sample.source_state_identity != _h4_source_state_identity(
+                sample.public_inputs, sample.belief_input
+            ):
+                raise ValueError("H4 belief sample source-state identity mismatch")
             if sample.belief_input.acting_role != transition.role:
                 raise ValueError("H4 belief/public replay roles differ")
             if needs_labels and sample.label is None:
@@ -458,7 +563,6 @@ class V3H4Learner:
         if not transitions or len(transitions) > self.config.base.public.batch_size:
             raise ValueError("H4 requires a non-empty batch within configured size")
         phase = self.phase()
-        enabled = self.config.belief.enabled
         policy_phase = phase in {
             BELIEF_PHASE_DISABLED, BELIEF_PHASE_AUXILIARY, BELIEF_PHASE_POLICY
         }
@@ -593,6 +697,13 @@ class V3H4Learner:
             if conservation_error > 2e-4:
                 raise RuntimeError("H4 belief posterior violated exact conservation")
 
+        consumed_update = belief_updated or bool(
+            base_metrics
+            and (base_metrics.public_updated or base_metrics.oracle_updated)
+        )
+        if not consumed_update:
+            return self._metrics_noop(phase, base=base_metrics)
+
         count = len(transitions)
         self.eligible_updates += 1
         self.samples_consumed += count
@@ -632,7 +743,9 @@ class V3H4Learner:
         self.statistics.update(metrics)
         return metrics
 
-    def _metrics_noop(self, phase: str) -> V3H4StepMetrics:
+    def _metrics_noop(
+        self, phase: str, *, base: V3H3StepMetrics | None = None
+    ) -> V3H4StepMetrics:
         return V3H4StepMetrics(
             eligible_update=self.eligible_updates,
             phase=phase,
@@ -652,7 +765,7 @@ class V3H4Learner:
             dp_latency_ms=0.0,
             role_samples={role: 0 for role in V3_HYBRID_ROLES},
             role_effective_weights={role: 0.0 for role in V3_HYBRID_ROLES},
-            base=None,
+            base=base,
         )
 
     def _inner_bundle(self) -> dict[str, object]:

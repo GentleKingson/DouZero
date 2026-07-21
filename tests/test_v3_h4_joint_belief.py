@@ -191,6 +191,47 @@ def test_disabled_h4_is_exact_h3_and_creates_no_belief_graph():
         assert torch.equal(tensor, h3.model.state_dict()[name])
 
 
+def test_disabled_h4_preserves_h3_noop_counters_and_statistics():
+    _, transition, _ = _decision()
+    config = dataclasses.replace(
+        _base(), public=dataclasses.replace(_base().public, lambda_dmc=0.0)
+    )
+    left_model = _model()
+    right_model = copy.deepcopy(left_model)
+    h4 = V3H4Learner(
+        left_model,
+        ruleset=RuleSet.legacy(),
+        config=V3H4LearnerConfig(base=config),
+    )
+    h3 = V3H3Learner(right_model, ruleset=RuleSet.legacy(), config=config)
+
+    h4_metrics = h4.train_batch([transition])
+    h3_metrics = h3.train_batch([transition])
+
+    assert h4_metrics.base.as_dict() == h3_metrics.as_dict()
+    assert h4_metrics.samples == 0
+    assert h4.eligible_updates == h4.samples_consumed == 0
+    assert h4.statistics.state_dict() == {
+        name: 0 for name in h4.statistics._FIELDS
+    }
+
+
+def test_belief_sample_source_identity_rejects_same_role_input_swap():
+    _, left_transition, left = _decision(seed=31, advance=1)
+    _, right_transition, right = _decision(seed=32, advance=1)
+    assert left_transition.role == right_transition.role
+    assert left.source_state_identity != right.source_state_identity
+
+    with pytest.raises(ValueError, match="source-state identity mismatch"):
+        dataclasses.replace(
+            left,
+            belief_input=right.belief_input,
+            label=right.label,
+        )
+    with pytest.raises(ValueError, match="source-state identity mismatch"):
+        dataclasses.replace(left, source_state_identity="0" * 64)
+
+
 def test_unsupported_h4_combinations_fail_before_training_initialization():
     oracle = dataclasses.replace(
         _base(),
@@ -200,6 +241,14 @@ def test_unsupported_h4_combinations_fail_before_training_initialization():
     )
     with pytest.raises(ValueError, match="deferred to H6"):
         V3H4LearnerConfig(base=oracle, belief=_belief_config())
+    no_public_policy = dataclasses.replace(
+        _base(), public=dataclasses.replace(_base().public, lambda_dmc=0.0)
+    )
+    with pytest.raises(ValueError, match="policy phases require lambda_dmc"):
+        V3H4LearnerConfig(
+            base=no_public_policy,
+            belief=_belief_config(mode=BELIEF_MODE_ALTERNATING),
+        )
     with pytest.raises(ValueError, match="shared_context_dim"):
         V3H4Learner(
             _model(BELIEF_FEEDBACK_FARMERS),

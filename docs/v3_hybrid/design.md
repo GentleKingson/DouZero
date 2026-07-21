@@ -228,11 +228,15 @@ Belief supervision supports two optimizer schedules:
    are restored exactly.
 
 H4 reuses H2 public replay. `V3H4BeliefSample` is a separate training-side
-binding of the same public tensors to an optional privileged label; labels are
-never serialized into replay or public checkpoints. Belief loss and role
-weights normalize over real decisions exactly once. Metrics include masked
-CE, MAP rank/exact accuracy, constrained-posterior calibration error, exact
-conservation, DP latency, and separate belief/shared gradient norms.
+binding of the same public tensors to an optional privileged label. A stable
+source-state fingerprint covers both the policy bundle and belief input, so a
+same-role sample swap fails closed before either feedback or supervision.
+Labels and the fingerprint are never serialized into replay or public
+checkpoints. Belief loss and role weights normalize over real decisions
+exactly once. A delegated H3 no-op does not advance the H4 phase, sample, or
+statistics clocks. Metrics include masked CE, MAP rank/exact accuracy,
+constrained-posterior calibration error, exact conservation, DP latency, and
+separate belief/shared gradient norms.
 
 The coupled H4 public checkpoint contains only the V3 student, public belief
 model, strict configs, ruleset/schema identities, and public feedback contract.
