@@ -7,6 +7,7 @@ from douzero.gpu_v3.config import SHARED_TRUNK_ROLE_HEADS
 from douzero.gpu_v3.distillation import (
     GPU_V3_LEGACY_ACTION_WIDTH,
     GPU_V3_LEGACY_STATE_WIDTH,
+    _single_decision_policy_kl,
     build_legacy_student_inputs,
     legacy_teacher_distillation_loss,
 )
@@ -62,3 +63,20 @@ def test_legacy_teacher_distillation_updates_only_student():
     assert set(metrics) == {
         "value_loss", "policy_loss", "teacher_argmax", "student_argmax"
     }
+
+
+def test_policy_kl_does_not_shrink_when_action_set_is_duplicated():
+    teacher = torch.tensor([2.0, -1.0])
+    student = torch.tensor([0.5, 0.0], requires_grad=True)
+    base = _single_decision_policy_kl(student, teacher, temperature=1.0)
+    duplicated = _single_decision_policy_kl(
+        student.repeat(10), teacher.repeat(10), temperature=1.0
+    )
+
+    expected = torch.nn.functional.kl_div(
+        torch.log_softmax(student, dim=0),
+        torch.softmax(teacher, dim=0),
+        reduction="sum",
+    )
+    assert base.item() == pytest.approx(expected.item())
+    assert duplicated.item() == pytest.approx(base.item())

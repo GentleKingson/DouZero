@@ -10,6 +10,23 @@ GPU_V3_LEGACY_STATE_WIDTH = 5 * 162 + 430
 GPU_V3_LEGACY_ACTION_WIDTH = 54
 
 
+def _single_decision_policy_kl(
+    student_values, teacher_values, temperature
+):
+    """Return KL for one decision without treating actions as batch items."""
+    teacher_distribution = F.softmax(
+        teacher_values.unsqueeze(0) / temperature, dim=1
+    )
+    student_log_distribution = F.log_softmax(
+        student_values.unsqueeze(0) / temperature, dim=1
+    )
+    return F.kl_div(
+        student_log_distribution,
+        teacher_distribution,
+        reduction="batchmean",
+    ) * temperature ** 2
+
+
 def build_legacy_student_inputs(
     position,
     z_single,
@@ -72,13 +89,9 @@ def legacy_teacher_distillation_loss(
     )
     student_values = student(*inputs)[0, :x_action.shape[0]]
     value_loss = F.mse_loss(student_values, teacher_values)
-    teacher_distribution = F.softmax(teacher_values / temperature, dim=0)
-    student_log_distribution = F.log_softmax(student_values / temperature, dim=0)
-    policy_loss = F.kl_div(
-        student_log_distribution,
-        teacher_distribution,
-        reduction="batchmean",
-    ) * temperature ** 2
+    policy_loss = _single_decision_policy_kl(
+        student_values, teacher_values, temperature
+    )
     loss = value_loss + kl_weight * policy_loss
     return loss, {
         "value_loss": value_loss.detach(),
