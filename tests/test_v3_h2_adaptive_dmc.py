@@ -313,6 +313,14 @@ def test_replay_modes_serialization_and_old_schema_fail_closed():
     old["schema_version"] = 1
     with pytest.raises(ValueError, match="unsupported"):
         V3ReplayBuffer.from_state_dict(old)
+    coercive = plain.state_dict()
+    coercive["selected_action_index"] = True
+    with pytest.raises(TypeError, match="selected_action_index"):
+        V3ReplayTransition.from_state_dict(coercive)
+    coercive_buffer = ordinary.state_dict()
+    coercive_buffer["adaptive_required"] = "false"
+    with pytest.raises(TypeError, match="adaptive_required"):
+        V3ReplayBuffer.from_state_dict(coercive_buffer)
 
     adaptive = V3ReplayBuffer(
         4,
@@ -325,6 +333,10 @@ def test_replay_modes_serialization_and_old_schema_fail_closed():
     snapshot = _model().eval()
     adaptive_row = _adaptive_transition(snapshot, 303, "landlord_down")
     adaptive.add(adaptive_row)
+    coercive_q = adaptive_row.state_dict()
+    coercive_q["adaptive_provenance"]["q_old"] = "0.0"
+    with pytest.raises(ValueError, match="q_old"):
+        V3ReplayTransition.from_state_dict(coercive_q)
     with pytest.raises(ValueError, match="must not depend"):
         ordinary.add(adaptive_row)
 

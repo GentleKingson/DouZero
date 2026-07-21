@@ -93,7 +93,11 @@ class AdaptiveSnapshotProvenance:
     generation: int
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.q_old):
+        if (
+            isinstance(self.q_old, bool)
+            or not isinstance(self.q_old, (int, float))
+            or not math.isfinite(self.q_old)
+        ):
             raise ValueError("q_old must be finite")
         for name in ("policy_version", "snapshot_slot", "owner_id", "generation"):
             value = getattr(self, name)
@@ -117,11 +121,11 @@ class AdaptiveSnapshotProvenance:
         if not isinstance(payload, Mapping) or set(payload) != expected:
             raise ValueError("adaptive snapshot provenance fields mismatch")
         return cls(
-            q_old=float(payload["q_old"]),
-            policy_version=int(payload["policy_version"]),
-            snapshot_slot=int(payload["snapshot_slot"]),
-            owner_id=int(payload["owner_id"]),
-            generation=int(payload["generation"]),
+            q_old=payload["q_old"],
+            policy_version=payload["policy_version"],
+            snapshot_slot=payload["snapshot_slot"],
+            owner_id=payload["owner_id"],
+            generation=payload["generation"],
         )
 
 
@@ -350,6 +354,22 @@ class V3ReplayTransition:
         }
         if not isinstance(tensors, Mapping) or set(tensors) != tensor_keys:
             raise ValueError("V3 replay public tensor fields mismatch")
+        for name in (
+            "acting_role", "feature_schema_hash", "role", "episode_id",
+            "deal_id", "target_transform",
+        ):
+            if not isinstance(payload[name], str):
+                raise TypeError(f"V3 replay {name} must be a string")
+        if (
+            isinstance(payload["selected_action_index"], bool)
+            or not isinstance(payload["selected_action_index"], int)
+        ):
+            raise TypeError("V3 replay selected_action_index must be an int")
+        if (
+            isinstance(payload["mc_return"], bool)
+            or not isinstance(payload["mc_return"], (int, float))
+        ):
+            raise TypeError("V3 replay mc_return must be numeric")
         bundle = ModelInputBundle(
             state_card_vectors=tuple(tensors["state_card_vectors"]),
             state_context_flat=tensors["state_context_flat"],
@@ -359,18 +379,18 @@ class V3ReplayTransition:
             history_key_padding_mask=tensors["history_key_padding_mask"],
             action_features=tensors["action_features"],
             action_mask=tensors["action_mask"],
-            acting_role=str(payload["acting_role"]),
-            feature_schema_hash=str(payload["feature_schema_hash"]),
+            acting_role=payload["acting_role"],
+            feature_schema_hash=payload["feature_schema_hash"],
         )
         provenance_payload = payload["adaptive_provenance"]
         return cls(
             model_inputs=bundle,
-            selected_action_index=int(payload["selected_action_index"]),
-            role=str(payload["role"]),
-            episode_id=str(payload["episode_id"]),
-            deal_id=str(payload["deal_id"]),
-            target_transform=str(payload["target_transform"]),
-            mc_return=float(payload["mc_return"]),
+            selected_action_index=payload["selected_action_index"],
+            role=payload["role"],
+            episode_id=payload["episode_id"],
+            deal_id=payload["deal_id"],
+            target_transform=payload["target_transform"],
+            mc_return=payload["mc_return"],
             adaptive_provenance=(
                 None
                 if provenance_payload is None
@@ -453,11 +473,22 @@ class V3ReplayBuffer:
             raise ValueError("unsupported V3 replay buffer schema version")
         if payload["semantics"] != V3_H2_REPLAY_SEMANTICS:
             raise ValueError("V3 replay buffer semantics mismatch")
+        if (
+            isinstance(payload["capacity"], bool)
+            or not isinstance(payload["capacity"], int)
+        ):
+            raise TypeError("V3 replay buffer capacity must be an int")
+        if not isinstance(payload["feature_schema_hash"], str):
+            raise TypeError("V3 replay buffer schema hash must be a string")
+        if not isinstance(payload["target_transform"], str):
+            raise TypeError("V3 replay buffer target transform must be a string")
+        if not isinstance(payload["adaptive_required"], bool):
+            raise TypeError("V3 replay buffer adaptive_required must be bool")
         buffer = cls(
-            int(payload["capacity"]),
-            feature_schema_hash=str(payload["feature_schema_hash"]),
-            target_transform=str(payload["target_transform"]),
-            adaptive_required=bool(payload["adaptive_required"]),
+            payload["capacity"],
+            feature_schema_hash=payload["feature_schema_hash"],
+            target_transform=payload["target_transform"],
+            adaptive_required=payload["adaptive_required"],
         )
         records = payload["records"]
         if not isinstance(records, list):
