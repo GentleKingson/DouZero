@@ -612,6 +612,9 @@ def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
                                 agent_output = role_model.forward_factorized(
                                     obs['z_single'], obs['x_state_single'],
                                     obs['x_action'], flags=flags,
+                                    split_dense1=getattr(
+                                        flags, 'legacy_actor_split_dense1', False
+                                    ),
                                 )
                             else:
                                 agent_output = model.forward(

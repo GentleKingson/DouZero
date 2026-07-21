@@ -539,6 +539,7 @@ class TrainingConfig:
     compile_model: bool = False
     legacy_actor_backend: str = "legacy"
     actor_torch_threads: int = 0
+    legacy_actor_split_dense1: bool = False
     legacy_contiguous_buffers: bool = False
     legacy_bulk_rollout: bool = False
     legacy_flush_ge: bool = False

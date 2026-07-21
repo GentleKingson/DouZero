@@ -45,6 +45,7 @@ ddp_backend: auto
 compile_model: false
 legacy_actor_backend: legacy
 actor_torch_threads: 0
+legacy_actor_split_dense1: false
 legacy_contiguous_buffers: false
 legacy_bulk_rollout: false
 legacy_flush_ge: false

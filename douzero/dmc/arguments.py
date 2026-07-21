@@ -84,6 +84,9 @@ parser.add_argument('--legacy_actor_backend',
                     default='legacy', help='V1 actor inference backend')
 parser.add_argument('--actor_torch_threads', default=0, type=int,
                     help='Actor Torch threads; 0 preserves legacy (factorized defaults to 1)')
+parser.add_argument('--legacy_actor_split_dense1',
+                    action=argparse.BooleanOptionalAction, default=False,
+                    help='Adaptively split factorized Actor dense1 projection')
 parser.add_argument('--legacy_contiguous_buffers',
                     action=argparse.BooleanOptionalAction, default=False,
                     help='Use contiguous [num_buffers,T,...] rollout storage')

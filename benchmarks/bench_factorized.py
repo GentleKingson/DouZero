@@ -231,15 +231,36 @@ def bench_model_forward_only(rounds, warmup, seed):
 
         def run_factorized_split(zs=z_single, xs=x_state_single, xa=xa):
             with torch.no_grad():
-                factorized.forward_factorized(zs, xs, xa, return_value=True)
+                factorized.forward_factorized(
+                    zs, xs, xa, return_value=True, split_dense1=True
+                )
+
+        def run_factorized_unsplit_dense1(
+                zs=z_single, xs=x_state_single, xa=xa):
+            with torch.no_grad():
+                factorized.forward_factorized(
+                    zs, xs, xa, return_value=True, split_dense1=False
+                )
 
         legacy_stats = _bench(run_legacy, rounds, warmup)
         fact_batch_stats = _bench(run_factorized, rounds, warmup)
         fact_split_stats = _bench(run_factorized_split, rounds, warmup)
+        fact_unsplit_dense1_stats = _bench(
+            run_factorized_unsplit_dense1, rounds, warmup
+        )
         results[f"n={n}"] = {
             "legacy_model_forward": legacy_stats,
             "factorized_model_forward_tiled_batch": fact_batch_stats,
             "factorized_model_forward_split_obs": fact_split_stats,
+            "factorized_model_forward_split_obs_unsplit_dense1": (
+                fact_unsplit_dense1_stats
+            ),
+            "speedup_median_adaptive_split_dense1": (
+                round(
+                    fact_unsplit_dense1_stats["median_ms"]
+                    / fact_split_stats["median_ms"], 3
+                ) if fact_split_stats["median_ms"] else None
+            ),
             "speedup_median_split_vs_legacy": (
                 round(legacy_stats["median_ms"] / fact_split_stats["median_ms"], 3)
                 if fact_split_stats["median_ms"] else None

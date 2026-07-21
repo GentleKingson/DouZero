@@ -173,6 +173,15 @@ def test_split_dense1_packed_values_and_actions_match(position, state_width):
     assert torch.equal(new, old)
 
 
+def test_a1_split_dense1_flag_defaults_off_and_is_opt_in():
+    from douzero.dmc.arguments import parse_args
+
+    assert parse_args([]).legacy_actor_split_dense1 is False
+    assert parse_args([
+        "--legacy_actor_split_dense1"
+    ]).legacy_actor_split_dense1 is True
+
+
 @pytest.mark.parametrize("position,state_width", [
     ("landlord", 319), ("landlord_up", 430), ("landlord_down", 430),
 ])
