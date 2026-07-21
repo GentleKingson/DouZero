@@ -136,7 +136,13 @@ def _run_training(command, *, log_file, timeout, cwd=ROOT):
         ) from exc
 
 
-def _environment():
+def _checkpoint_cli_args(enabled):
+    if enabled:
+        return ["--no-disable_checkpoint", "--save_interval", "1"]
+    return ["--disable_checkpoint"]
+
+
+def _environment(source_root=ROOT):
     import torch
 
     try:
@@ -153,13 +159,13 @@ def _environment():
         gpu = None
     try:
         git = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+            ["git", "rev-parse", "HEAD"], cwd=source_root, text=True
         ).strip()
     except (OSError, subprocess.SubprocessError):
         git = os.environ.get("DOUZERO_GIT_SHA")
     try:
         git_status = subprocess.check_output(
-            ["git", "status", "--porcelain"], cwd=ROOT, text=True
+            ["git", "status", "--porcelain"], cwd=source_root, text=True
         ).splitlines()
     except (OSError, subprocess.SubprocessError):
         git_status = None
@@ -271,6 +277,14 @@ def main(argv=None):
     parser.add_argument("--output_dir", default="artifacts/legacy-training")
     parser.add_argument("--timeout_seconds", type=float, default=1800)
     parser.add_argument(
+        "--source_root", type=Path, default=ROOT,
+        help="Clean source checkout to benchmark; defaults to this repository",
+    )
+    parser.add_argument(
+        "--checkpoint_enabled", action="store_true",
+        help="Keep checkpoints enabled and require a final model.tar per repeat",
+    )
+    parser.add_argument(
         "--docker_image_digest", default=os.environ.get("DOUZERO_IMAGE_DIGEST"),
         help=(
             "Caller-declared immutable image ID/digest recorded in evidence; "
@@ -290,18 +304,24 @@ def main(argv=None):
         help="Require an immutable image digest and a clean checkout",
     )
     args = parser.parse_args(argv)
+    source_root = args.source_root.resolve()
+    if not (source_root / "train.py").is_file():
+        raise ValueError(f"source root has no train.py: {source_root}")
     _validate_evidence_mode(args)
     if args.repeats < 3:
         raise ValueError("at least three repetitions are required")
     if args.warmup_frames < 0 or args.measure_frames <= 0:
         raise ValueError("warmup_frames must be non-negative and measure_frames positive")
 
-    configs = [Path(item) for item in args.config]
+    configs = [Path(item).resolve() for item in args.config]
     if not configs:
-        configs = [ROOT / "benchmarks" / "configs" / name for name in DEFAULT_CONFIGS]
-    environment = _environment()
+        configs = [
+            source_root / "benchmarks" / "configs" / name
+            for name in DEFAULT_CONFIGS
+        ]
+    environment = _environment(source_root)
     _validate_provenance(args, environment)
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_rows = []
     aggregate = {}
@@ -313,7 +333,7 @@ def main(argv=None):
             metrics_path = output_dir / f"{run_name}.json"
             log_path = output_dir / f"{run_name}.log"
             command = [
-                sys.executable, str(ROOT / "train.py"),
+                sys.executable, str(source_root / "train.py"),
                 "--config", str(config),
                 "--total_frames", str(args.warmup_frames + args.measure_frames),
                 "--benchmark_warmup_frames", str(args.warmup_frames),
@@ -323,10 +343,10 @@ def main(argv=None):
                 "--legacy_monitor_interval_seconds",
                 str(args.monitor_interval_seconds),
                 "--seed", str(args.seed),
-                "--disable_checkpoint",
                 "--savedir", str(output_dir / "run-logs"),
                 "--xpid", run_name,
             ]
+            command.extend(_checkpoint_cli_args(args.checkpoint_enabled))
             if args.num_actors is not None:
                 command.extend(["--num_actors", str(args.num_actors)])
             for option in (
@@ -341,6 +361,7 @@ def main(argv=None):
                 returncode = _run_training(
                     command, log_file=log_file,
                     timeout=args.timeout_seconds,
+                    cwd=source_root,
                 )
             wall_seconds = time.monotonic() - started
             if returncode != 0:
@@ -349,6 +370,13 @@ def main(argv=None):
                     f"inspect {log_path}"
                 )
             payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+            checkpoint_path = (
+                output_dir / "run-logs" / run_name / "model.tar"
+            )
+            if args.checkpoint_enabled and not checkpoint_path.is_file():
+                raise RuntimeError(
+                    f"{run_name} completed without {checkpoint_path}"
+                )
             measured_frames = payload["counts"]["learner"]["frames"]
             expected_total = args.warmup_frames + args.measure_frames
             if payload["frames_total"] != expected_total:
@@ -368,6 +396,10 @@ def main(argv=None):
                 "frames_total": payload["frames_total"],
                 "measurement_frames": measured_frames,
                 "metrics_sha256": _sha256(metrics_path),
+                "checkpoint_sha256": (
+                    _sha256(checkpoint_path)
+                    if args.checkpoint_enabled else None
+                ),
                 **_flatten(payload),
             }
             raw_rows.append(row)
@@ -384,7 +416,8 @@ def main(argv=None):
             "warmup_frames": args.warmup_frames,
             "measure_frames": args.measure_frames,
             "repeats": args.repeats,
-            "checkpoint_disabled": True,
+            "checkpoint_disabled": not args.checkpoint_enabled,
+            "source_root": str(source_root),
             "seed": args.seed,
             "docker_image_digest": args.docker_image_digest,
             "docker_image_digest_source": "caller_declared",
