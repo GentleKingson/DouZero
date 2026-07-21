@@ -46,3 +46,26 @@ def test_gpu_v3_checkpoint_rejects_architecture_config_mismatch(tmp_path):
     save_gpu_v3_checkpoint(path, model, GPUV3Config(hidden_size=64))
     with pytest.raises(CheckpointCompatibilityError, match="config hash"):
         load_gpu_v3_checkpoint(path, model, GPUV3Config(hidden_size=128))
+
+
+def test_gpu_v3_optimizer_resume_round_trip(tmp_path):
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model(torch.randn(3, 4)).sum().backward()
+    optimizer.step()
+    config = GPUV3Config(hidden_size=64)
+    path = tmp_path / "gpu_v3_resume.pt"
+    save_gpu_v3_checkpoint(path, model, config, optimizer=optimizer, steps=11)
+
+    resumed_model = torch.nn.Linear(4, 2)
+    resumed_optimizer = torch.optim.Adam(resumed_model.parameters(), lr=1e-3)
+    bundle, _ = load_gpu_v3_checkpoint(
+        path,
+        resumed_model,
+        config,
+        optimizer=resumed_optimizer,
+    )
+    assert bundle["steps"] == 11
+    assert resumed_optimizer.state_dict()["state"]
+    for expected, actual in zip(model.parameters(), resumed_model.parameters()):
+        assert torch.equal(expected, actual)
