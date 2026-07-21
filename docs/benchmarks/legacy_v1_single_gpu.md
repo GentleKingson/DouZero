@@ -266,6 +266,13 @@ six checkpoint saves. Resume advanced the same run exactly to 27,520,000
 frames and 8,600 updates; all actors, learner threads, and the inference thread
 exited cleanly. These results establish the current disposition:
 
+The 2026-07-21 closeout reran the checkpoint-enabled C0 workload after the
+supervised shutdown changes. It completed 27.2M frames and then resumed to
+30.4M frames, with 3,807.318 measured seconds, maximum policy lag of 20
+updates, and clean Actor, learner, and inference-thread shutdown. Full frozen
+environment, artifact hashes, and fault-injection results are recorded in
+`docs/benchmarks/legacy_c0_validation_20260721.md`.
+
 - A1 remains the production default for Legacy V1 single-GPU training.
 - C0 remains opt-in and experimental, primarily for larger compatible models
   and architecture research.
