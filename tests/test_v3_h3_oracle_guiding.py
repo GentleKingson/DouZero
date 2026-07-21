@@ -265,7 +265,7 @@ def test_disabled_dmc_has_no_q_old_dependency_and_scheduled_noops_advance():
 
 def test_oracle_warmup_accepts_unconsumed_adaptive_provenance():
     observation, _, _, sample = _decision()
-    snapshot = _model()
+    snapshot = _model().eval()
     lease = PolicyLease(
         slot=0,
         version=0,
