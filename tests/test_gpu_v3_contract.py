@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -10,6 +12,20 @@ from douzero.gpu_v3 import (
     load_gpu_v3_checkpoint,
     save_gpu_v3_checkpoint,
 )
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_gpu_v3_config_is_fail_closed_for_legacy_training():
+    from douzero.dmc.arguments import parse_args
+    from douzero.dmc.dmc import train
+
+    flags = parse_args([
+        "--config", str(REPO_ROOT / "configs" / "gpu_v3.yaml")
+    ])
+    with pytest.raises(ValueError, match="Only 'legacy' is supported for training"):
+        train(flags)
 
 
 def test_gpu_v3_checkpoint_identity_and_round_trip(tmp_path):
