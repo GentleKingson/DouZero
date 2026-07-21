@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from douzero.models_v2.batch import ModelInputBundle
 
 from .model import V3HybridModel
+from .config import BELIEF_FEEDBACK_NONE
 
 
 class ExportableV3HybridModel(nn.Module):
@@ -21,6 +22,10 @@ class ExportableV3HybridModel(nn.Module):
 
     def __init__(self, model: V3HybridModel, acting_role: str) -> None:
         super().__init__()
+        if model.config.belief_feedback != BELIEF_FEEDBACK_NONE:
+            raise ValueError(
+                "H1 tensor export cannot omit an enabled H4 belief model"
+            )
         model.role_index(acting_role)
         self.model = model
         self.acting_role = acting_role

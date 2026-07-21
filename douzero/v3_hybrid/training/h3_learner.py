@@ -23,6 +23,7 @@ from douzero.env.rules import RuleSet
 from douzero.models_v2.batch import ModelInputBundle, model_input_bundles_to_batch
 
 from ..adaptive_dmc import ADMC_DISABLED, adaptive_dmc_loss, transform_dmc_target
+from ..config import BELIEF_FEEDBACK_NONE
 from ..h2_learner import (
     V3H2LearnerConfig,
     _validate_optimizer_param_groups,
@@ -378,12 +379,22 @@ class V3H3Learner:
         ruleset: RuleSet,
         config: V3H3LearnerConfig | None = None,
         oracle=None,
+        _allow_h4_belief_feedback: bool = False,
     ) -> None:
         if not isinstance(model, V3HybridModel):
             raise TypeError("H3 learner requires a V3HybridModel")
         if not isinstance(ruleset, RuleSet):
             raise TypeError("H3 learner requires a RuleSet")
         self.config = config or V3H3LearnerConfig()
+        if model.config.belief_feedback != BELIEF_FEEDBACK_NONE:
+            if not _allow_h4_belief_feedback:
+                raise ValueError(
+                    "belief-feedback models require the H4 learner"
+                )
+            if self.config.schedule.enabled:
+                raise ValueError(
+                    "H4 belief feedback and H3 Oracle combine only in H6"
+                )
         self.device = torch.device(self.config.public.device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA H3 learner requested but CUDA is unavailable")
@@ -515,6 +526,7 @@ class V3H3Learner:
         transitions: Sequence[V3ReplayTransition],
         *,
         oracle_samples: Sequence["OfflineDistillationSample"] | None = None,
+        belief_features: torch.Tensor | None = None,
     ) -> V3H3StepMetrics:
         state = self.schedule_state()
         if state.phase == ORACLE_PHASE_COMPLETE:
@@ -542,7 +554,9 @@ class V3H3Learner:
                 [transition.model_inputs for transition in transitions],
                 [transition.selected_action_index for transition in transitions],
             ).to(self.device)
-            output = self.model.forward_input_batch(inputs)
+            output = self.model.forward_input_batch(
+                inputs, belief_features=belief_features
+            )
             gathered = output.gather_chosen(inputs.chosen_action_index)
             q_new = gathered["dmc_q"].squeeze(-1)
             if self.config.public.lambda_dmc > 0.0:

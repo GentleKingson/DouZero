@@ -16,7 +16,16 @@ from .checkpoint import (
     load_v3_hybrid_public_checkpoint,
     save_v3_hybrid_public_checkpoint,
 )
+from .belief_checkpoint import (
+    V3_H4_PUBLIC_CHECKPOINT_FORMAT,
+    load_v3_h4_public_checkpoint,
+    save_v3_h4_public_checkpoint,
+)
+from .belief_policy import V3BeliefPolicy
 from .config import (
+    BELIEF_FEEDBACK_ALL,
+    BELIEF_FEEDBACK_FARMERS,
+    BELIEF_FEEDBACK_NONE,
     CHANNEL_GATE_NONE,
     CHANNEL_GATE_SE,
     DMC_TARGET_RAW,
@@ -81,6 +90,9 @@ __all__ = [
     "HISTORY_ENCODER_LSTM",
     "HISTORY_ENCODER_TRANSFORMER",
     "V3HybridModelConfig",
+    "BELIEF_FEEDBACK_NONE",
+    "BELIEF_FEEDBACK_FARMERS",
+    "BELIEF_FEEDBACK_ALL",
     "V3_HYBRID_ROLES",
     "V3HybridModel",
     "V3HybridModelOutput",
@@ -89,6 +101,10 @@ __all__ = [
     "h1_compatibility_identity",
     "save_v3_hybrid_public_checkpoint",
     "load_v3_hybrid_public_checkpoint",
+    "V3_H4_PUBLIC_CHECKPOINT_FORMAT",
+    "V3BeliefPolicy",
+    "save_v3_h4_public_checkpoint",
+    "load_v3_h4_public_checkpoint",
     "ExportableV3HybridModel",
     "export_v3_hybrid_padded",
     "ADMC_DISABLED",

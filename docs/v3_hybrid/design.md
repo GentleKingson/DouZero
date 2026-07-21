@@ -200,6 +200,61 @@ losses, optimizer gradient norms, phase, temperature, gate, and role weights.
 Throughput, VRAM, and playing strength require real CUDA runs and paired
 evaluation of the exported public checkpoint. Playing strength not measured.
 
+## H4 conservative belief contract
+
+H4 extends the existing `douzero.belief.BeliefModel`; it does not introduce a
+second belief representation. Raw `[B, 15, 5]` rank-count logits receive
+privileged true-hand targets only inside the training namespace. The existing
+exact constrained dynamic program remains authoritative for marginals, MAP,
+and sampling. Every posterior satisfies the unseen-pool per-rank caps, joker
+caps, opponent-A total, and opponent-B subtraction constraints.
+
+Policy feedback uses the existing 48-field constrained-posterior layout. The
+posterior is converted through the exact evaluation DP and detached before it
+enters the V3 role adapters; policy loss therefore cannot backpropagate through
+the DP or into the belief model. `belief_feedback` is identity-bound as
+`none`, `farmers`, or `all_roles`; `none` creates no projection parameters.
+The default feedback target is the two farmer roles. Landlord feedback is an
+explicit ablation.
+
+Belief supervision supports two optimizer schedules:
+
+1. `auxiliary`: policy and supervised belief updates occur on each eligible
+   batch. Optional shared state/history encoders receive only the supervised
+   belief gradient, never a policy gradient through the posterior.
+2. `alternating`: identity-bound counts select `policy`, `belief`, and optional
+   `joint_shared_encoder` phases using the eligible-update counter. The counter,
+   phase, both optimizers, public policy version, cumulative metrics, and RNG
+   are restored exactly.
+
+H4 reuses H2 public replay. `V3H4BeliefSample` is a separate training-side
+binding of the same public tensors to an optional privileged label; labels are
+never serialized into replay or public checkpoints. Belief loss and role
+weights normalize over real decisions exactly once. Metrics include masked
+CE, MAP rank/exact accuracy, constrained-posterior calibration error, exact
+conservation, DP latency, and separate belief/shared gradient norms.
+
+The coupled H4 public checkpoint contains only the V3 student, public belief
+model, strict configs, ruleset/schema identities, and public feedback contract.
+The H1 loader rejects it, and the H4 loader rejects training checkpoints or
+partial model pairs. Public imports lazily exclude belief labels, privileged
+observations, Oracle code, and H4 trainer code. Oracle plus belief feedback is
+deliberately rejected until H6 integrates the full loss graph.
+
+| H4 combination | Status |
+|---|---|
+| Belief auxiliary only | Supported |
+| Detached belief feedback to farmers | Supported, preferred |
+| Detached belief feedback to all roles | Supported ablation |
+| Independent belief encoder updates | Supported |
+| Belief updates to shared V3 state/history encoders | Supported by explicit phase |
+| Policy gradient through exact DP | Rejected |
+| H3 Oracle plus H4 belief in one learner | Rejected until H6 |
+| Bidding/BC/strategy/cooperation integration | Deferred to H6 |
+
+H4 playing strength not measured. Feedback is not a default until paired
+farmer/landlord evaluation demonstrates benefit without role regression.
+
 ## Batching and masks
 
 The scalar API accepts any positive action count. The batched API pads to the
@@ -213,7 +268,7 @@ chosen index before reduction.
 `V3HybridModelConfig.stable_hash()` binds hidden width, history backend and
 depth, history heads/dropout, shared fusion depth, all role depths, channel
 gate type/reduction, adapter dropout, attention type, score/Q clamps, output
-target transform, and numerical guard semantics.
+target transform, numerical guard semantics, and the H4 belief-feedback graph.
 
 The public sidecar additionally binds the complete H0 compatibility identity:
 

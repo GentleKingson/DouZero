@@ -40,6 +40,8 @@ Public modules:
 
 from __future__ import annotations
 
+from importlib import import_module
+
 from .constraints import (
     BELIEF_RANKS,
     BELIEF_RANK_INDEX,
@@ -71,21 +73,6 @@ from .features import (
     build_belief_feature_vector,
     build_belief_input,
 )
-from .labels import (
-    BeliefLabel,
-    build_belief_label,
-    target_allocation_tensor,
-)
-from .losses import (
-    BeliefLossComponents,
-    belief_loss,
-    belief_metrics,
-)
-from .joint_checkpoint import (
-    JointCheckpointManifest,
-    load_joint_checkpoint,
-    save_joint_checkpoint,
-)
 from .model import (
     BELIEF_FEATURE_DIM,
     BeliefConfig,
@@ -94,6 +81,39 @@ from .model import (
     belief_features_from_probs,
     belief_features_from_torch_probs,
 )
+
+_TRAINING_ONLY_EXPORTS = {
+    "BeliefLabel": ("douzero.belief.labels", "BeliefLabel"),
+    "build_belief_label": ("douzero.belief.labels", "build_belief_label"),
+    "target_allocation_tensor": (
+        "douzero.belief.labels", "target_allocation_tensor"
+    ),
+    "BeliefLossComponents": (
+        "douzero.belief.losses", "BeliefLossComponents"
+    ),
+    "belief_loss": ("douzero.belief.losses", "belief_loss"),
+    "belief_metrics": ("douzero.belief.losses", "belief_metrics"),
+    "JointCheckpointManifest": (
+        "douzero.belief.joint_checkpoint", "JointCheckpointManifest"
+    ),
+    "load_joint_checkpoint": (
+        "douzero.belief.joint_checkpoint", "load_joint_checkpoint"
+    ),
+    "save_joint_checkpoint": (
+        "douzero.belief.joint_checkpoint", "save_joint_checkpoint"
+    ),
+}
+
+
+def __getattr__(name: str):
+    """Load privileged-label and trainer helpers only when explicitly requested."""
+
+    target = _TRAINING_ONLY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(target[0]), target[1])
+    globals()[name] = value
+    return value
 
 __all__ = [
     "BELIEF_RANKS",
