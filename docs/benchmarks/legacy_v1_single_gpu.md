@@ -210,7 +210,7 @@ production dependency.
 
 ## C0 decision record
 
-The final formal comparison on `211a3cebe92bc53cfba8a43f12ea8b62e42bc6d6`
+The final formal comparison on `1b3da1ac3903fa119106c9163f9fb4b264a42659`
 used image
 `sha256:6f57b50161e8a4c4147fda854b76b255bdf643a2703c7da464b89277da01f953`,
 checkpointing enabled, profiling disabled, 64,000 warmup frames, 256,000
@@ -218,17 +218,45 @@ measured frames, and three repeats:
 
 | topology | median frames/s | min-max frames/s |
 |---|---:|---:|
-| A1 CPU factorized | 16,755 | 16,736-16,793 |
-| synchronous C0 baseline | 4,825 | 4,824-4,932 |
-| optimized centralized C0 | 7,717 | 7,328-7,930 |
+| A1 CPU factorized | 16,769 | 16,715-16,776 |
+| optimized centralized C0 | 8,112 | 8,095-8,313 |
 
-Optimized C0 is about 59.9% faster than synchronous C0, but remains about
-53.9% slower than A1. Its mean end-to-end inference latency was 8.92 ms:
-6.26 ms IPC wait, 1.77 ms server batching, 0.35 ms forward, and 0.032 ms H2D.
-The actor inference-blocked ratio was 96.68%, the mean microbatch was 2.84,
-and selected requests were only 30.7% of those available. Communication,
-scheduling, and compatible-group fragmentation therefore dominate the small
-Legacy V1 model; eliminating forward time cannot close the A1 gap.
+Against the earlier matched synchronous-C0 reference of 4,825 frames/s,
+optimized C0 is about 68.1% faster, but it remains about 51.6% slower than A1.
+Its mean end-to-end inference latency was 5.15 ms and
+IPC wait was 1.92 ms. The actor inference-blocked ratio was 94.66%, the mean
+microbatch was 3.32, and selected requests were only 24.6% of those available.
+Communication, scheduling, and compatible-group fragmentation therefore
+dominate the small Legacy V1 model; eliminating forward time cannot close the
+A1 gap.
+
+### Final parameter ceiling search
+
+A bounded sequential search used three repeats per point with 16,000 warmup
+and 64,000 measured frames. These short-window values are screening results,
+not substitutes for the full-window comparison above:
+
+| sweep | median frames/s by value | retained value |
+|---|---|---:|
+| actors | 8: 5,728; 12: 5,355; 16: 4,782 | 8 |
+| environments per actor | 2: 2,802; 4: 5,744; 6: 5,210 | 4 |
+| snapshot interval | 16: 5,772; 32: 5,736; 64: 5,736 | 16 |
+| target microbatch | 4: 5,462; 8: 5,777; 12: 5,734 | 8 |
+| maximum delay (ms) | 0.5: 5,812; 1: 5,822; 2: 5,752; 4: 6,191 | 4 |
+
+The 20-actor and eight-environments-per-actor cases both stopped making exact
+frame-budget progress at 76,800 of 80,000 frames and were rejected rather than
+timed as successes. The retained configuration is therefore 8 actors, 4
+environments per actor, snapshot interval 16, target microbatch 8, and maximum
+delay 4 ms. A full-window comparison measured 8,090 frames/s for this setting
+versus 7,339 for the prior 12-actor, 2 ms setting, a 10.2% median improvement.
+The exact committed configuration was then reconfirmed at 8,112 frames/s.
+
+Checkpoint/resume validation for the tuned configuration advanced exactly from
+320,000 frames and 100 updates to 640,000 frames and 200 updates. All eight
+actors and the inference thread exited with status zero. The longer stability
+run below predates this final parameter-only adjustment and validates the same
+threaded C0 architecture rather than the tuned throughput claim.
 
 A 3,986-second run completed exactly 27,200,000 frames and 8,500 updates with
 six checkpoint saves. Resume advanced the same run exactly to 27,520,000

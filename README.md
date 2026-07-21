@@ -290,7 +290,7 @@ The complete Docker command, shared-memory requirements, formal evidence
 protocol, and experimental GPU Actor limitations are in the
 [Legacy V1 single-GPU guide](docs/benchmarks/legacy_v1_single_gpu.md).
 The measured centralized C0 topology remains experimental: its final
-three-repeat median was 7,717 frames/s versus 16,755 frames/s for A1. C0 is
+three-repeat median was 8,112 frames/s versus 16,769 frames/s for A1. C0 is
 disabled unless explicitly selected and is not a production acceleration path
 for the current Legacy V1 model.
 Legacy training commits complete learner updates, so `total_frames` must be a
