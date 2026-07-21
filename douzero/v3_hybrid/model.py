@@ -298,7 +298,6 @@ class V3HybridModel(nn.Module):
         action_features: torch.Tensor,
         action_mask: torch.Tensor,
         acting_role: torch.Tensor,
-        belief_features: torch.Tensor | None = None,
     ) -> tuple[int, int]:
         if action_features.ndim != 3 or action_features.shape[-1] != self._action_width:
             raise ValueError(
@@ -328,6 +327,7 @@ class V3HybridModel(nn.Module):
         action_features: torch.Tensor,
         action_mask: torch.Tensor,
         acting_role: torch.Tensor,
+        belief_features: torch.Tensor | None = None,
     ) -> BatchedV3HybridModelOutput:
         """Score a padded heterogeneous-role batch with independent adapters."""
 
@@ -472,7 +472,7 @@ class V3HybridModel(nn.Module):
             inputs.action_features.to(dtype=parameter.dtype),
             inputs.action_mask,
             inputs.acting_role,
-            belief_features,
+            belief_features=belief_features,
         )
 
     def encode_input_batch_context(
