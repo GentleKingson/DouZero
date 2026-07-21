@@ -98,7 +98,8 @@ real legal-action index, acting role, episode/deal identity, raw terminal MC
 return, target transform, complete ruleset id/version/hash, and immutable
 `PolicyLease` provenance (`q_old`, policy version, slot, owner, and generation).
 Ordinary DMC replay has no `q_old` dependency. Schema, ruleset, and protocol
-version mismatches fail closed at replay-buffer and learner admission.
+version mismatches fail closed at replay-buffer and learner admission; a
+serialized buffer also rejects record counts above its declared capacity.
 
 The learner supports three exclusive modes:
 
@@ -123,8 +124,11 @@ NumPy, Torch, and CUDA RNG states. Resume rejects partial envelopes, changed
 model/learner/ruleset/schema identity, stale source SHA, replay protocol drift,
 or counter/schedule/statistic disagreement. Cumulative statistics additionally
 validate role totals, configured role weights, adaptive-mode-only fields, and
-event-count bounds before any state is restored. Replay is explicitly flushed
-at a checkpoint boundary; H7 owns persistent actor/replay runtime integration.
+event-count bounds before any state is restored. Optimizer parameter layout and
+all identity-bound RMSprop hyperparameters must exactly match the configured
+optimizer. A public model carrying a checkpoint ruleset binding cannot be
+attached to a learner for another ruleset. Replay is explicitly flushed at a
+checkpoint boundary; H7 owns persistent actor/replay runtime integration.
 
 The frozen H1 public sidecar remains unchanged. A trained H2 model is released
 through that public-only sidecar, which excludes optimizer state, `q_old`,

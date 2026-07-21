@@ -87,6 +87,47 @@ def _positive_finite(name: str, value: float) -> None:
         raise ValueError(f"{name} must be positive and finite")
 
 
+def _validate_optimizer_param_groups(
+    actual_groups: object,
+    expected_groups: list[dict[str, object]],
+) -> None:
+    if (
+        not isinstance(actual_groups, list)
+        or len(actual_groups) != len(expected_groups)
+    ):
+        raise CheckpointCompatibilityError(
+            "H2 checkpoint optimizer parameter-group layout mismatch"
+        )
+    for actual, expected in zip(actual_groups, expected_groups):
+        if not isinstance(actual, dict) or set(actual) != set(expected):
+            raise CheckpointCompatibilityError(
+                "H2 checkpoint optimizer parameter-group fields mismatch"
+            )
+        parameters = actual["params"]
+        if (
+            not isinstance(parameters, list)
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in parameters
+            )
+            or parameters != expected["params"]
+        ):
+            raise CheckpointCompatibilityError(
+                "H2 checkpoint optimizer parameter layout mismatch"
+            )
+        for name, expected_value in expected.items():
+            if name == "params":
+                continue
+            actual_value = actual[name]
+            if (
+                type(actual_value) is not type(expected_value)
+                or actual_value != expected_value
+            ):
+                raise CheckpointCompatibilityError(
+                    f"H2 checkpoint optimizer hyperparameter {name} mismatch"
+                )
+
+
 @dataclass(frozen=True)
 class V3H2LearnerConfig:
     """Identity-bound standalone H2 learner configuration."""
@@ -489,11 +530,27 @@ class V3H2Learner:
             raise TypeError("H2 learner requires a V3HybridModel")
         if not isinstance(ruleset, RuleSet):
             raise TypeError("H2 learner requires a RuleSet")
+        ruleset_identity = (
+            ruleset.ruleset_id,
+            ruleset.ruleset_version,
+            ruleset.stable_hash(),
+        )
+        model_ruleset_identity = getattr(model, "expected_ruleset_identity", None)
+        if model_ruleset_identity is not None:
+            if (
+                not isinstance(model_ruleset_identity, tuple)
+                or len(model_ruleset_identity) != 3
+                or any(not isinstance(value, str) for value in model_ruleset_identity)
+            ):
+                raise ValueError("H2 model carries an invalid ruleset identity")
+            if model_ruleset_identity != ruleset_identity:
+                raise ValueError("H2 model and learner ruleset identities differ")
         self.config = config or V3H2LearnerConfig()
         self.device = torch.device(self.config.device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA H2 learner requested but CUDA is unavailable")
         self.model = model.to(self.device)
+        self.model.expected_ruleset_identity = ruleset_identity
         self.model.train()
         self.ruleset = ruleset
         self.optimizer = torch.optim.RMSprop(
@@ -883,6 +940,14 @@ class V3H2Learner:
             raise CheckpointCompatibilityError(
                 "H2 checkpoint optimizer state envelope mismatch"
             )
+        if not isinstance(optimizer_state["state"], dict):
+            raise CheckpointCompatibilityError(
+                "H2 checkpoint optimizer tensor state must be a dict"
+            )
+        _validate_optimizer_param_groups(
+            optimizer_state["param_groups"],
+            self.optimizer.state_dict()["param_groups"],
+        )
         rng = bundle["rng"]
         if not isinstance(rng, dict) or set(rng) != {
             "learner", "python", "numpy", "torch", "cuda"

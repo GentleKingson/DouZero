@@ -324,6 +324,12 @@ def test_replay_modes_serialization_and_old_schema_fail_closed():
     assert len(restored) == 1
     assert restored.sample(1, rng=__import__("random").Random(3))[0].deal_id == plain.deal_id
 
+    oversized = ordinary.state_dict()
+    oversized["capacity"] = 1
+    oversized["records"] = oversized["records"] * 2
+    with pytest.raises(ValueError, match="exceed the declared capacity"):
+        V3ReplayBuffer.from_state_dict(oversized)
+
     old = ordinary.state_dict()
     old["schema_version"] = 2
     with pytest.raises(ValueError, match="unsupported"):
@@ -564,6 +570,52 @@ def test_checkpoint_identity_partial_load_and_public_loader_fail_closed(tmp_path
             ruleset=RuleSet.legacy(),
             config=_config(),
         )
+
+
+def test_learner_rejects_a_loaded_model_bound_to_another_ruleset(tmp_path):
+    path = tmp_path / "standard-public.ckpt"
+    save_v3_hybrid_public_checkpoint(path, _model(), ruleset=RuleSet.standard())
+    loaded = load_v3_hybrid_public_checkpoint(
+        path,
+        schema=build_v2_schema(),
+        ruleset=RuleSet.standard(),
+        config=_config(),
+    )
+    with pytest.raises(ValueError, match="ruleset identities differ"):
+        V3H2Learner(
+            loaded,
+            ruleset=RuleSet.legacy(),
+            config=V3H2LearnerConfig(batch_size=8),
+        )
+
+
+def test_checkpoint_rejects_optimizer_hyperparameter_and_layout_drift(tmp_path):
+    learner = _learner(ADMC_DISABLED, model=_model())
+    learner.train_batch([_plain_transition(335, "landlord")])
+    path = tmp_path / "optimizer.ckpt"
+    learner.save_checkpoint(path)
+    bundle = torch.load(path, weights_only=True)
+
+    corruptions = []
+    for name in ("lr", "alpha", "momentum", "eps"):
+        changed = copy.deepcopy(bundle)
+        changed["optimizer_state_dict"]["param_groups"][0][name] += 0.5
+        corruptions.append((f"optimizer-{name}.ckpt", changed, "hyperparameter"))
+    changed_layout = copy.deepcopy(bundle)
+    parameters = changed_layout["optimizer_state_dict"]["param_groups"][0]["params"]
+    changed_layout["optimizer_state_dict"]["param_groups"][0]["params"] = list(
+        reversed(parameters)
+    )
+    corruptions.append(("optimizer-layout.ckpt", changed_layout, "parameter layout"))
+
+    for filename, changed, message in corruptions:
+        poisoned = tmp_path / filename
+        torch.save(changed, poisoned)
+        resumed = _learner(ADMC_DISABLED, model=_model())
+        with pytest.raises(CheckpointCompatibilityError, match=message):
+            resumed.load_checkpoint(poisoned)
+        assert resumed.learner_updates == 0
+        assert resumed.samples_consumed == 0
 
 
 def test_checkpoint_rejects_corrupted_cumulative_statistics_invariants(tmp_path):

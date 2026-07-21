@@ -557,6 +557,8 @@ class V3ReplayBuffer:
         records = payload["records"]
         if not isinstance(records, list):
             raise ValueError("V3 replay records must be a list")
+        if len(records) > buffer.capacity:
+            raise ValueError("V3 replay records exceed the declared capacity")
         for raw in records:
             record = V3ReplayTransition.from_state_dict(raw)
             buffer.add(record)
