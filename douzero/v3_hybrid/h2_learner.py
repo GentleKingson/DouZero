@@ -23,6 +23,8 @@ from douzero.models_v2.batch import model_input_bundles_to_batch
 
 from .adaptive_dmc import (
     ADMC_DISABLED,
+    ADMC_PAPER_RATIO,
+    ADMC_SAFE_HYBRID,
     AdaptiveDMCConfig,
     AdaptiveDMCResult,
     adaptive_dmc_loss,
@@ -341,6 +343,89 @@ class AdaptiveDMCCumulativeStats:
             setattr(stats, name, converted)
         return stats
 
+    def validate_invariants(
+        self,
+        *,
+        mode: str,
+        learner_updates: int,
+        samples_consumed: int,
+        batch_size: int,
+        role_weights: Mapping[str, float],
+    ) -> None:
+        """Reject internally inconsistent diagnostic state before resume."""
+
+        if mode not in {ADMC_DISABLED, ADMC_PAPER_RATIO, ADMC_SAFE_HYBRID}:
+            raise ValueError("Adaptive DMC statistics mode is unsupported")
+        if self.steps != learner_updates or self.samples != samples_consumed:
+            raise ValueError("Adaptive DMC statistics/counter drift")
+        if self.steps == 0:
+            if self.samples != 0:
+                raise ValueError("Adaptive DMC zero-step statistics contain samples")
+        elif not self.steps <= self.samples <= self.steps * batch_size:
+            raise ValueError("Adaptive DMC statistics batch cardinality is impossible")
+        if sum(self.role_samples.values()) != self.samples:
+            raise ValueError("Adaptive DMC role samples do not sum to total samples")
+
+        nonnegative_values = {
+            "q_new_square_sum": self.q_new_square_sum,
+            "q_old_square_sum": self.q_old_square_sum,
+            "q_drift_sum": self.q_drift_sum,
+            "gradient_norm_sum": self.gradient_norm_sum,
+        }
+        if any(value < 0.0 for value in nonnegative_values.values()):
+            raise ValueError("Adaptive DMC cumulative magnitude is negative")
+        for role in V3_HYBRID_ROLES:
+            if self.role_loss_sum[role] < 0.0:
+                raise ValueError("Adaptive DMC cumulative role loss is negative")
+            expected_weight = self.role_samples[role] * float(role_weights[role])
+            if not math.isclose(
+                self.role_effective_weight_sum[role],
+                expected_weight,
+                rel_tol=1e-6,
+                abs_tol=1e-7 * max(1.0, abs(expected_weight)),
+            ):
+                raise ValueError("Adaptive DMC cumulative role weight is inconsistent")
+            if self.role_samples[role] == 0 and self.role_loss_sum[role] != 0.0:
+                raise ValueError("Adaptive DMC empty role has a non-zero loss sum")
+
+        event_counts = {
+            "ratio_clip_count": self.ratio_clip_count,
+            "near_zero_count": self.near_zero_count,
+            "target_clamp_count": self.target_clamp_count,
+            "non_finite_fallback_count": self.non_finite_fallback_count,
+        }
+        if any(count > self.samples for count in event_counts.values()):
+            raise ValueError("Adaptive DMC event count exceeds total samples")
+        if self.ratio_samples > self.q_old_samples:
+            raise ValueError("Adaptive DMC ratio samples exceed q_old samples")
+        if self.ratio_clip_count > self.ratio_samples:
+            raise ValueError("Adaptive DMC clipped ratios exceed finite ratios")
+
+        if mode == ADMC_DISABLED:
+            disabled_values = (
+                self.q_old_sum,
+                self.q_old_square_sum,
+                self.q_old_samples,
+                self.q_drift_sum,
+                self.ratio_sum,
+                self.ratio_samples,
+                self.ratio_clip_count,
+                self.near_zero_count,
+                self.non_finite_fallback_count,
+            )
+            if any(value != 0 for value in disabled_values):
+                raise ValueError("ordinary DMC statistics contain adaptive-only state")
+        else:
+            if self.q_old_samples != self.samples:
+                raise ValueError("Adaptive DMC q_old sample count is incomplete")
+            if mode == ADMC_PAPER_RATIO and self.near_zero_count != 0:
+                raise ValueError("paper-ratio statistics contain safe-hybrid fallbacks")
+            if (
+                mode == ADMC_SAFE_HYBRID
+                and self.ratio_clip_count > self.samples - self.near_zero_count
+            ):
+                raise ValueError("safe-hybrid ratio and near-zero counts overlap")
+
 
 def h2_training_identity(
     model: V3HybridModel,
@@ -481,6 +566,7 @@ class V3H2Learner:
             transition.validate(
                 expected_schema_hash=self.model.schema.stable_hash(),
                 expected_target_transform=self.model.config.dmc_target_transform,
+                expected_ruleset_identity=self.ruleset.identity(),
                 adaptive_required=adaptive_required,
             )
             if adaptive_required:
@@ -766,11 +852,21 @@ class V3H2Learner:
         if schedule != expected_schedule:
             raise CheckpointCompatibilityError("H2 checkpoint schedule state mismatch")
 
-        statistics = AdaptiveDMCCumulativeStats.from_state_dict(
-            bundle["adaptive_statistics"]
-        )
-        if statistics.steps != learner_updates or statistics.samples != samples_consumed:
-            raise CheckpointCompatibilityError("H2 checkpoint statistics/counter drift")
+        try:
+            statistics = AdaptiveDMCCumulativeStats.from_state_dict(
+                bundle["adaptive_statistics"]
+            )
+            statistics.validate_invariants(
+                mode=self.config.adaptive_dmc.mode,
+                learner_updates=learner_updates,
+                samples_consumed=samples_consumed,
+                batch_size=self.config.batch_size,
+                role_weights=self.config.role_weights,
+            )
+        except (TypeError, ValueError) as exc:
+            raise CheckpointCompatibilityError(
+                f"H2 checkpoint cumulative statistics mismatch: {exc}"
+            ) from exc
         state_dict = bundle["model_state_dict"]
         if not isinstance(state_dict, dict) or set(state_dict) != set(self.model.state_dict()):
             raise CheckpointCompatibilityError("H2 checkpoint model state keys mismatch")

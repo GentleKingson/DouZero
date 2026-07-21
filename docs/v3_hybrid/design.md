@@ -95,15 +95,18 @@ H2 adds a standalone V3-only selected-action learner. It does not route V3
 through the Legacy or V2 trainers and does not implement the H7 actor/runtime
 topology. Each adaptive replay row binds the public tensor bundle, selected
 real legal-action index, acting role, episode/deal identity, raw terminal MC
-return, target transform, and immutable `PolicyLease` provenance (`q_old`,
-policy version, slot, owner, and generation). Ordinary DMC replay has no
-`q_old` dependency. Schema/version mismatches fail closed.
+return, target transform, complete ruleset id/version/hash, and immutable
+`PolicyLease` provenance (`q_old`, policy version, slot, owner, and generation).
+Ordinary DMC replay has no `q_old` dependency. Schema, ruleset, and protocol
+version mismatches fail closed at replay-buffer and learner admission.
 
 The learner supports three exclusive modes:
 
 - `disabled`: ordinary selected-action `MSE(q_new, transformed_mc_return)`;
 - `paper_ratio`: clamp `q_new / q_old` to `[1-gamma, 1+gamma]`, multiply by
-  sign-preserving `q_old`, then clamp to the representable target range;
+  sign-preserving `q_old`, then clamp to the representable target range; exact
+  zero `q_old` uses a branch-safe ordinary-prediction fallback with finite
+  gradients;
 - `safe_hybrid`: use the ratio path when `abs(q_old) >= epsilon`, otherwise
   clamp the additive change `q_new - q_old` to `[-delta, delta]`.
 
@@ -118,8 +121,10 @@ H2 trainer checkpoints strictly persist model, optimizer, learner update,
 clip schedule, policy version, cumulative finite statistics, and Python,
 NumPy, Torch, and CUDA RNG states. Resume rejects partial envelopes, changed
 model/learner/ruleset/schema identity, stale source SHA, replay protocol drift,
-or counter/schedule/statistic disagreement. Replay is explicitly flushed at a
-checkpoint boundary; H7 owns persistent actor/replay runtime integration.
+or counter/schedule/statistic disagreement. Cumulative statistics additionally
+validate role totals, configured role weights, adaptive-mode-only fields, and
+event-count bounds before any state is restored. Replay is explicitly flushed
+at a checkpoint boundary; H7 owns persistent actor/replay runtime integration.
 
 The frozen H1 public sidecar remains unchanged. A trained H2 model is released
 through that public-only sidecar, which excludes optimizer state, `q_old`,

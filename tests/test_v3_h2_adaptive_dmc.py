@@ -56,19 +56,29 @@ def _model(**overrides) -> V3HybridModel:
     return V3HybridModel(build_v2_schema(), _config(**overrides))
 
 
-def _observation(seed: int, role: str):
+def _observation(seed: int, role: str, *, ruleset: RuleSet | None = None):
     np.random.seed(seed)
     env = Env("adp")
     env.reset()
     for _ in range(80):
         if env._acting_player_position == role:
-            return get_obs_v2(env.infoset)
+            return (
+                get_obs_v2(env.infoset)
+                if ruleset is None
+                else get_obs_v2(env.infoset, ruleset=ruleset)
+            )
         env.step(env.infoset.legal_actions[0])
     raise AssertionError(f"could not reach {role}")
 
 
-def _plain_transition(seed: int, role: str, mc_return: float = 1.0):
-    observation = _observation(seed, role)
+def _plain_transition(
+    seed: int,
+    role: str,
+    mc_return: float = 1.0,
+    *,
+    ruleset: RuleSet | None = None,
+):
+    observation = _observation(seed, role, ruleset=ruleset)
     return capture_plain_transition(
         observation,
         selected_action_index=0,
@@ -240,7 +250,7 @@ def test_negative_q_old_sign_is_not_destroyed_by_ratio_clipping():
     assert result.constrained_q.item() == pytest.approx(-2.4)
 
 
-def test_nonfinite_inputs_fail_closed_and_paper_zero_records_fallback():
+def test_nonfinite_inputs_fail_closed_and_paper_zero_has_finite_backward():
     with pytest.raises(FloatingPointError, match="q_new"):
         adaptive_dmc_loss(
             torch.tensor([float("nan")]),
@@ -250,17 +260,21 @@ def test_nonfinite_inputs_fail_closed_and_paper_zero_records_fallback():
             target_clamp=32.0,
             learner_update=0,
         )
+    q_new = torch.tensor([0.0, 2.0], requires_grad=True)
     result = adaptive_dmc_loss(
-        torch.tensor([0.0]),
-        torch.tensor([0.0]),
+        q_new,
+        torch.tensor([0.0, 1.0]),
         config=AdaptiveDMCConfig(mode=ADMC_PAPER_RATIO),
         target_transform="raw",
         target_clamp=32.0,
         learner_update=0,
-        q_old=torch.tensor([0.0]),
+        q_old=torch.tensor([0.0, 0.0]),
     )
-    assert result.non_finite_fallback.item()
-    assert result.constrained_q.item() == 0.0
+    assert result.non_finite_fallback.tolist() == [True, True]
+    assert torch.equal(result.constrained_q, q_new)
+    result.loss_per_sample.sum().backward()
+    assert torch.isfinite(q_new.grad).all()
+    assert torch.equal(q_new.grad, torch.tensor([0.0, 2.0]))
 
 
 def test_q_old_is_captured_from_the_exact_eval_snapshot():
@@ -302,6 +316,7 @@ def test_replay_modes_serialization_and_old_schema_fail_closed():
         4,
         feature_schema_hash=build_v2_schema().stable_hash(),
         target_transform="raw",
+        ruleset_identity=RuleSet.legacy().identity(),
         adaptive_required=False,
     )
     ordinary.add(plain)
@@ -310,7 +325,7 @@ def test_replay_modes_serialization_and_old_schema_fail_closed():
     assert restored.sample(1, rng=__import__("random").Random(3))[0].deal_id == plain.deal_id
 
     old = ordinary.state_dict()
-    old["schema_version"] = 1
+    old["schema_version"] = 2
     with pytest.raises(ValueError, match="unsupported"):
         V3ReplayBuffer.from_state_dict(old)
     coercive = plain.state_dict()
@@ -326,6 +341,7 @@ def test_replay_modes_serialization_and_old_schema_fail_closed():
         4,
         feature_schema_hash=build_v2_schema().stable_hash(),
         target_transform="raw",
+        ruleset_identity=RuleSet.legacy().identity(),
         adaptive_required=True,
     )
     with pytest.raises(ValueError, match="missing actor-snapshot"):
@@ -339,6 +355,35 @@ def test_replay_modes_serialization_and_old_schema_fail_closed():
         V3ReplayTransition.from_state_dict(coercive_q)
     with pytest.raises(ValueError, match="must not depend"):
         ordinary.add(adaptive_row)
+
+
+def test_replay_and_learner_reject_complete_ruleset_mismatch():
+    custom_ruleset = dataclasses.replace(RuleSet.legacy(), bomb_multiplier=3)
+    custom = _plain_transition(
+        305, "landlord", ruleset=custom_ruleset
+    )
+    assert custom.ruleset_identity == custom_ruleset.identity()
+    assert custom.ruleset_hash != RuleSet.legacy().stable_hash()
+
+    learner = _learner(ADMC_DISABLED)
+    with pytest.raises(ValueError, match="ruleset identity mismatch"):
+        learner.train_batch([custom])
+
+    buffer = V3ReplayBuffer(
+        4,
+        feature_schema_hash=build_v2_schema().stable_hash(),
+        target_transform="raw",
+        ruleset_identity=RuleSet.legacy().identity(),
+        adaptive_required=False,
+    )
+    with pytest.raises(ValueError, match="ruleset identity mismatch"):
+        buffer.add(custom)
+
+    payload = custom.state_dict()
+    assert payload["ruleset_identity"] == custom_ruleset.identity()
+    payload.pop("ruleset_identity")
+    with pytest.raises(ValueError, match="envelope fields mismatch"):
+        V3ReplayTransition.from_state_dict(payload)
 
 
 def test_replay_import_and_payload_remain_public_only():
@@ -519,6 +564,46 @@ def test_checkpoint_identity_partial_load_and_public_loader_fail_closed(tmp_path
             ruleset=RuleSet.legacy(),
             config=_config(),
         )
+
+
+def test_checkpoint_rejects_corrupted_cumulative_statistics_invariants(tmp_path):
+    safe = _learner(ADMC_SAFE_HYBRID, model=_model())
+    snapshot = copy.deepcopy(safe.model).eval()
+    safe.train_batch([
+        _adaptive_transition(snapshot, 336, "landlord", policy_version=0),
+        _adaptive_transition(snapshot, 337, "landlord_up", policy_version=0),
+    ])
+    safe_path = tmp_path / "safe.ckpt"
+    safe.save_checkpoint(safe_path)
+    safe_bundle = torch.load(safe_path, weights_only=True)
+
+    corruptions = []
+    wrong_roles = copy.deepcopy(safe_bundle)
+    wrong_roles["adaptive_statistics"]["role_samples"]["landlord"] += 1
+    corruptions.append(("wrong-roles.ckpt", wrong_roles))
+    excessive_events = copy.deepcopy(safe_bundle)
+    excessive_events["adaptive_statistics"]["target_clamp_count"] = 3
+    corruptions.append(("excessive-events.ckpt", excessive_events))
+    for filename, bundle in corruptions:
+        path = tmp_path / filename
+        torch.save(bundle, path)
+        resumed = _learner(ADMC_SAFE_HYBRID, model=_model())
+        with pytest.raises(CheckpointCompatibilityError, match="cumulative statistics"):
+            resumed.load_checkpoint(path)
+        assert resumed.learner_updates == 0
+        assert resumed.samples_consumed == 0
+
+    ordinary = _learner(ADMC_DISABLED, model=_model())
+    ordinary.train_batch([_plain_transition(338, "landlord_down")])
+    ordinary_path = tmp_path / "ordinary.ckpt"
+    ordinary.save_checkpoint(ordinary_path)
+    adaptive_state = torch.load(ordinary_path, weights_only=True)
+    adaptive_state["adaptive_statistics"]["q_old_samples"] = 1
+    poisoned_path = tmp_path / "ordinary-with-q-old.ckpt"
+    torch.save(adaptive_state, poisoned_path)
+    resumed = _learner(ADMC_DISABLED, model=_model())
+    with pytest.raises(CheckpointCompatibilityError, match="cumulative statistics"):
+        resumed.load_checkpoint(poisoned_path)
 
 
 def test_h2_trained_model_exports_as_strict_public_h1_sidecar(tmp_path):

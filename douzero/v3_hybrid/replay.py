@@ -17,10 +17,11 @@ from douzero.runtime.policy_snapshot import PolicyLease
 from .config import DMC_TARGET_RAW, DMC_TARGET_SIGNED_LOG
 from .model import V3_HYBRID_ROLES, V3HybridModel
 
-V3_H2_REPLAY_SCHEMA_VERSION = 2
-V3_H2_REPLAY_SEMANTICS = "selected_action_actor_snapshot_q_old_v1"
+V3_H2_REPLAY_SCHEMA_VERSION = 3
+V3_H2_REPLAY_SEMANTICS = "selected_action_actor_snapshot_q_old_ruleset_v2"
 
 _TRANSFORMS = frozenset({DMC_TARGET_RAW, DMC_TARGET_SIGNED_LOG})
+_RULESET_IDENTITY_KEYS = frozenset({"ruleset_id", "ruleset_version", "ruleset_hash"})
 _TENSOR_FIELDS = (
     "state_context_flat",
     "context_flat",
@@ -29,6 +30,23 @@ _TENSOR_FIELDS = (
     "action_features",
     "action_mask",
 )
+
+
+def _normalize_ruleset_identity(identity: Mapping[str, object]) -> dict[str, str]:
+    if not isinstance(identity, Mapping) or set(identity) != _RULESET_IDENTITY_KEYS:
+        raise ValueError("V3 replay ruleset identity fields mismatch")
+    normalized: dict[str, str] = {}
+    for name in ("ruleset_id", "ruleset_version", "ruleset_hash"):
+        value = identity[name]
+        if not isinstance(value, str) or not value:
+            raise TypeError(f"V3 replay {name} must be a non-empty string")
+        normalized[name] = value
+    ruleset_hash = normalized["ruleset_hash"]
+    if len(ruleset_hash) != 64 or any(
+        character not in "0123456789abcdef" for character in ruleset_hash
+    ):
+        raise ValueError("V3 replay ruleset_hash must be a full SHA-256")
+    return normalized
 
 
 def _clone_public_bundle(observation: ObservationV2) -> ModelInputBundle:
@@ -139,7 +157,18 @@ class PendingV3Transition:
     episode_id: str
     deal_id: str
     target_transform: str
+    ruleset_id: str
+    ruleset_version: str
+    ruleset_hash: str
     adaptive_provenance: AdaptiveSnapshotProvenance | None = None
+
+    @property
+    def ruleset_identity(self) -> dict[str, str]:
+        return {
+            "ruleset_id": self.ruleset_id,
+            "ruleset_version": self.ruleset_version,
+            "ruleset_hash": self.ruleset_hash,
+        }
 
     def finalize(self, mc_return: float) -> "V3ReplayTransition":
         transition = V3ReplayTransition(
@@ -149,12 +178,16 @@ class PendingV3Transition:
             episode_id=self.episode_id,
             deal_id=self.deal_id,
             target_transform=self.target_transform,
+            ruleset_id=self.ruleset_id,
+            ruleset_version=self.ruleset_version,
+            ruleset_hash=self.ruleset_hash,
             mc_return=float(mc_return),
             adaptive_provenance=self.adaptive_provenance,
         )
         transition.validate(
             expected_schema_hash=self.model_inputs.feature_schema_hash,
             expected_target_transform=self.target_transform,
+            expected_ruleset_identity=self.ruleset_identity,
             adaptive_required=self.adaptive_provenance is not None,
         )
         return transition
@@ -170,6 +203,11 @@ def _pending_from_observation(
     provenance: AdaptiveSnapshotProvenance | None,
 ) -> PendingV3Transition:
     bundle = _clone_public_bundle(observation)
+    ruleset_identity = _normalize_ruleset_identity({
+        "ruleset_id": observation.public.ruleset_id,
+        "ruleset_version": observation.public.ruleset_version,
+        "ruleset_hash": observation.public.ruleset_hash,
+    })
     if isinstance(selected_action_index, bool) or not isinstance(selected_action_index, int):
         raise TypeError("selected_action_index must be an int")
     count = int(bundle.action_features.shape[0])
@@ -189,6 +227,7 @@ def _pending_from_observation(
         episode_id=episode_id,
         deal_id=deal_id,
         target_transform=target_transform,
+        **ruleset_identity,
         adaptive_provenance=provenance,
     )
 
@@ -268,17 +307,33 @@ class V3ReplayTransition:
     episode_id: str
     deal_id: str
     target_transform: str
+    ruleset_id: str
+    ruleset_version: str
+    ruleset_hash: str
     mc_return: float
     adaptive_provenance: AdaptiveSnapshotProvenance | None
+
+    @property
+    def ruleset_identity(self) -> dict[str, str]:
+        return {
+            "ruleset_id": self.ruleset_id,
+            "ruleset_version": self.ruleset_version,
+            "ruleset_hash": self.ruleset_hash,
+        }
 
     def validate(
         self,
         *,
         expected_schema_hash: str,
         expected_target_transform: str,
+        expected_ruleset_identity: Mapping[str, object],
         adaptive_required: bool,
     ) -> None:
         _validate_bundle(self.model_inputs, expected_schema_hash)
+        actual_ruleset = _normalize_ruleset_identity(self.ruleset_identity)
+        expected_ruleset = _normalize_ruleset_identity(expected_ruleset_identity)
+        if actual_ruleset != expected_ruleset:
+            raise ValueError("V3 replay ruleset identity mismatch")
         if self.role != self.model_inputs.acting_role or self.role not in V3_HYBRID_ROLES:
             raise ValueError("V3 replay role does not match its public inputs")
         count = int(self.model_inputs.action_features.shape[0])
@@ -325,6 +380,7 @@ class V3ReplayTransition:
             "episode_id": self.episode_id,
             "deal_id": self.deal_id,
             "target_transform": self.target_transform,
+            "ruleset_identity": self.ruleset_identity,
             "mc_return": float(self.mc_return),
             "adaptive_provenance": (
                 None
@@ -338,7 +394,8 @@ class V3ReplayTransition:
         expected = {
             "schema_version", "semantics", "model_inputs", "acting_role",
             "feature_schema_hash", "selected_action_index", "role", "episode_id",
-            "deal_id", "target_transform", "mc_return", "adaptive_provenance",
+            "deal_id", "target_transform", "ruleset_identity", "mc_return",
+            "adaptive_provenance",
         }
         if not isinstance(payload, Mapping) or set(payload) != expected:
             raise ValueError("V3 replay envelope fields mismatch")
@@ -346,6 +403,7 @@ class V3ReplayTransition:
             raise ValueError("unsupported V3 replay schema version")
         if payload["semantics"] != V3_H2_REPLAY_SEMANTICS:
             raise ValueError("V3 replay semantics mismatch")
+        ruleset_identity = _normalize_ruleset_identity(payload["ruleset_identity"])
         tensors = payload["model_inputs"]
         tensor_keys = {
             "state_card_vectors", "state_context_flat", "context_card_vectors",
@@ -390,6 +448,7 @@ class V3ReplayTransition:
             episode_id=payload["episode_id"],
             deal_id=payload["deal_id"],
             target_transform=payload["target_transform"],
+            **ruleset_identity,
             mc_return=payload["mc_return"],
             adaptive_provenance=(
                 None
@@ -408,6 +467,7 @@ class V3ReplayBuffer:
         *,
         feature_schema_hash: str,
         target_transform: str,
+        ruleset_identity: Mapping[str, object],
         adaptive_required: bool,
     ) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
@@ -421,6 +481,7 @@ class V3ReplayBuffer:
         self.capacity = capacity
         self.feature_schema_hash = feature_schema_hash
         self.target_transform = target_transform
+        self.ruleset_identity = _normalize_ruleset_identity(ruleset_identity)
         self.adaptive_required = adaptive_required
         self._records: deque[V3ReplayTransition] = deque(maxlen=capacity)
 
@@ -433,6 +494,7 @@ class V3ReplayBuffer:
         transition.validate(
             expected_schema_hash=self.feature_schema_hash,
             expected_target_transform=self.target_transform,
+            expected_ruleset_identity=self.ruleset_identity,
             adaptive_required=self.adaptive_required,
         )
         self._records.append(transition)
@@ -457,6 +519,7 @@ class V3ReplayBuffer:
             "capacity": self.capacity,
             "feature_schema_hash": self.feature_schema_hash,
             "target_transform": self.target_transform,
+            "ruleset_identity": dict(self.ruleset_identity),
             "adaptive_required": self.adaptive_required,
             "records": [record.state_dict() for record in self._records],
         }
@@ -465,7 +528,7 @@ class V3ReplayBuffer:
     def from_state_dict(cls, payload: Mapping[str, object]) -> "V3ReplayBuffer":
         expected = {
             "schema_version", "semantics", "capacity", "feature_schema_hash",
-            "target_transform", "adaptive_required", "records",
+            "target_transform", "ruleset_identity", "adaptive_required", "records",
         }
         if not isinstance(payload, Mapping) or set(payload) != expected:
             raise ValueError("V3 replay buffer fields mismatch")
@@ -488,6 +551,7 @@ class V3ReplayBuffer:
             payload["capacity"],
             feature_schema_hash=payload["feature_schema_hash"],
             target_transform=payload["target_transform"],
+            ruleset_identity=payload["ruleset_identity"],
             adaptive_required=payload["adaptive_required"],
         )
         records = payload["records"]

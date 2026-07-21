@@ -227,12 +227,16 @@ def adaptive_dmc_loss(
         upper = 1.0 + gamma
 
         if config.mode == ADMC_PAPER_RATIO:
-            ratio = current / previous
+            stable = previous != 0.0
+            denominator = torch.where(stable, previous, torch.ones_like(previous))
+            ratio = torch.where(
+                stable, current / denominator, torch.ones_like(current)
+            )
             clipped_ratio = ratio.clamp(lower, upper)
             candidate = clipped_ratio * previous
-            non_finite = ~torch.isfinite(candidate)
+            non_finite = ~stable | ~torch.isfinite(candidate)
             constrained = torch.where(non_finite, current, candidate)
-            ratio_clipped = torch.isfinite(ratio) & (ratio != clipped_ratio)
+            ratio_clipped = stable & torch.isfinite(ratio) & (ratio != clipped_ratio)
         else:
             near_zero = previous.abs() < config.epsilon
             stable = ~near_zero
