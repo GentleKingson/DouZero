@@ -389,6 +389,12 @@ def test_safe_hybrid_learner_metrics_and_policy_lag():
             records[0].adaptive_provenance, q_old=0.0
         ),
     )
+    records[1] = dataclasses.replace(
+        records[1],
+        adaptive_provenance=dataclasses.replace(
+            records[1].adaptive_provenance, q_old=1.0
+        ),
+    )
     metrics = learner.train_batch(records)
     assert metrics.near_zero_fallback_fraction == pytest.approx(0.5)
     assert metrics.max_policy_lag == 2
