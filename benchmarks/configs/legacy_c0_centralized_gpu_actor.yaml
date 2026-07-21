@@ -3,7 +3,7 @@ xpid: legacy-c0-centralized-gpu-actor
 actor_device_cpu: true
 training_device: "0"
 num_actor_devices: 1
-num_actors: 12
+num_actors: 8
 num_threads: 1
 batch_size: 32
 unroll_length: 100
@@ -28,7 +28,7 @@ central_actor_envs_per_actor: 4
 central_actor_min_microbatch: 2
 central_actor_target_microbatch: 8
 central_actor_max_microbatch: 16
-central_actor_max_delay_ms: 2.0
+central_actor_max_delay_ms: 4.0
 central_actor_max_pending_requests: 128
 central_actor_queue_high_watermark: 32
 central_actor_inference_deadline_ms: 10.0
