@@ -533,17 +533,23 @@ def _to_markdown(bundle):
         "",
         "## Model-forward-only latency (landlord, NOT end-to-end)",
         "",
-        "| actions | legacy median (ms) | factorized split median (ms) | speedup |",
-        "|---:|---:|---:|---:|",
+        "| actions | legacy median (ms) | unsplit dense1 (ms) | "
+        "adaptive split dense1 (ms) | dense1 speedup | legacy speedup |",
+        "|---:|---:|---:|---:|---:|---:|",
     ]
     mfo = bundle["results"].get("model_forward_only", {})
     full_n = bundle["results"].get("full_action_count", "?")
     for name, b in mfo.items():
         legacy_md = b["legacy_model_forward"]["median_ms"]
         fact_md = b["factorized_model_forward_split_obs"]["median_ms"]
+        unsplit_md = b[
+            "factorized_model_forward_split_obs_unsplit_dense1"
+        ]["median_ms"]
+        dense1_sp = b["speedup_median_adaptive_split_dense1"]
         sp = b["speedup_median_split_vs_legacy"]
         lines.append(
-            f"| {name} (full={full_n}) | {legacy_md} | {fact_md} | {sp} |"
+            f"| {name} (full={full_n}) | {legacy_md} | {unsplit_md} | "
+            f"{fact_md} | {dense1_sp} | {sp} |"
         )
     lines += [
         "",

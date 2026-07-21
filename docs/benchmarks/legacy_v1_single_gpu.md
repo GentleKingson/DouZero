@@ -176,6 +176,34 @@ production default is `highest`; `legacy_a5_cpu_factorized_tf32.yaml` measures
 existing fixed-shape learner compile path. Neither changes actor precision or
 the Legacy checkpoint parameter contract.
 
+## Legacy A1 model-optimization decision record
+
+The model-optimization work started at
+`22a891cb98212e788d1e77a6c5a92bc21e1847d0`; all C0 commits below that point
+remain unchanged. A1 remains the production topology and C0 remains an
+experimental comparison target.
+
+On the RTX 5070 test host, the 200-round CPU attribution benchmark measured
+adaptive split-dense1 speedups over the original Legacy forward of `1.103x`
+at 10 actions, `1.412x` at 50 actions, and `1.695x` at 287 actions. One-action
+latency regressed to `0.968x`, which is why the experiment retains the
+single-action bypass and only applies the split above its action-count
+threshold.
+
+Two complete formal 8-actor/48-buffer A1 runs at commit `94a2fec` measured
+`12,632.96` and `12,729.28` frames/s, with `13,023.60` and `13,026.43`
+decisions/s. Both reported CUDA available, zero live learner threads at exit,
+and completed checkpoint output. The third repeat was killed externally at
+startup on this host, so this is diagnostic evidence rather than a promotable
+three-repeat result.
+
+Accordingly, adaptive A1 split-dense1, TF32, and learner compile remain
+opt-in. Reusable pinned/device staging and per-snapshot role lookup caching are
+retained because their correctness tests pass and they do not alter model or
+checkpoint identity. Production A1 keeps `legacy_matmul_precision: highest`,
+AMP disabled, and compile disabled until a complete three-repeat run clears
+both throughput and numerical gates.
+
 ### Optimized C0 runtime
 
 The current experimental configuration uses `central_actor_runtime: thread`.
