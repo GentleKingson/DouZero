@@ -25,6 +25,7 @@ from douzero.observation.schema import (
 )
 from douzero.runtime.policy_snapshot import PolicyLease
 
+from .belief_policy import V3BeliefPolicy
 from .config import DMC_TARGET_RAW, DMC_TARGET_SIGNED_LOG
 from .model import V3_HYBRID_ROLES, V3HybridModel
 
@@ -325,7 +326,7 @@ def capture_plain_transition(
 
 
 def capture_adaptive_transition(
-    lease: PolicyLease[V3HybridModel],
+    lease: PolicyLease[V3HybridModel | V3BeliefPolicy],
     observation: ObservationV2,
     *,
     selected_action_index: int,
@@ -337,11 +338,17 @@ def capture_adaptive_transition(
 
     if not isinstance(lease, PolicyLease):
         raise TypeError("Adaptive DMC capture requires a PolicyLease")
-    if not isinstance(lease.model, V3HybridModel):
-        raise TypeError("Adaptive DMC lease must contain a V3HybridModel")
+    if isinstance(lease.model, V3HybridModel):
+        student = lease.model
+    elif isinstance(lease.model, V3BeliefPolicy):
+        student = lease.model.model
+    else:
+        raise TypeError(
+            "Adaptive DMC lease must contain a V3HybridModel or V3BeliefPolicy"
+        )
     if lease.model.training:
         raise ValueError("actor policy snapshot must be in eval mode")
-    if target_transform != lease.model.config.dmc_target_transform:
+    if target_transform != student.config.dmc_target_transform:
         raise ValueError("replay target transform does not match the snapshot model")
     with torch.inference_mode():
         output = lease.model.forward_observation(observation)

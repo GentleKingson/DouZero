@@ -11,11 +11,19 @@ HISTORY_ENCODER_LSTM = "lstm"
 HISTORY_ENCODER_TRANSFORMER = "transformer"
 CHANNEL_GATE_NONE = "none"
 CHANNEL_GATE_SE = "se"
+BELIEF_FEEDBACK_NONE = "none"
+BELIEF_FEEDBACK_FARMERS = "farmers"
+BELIEF_FEEDBACK_ALL = "all_roles"
 DMC_TARGET_RAW = "raw"
 DMC_TARGET_SIGNED_LOG = "signed_log"
 
 _HISTORY_ENCODERS = frozenset({HISTORY_ENCODER_LSTM, HISTORY_ENCODER_TRANSFORMER})
 _CHANNEL_GATES = frozenset({CHANNEL_GATE_NONE, CHANNEL_GATE_SE})
+_BELIEF_FEEDBACK = frozenset({
+    BELIEF_FEEDBACK_NONE,
+    BELIEF_FEEDBACK_FARMERS,
+    BELIEF_FEEDBACK_ALL,
+})
 _DMC_TARGETS = frozenset({DMC_TARGET_RAW, DMC_TARGET_SIGNED_LOG})
 
 
@@ -44,8 +52,9 @@ class V3HybridModelConfig:
     dmc_target_transform: str = DMC_TARGET_RAW
     dmc_target_clamp: float = 32.0
     nan_guard: bool = True
+    belief_feedback: str = BELIEF_FEEDBACK_NONE
 
-    IDENTITY_VERSION = 1
+    IDENTITY_VERSION = 2
 
     def __post_init__(self) -> None:
         for name in (
@@ -89,6 +98,11 @@ class V3HybridModelConfig:
             raise ValueError(
                 "farmer_channel_gate_reduction must not reduce hidden_size below 1"
             )
+        if self.belief_feedback not in _BELIEF_FEEDBACK:
+            raise ValueError(
+                f"belief_feedback must be one of {sorted(_BELIEF_FEEDBACK)}, "
+                f"got {self.belief_feedback!r}"
+            )
         for name in ("history_dropout", "adapter_dropout"):
             value = getattr(self, name)
             if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -126,6 +140,14 @@ class V3HybridModelConfig:
                 "dmc_q": "acting_team_monte_carlo_return",
                 "win": "acting_team_probability",
                 "score": "acting_team_conditional_signed_score",
+            },
+            "belief_feedback": {
+                "mode": self.belief_feedback,
+                "layout": (
+                    "disabled_no_parameters"
+                    if self.belief_feedback == BELIEF_FEEDBACK_NONE
+                    else "detached_exact_constrained_posterior_features_v1"
+                ),
             },
         }
 

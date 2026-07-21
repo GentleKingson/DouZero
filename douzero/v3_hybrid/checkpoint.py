@@ -18,7 +18,7 @@ from douzero.checkpoint.manifest import (
 from douzero.env.rules import RuleSet
 from douzero.observation.schema import FeatureSchemaManifest
 
-from .config import V3HybridModelConfig
+from .config import BELIEF_FEEDBACK_NONE, V3HybridModelConfig
 from .contract import (
     V3_HYBRID_CHECKPOINT_KIND,
     V3_HYBRID_FEATURE_VERSION,
@@ -140,6 +140,10 @@ def save_v3_hybrid_public_checkpoint(
         raise TypeError("public checkpoint requires a V3HybridModel")
     if not isinstance(ruleset, RuleSet):
         raise TypeError("public checkpoint requires a RuleSet")
+    if model.config.belief_feedback != BELIEF_FEEDBACK_NONE:
+        raise ValueError(
+            "belief-feedback policies require the coupled H4 public checkpoint"
+        )
     bound_ruleset = getattr(model, "expected_ruleset_identity", None)
     requested_ruleset = (
         ruleset.ruleset_id,
@@ -214,6 +218,10 @@ def load_v3_hybrid_public_checkpoint(
         raise TypeError("ruleset must be a RuleSet")
     if not isinstance(config, V3HybridModelConfig):
         raise TypeError("config must be a V3HybridModelConfig")
+    if config.belief_feedback != BELIEF_FEEDBACK_NONE:
+        raise CheckpointCompatibilityError(
+            "H1 public loader cannot construct a coupled H4 belief policy"
+        )
     checkpoint = Path(path)
     bundle = _load_bundle(checkpoint, device)
     if bundle["format"] != V3_HYBRID_H1_CHECKPOINT_FORMAT:

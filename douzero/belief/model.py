@@ -74,6 +74,7 @@ class BeliefConfig:
     dropout: float = 0.0
     style_enabled: bool = False
     style_embedding_dim: int = 32
+    shared_context_dim: int = 0
     #: Identity version; bump when the compatibility-dict field set changes.
     IDENTITY_VERSION: ClassVar[int] = 1
 
@@ -96,6 +97,12 @@ class BeliefConfig:
             raise ValueError(
                 f"style_embedding_dim must be positive, got {self.style_embedding_dim}"
             )
+        if (
+            isinstance(self.shared_context_dim, bool)
+            or not isinstance(self.shared_context_dim, int)
+            or self.shared_context_dim < 0
+        ):
+            raise ValueError("shared_context_dim must be a non-negative int")
 
     def compatibility_dict(self) -> dict:
         compatibility = {
@@ -117,6 +124,11 @@ class BeliefConfig:
                 "style_embedding_dim": self.style_embedding_dim,
                 "style_feature_version": STYLE_FEATURE_VERSION,
                 "style_layout_hash": STYLE_LAYOUT_HASH,
+            })
+        if self.shared_context_dim:
+            compatibility.update({
+                "shared_context_dim": self.shared_context_dim,
+                "shared_context_semantics": "v3_public_state_history_mean_v1",
             })
         return compatibility
 
@@ -223,6 +235,7 @@ class BeliefModel(nn.Module):
                 hidden_dim=self.config.style_embedding_dim,
             )
             encoder_input_dim += self.config.style_embedding_dim
+        encoder_input_dim += self.config.shared_context_dim
         self.encoder = _build_mlp(
             encoder_input_dim,
             self.config.hidden_size,
@@ -239,6 +252,7 @@ class BeliefModel(nn.Module):
         self,
         feature_matrix: torch.Tensor,
         style_features: torch.Tensor | None = None,
+        shared_context: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode a ``(B, BELIEF_INPUT_DIM)`` matrix to ``(B, 15, 5)`` logits."""
         if feature_matrix.shape[-1] != BELIEF_INPUT_DIM:
@@ -260,6 +274,20 @@ class BeliefModel(nn.Module):
             raise ValueError(
                 "style_features were passed to a style-disabled BeliefModel"
             )
+        if self.config.shared_context_dim:
+            expected = (*feature_matrix.shape[:-1], self.config.shared_context_dim)
+            if shared_context is None or tuple(shared_context.shape) != expected:
+                raise ValueError(
+                    f"shared_context must have shape {expected} for this BeliefModel"
+                )
+            shared_context = shared_context.to(
+                device=feature_matrix.device, dtype=feature_matrix.dtype
+            )
+            feature_matrix = torch.cat([feature_matrix, shared_context], dim=-1)
+        elif shared_context is not None:
+            raise ValueError(
+                "shared_context was passed to a context-independent BeliefModel"
+            )
         h = self.encoder(feature_matrix)
         flat = self.head(h)
         return flat.view(*feature_matrix.shape[:-1], NUM_BELIEF_RANKS, NUM_COUNT_SLOTS)
@@ -269,6 +297,7 @@ class BeliefModel(nn.Module):
         inputs: list[BeliefInput] | BeliefInput,
         *,
         differentiable: bool = False,
+        shared_context: torch.Tensor | None = None,
     ) -> BeliefOutput:
         """Run a forward pass for one (or a batch of) :class:`BeliefInput`.
 
@@ -322,7 +351,9 @@ class BeliefModel(nn.Module):
         )  # (B,)
         roles = [inp.opponent_a_role for inp in inputs]
 
-        logits = self._forward_logits(feature_matrix, style_matrix)
+        logits = self._forward_logits(
+            feature_matrix, style_matrix, shared_context
+        )
         legal = torch.as_tensor(legal_np, device=logits.device).bool()
         # Masked softmax and constrained partition arithmetic are intentionally
         # float32 even when the encoder runs under autocast.
@@ -367,10 +398,15 @@ class BeliefModel(nn.Module):
         )
 
     def forward_differentiable(
-        self, inputs: list[BeliefInput] | BeliefInput
+        self,
+        inputs: list[BeliefInput] | BeliefInput,
+        *,
+        shared_context: torch.Tensor | None = None,
     ) -> BeliefOutput:
         """Convenience wrapper for the graph-preserving training path."""
-        return self.forward(inputs, differentiable=True)
+        return self.forward(
+            inputs, differentiable=True, shared_context=shared_context
+        )
 
     # ------------------------------------------------------------------ #
     # Constrained decoding / sampling

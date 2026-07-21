@@ -26,7 +26,13 @@ from douzero.observation.schema import (
     state_width,
 )
 
-from .config import CHANNEL_GATE_SE, V3HybridModelConfig
+from .config import (
+    BELIEF_FEEDBACK_ALL,
+    BELIEF_FEEDBACK_FARMERS,
+    BELIEF_FEEDBACK_NONE,
+    CHANNEL_GATE_SE,
+    V3HybridModelConfig,
+)
 from .contract import V3_HYBRID_OBSERVATION_SCHEMA_HASH
 from .layers import RoleAdapter, RoleValueHeads, SharedStateActionFusion
 from .output import BatchedV3HybridModelOutput, V3HybridModelOutput
@@ -130,6 +136,16 @@ class V3HybridModel(nn.Module):
             )
             for role in V3_HYBRID_ROLES
         })
+        self.belief_projection: nn.Module | None = None
+        self._belief_feature_dim = 0
+        if cfg.belief_feedback != BELIEF_FEEDBACK_NONE:
+            from douzero.belief.model import BELIEF_FEATURE_DIM
+
+            self._belief_feature_dim = BELIEF_FEATURE_DIM
+            self.belief_projection = nn.Sequential(
+                nn.Linear(BELIEF_FEATURE_DIM, cfg.hidden_size, bias=False),
+                nn.LayerNorm(cfg.hidden_size),
+            )
 
     def role_index(self, role: str) -> int:
         try:
@@ -186,6 +202,63 @@ class V3HybridModel(nn.Module):
             if not bool(torch.isfinite(valid).all()):
                 raise NumericalError(f"{prefix}{name} contains NaN or Inf")
 
+    def _role_uses_belief(self, role: str) -> bool:
+        return self.config.belief_feedback == BELIEF_FEEDBACK_ALL or (
+            self.config.belief_feedback == BELIEF_FEEDBACK_FARMERS
+            and role != "landlord"
+        )
+
+    def _apply_scalar_belief(
+        self,
+        shared: torch.Tensor,
+        acting_role: str,
+        belief_features: torch.Tensor | None,
+    ) -> torch.Tensor:
+        uses_belief = self._role_uses_belief(acting_role)
+        if not uses_belief:
+            if belief_features is not None and self.config.belief_feedback == BELIEF_FEEDBACK_NONE:
+                raise ValueError("belief features were passed to a belief-disabled V3 model")
+            return shared
+        if belief_features is None:
+            raise ValueError("belief features are required by this V3 role")
+        if belief_features.shape != (self._belief_feature_dim,):
+            raise ValueError(
+                f"belief_features must have shape ({self._belief_feature_dim},)"
+            )
+        parameter = next(self.belief_projection.parameters())
+        features = belief_features.detach().to(
+            device=shared.device, dtype=parameter.dtype
+        )
+        return shared + self.belief_projection(features).to(shared.dtype).unsqueeze(0)
+
+    def _apply_batched_belief(
+        self,
+        shared: torch.Tensor,
+        acting_role: torch.Tensor,
+        belief_features: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.config.belief_feedback == BELIEF_FEEDBACK_NONE:
+            if belief_features is not None:
+                raise ValueError("belief features were passed to a belief-disabled V3 model")
+            return shared
+        if belief_features is None:
+            raise ValueError("belief features are required by this V3 batch")
+        if belief_features.shape != (shared.shape[0], self._belief_feature_dim):
+            raise ValueError(
+                "belief_features must have shape "
+                f"({shared.shape[0]}, {self._belief_feature_dim})"
+            )
+        parameter = next(self.belief_projection.parameters())
+        projected = self.belief_projection(
+            belief_features.detach().to(device=shared.device, dtype=parameter.dtype)
+        ).to(shared.dtype)
+        if self.config.belief_feedback == BELIEF_FEEDBACK_FARMERS:
+            enabled = (acting_role != V3_HYBRID_ROLE_TO_INDEX["landlord"]).to(
+                shared.dtype
+            )
+            projected = projected * enabled.unsqueeze(-1)
+        return shared + projected.unsqueeze(1)
+
     def forward(
         self,
         state_card_vectors: tuple[torch.Tensor, ...],
@@ -197,6 +270,7 @@ class V3HybridModel(nn.Module):
         action_features: torch.Tensor,
         action_mask: torch.Tensor,
         acting_role: str,
+        belief_features: torch.Tensor | None = None,
     ) -> V3HybridModelOutput:
         """Score one public decision without assuming a maximum action count."""
 
@@ -210,6 +284,9 @@ class V3HybridModel(nn.Module):
             history_tokens,
             history_key_padding_mask,
             action_features,
+        )
+        shared = self._apply_scalar_belief(
+            shared, acting_role, belief_features
         )
         adapted = self.role_adapters[acting_role](shared)
         values = self.role_heads[acting_role](adapted)
@@ -250,6 +327,7 @@ class V3HybridModel(nn.Module):
         action_features: torch.Tensor,
         action_mask: torch.Tensor,
         acting_role: torch.Tensor,
+        belief_features: torch.Tensor | None = None,
     ) -> BatchedV3HybridModelOutput:
         """Score a padded heterogeneous-role batch with independent adapters."""
 
@@ -262,6 +340,9 @@ class V3HybridModel(nn.Module):
         history = self.history_encoder(history_tokens, history_key_padding_mask)
         action_embeddings = self.action_encoder(action_features)
         shared = self.shared_fusion.forward_batched(state, history, action_embeddings)
+        shared = self._apply_batched_belief(
+            shared, acting_role, belief_features
+        )
 
         outputs = {
             name: shared.new_zeros((batch, actions, 1))
@@ -328,7 +409,12 @@ class V3HybridModel(nn.Module):
                 )
         return bundle
 
-    def forward_observation(self, observation: object) -> V3HybridModelOutput:
+    def forward_observation(
+        self,
+        observation: object,
+        *,
+        belief_features: torch.Tensor | None = None,
+    ) -> V3HybridModelOutput:
         obs = self._check_public_observation(observation)
         bundle = self._move_bundle(observation_to_model_inputs(obs))
         return self(
@@ -341,10 +427,15 @@ class V3HybridModel(nn.Module):
             bundle.action_features,
             bundle.action_mask,
             bundle.acting_role,
+            belief_features,
         )
 
     def forward_observation_batch(
-        self, observations: Iterable[object], *, pad_to_actions: int | None = None
+        self,
+        observations: Iterable[object],
+        *,
+        pad_to_actions: int | None = None,
+        belief_features: torch.Tensor | None = None,
     ) -> BatchedV3HybridModelOutput:
         public = [self._check_public_observation(obs) for obs in observations]
         if not public:
@@ -352,10 +443,13 @@ class V3HybridModel(nn.Module):
         inputs = observation_batch_to_model_inputs(
             public, pad_to_actions=pad_to_actions
         )
-        return self.forward_input_batch(inputs)
+        return self.forward_input_batch(inputs, belief_features=belief_features)
 
     def forward_input_batch(
-        self, inputs: BatchedModelInputBundle
+        self,
+        inputs: BatchedModelInputBundle,
+        *,
+        belief_features: torch.Tensor | None = None,
     ) -> BatchedV3HybridModelOutput:
         """Forward an already tensorized public replay or inference batch."""
 
@@ -378,7 +472,41 @@ class V3HybridModel(nn.Module):
             inputs.action_features.to(dtype=parameter.dtype),
             inputs.action_mask,
             inputs.acting_role,
+            belief_features=belief_features,
         )
+
+    def encode_input_batch_context(
+        self, inputs: BatchedModelInputBundle
+    ) -> torch.Tensor:
+        """Encode one public context vector per decision for belief supervision."""
+
+        if not isinstance(inputs, BatchedModelInputBundle):
+            raise TypeError("V3 context encoding requires BatchedModelInputBundle")
+        expected_hash = self.schema.stable_hash()
+        if not inputs.feature_schema_hashes or any(
+            value != expected_hash for value in inputs.feature_schema_hashes
+        ):
+            raise ValueError("V3 context input feature schema mismatch")
+        parameter = next(self.parameters())
+        inputs.to(parameter.device)
+        cards = tuple(
+            value.to(dtype=parameter.dtype) for value in inputs.state_card_vectors
+        ) + tuple(
+            value.to(dtype=parameter.dtype) for value in inputs.context_card_vectors
+        )
+        context = torch.cat(
+            (
+                inputs.state_context_flat.to(dtype=parameter.dtype),
+                inputs.context_flat.to(dtype=parameter.dtype),
+            ),
+            dim=-1,
+        )
+        state = self.state_encoder(cards, context)
+        history = self.history_encoder(
+            inputs.history_tokens.to(dtype=parameter.dtype),
+            inputs.history_key_padding_mask,
+        )
+        return (state + history) * 0.5
 
     def act(self, observation: object, *, output: str = "dmc_q") -> tuple[int, ...]:
         obs = self._check_public_observation(observation)
@@ -409,6 +537,8 @@ class V3HybridModel(nn.Module):
             (f"heads.{role}", self.role_heads[role])
             for role in V3_HYBRID_ROLES
         )
+        if self.belief_projection is not None:
+            modules.append(("belief_projection", self.belief_projection))
         counts = {
             name: sum(parameter.numel() for parameter in module.parameters())
             for name, module in modules
