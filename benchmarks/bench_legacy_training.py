@@ -208,6 +208,17 @@ def _flatten(payload):
     }
 
 
+def _validate_policy_lag(row, max_updates):
+    if max_updates is None:
+        return
+    observed = row["policy_lag_max"]
+    if observed > max_updates:
+        raise RuntimeError(
+            "policy lag exceeded the configured upper bound: "
+            f"observed {observed} updates, allowed {max_updates}"
+        )
+
+
 def _aggregate(rows):
     result = {}
     numeric_keys = [
@@ -285,6 +296,10 @@ def main(argv=None):
         help="Keep checkpoints enabled and require a final model.tar per repeat",
     )
     parser.add_argument(
+        "--max_policy_lag_updates", type=int,
+        help="Fail when any repeat observes a larger maximum policy lag",
+    )
+    parser.add_argument(
         "--docker_image_digest", default=os.environ.get("DOUZERO_IMAGE_DIGEST"),
         help=(
             "Caller-declared immutable image ID/digest recorded in evidence; "
@@ -312,6 +327,8 @@ def main(argv=None):
         raise ValueError("at least three repetitions are required")
     if args.warmup_frames < 0 or args.measure_frames <= 0:
         raise ValueError("warmup_frames must be non-negative and measure_frames positive")
+    if args.max_policy_lag_updates is not None and args.max_policy_lag_updates < 0:
+        raise ValueError("max_policy_lag_updates must be non-negative")
 
     configs = [Path(item).resolve() for item in args.config]
     if not configs:
@@ -402,6 +419,7 @@ def main(argv=None):
                 ),
                 **_flatten(payload),
             }
+            _validate_policy_lag(row, args.max_policy_lag_updates)
             raw_rows.append(row)
             candidate_rows.append(row)
         aggregate[config.stem] = {
@@ -417,6 +435,7 @@ def main(argv=None):
             "measure_frames": args.measure_frames,
             "repeats": args.repeats,
             "checkpoint_disabled": not args.checkpoint_enabled,
+            "max_policy_lag_updates": args.max_policy_lag_updates,
             "source_root": str(source_root),
             "seed": args.seed,
             "docker_image_digest": args.docker_image_digest,

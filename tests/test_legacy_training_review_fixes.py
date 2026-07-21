@@ -464,6 +464,16 @@ def test_benchmark_checkpoint_mode_is_explicit():
     ]
 
 
+def test_benchmark_policy_lag_bound_fails_closed():
+    bench_legacy_training._validate_policy_lag(
+        {"policy_lag_max": 64}, max_updates=64
+    )
+    with pytest.raises(RuntimeError, match="observed 65 updates, allowed 64"):
+        bench_legacy_training._validate_policy_lag(
+            {"policy_lag_max": 65}, max_updates=64
+        )
+
+
 def test_production_a1_config_keeps_checkpointing_safe_defaults():
     from douzero.dmc.arguments import parse_args
 
