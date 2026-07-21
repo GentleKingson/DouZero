@@ -123,16 +123,18 @@ latency regressed to `0.968x`, which is why the experiment retains the
 single-action bypass and only applies the split above its action-count
 threshold.
 
-Two complete formal 8-actor/48-buffer A1 runs measured `12,632.96` and
-`12,729.28` frames/s, with `13,023.60` and `13,026.43` decisions/s. Both
-reported CUDA available, zero live learner threads at exit, and completed
-checkpoint output. The third repeat was killed externally at startup on this
-host, so this is diagnostic evidence rather than a promotable three-repeat
-result.
+The 2026-07-21 same-host validation completed three checkpoint-enabled repeats
+for both main and this candidate. Main measured a median `15,475.522` frames/s;
+the candidate measured `14,242.937` frames/s, a 7.97% regression. Both sets had
+less than 0.23% relative range and maximum policy lag of 20 updates. A separate
+checkpoint/resume soak advanced A1 monotonically from 43.2M to 56.96M frames
+with clean worker shutdown. See
+`docs/benchmarks/legacy_a1_validation_20260721.md` for the frozen environment,
+raw run values, hashes, and resume evidence.
 
 Accordingly, adaptive A1 split-dense1, TF32, and learner compile remain
 opt-in. Reusable pinned/device staging and per-snapshot role lookup caching are
 retained because their correctness tests pass and they do not alter model or
 checkpoint identity. Production A1 keeps `legacy_matmul_precision: highest`,
-AMP disabled, and compile disabled until a complete three-repeat run clears
-both throughput and numerical gates.
+AMP disabled, and compile disabled; the candidate branch must isolate and
+remove its formal throughput regression before promotion.
