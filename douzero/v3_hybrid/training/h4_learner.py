@@ -520,7 +520,7 @@ class V3H4Learner:
             ce_values = []
             for index, sample in enumerate(samples):
                 assert sample.label is not None
-                target = torch.from_numpy(sample.label.count_onehot).to(
+                target = torch.from_numpy(sample.label.count_onehot.copy()).to(
                     device=self.device, dtype=output.logits.dtype
                 ).unsqueeze(0)
                 item = belief_loss(
