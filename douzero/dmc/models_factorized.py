@@ -84,6 +84,7 @@ _LSTM_SEQ_LEN: int = 5
 
 # MLP widths, matching the legacy models exactly.
 _MLP_WIDTH: int = 512
+_SPLIT_DENSE1_MIN_ACTIONS: int = 16
 
 
 class _LegacyFactorizedBase(nn.Module):
@@ -282,7 +283,7 @@ class _LegacyFactorizedBase(nn.Module):
         return dict(action=action)
 
     def forward_factorized(self, z_single, x_state_single, x_action,
-                           return_value=False, flags=None):
+                           return_value=False, flags=None, split_dense1=False):
         """Pure factorized forward taking already-split inputs.
 
         This is the canonical factorized interface: the shared history and
@@ -300,15 +301,18 @@ class _LegacyFactorizedBase(nn.Module):
             return_value, flags: as in :meth:`forward`.
         """
         self._validate_factorized_inputs(z_single, x_state_single, x_action)
-        n = x_action.shape[0]
         lstm_out, _ = self.lstm(z_single)             # (1, 5, 128)
         h_lstm = lstm_out[:, -1, :]                     # (1, 128)
-        h = torch.cat([
-            h_lstm.expand(n, _LSTM_HIDDEN_SIZE),
-            x_state_single.expand(n, self._state_width),
-            x_action,
-        ], dim=-1)
-        h = self.dense1(h)
+        n = x_action.shape[0]
+        if split_dense1 and n >= _SPLIT_DENSE1_MIN_ACTIONS:
+            h = self._dense1_split(h_lstm, x_state_single, x_action)
+        else:
+            h = torch.cat([
+                h_lstm.expand(n, _LSTM_HIDDEN_SIZE),
+                x_state_single.expand(n, self._state_width),
+                x_action,
+            ], dim=-1)
+            h = self.dense1(h)
         h = torch.relu(h)
         h = self.dense2(h)
         h = torch.relu(h)

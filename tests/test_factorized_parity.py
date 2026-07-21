@@ -306,6 +306,33 @@ def test_forward_factorized_matches_legacy(position, seed_factory):
     assert torch.allclose(legacy_vals, fact_vals, atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.parametrize("position", POSITIONS)
+def test_a1_split_dense1_values_actions_and_checkpoint_contract(position, seed_factory):
+    seed_factory(945 + POSITIONS.index(position))
+    env = Env("adp")
+    infoset = _drive_to_position(env, position)
+    obs = get_obs(infoset)
+    z, x = _to_tensors(obs)
+    legacy, factorized = _build_paired_models(position)
+    z_single, x_state, x_action = split_legacy_batch(position, z, x)
+
+    with torch.no_grad():
+        split = factorized.forward_factorized(
+            z_single, x_state, x_action, return_value=True,
+            split_dense1=True,
+        )["values"]
+        unsplit = factorized.forward_factorized(
+            z_single, x_state, x_action, return_value=True
+        )["values"]
+    assert torch.allclose(split, unsplit, atol=ATOL, rtol=RTOL)
+    assert int(split.argmax()) == int(unsplit.argmax())
+    assert {
+        key: tuple(value.shape) for key, value in factorized.state_dict().items()
+    } == {
+        key: tuple(value.shape) for key, value in legacy.state_dict().items()
+    }
+
+
 # --------------------------------------------------------------------------- #
 # LSTM work reduction — the P04 efficiency proof
 # --------------------------------------------------------------------------- #

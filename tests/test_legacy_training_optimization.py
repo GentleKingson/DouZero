@@ -130,6 +130,15 @@ def test_packed_factorized_selection_matches_individual_decisions(seed_factory):
     assert torch.equal(packed, individual)
 
 
+def test_a1_split_dense1_flag_defaults_off_and_is_opt_in():
+    from douzero.dmc.arguments import parse_args
+
+    assert parse_args([]).legacy_actor_split_dense1 is False
+    assert parse_args([
+        "--legacy_actor_split_dense1"
+    ]).legacy_actor_split_dense1 is True
+
+
 def test_centralized_slots_are_actor_isolated_and_capacity_checked():
     slots = CentralizedInferenceSlots(num_actors=2, max_actions=64)
     slots.z.zero_()
