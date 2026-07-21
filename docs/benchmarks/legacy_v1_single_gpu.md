@@ -268,7 +268,10 @@ measured frames, and three repeats:
 Against the earlier matched synchronous-C0 reference of 4,825 frames/s,
 optimized C0 is about 68.1% faster, but it remains about 51.6% slower than A1.
 Its mean end-to-end inference latency was 5.15 ms and
-IPC wait was 1.92 ms. The actor inference-blocked ratio was 94.66%, the mean
+IPC wait was 1.92 ms. The originally reported actor inference-blocked ratio of
+94.66% used a denominator that double-counted legal-action and observation
+sub-spans inside environment-step time, so it is retained only as historical
+context and must not be compared with corrected runs. The mean
 microbatch was 3.32, and selected requests were only 24.6% of those available.
 Communication, scheduling, and compatible-group fragmentation therefore
 dominate the small Legacy V1 model; eliminating forward time cannot close the
