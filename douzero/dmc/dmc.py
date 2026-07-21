@@ -312,18 +312,20 @@ def learn(position,
         )
         cuda_h2d_events[0].record()
     with legacy_profile_range(profile, "learner.h2d"):
-        obs_x_no_action = batch['obs_x_no_action'].to(
-            device, non_blocking=non_blocking
-        )
-        obs_action = batch['obs_action'].to(device, non_blocking=non_blocking)
+        transfer_keys = ('obs_x_no_action', 'obs_action', 'obs_z', 'target')
+        if stager is not None:
+            device_batch = stager.to_device(device, transfer_keys)
+        else:
+            device_batch = {
+                key: batch[key].to(device, non_blocking=non_blocking)
+                for key in transfer_keys
+            }
+        obs_x_no_action = device_batch['obs_x_no_action']
+        obs_action = device_batch['obs_action']
         obs_x = torch.cat((obs_x_no_action, obs_action), dim=2).float()
         obs_x = torch.flatten(obs_x, 0, 1)
-        obs_z = torch.flatten(
-            batch['obs_z'].to(device, non_blocking=non_blocking), 0, 1
-        ).float()
-        target = torch.flatten(
-            batch['target'].to(device, non_blocking=non_blocking), 0, 1
-        )
+        obs_z = torch.flatten(device_batch['obs_z'], 0, 1).float()
+        target = torch.flatten(device_batch['target'], 0, 1)
     if stager is not None:
         stager.mark_h2d(device)
     if cuda_h2d_events is not None:

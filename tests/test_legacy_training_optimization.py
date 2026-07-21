@@ -162,6 +162,27 @@ def test_legacy_actor_does_not_resolve_factorized_role_models():
     snapshot.get_model.assert_not_called()
 
 
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_pinned_stager_reuses_cuda_destinations():
+    from types import SimpleNamespace
+
+    from douzero.dmc.utils import PinnedBatchStager
+
+    buffers = {"obs_z": torch.arange(24).view(4, 2, 3)}
+    stager = PinnedBatchStager(buffers, SimpleNamespace(batch_size=2))
+    first_batch = stager.stage(buffers, [0, 1])
+    first = stager.to_device("cuda:0", ("obs_z",))["obs_z"]
+    stager.mark_h2d("cuda:0")
+    stager.stage(buffers, [2, 3])
+    second = stager.to_device("cuda:0", ("obs_z",))["obs_z"]
+    torch.cuda.synchronize()
+
+    assert first.data_ptr() == second.data_ptr()
+    assert torch.equal(second.cpu(), stager.batch["obs_z"])
+    assert first_batch is stager.batch
+
+
 def test_centralized_slots_are_actor_isolated_and_capacity_checked():
     slots = CentralizedInferenceSlots(num_actors=2, max_actions=64)
     slots.z.zero_()

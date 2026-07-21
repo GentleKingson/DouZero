@@ -92,23 +92,45 @@ class PinnedBatchStager:
             )
             for key, value in buffers.items()
         }
-        self._h2d_done = None
+        self.batch = {
+            key: value.transpose(0, 1) for key, value in self.storage.items()
+        }
+        self._device_storage = {}
+        self._h2d_event = None
+        self._h2d_pending = False
 
     def stage(self, buffers, indices):
-        if self._h2d_done is not None:
-            self._h2d_done.synchronize()
-            self._h2d_done = None
+        if self._h2d_pending:
+            self._h2d_event.synchronize()
+            self._h2d_pending = False
         index = torch.tensor(indices, dtype=torch.long)
         for key, source in buffers.items():
             torch.index_select(source, 0, index, out=self.storage[key])
-        return {key: value.transpose(0, 1) for key, value in self.storage.items()}
+        return self.batch
+
+    def to_device(self, device, keys):
+        """Copy selected staged tensors into reusable device destinations."""
+        device = torch.device(device)
+        device_key = str(device)
+        targets = self._device_storage.setdefault(device_key, {})
+        result = {}
+        for key in keys:
+            source = self.batch[key]
+            target = targets.get(key)
+            if target is None:
+                target = torch.empty_like(source, device=device)
+                targets[key] = target
+            target.copy_(source, non_blocking=device.type == "cuda")
+            result[key] = target
+        return result
 
     def mark_h2d(self, device):
         if torch.device(device).type != "cuda":
             return
-        event = torch.cuda.Event()
-        event.record()
-        self._h2d_done = event
+        if self._h2d_event is None:
+            self._h2d_event = torch.cuda.Event()
+        self._h2d_event.record()
+        self._h2d_pending = True
 
 def get_batch(free_queue,
               full_queue,
