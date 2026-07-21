@@ -160,6 +160,16 @@ actor blocking, learner waiting/throttling, utilization, VRAM, policy lag, and
 worker exit status. Do not promote C0 unless three-repeat median frames/s shows
 a stable gain over both old C0 and A1. GPU utilization alone is not evidence.
 
+## A1 profiler baseline
+
+With `legacy_profile: true`, A1 emits stable PyTorch profiler/NVTX ranges for
+`actor.inference`, `learner.batch_wait`, `learner.batch_assembly`,
+`learner.pin_memory`, `learner.h2d`, and `learner.optimization_step`. The ranges
+are absent when profiling is disabled, so the production configuration does
+not pay profiler instrumentation overhead. These ranges complement aggregate
+JSON timings and expose CPU packing, transfer, and learner work separately in
+PyTorch Profiler or Nsight Systems.
+
 ### Optimized C0 runtime
 
 The current experimental configuration uses `central_actor_runtime: thread`.
