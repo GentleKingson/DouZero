@@ -565,7 +565,7 @@ _LEGACY_ONLY_VERSIONS: dict[str, frozenset[str]] = {
     # the config layer so DeepAgentV2 and model construction can be selected;
     # the training gate in dmc.py still rejects v2 training until P06 wires
     # multi-objective losses and the actor/learner loop to it.
-    "model_version": frozenset({"legacy", "factorized", "v2"}),
+    "model_version": frozenset({"legacy", "factorized", "v2", "gpu_v3"}),
 }
 
 

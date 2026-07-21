@@ -198,7 +198,8 @@ parser.add_argument('--ruleset', default='legacy', type=str, choices=['legacy', 
                     help='Rule set identifier (P02). "legacy" (default) reproduces the '
                          'original environment. "standard" adds bidding/scoring but is '
                          'not yet supported for training.')
-parser.add_argument('--model_version', default='legacy', type=str, choices=['legacy', 'factorized', 'v2'],
+parser.add_argument('--model_version', default='legacy', type=str,
+                    choices=['legacy', 'factorized', 'v2', 'gpu_v3'],
                     help='Model version. "legacy" (default) is the original per-action forward. '
                          '"factorized" (P04) encodes the shared state/history once per decision and '
                          'is numerically equivalent to legacy under the same weights; it is a '

@@ -1,0 +1,3 @@
+GPU_V3_MODEL_VERSION = "gpu_v3"
+GPU_V3_FEATURE_VERSION = "v2"
+GPU_V3_CHECKPOINT_KIND = "public_policy"
