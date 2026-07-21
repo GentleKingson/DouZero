@@ -461,6 +461,30 @@ def test_checkpoint_identity_partial_load_and_public_loader_fail_closed(tmp_path
     with pytest.raises(CheckpointCompatibilityError, match="envelope"):
         learner.load_checkpoint(poisoned)
 
+    invalid_rng = torch.load(path, weights_only=True)
+    invalid_rng["rng"]["torch"] = torch.zeros(8, dtype=torch.float32)
+    invalid_rng_path = tmp_path / "invalid-rng.ckpt"
+    torch.save(invalid_rng, invalid_rng_path)
+    before = copy.deepcopy(learner.model.state_dict())
+    with pytest.raises(CheckpointCompatibilityError, match="RNG state"):
+        learner.load_checkpoint(invalid_rng_path)
+    assert all(
+        torch.equal(before[name], value)
+        for name, value in learner.model.state_dict().items()
+    )
+
+    invalid_model = torch.load(path, weights_only=True)
+    first_key = next(iter(invalid_model["model_state_dict"]))
+    invalid_model["model_state_dict"][first_key] = torch.zeros(1)
+    invalid_model_path = tmp_path / "invalid-model.ckpt"
+    torch.save(invalid_model, invalid_model_path)
+    with pytest.raises(CheckpointCompatibilityError, match="transactionally"):
+        learner.load_checkpoint(invalid_model_path)
+    assert all(
+        torch.equal(before[name], value)
+        for name, value in learner.model.state_dict().items()
+    )
+
     with pytest.raises(CheckpointCompatibilityError, match="envelope"):
         load_v3_hybrid_public_checkpoint(
             path,

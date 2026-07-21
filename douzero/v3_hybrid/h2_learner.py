@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -701,7 +702,9 @@ class V3H2Learner:
         """Strictly resume H2 state into an identically configured learner."""
 
         try:
-            bundle = torch.load(path, map_location=self.device, weights_only=True)
+            # Keep CPU RNG tensors on CPU even when resuming a CUDA learner.
+            # Model and optimizer loaders copy their tensors to parameter devices.
+            bundle = torch.load(path, map_location="cpu", weights_only=True)
         except Exception as exc:
             raise CheckpointCompatibilityError(
                 f"unable to safely load H2 trainer checkpoint: {exc}"
@@ -784,33 +787,69 @@ class V3H2Learner:
             raise CheckpointCompatibilityError(
                 "H2 checkpoint optimizer state envelope mismatch"
             )
-        try:
-            self.model.load_state_dict(state_dict, strict=True)
-            self.optimizer.load_state_dict(optimizer_state)
-        except (KeyError, RuntimeError, ValueError) as exc:
-            raise CheckpointCompatibilityError(
-                f"H2 checkpoint model/optimizer state mismatch: {exc}"
-            ) from exc
-
         rng = bundle["rng"]
         if not isinstance(rng, dict) or set(rng) != {
             "learner", "python", "numpy", "torch", "cuda"
         }:
             raise CheckpointCompatibilityError("H2 checkpoint RNG fields mismatch")
         try:
-            self.rng.setstate(rng["learner"])
-            random.setstate(rng["python"])
-            np.random.set_state(self._decode_numpy_rng_state(rng["numpy"]))
-            torch.random.set_rng_state(rng["torch"])
+            learner_probe = random.Random()
+            learner_probe.setstate(rng["learner"])
+            python_probe = random.Random()
+            python_probe.setstate(rng["python"])
+            numpy_state = self._decode_numpy_rng_state(rng["numpy"])
+            numpy_probe = np.random.RandomState()
+            numpy_probe.set_state(numpy_state)
+            torch_probe = torch.Generator(device="cpu")
+            torch_probe.set_state(rng["torch"])
             if self.device.type == "cuda":
                 if rng["cuda"] is None:
                     raise ValueError("CUDA H2 checkpoint is missing CUDA RNG state")
-                torch.cuda.set_rng_state(rng["cuda"], self.device)
+                cuda_probe = torch.Generator(device=self.device)
+                cuda_probe.set_state(rng["cuda"])
             elif rng["cuda"] is not None:
                 raise ValueError("CPU H2 checkpoint unexpectedly contains CUDA RNG state")
         except (TypeError, ValueError, RuntimeError) as exc:
             raise CheckpointCompatibilityError(
                 f"H2 checkpoint RNG state mismatch: {exc}"
+            ) from exc
+
+        model_backup = {
+            name: value.detach().cpu().clone()
+            for name, value in self.model.state_dict().items()
+        }
+        optimizer_backup = copy.deepcopy(self.optimizer.state_dict())
+        rng_backup = {
+            "learner": self.rng.getstate(),
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.random.get_rng_state(),
+            "cuda": (
+                torch.cuda.get_rng_state(self.device)
+                if self.device.type == "cuda"
+                else None
+            ),
+        }
+        try:
+            self.model.load_state_dict(state_dict, strict=True)
+            self.optimizer.load_state_dict(optimizer_state)
+            self.rng.setstate(rng["learner"])
+            random.setstate(rng["python"])
+            np.random.set_state(numpy_state)
+            torch.random.set_rng_state(rng["torch"])
+            if self.device.type == "cuda":
+                torch.cuda.set_rng_state(rng["cuda"], self.device)
+        except (KeyError, TypeError, RuntimeError, ValueError) as exc:
+            self.model.load_state_dict(model_backup, strict=True)
+            self.optimizer.load_state_dict(optimizer_backup)
+            self.rng.setstate(rng_backup["learner"])
+            random.setstate(rng_backup["python"])
+            np.random.set_state(rng_backup["numpy"])
+            torch.random.set_rng_state(rng_backup["torch"])
+            if self.device.type == "cuda":
+                torch.cuda.set_rng_state(rng_backup["cuda"], self.device)
+            raise CheckpointCompatibilityError(
+                f"H2 checkpoint state restore failed transactionally: {exc}"
             ) from exc
 
         self.learner_updates = learner_updates
