@@ -21,6 +21,7 @@ from douzero.dmc.centralized_actor import (
     wait_for_learner_admission,
 )
 from douzero.dmc.utils import (
+    _put_central_request_until_stopped,
     create_buffers,
     get_batch,
     receive_central_action,
@@ -431,3 +432,22 @@ def test_centralized_response_timeout_abort_and_shutdown():
     assert receive_central_action(responses, 0.1) is None
     responses.put(("ok", 7))
     assert receive_central_action(responses, 0.1) == 7
+
+
+def test_full_central_request_queue_observes_shutdown():
+    requests = queue.Queue(maxsize=1)
+    requests.put("occupied")
+    stop_event = threading.Event()
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(_put_central_request_until_stopped(
+            requests, "blocked", stop_event, timeout=0.01
+        ))
+    )
+    worker.start()
+    time.sleep(0.03)
+    stop_event.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert result == [False]

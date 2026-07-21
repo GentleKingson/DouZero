@@ -199,6 +199,22 @@ class _LearnerThreadSupervisor:
         raise exc.with_traceback(traceback)
 
 
+def _start_supervised_thread(supervisor, target, name, *args):
+    thread = threading.Thread(
+        target=supervisor.run,
+        name=name,
+        args=(target, *args),
+        daemon=False,
+    )
+    thread.start()
+    return thread
+
+
+def _recover_actor_owners(policy_pool, actor_id, env_count):
+    for env_slot in range(env_count):
+        policy_pool.recover_owner(actor_id * env_count + env_slot)
+
+
 def compute_loss(logits, targets):
     loss = ((logits.squeeze(-1) - targets)**2).mean()
     return loss
@@ -766,9 +782,9 @@ def train(flags):
     # Starting actor processes
     stop_event = ctx.Event()
     learner_supervisor = _LearnerThreadSupervisor(stop_event)
+    central_thread_supervisor = _LearnerThreadSupervisor(stop_event)
     central_process = None
     central_thread = None
-    central_thread_errors = queue.Queue()
     central_slots = None
     central_request_queue = None
     central_response_queues = None
@@ -815,19 +831,12 @@ def train(flags):
             )
             central_process.start()
         else:
-            def run_central_thread():
-                try:
-                    centralized_inference_loop(*central_args)
-                except BaseException as exc:
-                    central_thread_errors.put((exc, exc.__traceback__))
-                    stop_event.set()
-
-            central_thread = threading.Thread(
-                target=run_central_thread,
-                name='legacy-centralized-inference',
-                daemon=False,
+            central_thread = _start_supervised_thread(
+                central_thread_supervisor,
+                centralized_inference_loop,
+                'legacy-centralized-inference',
+                *central_args,
             )
-            central_thread.start()
     for device in device_iterator:
         num_actors = flags.num_actors
         for i in range(flags.num_actors):
@@ -877,8 +886,7 @@ def train(flags):
                     if getattr(flags, 'legacy_actor_backend', 'legacy')
                     == 'centralized_factorized' else 1
                 )
-                for env_slot in range(env_count):
-                    models[device].recover_owner(actor_id * env_count + env_slot)
+                _recover_actor_owners(models[device], actor_id, env_count)
         if central_process is not None:
             central_process.join(timeout=5)
             if central_process.is_alive():
@@ -1143,6 +1151,7 @@ def train(flags):
         last_periodic_log = timer()
         while frames < flags.total_frames:
             learner_supervisor.raise_if_failed()
+            central_thread_supervisor.raise_if_failed()
             for actor, device, actor_id in actor_processes:
                 if actor.exitcode not in (None, 0):
                     raise RuntimeError(
@@ -1155,12 +1164,6 @@ def train(flags):
                     'Centralized inference process exited with code '
                     f'{central_process.exitcode}'
                 )
-            try:
-                central_exc, central_traceback = central_thread_errors.get_nowait()
-            except queue.Empty:
-                pass
-            else:
-                raise central_exc.with_traceback(central_traceback)
             start_frames = frames
             position_start_frames = {k: position_frames[k] for k in position_frames}
             start_time = timer()
@@ -1168,6 +1171,7 @@ def train(flags):
                 timeout=getattr(flags, 'legacy_monitor_interval_seconds', 5.0)
             )
             learner_supervisor.raise_if_failed()
+            central_thread_supervisor.raise_if_failed()
 
             if system_sampler is not None and measurement_started:
                 sampled_pids = (

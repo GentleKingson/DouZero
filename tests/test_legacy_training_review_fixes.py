@@ -16,6 +16,9 @@ from torch import nn
 
 from benchmarks import bench_legacy_training
 from douzero.dmc.dmc import (
+    _LearnerThreadSupervisor,
+    _recover_actor_owners,
+    _start_supervised_thread,
     _SystemSampler,
     _TrainingTransactions,
     _UpdateBudget,
@@ -292,6 +295,36 @@ def test_policy_pool_resume_initializes_version_continuity():
     assert lease.version == 10_000
     pool.release(lease)
     assert pool.publish(source.models, version=10_001)
+
+
+def test_worker_thread_failure_sets_stop_and_preserves_original_error():
+    stop_event = threading.Event()
+    supervisor = _LearnerThreadSupervisor(stop_event)
+
+    def fail():
+        raise LookupError("injected worker failure")
+
+    worker = _start_supervised_thread(supervisor, fail, "injected-worker")
+    worker.join(timeout=1)
+
+    assert stop_event.is_set()
+    with pytest.raises(LookupError, match="injected worker failure"):
+        supervisor.raise_if_failed()
+
+
+def test_reaped_multi_environment_actor_recovers_every_owner():
+    context = mp.get_context("spawn")
+    pool = VersionedPolicyPool(
+        [_TinyPolicy(), _TinyPolicy()], mp_context=context, max_owners=8
+    )
+    leases = [pool.acquire(owner_id=4 + env_slot) for env_slot in range(4)]
+    assert pool.reader_counts() == (4, 0)
+
+    _recover_actor_owners(pool, actor_id=1, env_count=4)
+    assert pool.reader_counts() == (0, 0)
+    assert not pool.recover_owner(4)
+    with pytest.raises(RuntimeError, match="does not hold"):
+        pool.release(leases[0])
 
 
 def test_failed_file_writer_close_marks_metadata_unsuccessful(tmp_path):

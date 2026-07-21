@@ -69,6 +69,19 @@ def receive_central_action(response_queue, timeout_seconds):
     return int(response)
 
 
+def _put_central_request_until_stopped(
+    request_queue, request, stop_event, timeout=0.1
+):
+    """Bound queue backpressure while keeping shutdown observable."""
+    while not stop_event.is_set():
+        try:
+            request_queue.put(request, timeout=timeout)
+            return True
+        except queue.Full:
+            continue
+    return False
+
+
 def _flush_actor_rollouts(completed, sizes, free_queue, full_queue, buffers,
                           flags, recorder, stop_event):
     """Flush complete role rollouts assembled by one or more actor envs."""
@@ -251,15 +264,9 @@ def act_centralized_multi(i, device, free_queue, full_queue, policy_pool,
                     central_queue_pressure.begin_actor_enqueue(
                         storage_slot, request.actor_enqueue_started_ns
                     )
-                while not stop_event.is_set():
-                    try:
-                        central_request_queue.put(request, timeout=0.1)
-                        break
-                    except queue.Full:
-                        # Bounded blocking provides backpressure while still
-                        # observing shutdown promptly.
-                        continue
-                if stop_event.is_set():
+                if not _put_central_request_until_stopped(
+                    central_request_queue, request, stop_event
+                ):
                     scheduler.cancel_all()
                     return
                 enqueued_ns = time.perf_counter_ns()
