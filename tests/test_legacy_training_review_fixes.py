@@ -210,6 +210,47 @@ def test_metric_store_reports_integer_transition_max_lag():
     assert isinstance(lag["max_updates"], int)
 
 
+def test_central_metrics_survive_service_batch_without_actor_response():
+    store = LegacyMetricStore(mp.get_context("spawn"))
+    store.add_central(
+        microbatch_size=1,
+        legal_actions=3,
+        ipc_wait_ns=[10],
+        batch_wait_ns=[20],
+        batching_wait_ns=30,
+        cpu_packing_ns=40,
+        h2d_ns=50,
+        gpu_cast_ns=60,
+        forward_ns=70,
+        d2h_response_ns=80,
+        padded_actions=3,
+        total_available=1,
+        largest_compatible_group=1,
+        stream_priority_active=False,
+    )
+
+    timing = store.snapshot()["centralized_inference"]["timing_mean_ms"]
+    assert timing["forward"] == pytest.approx(70 / 1e6)
+    assert timing["queue_put_block"] is None
+    assert timing["response_consume"] is None
+
+
+def test_actor_blocked_ratio_excludes_nested_environment_subspans():
+    store = LegacyMetricStore(mp.get_context("spawn"))
+    store.add_actor(
+        {
+            "decisions": 1,
+            "inference_ns": 20,
+            "env_step_ns": 80,
+            "legal_actions_ns": 30,
+            "observation_ns": 20,
+        },
+        {},
+    )
+
+    assert store.snapshot()["actor_inference_blocked_ratio"] == pytest.approx(0.2)
+
+
 def test_actor_metric_flush_drops_pre_reset_generation():
     store = LegacyMetricStore(mp.get_context("spawn"))
     recorder = ActorMetricRecorder(store, flush_every=1_000)

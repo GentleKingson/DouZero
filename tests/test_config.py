@@ -224,6 +224,79 @@ def test_cli_overrides_yaml_explicit_value(tmp_path):
     assert ns.batch_size == 32
 
 
+def test_deprecated_central_actor_microbatch_yaml_maps_to_target(tmp_path):
+    yml = tmp_path / "old-c0.yaml"
+    yml.write_text("central_actor_microbatch: 4\n", encoding="utf-8")
+
+    with pytest.warns(FutureWarning, match="deprecated"):
+        cfg = load_config(str(yml))
+
+    assert cfg.central_actor_microbatch == 4
+    assert cfg.central_actor_target_microbatch == 4
+
+
+def test_deprecated_central_actor_microbatch_yaml_conflict_fails(tmp_path):
+    yml = tmp_path / "conflicting-c0.yaml"
+    yml.write_text(
+        "central_actor_microbatch: 4\n"
+        "central_actor_target_microbatch: 8\n",
+        encoding="utf-8",
+    )
+
+    with pytest.warns(FutureWarning, match="deprecated"):
+        with pytest.raises(ValueError, match="both explicitly set"):
+            load_config(str(yml))
+
+
+def test_deprecated_central_actor_microbatch_cli_maps_to_target():
+    from douzero.dmc.arguments import parse_args
+
+    with pytest.warns(FutureWarning, match="deprecated"):
+        ns = parse_args(["--central_actor_microbatch", "4"])
+
+    assert ns.central_actor_microbatch == 4
+    assert ns.central_actor_target_microbatch == 4
+
+
+def test_deprecated_central_actor_microbatch_cli_conflict_fails():
+    from douzero.dmc.arguments import parse_args
+
+    with pytest.warns(FutureWarning, match="deprecated"):
+        with pytest.raises(ValueError, match="both explicitly set"):
+            parse_args([
+                "--central_actor_microbatch", "4",
+                "--central_actor_target_microbatch", "8",
+            ])
+
+
+def test_deprecated_cli_microbatch_conflicts_with_explicit_yaml_target(tmp_path):
+    from douzero.dmc.arguments import parse_args
+
+    yml = tmp_path / "new-c0.yaml"
+    yml.write_text(
+        "central_actor_target_microbatch: 8\n", encoding="utf-8"
+    )
+    with pytest.warns(FutureWarning, match="deprecated"):
+        with pytest.raises(ValueError, match="both explicitly set"):
+            parse_args([
+                "--config", str(yml),
+                "--central_actor_microbatch", "4",
+            ])
+
+
+def test_deprecated_cli_microbatch_maps_when_yaml_target_is_implicit(tmp_path):
+    from douzero.dmc.arguments import parse_args
+
+    yml = tmp_path / "minimal.yaml"
+    yml.write_text("objective: adp\n", encoding="utf-8")
+    with pytest.warns(FutureWarning, match="deprecated"):
+        ns = parse_args([
+            "--config", str(yml),
+            "--central_actor_microbatch", "4",
+        ])
+    assert ns.central_actor_target_microbatch == 4
+
+
 def test_store_true_yaml_true_not_clobbered_by_cli_default_false(tmp_path):
     """YAML deterministic=true, CLI unspecified -> True.
 

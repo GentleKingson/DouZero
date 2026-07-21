@@ -11,6 +11,7 @@ Precedence (highest wins): CLI flags > YAML config file > dataclass defaults.
 from __future__ import annotations
 
 import argparse
+import warnings
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Any, Mapping
@@ -66,6 +67,14 @@ def load_config(yaml_path: str) -> TrainingConfig:
     return _build_training_config(raw)
 
 
+def load_config_with_explicit_fields(
+    yaml_path: str,
+) -> tuple[TrainingConfig, frozenset[str]]:
+    """Load YAML and retain its top-level field provenance for CLI merging."""
+    raw = _load_yaml(yaml_path)
+    return _build_training_config(raw), frozenset(raw)
+
+
 def load_legacy_config() -> TrainingConfig:
     """Load the bundled legacy config (shipped inside the wheel).
 
@@ -88,8 +97,38 @@ def load_legacy_config() -> TrainingConfig:
 # --------------------------------------------------------------------------- #
 # dict <-> dataclass
 # --------------------------------------------------------------------------- #
-def _build_training_config(raw: Mapping[str, Any]) -> TrainingConfig:
+def _resolve_deprecated_central_actor_microbatch(
+    raw: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve the old C0 target knob before dataclass defaults hide provenance."""
+    resolved = dict(raw)
+    if "central_actor_microbatch" not in raw:
+        return resolved
+    legacy = raw["central_actor_microbatch"]
+    warnings.warn(
+        "central_actor_microbatch is deprecated; use "
+        "central_actor_target_microbatch",
+        FutureWarning,
+        stacklevel=3,
+    )
+    if "central_actor_target_microbatch" in raw:
+        target = raw["central_actor_target_microbatch"]
+        if legacy != target:
+            raise ValueError(
+                "central_actor_microbatch and central_actor_target_microbatch "
+                "were both explicitly set with different values"
+            )
+    else:
+        resolved["central_actor_target_microbatch"] = legacy
+    return resolved
+
+
+def _build_training_config(
+    raw: Mapping[str, Any], *, resolve_deprecated: bool = True
+) -> TrainingConfig:
     """Construct a TrainingConfig from a raw mapping, validating keys."""
+    if resolve_deprecated:
+        raw = _resolve_deprecated_central_actor_microbatch(raw)
     nested_blocks = (
         "optimizer", "loss", "decision_policy", "model", "bc", "bidding",
         "distillation", "league", "curriculum", "search",
@@ -677,7 +716,12 @@ def to_argparse_namespace(cfg: TrainingConfig) -> argparse.Namespace:
 # --------------------------------------------------------------------------- #
 # Merge (CLI overrides YAML)
 # --------------------------------------------------------------------------- #
-def merge(base: TrainingConfig, override_ns: argparse.Namespace) -> TrainingConfig:
+def merge(
+    base: TrainingConfig,
+    override_ns: argparse.Namespace,
+    *,
+    base_explicit_fields: frozenset[str] = frozenset(),
+) -> TrainingConfig:
     """Overlay explicitly-set CLI overrides from a Namespace onto a base config.
 
     Precedence: dataclass defaults < YAML (base) < explicit CLI flags.
@@ -690,6 +734,46 @@ def merge(base: TrainingConfig, override_ns: argparse.Namespace) -> TrainingConf
     This avoids the classic "argparse default clobbers YAML" bug for booleans.
     """
     base_d = asdict(base)
+    legacy_microbatch_explicit = hasattr(
+        override_ns, "central_actor_microbatch"
+    )
+    target_microbatch_explicit = hasattr(
+        override_ns, "central_actor_target_microbatch"
+    )
+    if legacy_microbatch_explicit:
+        legacy = override_ns.central_actor_microbatch
+        warnings.warn(
+            "central_actor_microbatch is deprecated; use "
+            "central_actor_target_microbatch",
+            FutureWarning,
+            stacklevel=2,
+        )
+        target = (
+            override_ns.central_actor_target_microbatch
+            if target_microbatch_explicit
+            else base.central_actor_target_microbatch
+        )
+        if (
+            (target_microbatch_explicit
+             or "central_actor_target_microbatch" in base_explicit_fields)
+            and legacy != target
+        ):
+            raise ValueError(
+                "central_actor_microbatch and central_actor_target_microbatch "
+                "were both explicitly set with different values"
+            )
+        if not target_microbatch_explicit:
+            base_d["central_actor_target_microbatch"] = legacy
+    elif (
+        target_microbatch_explicit
+        and "central_actor_microbatch" in base_explicit_fields
+        and base.central_actor_microbatch
+        != override_ns.central_actor_target_microbatch
+    ):
+        raise ValueError(
+            "central_actor_microbatch and central_actor_target_microbatch "
+            "were both explicitly set with different values"
+        )
     opt_overrides = {}
     for name in _TRAINING_NAMESPACE_FIELDS:
         if not hasattr(override_ns, name):
@@ -701,4 +785,4 @@ def merge(base: TrainingConfig, override_ns: argparse.Namespace) -> TrainingConf
             base_d[name] = val
     if opt_overrides:
         base_d["optimizer"] = {**base_d["optimizer"], **opt_overrides}
-    return _build_training_config(base_d)
+    return _build_training_config(base_d, resolve_deprecated=False)

@@ -49,6 +49,16 @@ LEARNER_COUNTERS = (
     "central_throttle_count",
 )
 
+# These counters represent disjoint actor work. Legal-action generation and
+# observation encoding are useful sub-spans of env_step_ns, not extra wall time.
+ACTOR_EXCLUSIVE_WORK_COUNTERS = (
+    "env_step_ns",
+    "inference_ns",
+    "rollout_write_ns",
+    "free_queue_wait_ns",
+    "full_queue_put_ns",
+)
+
 
 class LegacyMetricStore:
     """Multiprocess counters with actor-side batching and an action histogram."""
@@ -280,9 +290,7 @@ class LegacyMetricStore:
         decisions = actor["decisions"]
         updates = learner["updates"]
         frames = learner["frames"]
-        actor_work_ns = sum(
-            actor[name] for name in ACTOR_COUNTERS if name.endswith("_ns")
-        )
+        actor_work_ns = sum(actor[name] for name in ACTOR_EXCLUSIVE_WORK_COUNTERS)
         learner_work_ns = sum(
             learner[name] for name in LEARNER_COUNTERS
             if name.endswith("_ns") and name != "log_write_ns"
@@ -421,19 +429,22 @@ class LegacyMetricStore:
                 },
                 "timing_mean_ms": {
                     name: (
-                        central_timing[index]
-                        / (
-                            central_requests if index in {6, 7}
-                            else central_actor_e2e_count if index in {8, 9}
-                            else central_batches
-                        )
-                        / 1e6 if central_batches else None
+                        central_timing[index] / count / 1e6
+                        if count else None
                     )
-                    for index, name in enumerate((
-                        "batching_wait", "cpu_packing", "h2d", "gpu_cast",
-                        "forward", "d2h_response", "ipc_queue_wait",
-                        "server_batch_wait",
-                        "queue_put_block", "response_consume",
+                    for index, (name, count) in enumerate(zip(
+                        (
+                            "batching_wait", "cpu_packing", "h2d", "gpu_cast",
+                            "forward", "d2h_response", "ipc_queue_wait",
+                            "server_batch_wait", "queue_put_block",
+                            "response_consume",
+                        ),
+                        (
+                            central_batches, central_batches, central_batches,
+                            central_batches, central_batches, central_batches,
+                            central_requests, central_requests,
+                            central_actor_e2e_count, central_actor_e2e_count,
+                        ),
                     ))
                 },
                 "end_to_end_inference_mean_ms": (

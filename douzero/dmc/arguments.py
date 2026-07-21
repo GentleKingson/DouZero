@@ -270,14 +270,38 @@ def parse_args(argv=None):
     if argv is None:
         argv = sys.argv[1:]
     flags = parser.parse_args(argv)
-    if not flags.config:
-        return flags
-    # Re-parse with SUPPRESS defaults to detect which flags were explicit.
     override_parser = _build_override_parser()
     explicit_ns, _unknown = override_parser.parse_known_args(argv)
-    # Load YAML base and overlay only the explicit CLI overrides.
-    from douzero.config import load_config, merge, to_argparse_namespace
+    if not flags.config:
+        if hasattr(explicit_ns, "central_actor_microbatch"):
+            import warnings
 
-    base = load_config(flags.config)
-    merged = merge(base, explicit_ns)
+            legacy = explicit_ns.central_actor_microbatch
+            warnings.warn(
+                "central_actor_microbatch is deprecated; use "
+                "central_actor_target_microbatch",
+                FutureWarning,
+                stacklevel=2,
+            )
+            if (
+                hasattr(explicit_ns, "central_actor_target_microbatch")
+                and legacy != explicit_ns.central_actor_target_microbatch
+            ):
+                raise ValueError(
+                    "central_actor_microbatch and "
+                    "central_actor_target_microbatch were both explicitly "
+                    "set with different values"
+                )
+            if not hasattr(explicit_ns, "central_actor_target_microbatch"):
+                flags.central_actor_target_microbatch = legacy
+        return flags
+    # Re-parse with SUPPRESS defaults to detect which flags were explicit.
+    # Load YAML base and overlay only the explicit CLI overrides.
+    from douzero.config import merge, to_argparse_namespace
+    from douzero.config.loader import load_config_with_explicit_fields
+
+    base, explicit_fields = load_config_with_explicit_fields(flags.config)
+    merged = merge(
+        base, explicit_ns, base_explicit_fields=explicit_fields
+    )
     return to_argparse_namespace(merged)
