@@ -234,7 +234,12 @@ same-role sample swap fails closed before either feedback or supervision.
 Labels and the fingerprint are never serialized into replay or public
 checkpoints. Belief loss and role weights normalize over real decisions
 exactly once. A delegated H3 no-op does not advance the H4 phase, sample, or
-statistics clocks. Metrics include masked CE, MAP rank/exact accuracy,
+statistics clocks. Coupled public belief policies remain valid immutable
+Adaptive-DMC snapshots, so `q_old` is captured from the exact public policy
+that selected the action. H4 checkpoints validate belief optimizer parameter
+groups and cross-check nested H3 updates, decisions, policy version, and
+optimizer schedule against H4 phase history before restoring. Metrics include
+masked CE, MAP rank/exact accuracy,
 constrained-posterior calibration error, exact conservation, DP latency, and
 separate belief/shared gradient norms.
 

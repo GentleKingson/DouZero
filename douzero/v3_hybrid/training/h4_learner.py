@@ -32,6 +32,7 @@ from douzero.observation.encode_v2 import ObservationV2
 from douzero.observation.privileged import PrivilegedObservation
 
 from ..config import BELIEF_FEEDBACK_NONE
+from ..h2_learner import _validate_optimizer_param_groups
 from ..model import V3_HYBRID_ROLES, V3HybridModel
 from ..replay import V3ReplayTransition
 from .belief_config import (
@@ -50,8 +51,8 @@ from .h3_learner import (
     _same_public_bundle,
 )
 
-V3_H4_TRAINER_CHECKPOINT_FORMAT = "v3-hybrid-h4-joint-belief-trainer-v2"
-V3_H4_TRAINING_CONTRACT = "conservative-belief-detached-policy-feedback-v2"
+V3_H4_TRAINER_CHECKPOINT_FORMAT = "v3-hybrid-h4-joint-belief-trainer-v3"
+V3_H4_TRAINING_CONTRACT = "conservative-belief-detached-policy-feedback-v3"
 
 _CHECKPOINT_KEYS = frozenset({
     "format",
@@ -161,7 +162,7 @@ class V3H4LearnerConfig:
         default_factory=V3H4BeliefTrainingConfig
     )
 
-    IDENTITY_VERSION = 2
+    IDENTITY_VERSION = 3
 
     def __post_init__(self) -> None:
         if not isinstance(self.base, V3H3LearnerConfig):
@@ -313,6 +314,9 @@ class H4CumulativeStats:
         "steps",
         "decisions",
         "policy_updates",
+        "oracle_updates",
+        "base_updates",
+        "base_decisions",
         "belief_updates",
         "shared_updates",
         "labels_consumed",
@@ -324,6 +328,9 @@ class H4CumulativeStats:
         self.steps = 0
         self.decisions = 0
         self.policy_updates = 0
+        self.oracle_updates = 0
+        self.base_updates = 0
+        self.base_decisions = 0
         self.belief_updates = 0
         self.shared_updates = 0
         self.labels_consumed = 0
@@ -334,6 +341,13 @@ class H4CumulativeStats:
         self.steps += 1
         self.decisions += metrics.samples
         self.policy_updates += int(metrics.policy_updated)
+        base_updated = bool(
+            metrics.base
+            and (metrics.base.public_updated or metrics.base.oracle_updated)
+        )
+        self.oracle_updates += int(bool(metrics.base and metrics.base.oracle_updated))
+        self.base_updates += int(base_updated)
+        self.base_decisions += 0 if metrics.base is None else metrics.base.samples
         self.belief_updates += int(metrics.belief_updated)
         self.shared_updates += int(metrics.shared_encoder_updated)
         self.labels_consumed += metrics.labels_consumed
@@ -351,7 +365,8 @@ class H4CumulativeStats:
         for name in cls._FIELDS:
             value = payload[name]
             if name in {
-                "steps", "decisions", "policy_updates", "belief_updates",
+                "steps", "decisions", "policy_updates", "oracle_updates",
+                "base_updates", "base_decisions", "belief_updates",
                 "shared_updates", "labels_consumed",
             }:
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -361,6 +376,10 @@ class H4CumulativeStats:
             setattr(result, name, value)
         if max(result.policy_updates, result.belief_updates, result.shared_updates) > result.steps:
             raise ValueError("H4 optimizer counts exceed learner steps")
+        if max(result.policy_updates, result.oracle_updates) > result.base_updates:
+            raise ValueError("H4 nested update counts exceed base updates")
+        if result.base_updates > result.steps or result.base_decisions > result.decisions:
+            raise ValueError("H4 nested progress exceeds learner progress")
         if result.labels_consumed > result.decisions:
             raise ValueError("H4 label count exceeds decisions")
         return result
@@ -373,7 +392,7 @@ def h4_training_identity(
     config: V3H4LearnerConfig,
 ) -> dict[str, object]:
     return {
-        "identity_version": 2,
+        "identity_version": 3,
         "training_contract": V3_H4_TRAINING_CONTRACT,
         "model_config_hash": model.config.stable_hash(),
         "belief_model_config_hash": (
@@ -387,7 +406,7 @@ def h4_training_identity(
         "supervision": "raw_logits_privileged_label_side_channel_v1",
         "shared_encoder": "state_history_context_optional_v1",
         "replay_protocol": (
-            "h2_public_replay_plus_source_bound_nonserialized_h4_labels_v2"
+            "h2_admc_coupled_public_policy_source_bound_h4_labels_v3"
         ),
         "topology": "single_process_h4_reference_v1",
     }
@@ -898,9 +917,47 @@ class V3H4Learner:
             or set(optimizer_state) != {"state", "param_groups"}
         ):
             raise CheckpointCompatibilityError("H4 belief state envelope mismatch")
+        if self.belief_optimizer is not None:
+            try:
+                _validate_optimizer_param_groups(
+                    optimizer_state["param_groups"],
+                    self.belief_optimizer.state_dict()["param_groups"],
+                )
+            except CheckpointCompatibilityError as exc:
+                raise CheckpointCompatibilityError(
+                    f"H4 belief optimizer mismatch: {exc}"
+                ) from exc
         inner = bundle["h3_checkpoint"]
         if not isinstance(inner, Mapping):
             raise CheckpointCompatibilityError("H4 nested H3 checkpoint is invalid")
+        inner_counters = inner.get("counters")
+        inner_statistics = inner.get("statistics")
+        if not isinstance(inner_counters, Mapping) or not isinstance(
+            inner_statistics, Mapping
+        ):
+            raise CheckpointCompatibilityError(
+                "H4 nested H3 progress envelope mismatch"
+            )
+        nested_progress = {
+            "learner_updates": statistics.base_updates,
+            "samples_consumed": statistics.base_decisions,
+            "policy_version": (
+                self.config.base.public.initial_policy_version
+                + statistics.policy_updates
+            ),
+            "steps": statistics.base_updates,
+            "decisions": statistics.base_decisions,
+            "public_updates": statistics.policy_updates,
+            "oracle_updates": statistics.oracle_updates,
+        }
+        for name, expected_value in nested_progress.items():
+            source = inner_counters if name in {
+                "learner_updates", "samples_consumed", "policy_version"
+            } else inner_statistics
+            if source.get(name) != expected_value:
+                raise CheckpointCompatibilityError(
+                    f"H4 nested H3 {name} does not match H4 progress"
+                )
         backup_inner = self._inner_bundle()
         backup_belief = (
             None

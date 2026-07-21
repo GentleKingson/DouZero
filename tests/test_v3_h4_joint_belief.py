@@ -17,6 +17,7 @@ from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.observation.privileged import PrivilegedObservation
+from douzero.runtime.policy_snapshot import PolicyLease
 from douzero.v3_hybrid import (
     AdaptiveDMCConfig,
     BELIEF_FEEDBACK_FARMERS,
@@ -25,6 +26,7 @@ from douzero.v3_hybrid import (
     V3H2LearnerConfig,
     V3HybridModel,
     V3HybridModelConfig,
+    capture_adaptive_transition,
     capture_plain_transition,
     load_v3_h4_public_checkpoint,
     load_v3_hybrid_public_checkpoint,
@@ -349,6 +351,79 @@ def test_h4_checkpoint_resume_preserves_phase_optimizers_and_policy_version(tmp_
             mode=BELIEF_MODE_ALTERNATING,
             shared=True,
         ).load_checkpoint(bad)
+
+
+def test_h4_checkpoint_rejects_optimizer_and_nested_h3_progress_drift(tmp_path):
+    _, transition, sample = _decision(advance=1)
+    learner = _learner(
+        feedback=BELIEF_FEEDBACK_FARMERS,
+        mode=BELIEF_MODE_ALTERNATING,
+        shared=True,
+    )
+    learner.train_batch([transition], belief_samples=[sample])
+    learner.train_batch([transition], belief_samples=[sample])
+    path = tmp_path / "h4-source.pt"
+    learner.save_checkpoint(path)
+
+    optimizer_drift = torch.load(path, map_location="cpu", weights_only=True)
+    optimizer_drift["belief_optimizer_state_dict"] = copy.deepcopy(
+        optimizer_drift["belief_optimizer_state_dict"]
+    )
+    optimizer_drift["belief_optimizer_state_dict"]["param_groups"][0]["lr"] *= 2
+    optimizer_bad = tmp_path / "h4-optimizer-drift.pt"
+    torch.save(optimizer_drift, optimizer_bad)
+    with pytest.raises(CheckpointCompatibilityError, match="optimizer"):
+        _learner(
+            feedback=BELIEF_FEEDBACK_FARMERS,
+            mode=BELIEF_MODE_ALTERNATING,
+            shared=True,
+        ).load_checkpoint(optimizer_bad)
+
+    ahead = _learner(
+        feedback=BELIEF_FEEDBACK_FARMERS,
+        mode=BELIEF_MODE_ALTERNATING,
+        shared=True,
+    )
+    for _ in range(4):
+        ahead.train_batch([transition], belief_samples=[sample])
+    ahead_path = tmp_path / "h4-ahead.pt"
+    ahead.save_checkpoint(ahead_path)
+    nested_drift = torch.load(path, map_location="cpu", weights_only=True)
+    ahead_bundle = torch.load(ahead_path, map_location="cpu", weights_only=True)
+    nested_drift["h3_checkpoint"] = ahead_bundle["h3_checkpoint"]
+    nested_bad = tmp_path / "h4-nested-drift.pt"
+    torch.save(nested_drift, nested_bad)
+    with pytest.raises(
+        CheckpointCompatibilityError, match="nested H3 learner_updates"
+    ):
+        _learner(
+            feedback=BELIEF_FEEDBACK_FARMERS,
+            mode=BELIEF_MODE_ALTERNATING,
+            shared=True,
+        ).load_checkpoint(nested_bad)
+
+
+def test_adaptive_capture_uses_exact_coupled_belief_policy_snapshot():
+    observation, _, _ = _decision(advance=1)
+    model = _model(BELIEF_FEEDBACK_FARMERS).eval()
+    belief = BeliefModel(BeliefConfig(hidden_size=16, num_layers=1)).eval()
+    policy = V3BeliefPolicy(model, belief, ruleset=RuleSet.legacy()).eval()
+    lease = PolicyLease(
+        slot=1, version=7, model=policy, owner_id=3, generation=5
+    )
+    expected = float(policy.forward_observation(observation).dmc_q[0, 0].item())
+
+    pending = capture_adaptive_transition(
+        lease,
+        observation,
+        selected_action_index=0,
+        episode_id="h4-admc-episode",
+        deal_id="h4-admc-deal",
+        target_transform="raw",
+    )
+
+    assert pending.adaptive_provenance.q_old == pytest.approx(expected)
+    assert pending.adaptive_provenance.policy_version == 7
 
 
 def test_public_policy_uses_only_public_posterior_and_strict_coupled_checkpoint(tmp_path):
