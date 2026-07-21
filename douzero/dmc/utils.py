@@ -19,6 +19,13 @@ from .profiling import legacy_profile_range
 Card2Column = {3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5, 9: 6, 10: 7,
                11: 8, 12: 9, 13: 10, 14: 11, 17: 12}
 
+
+def _actor_role_models(model, backend, positions):
+    """Resolve immutable snapshot role modules once per episode."""
+    if backend not in {"factorized", "centralized_factorized"}:
+        return None
+    return {position: model.get_model(position) for position in positions}
+
 NumOnes2Array = {0: np.array([0, 0, 0, 0]),
                  1: np.array([1, 0, 0, 0]),
                  2: np.array([1, 1, 0, 0]),
@@ -286,6 +293,8 @@ def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
         position, obs, env_output = env.initial()
         lease = policy_pool.acquire(owner_id=i)
         model = lease.model
+        backend = getattr(flags, "legacy_actor_backend", "legacy")
+        role_models = _actor_role_models(model, backend, positions)
         episode_policy_version = lease.version
 
         while stop_event is None or not stop_event.is_set():
@@ -296,7 +305,6 @@ def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
                 legal_count = len(obs['legal_actions'])
                 recorder.legal_actions(legal_count)
                 inference_started_ns = time.perf_counter_ns()
-                backend = getattr(flags, "legacy_actor_backend", "legacy")
                 if (legal_count == 1
                         and backend in {"factorized", "centralized_factorized"}):
                     # Preserve legacy epsilon RNG consumption even though the
@@ -343,7 +351,7 @@ def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
                             "actor.inference",
                         ):
                             if backend in {"factorized", "centralized_factorized"}:
-                                role_model = model.get_model(position)
+                                role_model = role_models[position]
                                 agent_output = role_model.forward_factorized(
                                     obs['z_single'], obs['x_state_single'],
                                     obs['x_action'], flags=flags,
@@ -397,6 +405,7 @@ def act(i, device, free_queue, full_queue, policy_pool, buffers, flags,
             lease = None
             lease = policy_pool.acquire(owner_id=i)
             model = lease.model
+            role_models = _actor_role_models(model, backend, positions)
             episode_policy_version = lease.version
 
             for p in positions:
