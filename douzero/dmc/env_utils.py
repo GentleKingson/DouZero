@@ -13,9 +13,10 @@ def _format_observation(obs, device):
     move them to CUDA.
     """
     position = obs['position']
-    if not device == "cpu":
-        device = 'cuda:' + str(device)
-    device = torch.device(device)
+    if not isinstance(device, torch.device):
+        if device != "cpu":
+            device = 'cuda:' + str(device)
+        device = torch.device(device)
     factorized = 'x_state_single' in obs
     if factorized:
         formatted = {
@@ -40,10 +41,16 @@ class Environment:
         """
         self.env = env
         self.device = device
+        self.torch_device = (
+            torch.device("cpu") if device == "cpu"
+            else torch.device("cuda:" + str(device))
+        )
         self.episode_return = None
 
     def initial(self):
-        initial_position, initial_obs, x_no_action, z = _format_observation(self.env.reset(), self.device)
+        initial_position, initial_obs, x_no_action, z = _format_observation(
+            self.env.reset(), self.torch_device
+        )
         initial_reward = torch.zeros(1, 1)
         self.episode_return = torch.zeros(1, 1)
         initial_done = torch.ones(1, 1, dtype=torch.bool)
@@ -69,7 +76,9 @@ class Environment:
             obs = self.env.reset()
             self.episode_return = torch.zeros(1, 1)
 
-        position, obs, x_no_action, z = _format_observation(obs, self.device)
+        position, obs, x_no_action, z = _format_observation(
+            obs, self.torch_device
+        )
         reward = torch.tensor(reward).view(1, 1)
         done = torch.tensor(done).view(1, 1)
         

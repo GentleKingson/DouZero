@@ -182,6 +182,29 @@ def test_a1_split_dense1_flag_defaults_off_and_is_opt_in():
     ]).legacy_actor_split_dense1 is True
 
 
+def test_factorized_actor_resolves_role_models_once_per_snapshot():
+    from unittest.mock import Mock
+
+    from douzero.dmc.utils import _actor_role_models
+
+    snapshot = Mock()
+    snapshot.get_model.side_effect = lambda position: f"model:{position}"
+    positions = ["landlord", "landlord_up", "landlord_down"]
+    resolved = _actor_role_models(snapshot, "factorized", positions)
+    assert resolved == {position: f"model:{position}" for position in positions}
+    assert snapshot.get_model.call_count == 3
+
+
+def test_legacy_actor_does_not_resolve_factorized_role_models():
+    from unittest.mock import Mock
+
+    from douzero.dmc.utils import _actor_role_models
+
+    snapshot = Mock()
+    assert _actor_role_models(snapshot, "legacy", ["landlord"]) is None
+    snapshot.get_model.assert_not_called()
+
+
 @pytest.mark.parametrize("position,state_width", [
     ("landlord", 319), ("landlord_up", 430), ("landlord_down", 430),
 ])
