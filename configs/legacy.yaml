@@ -58,6 +58,7 @@ legacy_metrics_path: ""
 benchmark_warmup_frames: 0
 compile_actor: false
 compile_learner: false
+legacy_matmul_precision: highest
 rmsprop_foreach: false
 grad_clip_foreach: false
 central_actor_max_actions: 512

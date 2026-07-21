@@ -115,6 +115,9 @@ parser.add_argument('--compile_actor', action=argparse.BooleanOptionalAction,
                     default=False, help='Compile actor only (unsupported for V1 dynamic actions)')
 parser.add_argument('--compile_learner', action=argparse.BooleanOptionalAction,
                     default=False, help='Compile the fixed-shape V1 learner forward')
+parser.add_argument('--legacy_matmul_precision',
+                    choices=['highest', 'high', 'medium'], default='highest',
+                    help='Float32 matmul precision experiment for the V1 learner')
 parser.add_argument('--rmsprop_foreach', action=argparse.BooleanOptionalAction,
                     default=False, help='Use the RMSprop foreach implementation')
 parser.add_argument('--grad_clip_foreach', action=argparse.BooleanOptionalAction,

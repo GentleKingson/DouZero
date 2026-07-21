@@ -288,6 +288,7 @@ _FIELD_TYPES: dict[str, type | tuple[type, ...]] = {
     "legacy_profile": bool, "legacy_profile_sample_interval": int,
     "legacy_metrics_path": str, "benchmark_warmup_frames": int,
     "compile_actor": bool, "compile_learner": bool,
+    "legacy_matmul_precision": str,
     "rmsprop_foreach": bool, "grad_clip_foreach": bool,
     "central_actor_max_actions": int, "central_actor_microbatch": int,
     "central_actor_envs_per_actor": int,
@@ -472,6 +473,8 @@ def _validate_training_system(cfg: TrainingConfig) -> None:
         raise ValueError("legacy_actor_backend is unsupported")
     if cfg.actor_torch_threads < 0:
         raise ValueError("actor_torch_threads must be >= 0")
+    if cfg.legacy_matmul_precision not in {"highest", "high", "medium"}:
+        raise ValueError("legacy_matmul_precision is unsupported")
     if cfg.legacy_log_interval_seconds < 0:
         raise ValueError("legacy_log_interval_seconds must be non-negative")
     if cfg.legacy_monitor_interval_seconds <= 0:
@@ -611,6 +614,7 @@ _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
     "legacy_monitor_interval_seconds", "legacy_profile",
     "legacy_profile_sample_interval", "legacy_metrics_path",
     "benchmark_warmup_frames", "compile_actor", "compile_learner",
+    "legacy_matmul_precision",
     "rmsprop_foreach", "grad_clip_foreach",
     "central_actor_max_actions", "central_actor_microbatch",
     "central_actor_envs_per_actor", "central_actor_min_microbatch",

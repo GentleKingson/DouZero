@@ -393,6 +393,15 @@ def learn(position,
                     raise FloatingPointError('non-finite learner parameter')
         return stats, timings
 
+
+def configure_legacy_matmul_precision(flags):
+    """Apply the explicit Legacy learner matmul experiment before model init."""
+    precision = getattr(flags, 'legacy_matmul_precision', 'highest')
+    if precision not in {'highest', 'high', 'medium'}:
+        raise ValueError('legacy_matmul_precision is unsupported')
+    torch.set_float32_matmul_precision(precision)
+
+
 def train(flags):
     """
     This is the main funtion for training. It will first
@@ -400,6 +409,7 @@ def train(flags):
     Then it will start subprocesses as actors. Then it will call
     learning function with multiple threads.
     """
+    configure_legacy_matmul_precision(flags)
     # P03: training only supports the legacy observation feature version. The
     # V2 observation schema (douzero/observation/) is accepted by configuration
     # but is NOT yet wired into the actor/learner — the buffers, models, and
