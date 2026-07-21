@@ -451,6 +451,21 @@ def test_checkpoint_resume_preserves_schedule_optimizer_policy_rng_and_stats(tmp
         torch.equal(learner.model.state_dict()[name], resumed.model.state_dict()[name])
         for name in learner.model.state_dict()
     )
+    continuation_snapshot = copy.deepcopy(learner.model).eval()
+    continuation = [
+        _adaptive_transition(
+            continuation_snapshot, 332, "landlord_down", policy_version=1
+        )
+    ]
+    expected_metrics = learner.train_batch(continuation)
+    resumed_metrics = resumed.train_batch(continuation)
+    assert resumed_metrics.loss_total == pytest.approx(expected_metrics.loss_total)
+    assert resumed_metrics.gamma == pytest.approx(expected_metrics.gamma)
+    assert resumed.statistics.state_dict() == learner.statistics.state_dict()
+    assert all(
+        torch.equal(learner.model.state_dict()[name], resumed.model.state_dict()[name])
+        for name in learner.model.state_dict()
+    )
 
 
 def test_checkpoint_identity_partial_load_and_public_loader_fail_closed(tmp_path):

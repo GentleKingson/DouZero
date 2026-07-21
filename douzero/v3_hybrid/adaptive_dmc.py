@@ -236,8 +236,10 @@ def adaptive_dmc_loss(
         else:
             near_zero = previous.abs() < config.epsilon
             stable = ~near_zero
-            ratio = torch.ones_like(current)
-            ratio[stable] = current[stable] / previous[stable]
+            denominator = torch.where(stable, previous, torch.ones_like(previous))
+            ratio = torch.where(
+                stable, current / denominator, torch.ones_like(current)
+            )
             clipped_ratio = ratio.clamp(lower, upper)
             ratio_candidate = clipped_ratio * previous
             delta_candidate = previous + (current - previous).clamp(
