@@ -1,8 +1,8 @@
 # DouZero V3 Hybrid Design
 
-Status: H0 contract frozen; H1 public card-play model and H2 Adaptive DMC
-learner components implemented. H3-H8 are not implemented. Playing strength
-not measured.
+Status: H0 contract frozen; H1 public card-play model, H2 Adaptive DMC, and H3
+online privileged Oracle guiding components implemented. H4-H8 are not
+implemented. Playing strength not measured.
 
 The repository audit and PR #28/#29/#30 file dispositions live in
 [`docs/v3_hybrid_contract.md`](../v3_hybrid_contract.md). This document is the
@@ -15,7 +15,7 @@ implementation-facing module and interface contract.
 | Observation V2 and public/privileged containers | Complete with leakage tests | Reused unchanged; public only |
 | Model V2 encoders and variable-action batching | Complete | Encoder and batching primitives reused |
 | Belief exact constrained posterior | Component complete; joint/alternating paths exist; long-run and strength evidence missing | Disabled, no parameters |
-| Offline privileged teacher/distillation | Component complete | Disabled, no import or parameters |
+| Offline privileged teacher/distillation | Component complete | P10 action alignment and cache identity reused by H3 |
 | Human BC, strategy, style, league, curriculum | Components integrated with V2 | Deferred to H6 |
 | Learned bidding | V2 component complete with distributed limitations | H1 fails closed |
 | Async/long-running single-GPU trainer | V2 implementation exists; topology-specific gaps remain | Deferred to H7 |
@@ -23,7 +23,7 @@ implementation-facing module and interface contract.
 | Public belief search | Budgeted component exists | Deferred to H7 |
 | Release package | Strict V2 package exists | H1 supplies a strict V3 public sidecar, not a formal release package |
 | Role residual V3 policy | H1 implemented | Current stage |
-| Adaptive DMC, online Oracle, cooperation mixer | H2 Adaptive DMC implemented; Oracle/cooperation absent | H2, H3, H5 |
+| Adaptive DMC, online Oracle, cooperation mixer | H2 Adaptive DMC and H3 Oracle implemented; cooperation absent | H2, H3, H5 |
 | Formal V3 long-run and playing strength | Missing | H8 |
 
 ## Data boundary
@@ -138,6 +138,67 @@ through that public-only sidecar, which excludes optimizer state, `q_old`,
 statistics, and all later-stage training data. The H2 training identity wraps
 the H1 public identity with `oadmcdou-ratio-safe-hybrid-v1`; it does not mutate
 or relabel existing H1 checkpoints.
+
+## H3 online Oracle contract
+
+H3 keeps privileged code under `douzero.v3_hybrid.training`. The public
+package, model, exporter, loader, DeepAgent, and search import graph remain
+unchanged and do not import the Oracle or `PrivilegedObservation`. Importing
+the disabled H3 learner configuration also has no privileged import side
+effect. An enabled learner lazily creates a separate `V3PrivilegedOracle`; it
+owns its own V3 public-shaped backbone plus a gated hidden-hand residual branch.
+It may copy the student's initial state, but never shares parameters or a
+deployment forward API with the student.
+
+Online samples reuse P10 `OfflineDistillationSample`, canonical action keys,
+`align_teacher_output`, and `TeacherCacheIdentity`. H3 adds no parallel
+privileged serialization or alignment format. Public replay remains the H2
+`V3ReplayTransition`; hidden hands and labels are held separately and required
+only during Oracle warmup and guided updates. Each Oracle sample must exactly
+match replay public tensors, selected real-action index, acting role,
+action-key count, and terminal target.
+
+The learner-update schedule has three exact states:
+
+1. `oracle_warmup`: only the Oracle optimizer advances; student parameters and
+   public policy version remain unchanged.
+2. `guided`: public DMC/Adaptive-DMC and Oracle value loss train together.
+   Temperature KL, top-k ranking, and chosen-action value distillation are
+   independently weighted. Oracle value weight, guidance, temperature, and the
+   privileged gate anneal by learner update.
+3. `public_finetune`: guidance, Oracle loss, and privileged gate are exactly
+   zero. Privileged samples are rejected and only public DMC/Adaptive-DMC
+   continues for exactly `finetune_updates`. The next learner tick enters an
+   immutable `complete` phase and rejects further training batches.
+
+A one-update guided phase applies the configured start weights on its sole
+update, then crosses directly to the zero-privilege public-finetune boundary.
+Guidance removes batch padding before aligning the student's real legal
+actions with the Oracle action keys.
+
+An enabled schedule advances on every admitted positive-role-weight learner
+batch, including a deliberately zero-loss boundary tick. This prevents a
+zero-weight warmup or fully annealed guided tail from trapping resume at one
+update forever. Such ticks consume real samples and are checkpointed, but do
+not advance the public policy version or either optimizer. Adaptive replay
+provenance may remain attached during Oracle-only phases even though `q_old`
+is not consumed; it becomes mandatory again when Adaptive-DMC is active.
+
+Role weights apply once and all losses normalize over real decisions, never
+padded action rows. H3 checkpoints bind the public H2 identity, Oracle graph,
+loss weights, phase lengths, annealing values, optimizer configurations,
+replay semantics, and normalization. They persist student and Oracle states
+separately, both optimizers, learner update, policy version, phase state,
+cumulative metrics, and Python/NumPy/Torch/CUDA RNG. H3 trainer checkpoints
+are privileged training artifacts and the public loader rejects them. Public
+export continues to use the H1 sidecar and serializes only the student.
+Resume also requires public policy version to equal its configured initial
+version plus the persisted number of public optimizer updates.
+
+H3 reports action agreement, chosen-action value error, KL, ranking/value
+losses, optimizer gradient norms, phase, temperature, gate, and role weights.
+Throughput, VRAM, and playing strength require real CUDA runs and paired
+evaluation of the exported public checkpoint. Playing strength not measured.
 
 ## Batching and masks
 
