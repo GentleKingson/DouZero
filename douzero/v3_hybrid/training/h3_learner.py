@@ -29,6 +29,7 @@ from ..h2_learner import (
     h2_training_identity,
 )
 from ..model import V3_HYBRID_ROLES, V3HybridModel
+from ..output import BatchedV3HybridModelOutput, V3HybridModelOutput
 from ..replay import V3ReplayTransition
 from .guidance_config import OracleGuidanceLossConfig
 from .oracle_schedule import (
@@ -85,6 +86,29 @@ def _nonnegative(name: str, value: float) -> None:
         or value < 0.0
     ):
         raise ValueError(f"{name} must be finite and non-negative")
+
+
+def _select_real_actions(
+    output: BatchedV3HybridModelOutput, index: int, action_count: int
+) -> V3HybridModelOutput:
+    """Remove batch padding before applying per-decision Oracle guidance."""
+
+    selected = output.select(index)
+    if not 0 < action_count <= selected.num_actions:
+        raise ValueError("Oracle action count is outside the student output")
+    if not bool(selected.action_mask[:action_count].all()) or bool(
+        selected.action_mask[action_count:].any()
+    ):
+        raise ValueError("student batch padding does not match Oracle actions")
+    return V3HybridModelOutput(
+        dmc_q=selected.dmc_q[:action_count],
+        win_logit=selected.win_logit[:action_count],
+        score_if_win=selected.score_if_win[:action_count],
+        score_if_loss=selected.score_if_loss[:action_count],
+        p_win=selected.p_win[:action_count],
+        score_mean=selected.score_mean[:action_count],
+        action_mask=selected.action_mask[:action_count],
+    )
 
 
 @dataclass(frozen=True)
@@ -567,7 +591,9 @@ class V3H3Learner:
                     assert output is not None
                     guidance_losses.append(
                         oracle_guidance_loss(
-                            output.select(index),
+                            _select_real_actions(
+                                output, index, len(sample.action_keys)
+                            ),
                             sample.action_keys,
                             oracle_output,
                             chosen_action_index=sample.action_index,

@@ -171,6 +171,11 @@ The learner-update schedule has three exact states:
    continues for exactly `finetune_updates`. The next learner tick enters an
    immutable `complete` phase and rejects further training batches.
 
+A one-update guided phase applies the configured start weights on its sole
+update, then crosses directly to the zero-privilege public-finetune boundary.
+Guidance removes batch padding before aligning the student's real legal
+actions with the Oracle action keys.
+
 An enabled schedule advances on every admitted positive-role-weight learner
 batch, including a deliberately zero-loss boundary tick. This prevents a
 zero-weight warmup or fully annealed guided tail from trapping resume at one

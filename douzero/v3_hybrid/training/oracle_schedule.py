@@ -46,7 +46,7 @@ class OracleGuidingScheduleConfig:
     privileged_gate_start: float = 1.0
     privileged_gate_end: float = 0.0
 
-    IDENTITY_VERSION = 2
+    IDENTITY_VERSION = 3
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -91,7 +91,7 @@ class OracleGuidingScheduleConfig:
     def compatibility_dict(self) -> dict[str, object]:
         return {
             "identity_version": self.IDENTITY_VERSION,
-            "phase_semantics": "bounded_finetune_scheduled_noop_tick_v2",
+            "phase_semantics": "bounded_finetune_scheduled_noop_single_start_v3",
             **asdict(self),
         }
 
@@ -110,7 +110,7 @@ class OracleGuidingScheduleConfig:
     @staticmethod
     def _linear(start: float, end: float, index: int, length: int) -> float:
         if length <= 1:
-            return float(end)
+            return float(start)
         fraction = min(max(index / float(length - 1), 0.0), 1.0)
         return float(start + fraction * (end - start))
 

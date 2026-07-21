@@ -59,12 +59,12 @@ def _model() -> V3HybridModel:
     )
 
 
-def _decision(seed: int = 3):
+def _decision(seed: int = 3, action_count: int = 4):
     np.random.seed(seed)
     env = Env("adp")
     env.reset()
     infoset = copy.deepcopy(env.infoset)
-    infoset.legal_actions = infoset.legal_actions[:4]
+    infoset.legal_actions = infoset.legal_actions[:action_count]
     observation = get_obs_v2(infoset, ruleset=RuleSet.legacy())
     privileged = PrivilegedObservation(
         all_handcards=infoset.all_handcards,
@@ -160,6 +160,17 @@ def test_schedule_is_update_based_and_reaches_exact_public_only_state():
         schedule, temperature_start=3.0
     ).stable_hash()
 
+    single = dataclasses.replace(schedule, warmup_updates=0, guided_updates=1)
+    only_guided = single.at(0)
+    assert only_guided.phase == ORACLE_PHASE_GUIDED
+    assert only_guided.oracle_weight == pytest.approx(single.oracle_weight_start)
+    assert only_guided.guidance_weight == pytest.approx(single.guidance_weight_start)
+    assert only_guided.temperature == pytest.approx(single.temperature_start)
+    assert only_guided.privileged_gate == pytest.approx(
+        single.privileged_gate_start
+    )
+    assert single.at(1).phase == ORACLE_PHASE_PUBLIC_FINETUNE
+
 
 def test_disabled_h3_import_and_training_need_no_privileged_module_or_object():
     code = (
@@ -222,6 +233,21 @@ def test_oracle_reuses_p10_action_alignment_and_guidance_tensor_formula():
         reduction="sum",
     ) * 4.0
     assert torch.allclose(loss.kl, expected)
+
+
+def test_guided_batch_trims_padding_to_each_real_legal_action_count():
+    _, _, short_transition, short_sample = _decision(seed=3, action_count=2)
+    _, _, long_transition, long_sample = _decision(seed=4, action_count=4)
+    learner = _learner(
+        schedule=dataclasses.replace(_schedule(), warmup_updates=0)
+    )
+    metrics = learner.train_batch(
+        [short_transition, long_transition],
+        oracle_samples=[short_sample, long_sample],
+    )
+    assert metrics.phase == ORACLE_PHASE_GUIDED
+    assert metrics.public_updated is True
+    assert metrics.action_agreement is not None
 
 
 def test_disabled_dmc_has_no_q_old_dependency_and_scheduled_noops_advance():
