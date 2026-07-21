@@ -126,8 +126,21 @@ def test_public_contract_has_no_privileged_import_side_effect():
         "import sys; "
         "assert 'douzero.observation.privileged' not in sys.modules; "
         "import douzero.v3_hybrid; "
+        "from douzero.observation.encode_v2 import ObservationV2; "
         "assert 'douzero.observation.privileged' not in sys.modules"
     )
     subprocess.run([sys.executable, "-c", probe], check=True)
     forbidden = v3_hybrid_semantic_contract()["deployment"]
     assert "all_handcards" in forbidden["forbidden_payloads"]
+
+
+def test_privileged_top_level_exports_remain_lazy_compatible():
+    probe = (
+        "import sys; "
+        "import douzero.observation as observation; "
+        "assert 'douzero.observation.privileged' not in sys.modules; "
+        "assert observation.PrivilegedObservation.__name__ == "
+        "'PrivilegedObservation'; "
+        "assert 'douzero.observation.privileged' in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", probe], check=True)

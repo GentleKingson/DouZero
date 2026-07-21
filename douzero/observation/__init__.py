@@ -23,6 +23,10 @@ The legacy encoder (``douzero.env.env.get_obs``) is unchanged and remains the
 default; V2 is opt-in via ``feature_version="v2"``.
 """
 
+from __future__ import annotations
+
+import importlib
+
 from douzero.observation.cards import (
     BIG_JOKER,
     BIG_JOKER_OFFSET,
@@ -59,11 +63,6 @@ from douzero.observation.history import (
     encode_history_token,
 )
 from douzero.observation.legacy_adapter import legacy_observation_from_v2
-from douzero.observation.privileged import (
-    PRIVILEGED_KIND,
-    PrivilegedObservation,
-    is_privileged,
-)
 from douzero.observation.public import (
     BIDDING_TOKEN_WIDTH,
     BiddingTokenBatch,
@@ -101,6 +100,29 @@ from douzero.observation.seats import (
     seats_from,
     teammate,
 )
+
+
+_PRIVILEGED_EXPORTS = frozenset({
+    "PRIVILEGED_KIND",
+    "PrivilegedObservation",
+    "is_privileged",
+})
+
+
+def __getattr__(name: str):
+    """Load training-only observation exports only when explicitly requested."""
+
+    if name not in _PRIVILEGED_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    privileged = importlib.import_module("douzero.observation.privileged")
+    value = getattr(privileged, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _PRIVILEGED_EXPORTS)
+
 
 __all__ = [
     # bidding observation
