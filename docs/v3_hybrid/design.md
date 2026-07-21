@@ -1,7 +1,8 @@
 # DouZero V3 Hybrid Design
 
-Status: H0 contract frozen; H1 public card-play model implemented. H2-H8 are
-not implemented by H1. Playing strength not measured.
+Status: H0 contract frozen; H1 public card-play model and H2 Adaptive DMC
+learner components implemented. H3-H8 are not implemented. Playing strength
+not measured.
 
 The repository audit and PR #28/#29/#30 file dispositions live in
 [`docs/v3_hybrid_contract.md`](../v3_hybrid_contract.md). This document is the
@@ -22,7 +23,7 @@ implementation-facing module and interface contract.
 | Public belief search | Budgeted component exists | Deferred to H7 |
 | Release package | Strict V2 package exists | H1 supplies a strict V3 public sidecar, not a formal release package |
 | Role residual V3 policy | H1 implemented | Current stage |
-| Adaptive DMC, online Oracle, cooperation mixer | Missing from H1 | H2, H3, H5 |
+| Adaptive DMC, online Oracle, cooperation mixer | H2 Adaptive DMC implemented; Oracle/cooperation absent | H2, H3, H5 |
 | Formal V3 long-run and playing strength | Missing | H8 |
 
 ## Data boundary
@@ -87,6 +88,56 @@ lambda_dmc * L_admc + lambda_win * L_win + lambda_score * L_score
 
 All schedule, valid-sample normalization, and role-weight accounting work is
 deferred to its owning stage rather than represented by an H1 placeholder.
+
+## H2 Adaptive DMC contract
+
+H2 adds a standalone V3-only selected-action learner. It does not route V3
+through the Legacy or V2 trainers and does not implement the H7 actor/runtime
+topology. Each adaptive replay row binds the public tensor bundle, selected
+real legal-action index, acting role, episode/deal identity, raw terminal MC
+return, target transform, complete ruleset id/version/hash, and immutable
+`PolicyLease` provenance (`q_old`, policy version, slot, owner, and generation).
+Ordinary DMC replay has no `q_old` dependency. Schema, ruleset, and protocol
+version mismatches fail closed at replay-buffer and learner admission; a
+serialized buffer also rejects record counts above its declared capacity and
+validates exact schema-derived card, flat, history, mask, and action shapes.
+
+The learner supports three exclusive modes:
+
+- `disabled`: ordinary selected-action `MSE(q_new, transformed_mc_return)`;
+- `paper_ratio`: clamp `q_new / q_old` to `[1-gamma, 1+gamma]`, multiply by
+  sign-preserving `q_old`, then clamp to the representable target range; exact
+  zero `q_old` uses a branch-safe ordinary-prediction fallback with finite
+  gradients;
+- `safe_hybrid`: use the ratio path when `abs(q_old) >= epsilon`, otherwise
+  clamp the additive change `q_new - q_old` to `[-delta, delta]`.
+
+Gamma follows a learner-update linear schedule. Mode, gamma endpoints and
+duration, epsilon, delta, target transform/clamp, optimizer settings, role
+weights, replay protocol, and reduction semantics are compatibility identity.
+Only gathered real actions enter the loss. Role weights are applied once and
+the weighted loss is normalized by their effective sum; per-role sample,
+weight, and loss metrics make accidental double weighting observable. A batch
+whose roles all have configured weight zero is an exact learner no-op so role
+ablations can resample without advancing optimizer, policy, or schedule state.
+
+H2 trainer checkpoints strictly persist model, optimizer, learner update,
+clip schedule, policy version, cumulative finite statistics, and Python,
+NumPy, Torch, and CUDA RNG states. Resume rejects partial envelopes, changed
+model/learner/ruleset/schema identity, stale source SHA, replay protocol drift,
+or counter/schedule/statistic disagreement. Cumulative statistics additionally
+validate role totals, configured role weights, adaptive-mode-only fields, and
+event-count bounds before any state is restored. Optimizer parameter layout and
+all identity-bound RMSprop hyperparameters must exactly match the configured
+optimizer. A public model carrying a checkpoint ruleset binding cannot be
+attached to a learner for another ruleset. Replay is explicitly flushed at a
+checkpoint boundary; H7 owns persistent actor/replay runtime integration.
+
+The frozen H1 public sidecar remains unchanged. A trained H2 model is released
+through that public-only sidecar, which excludes optimizer state, `q_old`,
+statistics, and all later-stage training data. The H2 training identity wraps
+the H1 public identity with `oadmcdou-ratio-safe-hybrid-v1`; it does not mutate
+or relabel existing H1 checkpoints.
 
 ## Batching and masks
 

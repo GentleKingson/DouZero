@@ -1,5 +1,15 @@
 """Opt-in DouZero V3 Hybrid contracts and H1 public card-play model."""
 
+from .adaptive_dmc import (
+    ADMC_DISABLED,
+    ADMC_PAPER_RATIO,
+    ADMC_SAFE_HYBRID,
+    AdaptiveDMCConfig,
+    AdaptiveDMCResult,
+    adaptive_dmc_loss,
+    transform_dmc_target,
+)
+
 from .checkpoint import (
     V3_HYBRID_H1_CHECKPOINT_FORMAT,
     h1_compatibility_identity,
@@ -32,6 +42,25 @@ from .contract import (
 from .export import ExportableV3HybridModel, export_v3_hybrid_padded
 from .model import V3_HYBRID_ROLES, V3HybridModel
 from .output import BatchedV3HybridModelOutput, V3HybridModelOutput
+from .h2_learner import (
+    V3_H2_TRAINER_CHECKPOINT_FORMAT,
+    V3_H2_TRAINING_CONTRACT,
+    AdaptiveDMCCumulativeStats,
+    V3H2Learner,
+    V3H2LearnerConfig,
+    V3H2StepMetrics,
+    h2_training_identity,
+)
+from .replay import (
+    V3_H2_REPLAY_SCHEMA_VERSION,
+    V3_H2_REPLAY_SEMANTICS,
+    AdaptiveSnapshotProvenance,
+    PendingV3Transition,
+    V3ReplayBuffer,
+    V3ReplayTransition,
+    capture_adaptive_transition,
+    capture_plain_transition,
+)
 
 __all__ = [
     "V3_HYBRID_CHECKPOINT_KIND",
@@ -62,4 +91,26 @@ __all__ = [
     "load_v3_hybrid_public_checkpoint",
     "ExportableV3HybridModel",
     "export_v3_hybrid_padded",
+    "ADMC_DISABLED",
+    "ADMC_PAPER_RATIO",
+    "ADMC_SAFE_HYBRID",
+    "AdaptiveDMCConfig",
+    "AdaptiveDMCResult",
+    "adaptive_dmc_loss",
+    "transform_dmc_target",
+    "V3_H2_REPLAY_SCHEMA_VERSION",
+    "V3_H2_REPLAY_SEMANTICS",
+    "AdaptiveSnapshotProvenance",
+    "PendingV3Transition",
+    "V3ReplayTransition",
+    "V3ReplayBuffer",
+    "capture_plain_transition",
+    "capture_adaptive_transition",
+    "V3_H2_TRAINER_CHECKPOINT_FORMAT",
+    "V3_H2_TRAINING_CONTRACT",
+    "AdaptiveDMCCumulativeStats",
+    "V3H2LearnerConfig",
+    "V3H2StepMetrics",
+    "V3H2Learner",
+    "h2_training_identity",
 ]

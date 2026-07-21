@@ -352,6 +352,20 @@ class V3HybridModel(nn.Module):
         inputs = observation_batch_to_model_inputs(
             public, pad_to_actions=pad_to_actions
         )
+        return self.forward_input_batch(inputs)
+
+    def forward_input_batch(
+        self, inputs: BatchedModelInputBundle
+    ) -> BatchedV3HybridModelOutput:
+        """Forward an already tensorized public replay or inference batch."""
+
+        if not isinstance(inputs, BatchedModelInputBundle):
+            raise TypeError("V3 input batch must be a BatchedModelInputBundle")
+        expected_hash = self.schema.stable_hash()
+        if not inputs.feature_schema_hashes or any(
+            value != expected_hash for value in inputs.feature_schema_hashes
+        ):
+            raise ValueError("V3 input batch feature schema mismatch")
         parameter = next(self.parameters())
         inputs.to(parameter.device)
         return self.forward_batched(
