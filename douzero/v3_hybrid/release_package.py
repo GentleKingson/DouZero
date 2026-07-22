@@ -32,6 +32,7 @@ from .contract import V3_HYBRID_MODEL_VERSION
 from .formal_evidence import (
     H8_REPORT_SCHEMA_VERSION,
     REQUIRED_VARIANTS,
+    h8a_support_matrix_hash,
     validate_h8_formal_evidence,
 )
 
@@ -220,8 +221,10 @@ def create_v3_public_model_package(
         report = {
             "schema_version": H8_REPORT_SCHEMA_VERSION,
             "evidence_sha256": "0" * 64,
+            "support_matrix_hash": h8a_support_matrix_hash(),
+            "development_status": "INCOMPLETE",
             "release_candidate": "NONE", "release_status": "NOT READY",
-            "playing_strength": "not measured", "training_run_count": 0,
+            "playing_strength": "NOT MEASURED", "training_run_count": 0,
             "evaluation_count": 0,
             "required_variants": list(REQUIRED_VARIANTS),
             "issues": ["formal evidence was not supplied"],
@@ -230,15 +233,15 @@ def create_v3_public_model_package(
     else:
         report = validate_h8_formal_evidence(formal_evidence)
         evidence_hash = report["evidence_sha256"]
-        if report["release_status"] == "READY" and formal_evidence[
-            "experiment_identity"
-        ]["git_sha"] != source_git_sha:
+        if formal_evidence["experiment_identity"]["git_sha"] != source_git_sha:
             raise V3ModelPackageError("formal evidence source SHA does not match package")
         if report["release_status"] == "READY":
             checkpoint_digest = _sha256(source)
             candidate_rows = [
                 row for row in formal_evidence["evaluations"]
-                if row["variant"] == "v3_full_hybrid_search_on"
+                if row["variant"] == report["release_candidate"]
+                and row["tier"] == "promotion"
+                and row["search_enabled"] is True
             ]
             if not candidate_rows or any(
                 row["model_checkpoint_sha256"] != checkpoint_digest
@@ -403,6 +406,7 @@ def verify_v3_public_model_package(
         "schema_version", "evidence_sha256", "release_candidate",
         "release_status", "playing_strength", "required_variants",
         "training_run_count", "evaluation_count", "issues",
+        "support_matrix_hash", "development_status",
     }
     if set(report) != expected_report_fields:
         raise V3ModelPackageError("formal_report.json fields mismatch")
@@ -416,6 +420,8 @@ def verify_v3_public_model_package(
             raise V3ModelPackageError("formal report does not match manifest")
     if report["schema_version"] != H8_REPORT_SCHEMA_VERSION:
         raise V3ModelPackageError("formal report schema mismatch")
+    if report["support_matrix_hash"] != h8a_support_matrix_hash():
+        raise V3ModelPackageError("formal report support matrix mismatch")
     checkpoint_format = _strict_load_checkpoint(
         root / "public_checkpoint.pt", schema=schema, ruleset=ruleset,
         model_config=model_config, belief_config=belief_config,

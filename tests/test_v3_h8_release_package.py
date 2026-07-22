@@ -9,13 +9,18 @@ import sys
 
 import pytest
 
+import douzero.v3_hybrid.release_package as release_package_module
+from douzero.belief.model import BeliefConfig, BeliefModel
 from douzero.env.rules import RuleSet
 from douzero.observation import build_v2_schema
 from douzero.v3_hybrid import (
+    BELIEF_FEEDBACK_FARMERS,
+    V3BeliefPolicy,
     V3HybridModel,
     V3HybridModelConfig,
     V3ModelPackageError,
     create_v3_public_model_package,
+    save_v3_h4_public_checkpoint,
     save_v3_hybrid_public_checkpoint,
     verify_v3_public_model_package,
 )
@@ -126,6 +131,43 @@ def test_package_rejects_false_ready_claim_even_with_recomputed_checksums(tmp_pa
         )
 
 
+def test_package_rejects_evidence_from_a_stale_source_head(
+    tmp_path, monkeypatch
+) -> None:
+    schema, config, ruleset, model = _runtime()
+    checkpoint = tmp_path / "public.pt"
+    save_v3_hybrid_public_checkpoint(checkpoint, model, ruleset=ruleset)
+    monkeypatch.setattr(
+        release_package_module,
+        "validate_h8_formal_evidence",
+        lambda _payload: {
+            "schema_version": release_package_module.H8_REPORT_SCHEMA_VERSION,
+            "evidence_sha256": "d" * 64,
+            "support_matrix_hash": release_package_module.h8a_support_matrix_hash(),
+            "development_status": "INCOMPLETE",
+            "release_candidate": "NONE",
+            "release_status": "NOT READY",
+            "playing_strength": "NOT MEASURED",
+            "training_run_count": 0,
+            "evaluation_count": 0,
+            "required_variants": [],
+            "issues": ["test fixture"],
+        },
+    )
+    with pytest.raises(V3ModelPackageError, match="source SHA"):
+        create_v3_public_model_package(
+            tmp_path / "package",
+            checkpoint,
+            schema=schema,
+            ruleset=ruleset,
+            model_config=config,
+            source_git_sha="a" * 40,
+            decision_config={"action_selection": "argmax_dmc_q"},
+            search_compatible=False,
+            formal_evidence={"experiment_identity": {"git_sha": "b" * 40}},
+        )
+
+
 def test_deployment_import_graph_excludes_training_only_modules() -> None:
     code = (
         "import sys; import douzero.v3_hybrid.release_package; "
@@ -133,3 +175,89 @@ def test_deployment_import_graph_excludes_training_only_modules() -> None:
         "assert not any(any(x in name for x in forbidden) for name in sys.modules)"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_package_round_trips_complete_h6_public_graph(tmp_path) -> None:
+    schema = build_v2_schema()
+    ruleset = RuleSet.standard()
+    config = V3HybridModelConfig(
+        hidden_size=16,
+        history_layers=1,
+        history_heads=4,
+        shared_fusion_layers=1,
+        landlord_adapter_layers=1,
+        farmer_adapter_layers=1,
+        human_prior_enabled=True,
+        strategy_features_enabled=True,
+        strategy_aux_enabled=True,
+        style_enabled=True,
+        style_embedding_dim=8,
+        bidding_enabled=True,
+        bidding_hidden_size=12,
+        bidding_uncertainty_enabled=True,
+    )
+    checkpoint = tmp_path / "h6-public.pt"
+    save_v3_hybrid_public_checkpoint(
+        checkpoint, V3HybridModel(schema, config), ruleset=ruleset
+    )
+    package = tmp_path / "h6-package"
+    create_v3_public_model_package(
+        package,
+        checkpoint,
+        schema=schema,
+        ruleset=ruleset,
+        model_config=config,
+        source_git_sha="b" * 40,
+        decision_config={"action_selection": "argmax_dmc_q"},
+        search_compatible=True,
+    )
+    verify_v3_public_model_package(
+        package,
+        schema=schema,
+        ruleset=ruleset,
+        model_config=config,
+        expected_source_git_sha="b" * 40,
+        expected_search_compatible=True,
+    )
+
+
+def test_package_round_trips_h4_public_belief_graph(tmp_path) -> None:
+    schema = build_v2_schema()
+    ruleset = RuleSet.legacy()
+    config = V3HybridModelConfig(
+        hidden_size=16,
+        history_layers=1,
+        history_heads=4,
+        shared_fusion_layers=1,
+        landlord_adapter_layers=1,
+        farmer_adapter_layers=1,
+        belief_feedback=BELIEF_FEEDBACK_FARMERS,
+    )
+    belief_config = BeliefConfig(hidden_size=16, num_layers=1)
+    policy = V3BeliefPolicy(
+        V3HybridModel(schema, config),
+        BeliefModel(belief_config),
+        ruleset=ruleset,
+    )
+    checkpoint = tmp_path / "h4-public.pt"
+    save_v3_h4_public_checkpoint(checkpoint, policy)
+    package = tmp_path / "h4-package"
+    create_v3_public_model_package(
+        package,
+        checkpoint,
+        schema=schema,
+        ruleset=ruleset,
+        model_config=config,
+        belief_config=belief_config,
+        source_git_sha="c" * 40,
+        decision_config={"action_selection": "argmax_dmc_q"},
+        search_compatible=False,
+    )
+    verify_v3_public_model_package(
+        package,
+        schema=schema,
+        ruleset=ruleset,
+        model_config=config,
+        belief_config=belief_config,
+        expected_source_git_sha="c" * 40,
+    )

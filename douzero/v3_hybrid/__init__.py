@@ -100,9 +100,15 @@ from .selective_search import (
     V3SelectiveSearch,
 )
 from .formal_evidence import (
+    DEVELOPMENT,
+    H8A_SUPPORT_MATRIX_VERSION,
+    H8A_VARIANT_RULESET_SUPPORT,
     H8_EVIDENCE_SCHEMA_VERSION,
     H8_REPORT_SCHEMA_VERSION,
     H8EvidenceError,
+    PROMOTION,
+    h8a_support_matrix_dict,
+    h8a_support_matrix_hash,
     validate_h8_formal_evidence,
 )
 from .release_package import (
@@ -191,9 +197,15 @@ __all__ = [
     "V3H7SearchMetrics",
     "V3H7SearchRecord",
     "V3SelectiveSearch",
+    "DEVELOPMENT",
+    "PROMOTION",
+    "H8A_SUPPORT_MATRIX_VERSION",
+    "H8A_VARIANT_RULESET_SUPPORT",
     "H8_EVIDENCE_SCHEMA_VERSION",
     "H8_REPORT_SCHEMA_VERSION",
     "H8EvidenceError",
+    "h8a_support_matrix_dict",
+    "h8a_support_matrix_hash",
     "validate_h8_formal_evidence",
     "V3_H8_PACKAGE_FORMAT",
     "V3ModelPackageError",

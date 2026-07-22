@@ -1,4 +1,4 @@
-# H8 Formal Evaluation And Release Contract
+# H8a Formal Evaluation And Public-Package Infrastructure
 
 ## Status
 
@@ -7,43 +7,58 @@
 - Release status: **NOT READY**
 - Playing strength: **NOT MEASURED**
 
-No formal V3 weights, authorized human-game corpus, three-seed ablation
-matrix, or 100,000-deal paired evaluation was available when this contract was
-implemented. Functional tests and synthetic evidence must not be cited as
-playing-strength evidence.
+H8a delivers contracts, validation, packaging, CLI coverage, and tests. It does
+not run formal training, create candidate weights, or claim playing strength.
+Those empirical gates belong to H8b, so H8a may merge in the status above.
 
 ## Scope
 
-H8 does not change the model graph, losses, replay, trainer protocol, or search
-algorithm. It adds a fail-closed evidence validator and a strict public-only V3
-package. Algorithmic defects discovered by formal runs must return to H1-H7.
+H8a does not change model, loss, replay, trainer, or search algorithms. It adds
+a fail-closed evidence validator and a strict public-only V3 package. An
+algorithmic defect discovered by later experiments must return to H1-H7.
 
-## Evidence
+## Support Matrix
 
-`v3-hybrid-h8-formal-evidence-v1` binds source, image, hardware, resolved
-configuration, training semantics, workload, feature/model/ruleset identities,
-trainer topology, replay protocol, initial checkpoint, deal sets, seeds,
-budgets, auxiliary configurations, schedules, and checkpoint cadence.
+The versioned machine-readable matrix is exposed by
+`h8a_support_matrix_dict()`. It permits only current mainline combinations:
 
-The validator recomputes the release decision from raw rows. It requires:
+| Variant | Rulesets |
+| --- | --- |
+| `legacy_a1` | legacy |
+| `model_v2` | legacy, standard |
+| `v3_role` | legacy, standard |
+| `v3_admc` | legacy, standard |
+| `v3_oracle` | legacy, standard |
+| `v3_belief` | legacy, standard |
+| `v3_farmer_cooperation` | legacy, standard |
+| `v3_full_hybrid` | legacy, standard |
+| `v3_full_hybrid_bc` | legacy, and only with authorized data |
 
-- every frozen ablation at every declared training seed;
-- matched sample and wall-clock budgets;
-- at least two cumulative hours, real SIGTERM, fresh-container resume, state
-  continuity, a subsequent update, bounded policy lag, clean shutdown, and no
-  stale artifact for every run;
-- legacy and standard paired evaluation for every variant and seed;
-- at least 100,000 deals, deal-clustered 95% confidence intervals, overall WP
-  and ADP lower bounds above zero, and no role regression;
-- ordered latency percentiles within the frozen budget, strict package
-  validation, zero privileged leakage, invalid actions, timeouts, and model
-  load failures.
+Unsupported rows fail closed. Missing supported rows produce a valid but
+incomplete `NOT READY` report. Authorized BC evidence binds dataset identity,
+license, version, pseudonymization contract, and HMAC key identity hash.
 
-Malformed identities, duplicate rows, contradictory counts, non-finite values,
-unfrozen variants, and mismatched deal sets raise an error. Complete but failed
-or missing gates produce `NOT READY`; they are not coerced into malformed data.
+## Evidence Contract
 
-Run:
+`v3-hybrid-h8a-formal-evidence-v2` binds source, image, hardware, budgets,
+seeds, feature/trainer/replay identities, and deal sets. Every training and
+evaluation row additionally binds its complete ruleset identity, training
+configuration hash, and checkpoint hash.
+
+Evaluation has two distinct tiers:
+
+- `development`: at least 20,000 paired deals for ablation screening; never
+  creates a release candidate.
+- `promotion`: at least 100,000 paired deals with deal-clustered 95% confidence
+  intervals and all promotion gates satisfied.
+
+Search is an evaluation/deployment wrapper. Promotion search-off and search-on
+rows share one full-hybrid training checkpoint; H8a does not define a separate
+search-trained variant.
+
+The validator recomputes readiness from raw rows. Malformed identities,
+duplicates, unsupported combinations, non-finite values, contradictory counts,
+stale identities, and ruleset or checkpoint drift are rejected.
 
 ```bash
 python tools/validate_v3_h8_evidence.py evidence.json --output report.json
@@ -54,35 +69,26 @@ status 2.
 
 ## Public Package
 
-`v3-hybrid-h8-public-package-v1` accepts only a strict H1 public-policy or H4
-coupled public-belief checkpoint. It reloads the checkpoint before copying it,
-uses an exact file allow-list, checksums every asset, binds model, feature,
-belief, ruleset, decision, source, search, and formal-evidence identities, and
-reloads the copied checkpoint again before returning.
+`v3-hybrid-h8-public-package-v1` strictly reloads H1 public policy checkpoints
+and H4 coupled public-belief checkpoints. H6 public strategy, style, human
+prior, and bidding modules are part of the V3 model identity and are preserved
+by the same strict checkpoint path. The package also binds decision config,
+search compatibility, ruleset identity, source SHA, and evidence identity.
 
-The package excludes training-only Oracle, mixer, labels, replay, optimizer,
-raw trajectories, human identifiers, caches, local paths, and secrets. A
-package without passing formal evidence is deliberately produced as a
+The exact allow-list excludes Oracle, teacher, cooperation mixer, optimizer,
+replay, privileged labels, trajectories, human identifiers, caches, local
+paths, and secrets. A package without promotion evidence is deliberately a
 non-release research artifact with playing strength not measured.
-
-Run:
 
 ```bash
 python tools/package_v3_hybrid.py --help
 ```
 
-## Formal Work Remaining
+## H8b Work
 
-The following items require approved weights/data and commit-bound Docker GPU
-execution and therefore remain open:
-
-1. Three seeds for the frozen ablation matrix under matched sample and time
-   budgets.
-2. Two-hour stability plus SIGTERM/fresh-container resume for every candidate.
-3. Legacy and standard 100,000-deal paired evaluation with role confidence
-   intervals.
-4. Search-off/search-on overall-benefit comparison.
-5. Authorized BC strength evaluation, if licensed data is supplied.
-6. Final empty-environment validation of the promoted, checksummed package.
-
-Until all items pass against one immutable identity, release remains `NONE / NOT READY`.
+H8b will freeze and execute real commit-bound experiments: three matched
+training seeds, stability and fresh-container resume, development ablations,
+100,000-deal promotion evaluation, search comparison, and empty-environment
+validation of a promoted package. Authorized BC strength evaluation remains
+conditional on licensed data. Until those gates pass, the release state stays
+`NONE / NOT READY / NOT MEASURED`.
