@@ -86,7 +86,7 @@ def _run_until(trainer, deadline: float, *, episodes: int) -> tuple[int, int]:
     while time.monotonic() < deadline:
         trainer.collect_episodes(episodes)
         if trainer.step() is None:
-            raise RuntimeError("H7 benchmark did not have a full learner batch")
+            continue
         steps += 1
         max_lag = max(max_lag, trainer.policy_step - trainer._snapshot_step)
     return steps, max_lag

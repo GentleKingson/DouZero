@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+import time
 
 import numpy as np
 import pytest
 import torch
+
+from benchmarks.run_v3_h7_topology import _run_until
 
 from douzero.belief import BeliefConfig, BeliefModel, build_belief_input
 from douzero.env.env import Env
@@ -92,6 +95,34 @@ def test_h7_runtime_identity_binds_protocol_and_topology_fields():
     assert config.stable_hash() != changed.stable_hash()
     with pytest.raises(ValueError, match="unknown H7 request protocol"):
         replace(config, request_protocol="unknown")
+
+
+def test_h7_benchmark_waits_for_a_full_single_process_replay_batch():
+    class FakeTrainer:
+        policy_step = 0
+        _snapshot_step = 0
+
+        def __init__(self):
+            self.collections = 0
+            self.updates = 0
+
+        def collect_episodes(self, episodes):
+            assert episodes == 1
+            self.collections += 1
+
+        def step(self):
+            if self.collections == 1:
+                return None
+            self.updates += 1
+            return object()
+
+    trainer = FakeTrainer()
+    steps, lag = _run_until(
+        trainer, time.monotonic() + 0.01, episodes=1
+    )
+    assert trainer.collections > trainer.updates
+    assert steps == trainer.updates
+    assert lag == 0
 
 
 def test_h7_support_matrix_enables_only_base_async_capabilities():
