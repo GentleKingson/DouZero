@@ -287,8 +287,8 @@ class V3H5FarmerTrajectory:
         if any(
             isinstance(index, bool) or not isinstance(index, int) or index < 0
             for index in self.decision_indices
-        ) or tuple(sorted(set(self.decision_indices))) != self.decision_indices:
-            raise ValueError("H5 decision indices must be unique and increasing")
+        ) or len(set(self.decision_indices)) != count:
+            raise ValueError("H5 decision indices must be unique and non-negative")
         if self.public_features.shape != (count, H5_PUBLIC_FEATURE_DIM):
             raise ValueError("H5 public feature shape mismatch")
         if self.public_features.device.type != "cpu" or not bool(
@@ -301,6 +301,31 @@ class V3H5FarmerTrajectory:
             or self.selected_action_is_pass.device.type != "cpu"
         ):
             raise ValueError("H5 pass flags must be a bool CPU vector")
+        order = tuple(
+            sorted(range(count), key=lambda position: self.decision_indices[position])
+        )
+        if order != tuple(range(count)):
+            tensor_order = torch.tensor(order, dtype=torch.long)
+            object.__setattr__(
+                self,
+                "decision_indices",
+                tuple(self.decision_indices[position] for position in order),
+            )
+            object.__setattr__(
+                self,
+                "transitions",
+                tuple(self.transitions[position] for position in order),
+            )
+            object.__setattr__(
+                self,
+                "public_features",
+                self.public_features.index_select(0, tensor_order),
+            )
+            object.__setattr__(
+                self,
+                "selected_action_is_pass",
+                self.selected_action_is_pass.index_select(0, tensor_order),
+            )
         if (
             isinstance(self.team_return, bool)
             or not isinstance(self.team_return, (int, float))

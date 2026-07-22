@@ -325,6 +325,23 @@ def test_farmer_pair_contract_binds_reward_perspective_and_league_teammates():
     pairs = validate_farmer_pairs(trajectories)
     assert pairs[0][0].team_return == pairs[0][1].team_return == -2.0
     assert pairs[0][0].policy_id != pairs[0][1].policy_id
+    original = trajectories[0]
+    canonical = dataclasses.replace(
+        original,
+        decision_indices=tuple(reversed(original.decision_indices)),
+        transitions=tuple(reversed(original.transitions)),
+        public_features=original.public_features.flip(0),
+        selected_action_is_pass=original.selected_action_is_pass.flip(0),
+    )
+    assert canonical.decision_indices == original.decision_indices
+    assert all(
+        actual is expected
+        for actual, expected in zip(canonical.transitions, original.transitions)
+    )
+    assert torch.equal(canonical.public_features, original.public_features)
+    assert torch.equal(
+        canonical.selected_action_is_pass, original.selected_action_is_pass
+    )
     with pytest.raises(ValueError):
         validate_farmer_pairs(
             (trajectories[0], dataclasses.replace(trajectories[1], team_return=2.0))
@@ -527,6 +544,24 @@ def test_checkpoint_identity_drift_and_public_package_exclusion(tmp_path):
             _learner(mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0).load_checkpoint(
                 corrupted_path
             )
+    sidecar_name = next(iter(checkpoint["cooperation_state_dict"]))
+    sidecar_value = checkpoint["cooperation_state_dict"][sidecar_name]
+    invalid_sidecar_values = {
+        "nonfinite": torch.full_like(sidecar_value, float("nan")),
+        "shape": sidecar_value.reshape(-1)[:-1],
+        "dtype": sidecar_value.to(torch.float64),
+    }
+    for suffix, invalid in invalid_sidecar_values.items():
+        corrupted = copy.deepcopy(checkpoint)
+        corrupted["cooperation_state_dict"][sidecar_name] = invalid
+        corrupted_path = tmp_path / f"training-sidecar-{suffix}.pt"
+        torch.save(corrupted, corrupted_path)
+        with pytest.raises(
+            CheckpointCompatibilityError, match="incompatible or non-finite"
+        ):
+            _learner(mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0).load_checkpoint(
+                corrupted_path
+            )
     drifted = _learner(
         mixer_mode=MIXER_PUBLIC,
         lambda_mixer=1.0,
@@ -601,8 +636,8 @@ def test_nonfinite_and_padding_contracts_fail_closed():
     broken[0, 0] = float("inf")
     with pytest.raises(ValueError, match="finite CPU"):
         dataclasses.replace(trajectories[0], public_features=broken)
-    with pytest.raises(ValueError, match="increasing"):
-        dataclasses.replace(trajectories[0], decision_indices=(2, 1))
+    with pytest.raises(ValueError, match="unique and non-negative"):
+        dataclasses.replace(trajectories[0], decision_indices=(2, 2))
     with pytest.raises(ValueError, match="both farmer trajectories"):
         _learner().train_batch(
             trajectories[0].transitions, trajectories=(trajectories[0],)

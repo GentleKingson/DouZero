@@ -311,6 +311,29 @@ def _validate_rmsprop_state(
                 )
 
 
+def _validate_cooperation_state(
+    payload: Mapping[object, object],
+    cooperation: FarmerCooperationModule,
+) -> None:
+    """Validate sidecar parameter tensors before strict restoration."""
+
+    expected = cooperation.state_dict()
+    if not isinstance(payload, Mapping) or set(payload) != set(expected):
+        raise CheckpointCompatibilityError("H5 cooperation state mismatch")
+    for name, reference in expected.items():
+        value = payload[name]
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.shape != reference.shape
+            or value.dtype != reference.dtype
+            or value.layout != reference.layout
+            or (value.is_floating_point() and not bool(torch.isfinite(value).all()))
+        ):
+            raise CheckpointCompatibilityError(
+                f"H5 cooperation parameter {name} is incompatible or non-finite"
+            )
+
+
 class V3H5Learner:
     """Run H4-compatible public learning plus an opt-in sequential sidecar."""
 
@@ -772,8 +795,7 @@ class V3H5Learner:
             if state is not None or optimizer is not None:
                 raise CheckpointCompatibilityError("disabled H5 contains sidecar state")
         else:
-            if not isinstance(state, dict) or set(state) != set(self.cooperation.state_dict()):
-                raise CheckpointCompatibilityError("H5 cooperation state mismatch")
+            _validate_cooperation_state(state, self.cooperation)
             if not isinstance(optimizer, dict) or set(optimizer) != {"state", "param_groups"}:
                 raise CheckpointCompatibilityError("H5 optimizer envelope mismatch")
             _validate_optimizer_param_groups(
