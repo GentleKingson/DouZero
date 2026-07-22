@@ -1,4 +1,4 @@
-"""Machine-readable H6 capability and topology support contract."""
+"""Machine-readable H6/H7 capability and topology support contract."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h6-support-matrix-v1"
+V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-support-matrix-v1"
 
 TOPOLOGY_SINGLE_PROCESS = "single_process"
 TOPOLOGY_ASYNC_SINGLE_GPU = "async_single_gpu"
@@ -44,12 +44,12 @@ class CapabilitySupport:
 
 _ROWS = {
     "role_model": CapabilitySupport(
-        True, False, False, True, True, True, True, True, False,
-        "H1 public card-play model; async and search are H7 scope",
+        True, True, False, True, True, True, True, True, False,
+        "H7 reuses the bounded V2 async protocol for public V3 card play",
     ),
     "adaptive_dmc": CapabilitySupport(
-        True, False, False, True, True, True, True, True, False,
-        "H2 single-process learner; public export contains only policy weights",
+        True, True, False, True, True, True, True, True, False,
+        "H7 async replay binds q_old to the immutable served snapshot",
     ),
     "oracle": CapabilitySupport(
         True, False, False, True, True, True, True, True, False,
@@ -88,11 +88,11 @@ _ROWS = {
         "learned bidding is a separate standard-rules decision head",
     ),
     "selective_search": CapabilitySupport(
-        False, False, False, True, True, False, False, False, False,
-        "budgeted V3 deployment search is H7 scope",
+        True, False, False, True, True, True, True, True, True,
+        "H7 public-only composite gate wraps existing budgeted belief search",
     ),
     "public_export": CapabilitySupport(
-        True, False, False, True, True, True, True, True, False,
+        True, True, False, True, True, True, True, True, False,
         "strict public-only model sidecar; formal release package is H8 scope",
     ),
 }

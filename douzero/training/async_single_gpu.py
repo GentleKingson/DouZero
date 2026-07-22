@@ -105,9 +105,18 @@ class RequestMetadata:
 class SharedObservationSlots:
     """Preallocated CPU shared tensors for inference requests and responses."""
 
-    def __init__(self, schema, num_slots: int, max_actions: int = 256) -> None:
+    def __init__(
+        self,
+        schema,
+        num_slots: int,
+        max_actions: int = 256,
+        *,
+        output_width: int = 5,
+    ) -> None:
         if num_slots < 1 or max_actions < 1:
             raise ValueError("shared slot dimensions must be positive")
+        if output_width not in {5, 6}:
+            raise ValueError("shared output width must be 5 (V2) or 6 (V3)")
         card_dim = schema.card_vector_dim
         state_flat = state_width(schema) - 6 * card_dim
         context_flat = context_width(schema) - 2 * card_dim
@@ -115,6 +124,7 @@ class SharedObservationSlots:
         action_feature_width = action_width(schema)
         self.num_slots = int(num_slots)
         self.max_actions = int(max_actions)
+        self.output_width = int(output_width)
 
         self._shared_owners = []
         self._shared_specs = []
@@ -142,7 +152,7 @@ class SharedObservationSlots:
         # Keep all response heads adjacent per action.  The inference service
         # publishes one contiguous row copy; compatibility views retain the
         # named fields used by the actor and protocol tests.
-        self.output_values = shared((num_slots, max_actions, 5))
+        self.output_values = shared((num_slots, max_actions, output_width))
         self._bind_output_views()
         self.action_counts = shared((num_slots,), torch.int32)
         self.roles = shared((num_slots,), torch.int64)
@@ -155,7 +165,7 @@ class SharedObservationSlots:
 
     _OUTPUT_VIEW_FIELDS = (
         "output_win", "output_score_win", "output_score_loss",
-        "output_p_win", "output_score",
+        "output_p_win", "output_score", "output_dmc_q",
     )
 
     def _bind_output_views(self) -> None:
@@ -164,6 +174,9 @@ class SharedObservationSlots:
         self.output_score_loss = self.output_values[..., 2]
         self.output_p_win = self.output_values[..., 3]
         self.output_score = self.output_values[..., 4]
+        self.output_dmc_q = (
+            self.output_values[..., 5] if self.output_width == 6 else None
+        )
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -272,7 +285,9 @@ class PinnedObservationBatchStager:
             (batch, action_capacity), slots.action_mask.dtype
         )
         self.roles = pinned((batch,), slots.roles.dtype)
-        self.output_values = pinned((batch, action_capacity, 5), torch.float32)
+        self.output_values = pinned(
+            (batch, action_capacity, slots.output_width), torch.float32
+        )
 
     @staticmethod
     def _gather(source: torch.Tensor, indices: torch.Tensor, destination) -> None:
@@ -436,9 +451,17 @@ class SharedReplaySlots:
         "target_structure_cost",
     )
 
-    def __init__(self, schema, num_slots: int, max_actions: int = 256) -> None:
+    def __init__(
+        self,
+        schema,
+        num_slots: int,
+        max_actions: int = 256,
+        *,
+        v3_provenance: bool = False,
+    ) -> None:
         self.context = mp.get_context("spawn")
         self.observations = SharedObservationSlots(schema, num_slots, max_actions)
+        self.v3_provenance = bool(v3_provenance)
         self._validation_shapes = compact_model_input_shapes(schema)
         self._shared_owners = []
         self._shared_specs = []
@@ -458,12 +481,27 @@ class SharedReplaySlots:
         self._shared_owners.append(owner)
         self._shared_specs.append(((num_slots,), torch.int64))
         self.policy_steps.fill_(-1)
+        self.q_old, owner = _shared_tensor((num_slots,), torch.float32)
+        self._shared_owners.append(owner)
+        self._shared_specs.append(((num_slots,), torch.float32))
+        self.q_old.fill_(float("nan"))
+        self.actor_ids, owner = _shared_tensor((num_slots,), torch.int32)
+        self._shared_owners.append(owner)
+        self._shared_specs.append(((num_slots,), torch.int32))
+        self.actor_ids.fill_(-1)
+        self.episode_ids, owner = _shared_tensor((num_slots,), torch.int64)
+        self._shared_owners.append(owner)
+        self._shared_specs.append(((num_slots,), torch.int64))
+        self.episode_ids.fill_(-1)
         self.free_queue = self.context.Queue()
         self.ready_queue = self.context.Queue()
         for slot_id in range(num_slots):
             self.free_queue.put(slot_id)
 
-    _TENSOR_FIELDS = ("labels", "action_indices", "trace_indices", "policy_steps")
+    _TENSOR_FIELDS = (
+        "labels", "action_indices", "trace_indices", "policy_steps",
+        "q_old", "actor_ids", "episode_ids",
+    )
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -500,6 +538,22 @@ class SharedReplaySlots:
         self.action_indices[slot_id] = transition.action_index
         self.trace_indices[slot_id] = transition.trace_index
         self.policy_steps[slot_id] = policy_step
+        if self.v3_provenance:
+            q_old = getattr(transition, "actor_q_old", None)
+            actor_id = getattr(transition, "actor_id", None)
+            episode_id = getattr(transition, "episode_id", None)
+            if (
+                isinstance(q_old, bool)
+                or not isinstance(q_old, (int, float))
+                or not math.isfinite(q_old)
+            ):
+                raise ValueError("V3 async transition requires finite actor q_old")
+            for name, value in (("actor_id", actor_id), ("episode_id", episode_id)):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"V3 async transition requires non-negative {name}")
+            self.q_old[slot_id] = float(q_old)
+            self.actor_ids[slot_id] = actor_id
+            self.episode_ids[slot_id] = episode_id
         for index, name in enumerate(self.TARGET_NAMES):
             self.labels[slot_id, index] = float(getattr(transition, name))
         self.ready_queue.put(slot_id)
@@ -552,6 +606,69 @@ class SharedReplaySlots:
             self.free_queue.put(slot_id)
         return records
 
+    def read_ready_v3(
+        self,
+        *,
+        feature_schema_hash: str,
+        target_transform: str,
+        ruleset_identity,
+    ):
+        """Drain public V3 rows with exact actor-snapshot Q provenance."""
+        if not self.v3_provenance:
+            raise RuntimeError("shared replay was not configured for V3 provenance")
+        from douzero.v3_hybrid.replay import (
+            AdaptiveSnapshotProvenance,
+            V3ReplayTransition,
+        )
+
+        records = []
+        while True:
+            try:
+                slot_id = int(self.ready_queue.get_nowait())
+            except queue.Empty:
+                break
+            source = self.observations.read_bundle(slot_id, feature_schema_hash)
+            episode_id = int(self.episode_ids[slot_id])
+            actor_id = int(self.actor_ids[slot_id])
+            policy_step = int(self.policy_steps[slot_id])
+            record = V3ReplayTransition(
+                model_inputs=ModelInputBundle(
+                    state_card_vectors=tuple(value.clone() for value in source.state_card_vectors),
+                    state_context_flat=source.state_context_flat.clone(),
+                    context_card_vectors=tuple(value.clone() for value in source.context_card_vectors),
+                    context_flat=source.context_flat.clone(),
+                    history_tokens=source.history_tokens.clone(),
+                    history_key_padding_mask=source.history_key_padding_mask.clone(),
+                    action_features=source.action_features.clone(),
+                    action_mask=source.action_mask.clone(),
+                    acting_role=source.acting_role,
+                    feature_schema_hash=feature_schema_hash,
+                ),
+                selected_action_index=int(self.action_indices[slot_id]),
+                role=source.acting_role,
+                episode_id=f"actor-{actor_id}-episode-{episode_id}",
+                deal_id=f"async-deal-{episode_id}",
+                target_transform=target_transform,
+                mc_return=float(self.labels[slot_id, 1]),
+                adaptive_provenance=AdaptiveSnapshotProvenance(
+                    q_old=float(self.q_old[slot_id]),
+                    policy_version=policy_step,
+                    snapshot_slot=0,
+                    owner_id=actor_id,
+                    generation=policy_step,
+                ),
+                **dict(ruleset_identity),
+            )
+            record.validate(
+                expected_schema_hash=feature_schema_hash,
+                expected_target_transform=target_transform,
+                expected_ruleset_identity=ruleset_identity,
+                adaptive_required=True,
+            )
+            records.append(record)
+            self.free_queue.put(slot_id)
+        return records
+
     def close(self) -> None:
         self.free_queue.close()
         self.ready_queue.close()
@@ -566,6 +683,7 @@ class AsyncRequestCoordinator:
         *,
         num_slots: int,
         max_actions: int = 256,
+        output_width: int = 5,
         request_timeout_seconds: float = 30.0,
     ) -> None:
         if request_timeout_seconds <= 0:
@@ -573,7 +691,9 @@ class AsyncRequestCoordinator:
         self.context = mp.get_context("spawn")
         if self.context.get_start_method() != "spawn":
             raise RuntimeError("async V2 requires multiprocessing spawn")
-        self.slots = SharedObservationSlots(schema, num_slots, max_actions)
+        self.slots = SharedObservationSlots(
+            schema, num_slots, max_actions, output_width=output_width
+        )
         self._shared_owners = []
         self._shared_specs = []
         self.states, owner = _shared_tensor((num_slots,), torch.int8)
@@ -819,6 +939,7 @@ def async_actor_main(
     policy_version: str,
     policy_step,
     games_per_actor: int,
+    runtime_kind: str = "v2",
 ) -> None:
     """CPU-only interleaved-game actor. CUDA is never initialized here."""
     import random
@@ -839,6 +960,8 @@ def async_actor_main(
         np.random.seed((environment_seed + actor_id) % (1 << 32))
     if games_per_actor < 1:
         raise ValueError("games_per_actor must be positive")
+    if runtime_kind not in {"v2", "v3_hybrid"}:
+        raise ValueError("runtime_kind must be v2 or v3_hybrid")
     request_id = actor_id << 48
 
     def start_game(task):
@@ -857,6 +980,8 @@ def async_actor_main(
             ),
             "steps": 0,
             "pending": None,
+            "started_at": time.monotonic(),
+            "blocked_seconds": 0.0,
         }
 
     def finish_game(game) -> None:
@@ -876,12 +1001,16 @@ def async_actor_main(
             "completed", actor_id, game["episode_id"], len(episode.transitions),
             0 if team == "landlord" else 1, game["snapshot"],
             len(episode.action_trace),
+            float(game["blocked_seconds"]),
+            float(time.monotonic() - game["started_at"]),
         ))
 
-    def apply_action(game, action_index, obs, position, legal_actions) -> bool:
+    def apply_action(
+        game, action_index, obs, position, legal_actions, *, q_old=None
+    ) -> bool:
         episode = game["episode"]
         if obs is not None:
-            episode.transitions.append(Transition(
+            transition = Transition(
                 obs=obs,
                 action_index=action_index,
                 position=position,
@@ -889,7 +1018,14 @@ def async_actor_main(
                 policy_id=policy_version,
                 policy_version=policy_version,
                 policy_step=game["snapshot"],
-            ))
+            )
+            if runtime_kind == "v3_hybrid":
+                if q_old is None or not math.isfinite(float(q_old)):
+                    raise ValueError("V3 actor decision requires finite snapshot q_old")
+                transition.actor_q_old = float(q_old)
+                transition.actor_id = int(actor_id)
+                transition.episode_id = int(game["episode_id"])
+            episode.transitions.append(transition)
         action = legal_actions[action_index]
         episode.action_trace.append((position, tuple(sorted(action))))
         _obs, _reward, done, info = game["env"].step(action)
@@ -914,7 +1050,7 @@ def async_actor_main(
                 continue
 
             obs = get_obs_v2(infoset, ruleset=ruleset)
-            if epsilon > 0 and rng.random() < epsilon:
+            if runtime_kind == "v2" and epsilon > 0 and rng.random() < epsilon:
                 action_index = rng.randrange(len(legal_actions))
                 if apply_action(
                     game, action_index, obs, position, legal_actions
@@ -938,7 +1074,9 @@ def async_actor_main(
 
     def resolve_request(game):
         slot_id, pending_id, obs, position, legal_actions = game["pending"]
+        blocked_started = time.monotonic()
         coordinator.wait_done(slot_id, pending_id)
+        game["blocked_seconds"] += time.monotonic() - blocked_started
         count = int(coordinator.slots.action_counts[slot_id])
         mask = coordinator.slots.action_mask[slot_id, :count].clone()
         packed = coordinator.slots.output_values[slot_id, :count].clone()
@@ -952,9 +1090,21 @@ def async_actor_main(
             score_mean=packed[:, 4:5],
             action_mask=mask,
         )
-        return (
-            select_action(output, decision_config), obs, position, legal_actions
-        )
+        if runtime_kind == "v3_hybrid":
+            if packed.shape[1] != 6:
+                raise RuntimeError("V3 async response is missing dmc_q")
+            q_values = packed[:, 5].masked_fill(~mask, float("-inf"))
+            valid_indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+            action_index = (
+                int(rng.choice(valid_indices))
+                if epsilon > 0 and rng.random() < epsilon
+                else int(torch.argmax(q_values).item())
+            )
+            q_old = float(q_values[action_index].item())
+        else:
+            action_index = select_action(output, decision_config)
+            q_old = None
+        return action_index, obs, position, legal_actions, q_old
 
     try:
         active = []
@@ -992,9 +1142,9 @@ def async_actor_main(
             resolved = [
                 (game, *resolve_request(game)) for game in pending_games
             ]
-            for game, action_index, obs, position, legal_actions in resolved:
+            for game, action_index, obs, position, legal_actions, q_old in resolved:
                 if apply_action(
-                    game, action_index, obs, position, legal_actions
+                    game, action_index, obs, position, legal_actions, q_old=q_old
                 ):
                     active.remove(game)
     except BaseException as exc:

@@ -1,8 +1,10 @@
 # DouZero V3 Hybrid Design
 
 Status: H0 contract frozen; H1-H5 components and the H6 single-process Hybrid
-integration contract are implemented. H7 runtime/search and H8 formal
-evaluation are not implemented. Playing strength not measured.
+integration contract are implemented. H7 adds the bounded base V3+ADMC async
+runtime and public-only selective-search contract; formal topology benchmarks,
+long-run evidence, and H8 evaluation remain promotion gates. Playing strength
+not measured.
 
 The repository audit and PR #28/#29/#30 file dispositions live in
 [`docs/v3_hybrid_contract.md`](../v3_hybrid_contract.md). This document is the
@@ -441,3 +443,42 @@ release status NOT READY.
 | H6 | implemented in `support_matrix`, `integration_config`, `loss_composer`, `integration_replay`, optional public graph adapters, and `training.h6_learner`; runtime-only league/curriculum remain explicitly unsupported |
 | H7 | extend existing async/long-running runtime, policy snapshots, checkpoint manifests, and search ranker |
 | H8 | extend paired evaluation, ablation reports, release manifest/package, and rollback evidence |
+
+### H7 runtime and selective-search contract
+
+H7 reuses `douzero.training.async_single_gpu` rather than defining a second
+request state machine. The existing shared observation slab now has an explicit
+five-channel V2 or six-channel V3 output layout. The sixth V3 channel is the
+selected-action `dmc_q`; the CPU actor records that value with the immutable
+served snapshot version before terminal labels exist. Shared replay produces
+public `V3ReplayTransition` rows and binds actor, episode, snapshot generation,
+ruleset, target transform, and protocol identity. Legacy/V2 callers retain the
+five-channel default.
+
+`V3AsyncSingleGPUTrainer` currently supports only legacy-rules card play with
+the public role model, Adaptive DMC, and public export. Oracle, joint belief,
+cooperation, BC, strategy/style, league/curriculum, bidding, standard full-game,
+DDP, and search-in-training fail before worker creation. The runtime publishes
+at a quiescent game boundary, enforces a configured policy-lag bound, uses the
+existing coarse action buckets and pinned staging, and exposes queue, collate,
+H2D, forward, D2H, publish, replay-drain, learner, microbatch, lag, and
+quiescence metrics. Its training checkpoint includes exact runtime/protocol
+identity, learner state, optimizer/schedules, RNG, counters, snapshot version,
+and long-running state; replay remains ephemeral at checkpoint boundaries.
+
+`V3SelectiveSearch` wraps the existing belief sampler and endgame solver. Its
+composite gate uses only `PublicObservation`, public model values, and a
+conserved public belief posterior. Remaining cards, own cards, top-two Q gap,
+bomb/rocket risk, spring risk, belief entropy, and card-control state can
+trigger search. Disabled search, an incompatible package, global stop,
+non-conserved belief, exhausted budgets, action-alignment drift, legal-action
+drift, and search exceptions return the exact base action with a fresh
+structured reason. Search never creates or filters legal actions. Metrics cover
+trigger/fallback reasons, samples, nodes, rollouts, action changes, and
+p50/p95/p99 added latency.
+
+The production recommendation remains unchanged until three repeated,
+checkpoint-enabled end-to-end measurements compare single-process, 4x4 async,
+and 8x4 async under the same SHA/image/config/hardware identity. Centralized
+inference is not promoted from a forward microbenchmark. Release candidate:
+NONE. Release status: NOT READY. Playing strength not measured.
