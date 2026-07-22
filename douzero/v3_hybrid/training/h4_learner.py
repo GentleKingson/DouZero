@@ -578,14 +578,7 @@ class V3H4Learner:
         transitions: Sequence[V3ReplayTransition],
         *,
         belief_samples: Sequence[V3H4BeliefSample] | None = None,
-        external_policy_version_offset: int = 0,
     ) -> V3H4StepMetrics:
-        if (
-            isinstance(external_policy_version_offset, bool)
-            or not isinstance(external_policy_version_offset, int)
-            or external_policy_version_offset < 0
-        ):
-            raise ValueError("external policy version offset must be non-negative")
         if not transitions or len(transitions) > self.config.base.public.batch_size:
             raise ValueError("H4 requires a non-empty batch within configured size")
         phase = self.phase()
@@ -629,7 +622,6 @@ class V3H4Learner:
             base_metrics = self.base.train_batch(
                 transitions,
                 belief_features=features,
-                external_policy_version_offset=external_policy_version_offset,
             )
 
         belief_total = next(self.model.parameters()).sum() * 0.0

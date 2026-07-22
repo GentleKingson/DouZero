@@ -492,6 +492,10 @@ def test_adaptive_replay_accepts_the_aggregate_h5_policy_version():
     assert learner.base.base.policy_version == 2
     assert second.base.base.policy_version == 3
     assert second.policy_version == learner.policy_version == 4
+    with pytest.raises(TypeError, match="external_policy_version_offset"):
+        learner.base.base.train_batch(
+            rows, external_policy_version_offset=10_000
+        )
 
 
 def test_mixer_training_uses_unequal_local_q_and_public_or_privileged_state():

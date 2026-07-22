@@ -381,6 +381,8 @@ class V3H5Learner:
         self.eligible_updates = 0
         self.samples_consumed = 0
         self.statistics = H5CumulativeStats()
+        if self.config.cooperation.enabled:
+            self.base.base._bind_h5_policy_version_owner(self)
         self.compatibility_identity = h5_training_identity(
             self.model, ruleset, self.config
         )
@@ -464,10 +466,8 @@ class V3H5Learner:
             kind = "disabled" if cfg.mixer_mode == MIXER_DISABLED else "public"
             raise ValueError(f"{kind} mixer rejects privileged state")
 
-        base_metrics = self.base.train_batch(
-            transitions,
-            external_policy_version_offset=self.statistics.public_updates,
-        )
+        with self.base.base._h5_policy_version_scope(self):
+            base_metrics = self.base.train_batch(transitions)
         schedule_weight = cfg.schedule_weight(self.eligible_updates)
         if schedule_weight == 0.0:
             metrics = self._scheduled_noop(base_metrics, ordered, pairs)

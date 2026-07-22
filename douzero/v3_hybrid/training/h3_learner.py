@@ -9,6 +9,7 @@ import math
 import os
 import random
 import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
@@ -469,6 +470,8 @@ class V3H3Learner:
         self.learner_updates = 0
         self.samples_consumed = 0
         self.policy_version = public.initial_policy_version
+        self._h5_policy_version_owner = None
+        self._h5_policy_version_offset = 0
         self.statistics = H3CumulativeStats()
         self.compatibility_identity = h3_training_identity(
             self.model, self.ruleset, self.config
@@ -477,6 +480,26 @@ class V3H3Learner:
 
     def schedule_state(self) -> OracleScheduleState:
         return self.config.schedule.at(self.learner_updates)
+
+    def _bind_h5_policy_version_owner(self, owner: object) -> None:
+        if owner is None or self._h5_policy_version_owner is not None:
+            raise RuntimeError("H3 H5 policy-version owner binding is invalid")
+        self._h5_policy_version_owner = owner
+
+    @contextmanager
+    def _h5_policy_version_scope(self, owner: object):
+        if owner is not self._h5_policy_version_owner:
+            raise RuntimeError("H3 H5 policy-version owner mismatch")
+        if self._h5_policy_version_offset != 0:
+            raise RuntimeError("H3 H5 policy-version scope cannot be nested")
+        offset = owner.statistics.public_updates
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise RuntimeError("H3 H5 policy-version offset is invalid")
+        self._h5_policy_version_offset = offset
+        try:
+            yield
+        finally:
+            self._h5_policy_version_offset = 0
 
     def _guidance_enabled(self) -> bool:
         guidance = self.config.guidance
@@ -551,16 +574,9 @@ class V3H3Learner:
         *,
         oracle_samples: Sequence["OfflineDistillationSample"] | None = None,
         belief_features: torch.Tensor | None = None,
-        external_policy_version_offset: int = 0,
     ) -> V3H3StepMetrics:
-        if (
-            isinstance(external_policy_version_offset, bool)
-            or not isinstance(external_policy_version_offset, int)
-            or external_policy_version_offset < 0
-        ):
-            raise ValueError("external policy version offset must be non-negative")
         effective_policy_version = (
-            self.policy_version + external_policy_version_offset
+            self.policy_version + self._h5_policy_version_offset
         )
         state = self.schedule_state()
         if state.phase == ORACLE_PHASE_COMPLETE:
@@ -731,7 +747,7 @@ class V3H3Learner:
         }
         metrics = V3H3StepMetrics(
             learner_update=self.learner_updates,
-            policy_version=self.policy_version + external_policy_version_offset,
+            policy_version=self.policy_version + self._h5_policy_version_offset,
             phase=state.phase,
             temperature=state.temperature,
             privileged_gate=state.privileged_gate,
