@@ -158,12 +158,13 @@ def _pair(
     return tuple(all_rows), tuple(trajectories)
 
 
-def _base(*, batch_size: int = 8) -> V3H4LearnerConfig:
+def _base(*, batch_size: int = 8, device: str = "cpu") -> V3H4LearnerConfig:
     return V3H4LearnerConfig(
         base=V3H3LearnerConfig(
             public=V3H2LearnerConfig(
                 batch_size=batch_size,
                 learning_rate=1e-3,
+                device=device,
                 adaptive_dmc=AdaptiveDMCConfig(mode="disabled"),
             )
         )
@@ -183,12 +184,12 @@ def _coop(**changes) -> V3H5CooperationConfig:
     return V3H5CooperationConfig(**values)
 
 
-def _learner(**coop_changes) -> V3H5Learner:
+def _learner(*, device: str = "cpu", **coop_changes) -> V3H5Learner:
     return V3H5Learner(
         _model(),
         ruleset=RuleSet.legacy(),
         config=V3H5LearnerConfig(
-            base=_base(), cooperation=_coop(**coop_changes)
+            base=_base(device=device), cooperation=_coop(**coop_changes)
         ),
     )
 
@@ -503,6 +504,28 @@ def test_public_scalar_and_batched_forward_remain_equal_after_h5_update():
         actual = batched.select(index)
         count = expected.num_actions
         assert torch.allclose(actual.dmc_q[:count], expected.dmc_q, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_parameter_update_checkpoint_resume_and_second_update(tmp_path):
+    rows, trajectories = _pair()
+    learner = _learner(device="cuda", mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0)
+    before = _state(learner.cooperation)
+    first = learner.train_batch(rows, trajectories=trajectories)
+    assert first.cooperation_updated and _changed(before, learner.cooperation)
+    assert all(parameter.is_cuda for parameter in learner.model.parameters())
+    assert all(parameter.is_cuda for parameter in learner.cooperation.parameters())
+    checkpoint = tmp_path / "cuda-h5.pt"
+    learner.save_checkpoint(checkpoint)
+    restored = _learner(
+        device="cuda", mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0
+    )
+    restored.load_checkpoint(checkpoint)
+    resumed_before = _state(restored.cooperation)
+    second = restored.train_batch(rows, trajectories=trajectories)
+    assert second.cooperation_updated
+    assert _changed(resumed_before, restored.cooperation)
+    assert restored.eligible_updates == 2
 
 
 def test_nonfinite_and_padding_contracts_fail_closed():
