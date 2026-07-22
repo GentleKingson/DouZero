@@ -53,6 +53,22 @@ _FORBIDDEN_FILE_TOKENS = (
     "oracle", "teacher", "privileged", "hidden", "replay", "optimizer",
     "mixer", "human_id", "cache", "secret",
 )
+_CANONICAL_LEGAL_SHA256 = {
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "THIRD_PARTY_NOTICES": (
+        "d72fc4fdfdeeda1d80c71e69bab0db402ed19d3eab2ee1a755951144faf6ff53"
+    ),
+}
+
+
+def _canonical_legal_assets() -> dict[str, bytes]:
+    repository_root = Path(__file__).resolve().parents[2]
+    return {
+        "LICENSE": (repository_root / "LICENSE").read_bytes(),
+        "THIRD_PARTY_NOTICES": (
+            repository_root / "douzero" / "deployment" / "THIRD_PARTY_NOTICES"
+        ).read_bytes(),
+    }
 
 
 class V3ModelPackageError(RuntimeError):
@@ -331,12 +347,8 @@ def create_v3_public_model_package(
     _write_json(root / "formal_report.json", report)
     for name, contents in _default_documents(report).items():
         (root / name).write_text(contents, encoding="utf-8")
-    repository_root = Path(__file__).resolve().parents[2]
-    shutil.copyfile(repository_root / "LICENSE", root / "LICENSE")
-    shutil.copyfile(
-        repository_root / "douzero" / "deployment" / "THIRD_PARTY_NOTICES",
-        root / "THIRD_PARTY_NOTICES",
-    )
+    for name, contents in _canonical_legal_assets().items():
+        (root / name).write_bytes(contents)
     manifest = {
         "format": V3_H8_PACKAGE_FORMAT,
         "model_version": V3_HYBRID_MODEL_VERSION,
@@ -424,6 +436,11 @@ def verify_v3_public_model_package(
     for name, digest in parsed.items():
         if _sha256(root / name) != digest:
             raise V3ModelPackageError(f"checksum mismatch for {name}")
+    for name, expected_digest in _CANONICAL_LEGAL_SHA256.items():
+        if _sha256(root / name) != expected_digest:
+            raise V3ModelPackageError(
+                f"package canonical legal asset {name} does not match"
+            )
     manifest = _read_json(root / "manifest.json")
     expected_manifest_fields = {
         "format", "model_version", "access", "source_git_sha", "checkpoint_kind",

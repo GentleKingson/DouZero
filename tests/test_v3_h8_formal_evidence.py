@@ -495,6 +495,26 @@ def test_public_evidence_metadata_rejects_paths_and_secrets(value: str) -> None:
         validate_h8_formal_evidence(payload)
 
 
+def test_ruleset_version_rejects_private_metadata() -> None:
+    payload = _evidence()
+    payload["training_runs"][0]["ruleset"]["ruleset_version"] = "/private/run"
+    with pytest.raises(H8EvidenceError, match="public metadata"):
+        validate_h8_formal_evidence(payload)
+
+
+def test_paired_deal_count_is_bounded_before_numpy_conversion() -> None:
+    payload = _evidence()
+    row = payload["evaluations"][0]
+    huge = 2**63
+    row["deals"] = huge
+    row["games"] = huge * 2
+    row["outcome_histogram"][0]["count"] = huge
+    for role in row["by_role"].values():
+        role["games"] = huge
+    with pytest.raises(H8EvidenceError, match="deals exceeds the maximum"):
+        validate_h8_formal_evidence(payload)
+
+
 def test_stale_artifact_is_valid_but_not_ready() -> None:
     payload = _evidence(promotion=True)
     payload["training_runs"][0]["artifact_stale"] = True

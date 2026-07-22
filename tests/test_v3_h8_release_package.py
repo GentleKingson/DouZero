@@ -146,6 +146,17 @@ def test_package_rejects_document_claim_drift(tmp_path, document) -> None:
         )
 
 
+@pytest.mark.parametrize("asset", ["LICENSE", "THIRD_PARTY_NOTICES"])
+def test_package_rejects_static_legal_asset_drift(tmp_path, asset) -> None:
+    package, _, schema, config, ruleset = _package(tmp_path)
+    (package / asset).write_text("tampered legal text\n", encoding="utf-8")
+    _refresh_checksums(package)
+    with pytest.raises(V3ModelPackageError, match="canonical legal asset"):
+        verify_v3_public_model_package(
+            package, schema=schema, ruleset=ruleset, model_config=config
+        )
+
+
 def test_package_rejects_false_ready_claim_even_with_recomputed_checksums(tmp_path) -> None:
     package, _, schema, config, ruleset = _package(tmp_path)
     manifest_path = package / "manifest.json"

@@ -149,10 +149,7 @@ def _ruleset_identity(value: object, label: str) -> Mapping[str, Any]:
     ruleset = identity["ruleset_id"]
     if ruleset not in RULESETS:
         raise H8EvidenceError(f"{label}.ruleset_id is unsupported")
-    if not isinstance(identity["ruleset_version"], str) or not identity[
-        "ruleset_version"
-    ]:
-        raise H8EvidenceError(f"{label}.ruleset_version must be non-empty")
+    _public_metadata(identity["ruleset_version"], f"{label}.ruleset_version")
     _digest(identity["ruleset_hash"], f"{label}.ruleset_hash")
     return identity
 
@@ -396,6 +393,7 @@ _MIN_BOOTSTRAP_RESAMPLES = 1_000
 _MAX_BOOTSTRAP_RESAMPLES = 100_000
 _MAX_OUTCOME_HISTOGRAM_ATOMS = 4_096
 _MAX_BOOTSTRAP_CELLS = 10_000_000
+_MAX_PAIRED_DEALS = 10_000_000
 
 
 def _bootstrap_shape(
@@ -629,6 +627,8 @@ def _validate_evaluation(
     ):
         raise H8EvidenceError("promotion evidence does not match frozen candidate")
     deals = _integer(row["deals"], f"evaluation {variant}.deals", minimum=1)
+    if deals > _MAX_PAIRED_DEALS:
+        raise H8EvidenceError(f"evaluation {variant}.deals exceeds the maximum")
     games = _integer(row["games"], f"evaluation {variant}.games", minimum=1)
     if games != deals * 2:
         raise H8EvidenceError(f"evaluation {variant} games/deals are inconsistent")
