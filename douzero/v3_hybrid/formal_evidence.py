@@ -51,6 +51,10 @@ REQUIRED_VARIANTS = tuple(
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _IMAGE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_PUBLIC_METADATA = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+(),-]{0,127}\Z")
+_SENSITIVE_METADATA_TOKENS = (
+    "secret", "token", "password", "credential", "api_key", "apikey", "bearer",
+)
 
 
 class H8EvidenceError(ValueError):
@@ -126,6 +130,15 @@ def _digest(
     return value
 
 
+def _public_metadata(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _PUBLIC_METADATA.fullmatch(value):
+        raise H8EvidenceError(f"{label} must use the public metadata schema")
+    lowered = value.lower()
+    if any(token in lowered for token in _SENSITIVE_METADATA_TOKENS):
+        raise H8EvidenceError(f"{label} contains sensitive metadata")
+    return value
+
+
 def _ruleset_identity(value: object, label: str) -> Mapping[str, Any]:
     identity = _mapping(value, label)
     _exact(
@@ -178,8 +191,7 @@ def _validate_identity(identity: Mapping[str, Any]) -> None:
     if identity["support_matrix_hash"] != h8a_support_matrix_hash():
         raise H8EvidenceError("support matrix hash mismatch")
     for name in ("driver", "cuda", "pytorch", "gpu", "cpu"):
-        if not isinstance(identity[name], str) or not identity[name].strip():
-            raise H8EvidenceError(f"{name} must be a non-empty string")
+        _public_metadata(identity[name], name)
     seeds = identity["training_seeds"]
     if (
         not isinstance(seeds, list) or len(seeds) < 3

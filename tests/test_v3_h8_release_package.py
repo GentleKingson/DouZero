@@ -131,6 +131,21 @@ def test_package_rejects_symlinked_assets(tmp_path) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "document", ["model_card.md", "evaluation_summary.md", "known_limitations.md"]
+)
+def test_package_rejects_document_claim_drift(tmp_path, document) -> None:
+    package, _, schema, config, ruleset = _package(tmp_path)
+    (package / document).write_text(
+        "Release status: READY\nPlaying strength: MEASURED\n", encoding="utf-8"
+    )
+    _refresh_checksums(package)
+    with pytest.raises(V3ModelPackageError, match="does not match the formal report"):
+        verify_v3_public_model_package(
+            package, schema=schema, ruleset=ruleset, model_config=config
+        )
+
+
 def test_package_rejects_false_ready_claim_even_with_recomputed_checksums(tmp_path) -> None:
     package, _, schema, config, ruleset = _package(tmp_path)
     manifest_path = package / "manifest.json"
@@ -212,6 +227,34 @@ def test_package_rejects_evidence_from_a_stale_source_head(
             decision_config={"action_selection": "argmax_dmc_q"},
             search_compatible=False,
             formal_evidence={"experiment_identity": {"git_sha": "b" * 40}},
+        )
+
+
+def test_package_rebinds_manifest_source_to_packaged_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    package, _, schema, config, ruleset = _package(tmp_path)
+    evidence_path = package / "formal_evidence.json"
+    evidence_path.write_text(
+        json.dumps({
+            "supplied": True,
+            "payload": {"experiment_identity": {"git_sha": "a" * 40}},
+        }),
+        encoding="utf-8",
+    )
+    manifest_path = package / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source_git_sha"] = "b" * 40
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    _refresh_checksums(package)
+    monkeypatch.setattr(
+        release_package_module,
+        "validate_h8_formal_evidence",
+        lambda _payload: release_package_module._empty_formal_report(),
+    )
+    with pytest.raises(V3ModelPackageError, match="does not match packaged evidence"):
+        verify_v3_public_model_package(
+            package, schema=schema, ruleset=ruleset, model_config=config
         )
 
 

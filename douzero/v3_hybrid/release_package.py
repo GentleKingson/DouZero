@@ -525,6 +525,22 @@ def verify_v3_public_model_package(
         raise V3ModelPackageError("formal report schema mismatch")
     if report["support_matrix_hash"] != h8a_support_matrix_hash():
         raise V3ModelPackageError("formal report support matrix mismatch")
+    expected_documents = _default_documents(report)
+    for name, expected_contents in expected_documents.items():
+        try:
+            contents = (root / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise V3ModelPackageError(f"invalid package document {name}: {exc}") from exc
+        if contents != expected_contents:
+            raise V3ModelPackageError(
+                f"package document {name} does not match the formal report"
+            )
+    if evidence_wrapper["supplied"] and evidence_payload[
+        "experiment_identity"
+    ]["git_sha"] != manifest["source_git_sha"]:
+        raise V3ModelPackageError(
+            "manifest source Git SHA does not match packaged evidence"
+        )
     checkpoint_format = _strict_load_checkpoint(
         root / "public_checkpoint.pt", schema=schema, ruleset=ruleset,
         model_config=model_config, belief_config=belief_config,

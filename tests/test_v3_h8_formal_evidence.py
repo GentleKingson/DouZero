@@ -470,6 +470,14 @@ def test_malformed_or_contradictory_evidence_fails_closed(mutation, message) -> 
         validate_h8_formal_evidence(payload)
 
 
+@pytest.mark.parametrize("value", ["/home/user/GPU", "api_token=secret"])
+def test_public_evidence_metadata_rejects_paths_and_secrets(value: str) -> None:
+    payload = _evidence()
+    payload["experiment_identity"]["gpu"] = value
+    with pytest.raises(H8EvidenceError, match="public metadata|sensitive metadata"):
+        validate_h8_formal_evidence(payload)
+
+
 def test_stale_artifact_is_valid_but_not_ready() -> None:
     payload = _evidence(promotion=True)
     payload["training_runs"][0]["artifact_stale"] = True
