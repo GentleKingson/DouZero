@@ -241,6 +241,8 @@ def test_config_is_identity_bound_scheduled_and_fail_closed():
         _coop(mixer_mode=MIXER_PUBLIC)
     with pytest.raises(ValueError, match="privileged_state_dim"):
         _coop(mixer_mode=MIXER_PRIVILEGED, lambda_mixer=1.0)
+    with pytest.raises(ValueError, match="active sidecar loss"):
+        _coop(lambda_team_value=0.0, lambda_trajectory_consistency=0.0)
 
 
 def test_unsupported_cross_stage_combinations_fail_before_graph_creation():
@@ -305,6 +307,15 @@ def test_public_feature_builder_uses_existing_strategy_and_conservative_belief()
     )
     assert features.shape == (H5_PUBLIC_FEATURE_DIM,)
     assert torch.isfinite(features).all()
+    for invalid_role in ("landlord_up", "typo", ""):
+        with pytest.raises(ValueError, match="teammate or landlord"):
+            build_h5_public_features(
+                observation,
+                0,
+                belief_features=values,
+                unseen_counts=unseen,
+                opponent_a_role=invalid_role,
+            )
     with pytest.raises(TypeError, match="ObservationV2"):
         build_h5_public_features({"all_handcards": {}}, 0)
 

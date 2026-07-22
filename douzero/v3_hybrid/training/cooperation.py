@@ -127,6 +127,11 @@ class V3H5CooperationConfig:
                 raise ValueError("public mixer cannot configure privileged state")
             if self.mixer_mode == MIXER_PRIVILEGED and self.privileged_state_dim <= 0:
                 raise ValueError("privileged mixer requires privileged_state_dim > 0")
+            active_loss = self.lambda_team_value + self.lambda_trajectory_consistency
+            if self.mixer_enabled:
+                active_loss += self.lambda_mixer
+            if active_loss <= 0.0:
+                raise ValueError("enabled H5 requires at least one active sidecar loss")
 
     @property
     def mixer_enabled(self) -> bool:
@@ -240,6 +245,10 @@ def build_h5_public_features(
             if observation.public.acting_role == "landlord_up"
             else "landlord_up"
         )
+        if opponent_a_role not in {"landlord", teammate}:
+            raise ValueError(
+                "opponent_a_role must identify the acting farmer's teammate or landlord"
+            )
         belief = teammate_belief_summary(
             belief_features,
             unseen_counts,
