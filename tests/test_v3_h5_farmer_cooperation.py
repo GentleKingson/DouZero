@@ -476,6 +476,34 @@ def test_checkpoint_resume_is_strict_and_schedule_continues(tmp_path):
         assert torch.equal(value, learner.cooperation.state_dict()[name])
 
 
+def test_checkpoint_accepts_only_the_enabled_sidecar_parameter_state(tmp_path):
+    rows, trajectories = _pair()
+    learner = _learner(lambda_trajectory_consistency=0.0)
+    learner.train_batch(rows, trajectories=trajectories)
+    payload = learner.cooperation_optimizer.state_dict()
+    parameter_ids = [
+        value for group in payload["param_groups"] for value in group["params"]
+    ]
+    parameter_names = [
+        name for name, _parameter in learner.cooperation.named_parameters()
+    ]
+    active_names = {
+        name
+        for parameter_id, name in zip(parameter_ids, parameter_names)
+        if parameter_id in payload["state"]
+    }
+    assert active_names
+    assert all(name.startswith("team_value_heads.") for name in active_names)
+
+    path = tmp_path / "team-value-only.pt"
+    learner.save_checkpoint(path)
+    restored = _learner(lambda_trajectory_consistency=0.0)
+    restored.load_checkpoint(path)
+    resumed = restored.train_batch(rows, trajectories=trajectories)
+    assert resumed.cooperation_updated
+    assert restored.eligible_updates == 2
+
+
 def test_checkpoint_identity_drift_and_public_package_exclusion(tmp_path):
     rows, trajectories = _pair()
     learner = _learner(mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0)
@@ -568,7 +596,7 @@ def test_cuda_parameter_update_checkpoint_resume_and_second_update(tmp_path):
 
 
 def test_nonfinite_and_padding_contracts_fail_closed():
-    _rows, trajectories = _pair()
+    rows, trajectories = _pair()
     broken = trajectories[0].public_features.clone()
     broken[0, 0] = float("inf")
     with pytest.raises(ValueError, match="finite CPU"):
@@ -579,3 +607,8 @@ def test_nonfinite_and_padding_contracts_fail_closed():
         _learner().train_batch(
             trajectories[0].transitions, trajectories=(trajectories[0],)
         )
+    _observation_value, omitted = _transition(
+        "landlord_up", 303, episode_id="episode-1", deal_id="deal-1"
+    )
+    with pytest.raises(ValueError, match="every farmer transition"):
+        _learner().train_batch((*rows, omitted), trajectories=trajectories)

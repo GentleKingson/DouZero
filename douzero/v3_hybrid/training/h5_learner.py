@@ -233,6 +233,7 @@ def h5_training_identity(
 def _validate_rmsprop_state(
     payload: Mapping[object, object],
     optimizer: torch.optim.Optimizer,
+    cooperation: FarmerCooperationModule,
     *,
     cooperation_updates: int,
 ) -> None:
@@ -241,21 +242,38 @@ def _validate_rmsprop_state(
     if not isinstance(payload, Mapping):
         raise CheckpointCompatibilityError("H5 optimizer tensor state must be a mapping")
     groups = optimizer.state_dict()["param_groups"]
-    expected_ids = [value for group in groups for value in group["params"]]
+    parameter_ids = [value for group in groups for value in group["params"]]
+    parameter_names = [name for name, _parameter in cooperation.named_parameters()]
+    if len(parameter_ids) != len(parameter_names):
+        raise CheckpointCompatibilityError("H5 optimizer parameter ownership mismatch")
+    active_prefixes = []
+    if cooperation.config.lambda_team_value > 0.0:
+        active_prefixes.append("team_value_heads.")
+    if cooperation.config.lambda_trajectory_consistency > 0.0:
+        active_prefixes.extend(("trajectory_encoder.", "trajectory_value_heads."))
+    if cooperation.config.lambda_mixer > 0.0:
+        active_prefixes.extend(("trajectory_encoder.", "mixer."))
+    expected_ids = {
+        parameter_id
+        for parameter_id, name in zip(parameter_ids, parameter_names)
+        if any(name.startswith(prefix) for prefix in active_prefixes)
+    }
     if cooperation_updates == 0:
         if payload:
             raise CheckpointCompatibilityError(
                 "zero-update H5 checkpoint contains optimizer tensor state"
             )
         return
-    if set(payload) != set(expected_ids):
+    if set(payload) != expected_ids:
         raise CheckpointCompatibilityError(
             "H5 optimizer per-parameter state is missing or incomplete"
         )
     parameters = [
         parameter for group in optimizer.param_groups for parameter in group["params"]
     ]
-    for parameter_id, parameter in zip(expected_ids, parameters):
+    parameters_by_id = dict(zip(parameter_ids, parameters))
+    for parameter_id in expected_ids:
+        parameter = parameters_by_id[parameter_id]
         state = payload[parameter_id]
         if not isinstance(state, Mapping):
             raise CheckpointCompatibilityError("H5 optimizer parameter state is invalid")
@@ -384,6 +402,17 @@ class V3H5Learner:
         transition_ids = {id(row) for row in transitions}
         if any(id(row) not in transition_ids for row in farmer_rows):
             raise ValueError("H5 trajectories are not aligned to the learner batch")
+        batch_farmer_rows = [
+            row for row in transitions if row.role in FARMER_ROLES
+        ]
+        if (
+            len(batch_farmer_rows) != len(farmer_rows)
+            or {id(row) for row in batch_farmer_rows}
+            != {id(row) for row in farmer_rows}
+        ):
+            raise ValueError(
+                "H5 trajectories must contain every farmer transition for their batch"
+            )
         if cfg.mixer_mode == MIXER_PRIVILEGED:
             expected_shape = (len(pairs), cfg.privileged_state_dim)
             if (
@@ -497,11 +526,16 @@ class V3H5Learner:
         if output.mixed_team_value is not None:
             episode_targets = targets.reshape(-1, 2)[:, 0]
             loss_mixer = (output.mixed_team_value - episode_targets).square().mean()
-        total = schedule_weight * (
-            cfg.lambda_team_value * loss_team
-            + cfg.lambda_trajectory_consistency * loss_trajectory
-            + cfg.lambda_mixer * loss_mixer
-        )
+        active_losses = []
+        if cfg.lambda_team_value > 0.0:
+            active_losses.append(cfg.lambda_team_value * loss_team)
+        if cfg.lambda_trajectory_consistency > 0.0:
+            active_losses.append(
+                cfg.lambda_trajectory_consistency * loss_trajectory
+            )
+        if cfg.lambda_mixer > 0.0:
+            active_losses.append(cfg.lambda_mixer * loss_mixer)
+        total = schedule_weight * torch.stack(active_losses).sum()
         if not bool(torch.isfinite(total)):
             raise FloatingPointError("H5 cooperation loss is NaN or Inf")
         self.cooperation_optimizer.zero_grad(set_to_none=True)
@@ -749,6 +783,7 @@ class V3H5Learner:
             _validate_rmsprop_state(
                 optimizer["state"],
                 self.cooperation_optimizer,
+                self.cooperation,
                 cooperation_updates=statistics.cooperation_updates,
             )
         inner = bundle["h4_checkpoint"]
