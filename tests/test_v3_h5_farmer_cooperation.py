@@ -269,6 +269,17 @@ def test_unsupported_cross_stage_combinations_fail_before_graph_creation():
             ruleset=RuleSet.legacy(),
             config=V3H5LearnerConfig(base=_base(), cooperation=_coop()),
         )
+    for role in FARMER_ROLES:
+        public = dataclasses.replace(
+            _base().base.public, **{f"{role}_weight": 0.0}
+        )
+        with pytest.raises(ValueError, match="positive weights for both farmers"):
+            V3H5LearnerConfig(
+                base=V3H4LearnerConfig(
+                    base=dataclasses.replace(_base().base, public=public)
+                ),
+                cooperation=_coop(warmup_updates=1),
+            )
 
 
 def test_public_feature_builder_uses_existing_strategy_and_conservative_belief():
@@ -460,6 +471,23 @@ def test_checkpoint_identity_drift_and_public_package_exclusion(tmp_path):
     learner.train_batch(rows, trajectories=trajectories)
     training_path = tmp_path / "training.pt"
     learner.save_checkpoint(training_path)
+    checkpoint = torch.load(training_path, map_location="cpu", weights_only=True)
+    optimizer_state = checkpoint["cooperation_optimizer_state_dict"]["state"]
+    assert len(optimizer_state) == len(learner.cooperation.state_dict())
+    for suffix, mutate in (
+        ("empty", lambda state: state.clear()),
+        ("partial", lambda state: state.pop(next(iter(state)))),
+    ):
+        corrupted = copy.deepcopy(checkpoint)
+        mutate(corrupted["cooperation_optimizer_state_dict"]["state"])
+        corrupted_path = tmp_path / f"training-{suffix}.pt"
+        torch.save(corrupted, corrupted_path)
+        with pytest.raises(
+            CheckpointCompatibilityError, match="missing or incomplete"
+        ):
+            _learner(mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0).load_checkpoint(
+                corrupted_path
+            )
     drifted = _learner(
         mixer_mode=MIXER_PUBLIC,
         lambda_mixer=1.0,

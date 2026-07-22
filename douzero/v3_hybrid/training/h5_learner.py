@@ -89,6 +89,9 @@ class V3H5LearnerConfig:
                 raise ValueError("H3 Oracle/H5 integration is deferred to H6")
             if self.base.base.public.lambda_dmc <= 0.0:
                 raise ValueError("enabled H5 requires ordinary public DMC updates")
+            farmer_weights = self.base.base.public.role_weights
+            if any(farmer_weights[role] <= 0.0 for role in FARMER_ROLES):
+                raise ValueError("enabled H5 requires positive weights for both farmers")
 
     def compatibility_dict(self) -> dict[str, object]:
         return {
@@ -225,6 +228,69 @@ def h5_training_identity(
         "replay_protocol": "h2_public_rows_plus_h5_public_side_channel_v1",
         "topology": "single_process_h5_reference_v1",
     }
+
+
+def _validate_rmsprop_state(
+    payload: Mapping[object, object],
+    optimizer: torch.optim.Optimizer,
+    *,
+    cooperation_updates: int,
+) -> None:
+    """Reject missing, partial, or malformed per-parameter RMSprop state."""
+
+    if not isinstance(payload, Mapping):
+        raise CheckpointCompatibilityError("H5 optimizer tensor state must be a mapping")
+    groups = optimizer.state_dict()["param_groups"]
+    expected_ids = [value for group in groups for value in group["params"]]
+    if cooperation_updates == 0:
+        if payload:
+            raise CheckpointCompatibilityError(
+                "zero-update H5 checkpoint contains optimizer tensor state"
+            )
+        return
+    if set(payload) != set(expected_ids):
+        raise CheckpointCompatibilityError(
+            "H5 optimizer per-parameter state is missing or incomplete"
+        )
+    parameters = [
+        parameter for group in optimizer.param_groups for parameter in group["params"]
+    ]
+    for parameter_id, parameter in zip(expected_ids, parameters):
+        state = payload[parameter_id]
+        if not isinstance(state, Mapping):
+            raise CheckpointCompatibilityError("H5 optimizer parameter state is invalid")
+        expected_fields = {"step", "square_avg"}
+        group = next(
+            group
+            for group in optimizer.param_groups
+            if any(candidate is parameter for candidate in group["params"])
+        )
+        if group.get("momentum", 0.0) > 0.0:
+            expected_fields.add("momentum_buffer")
+        if group.get("centered", False):
+            expected_fields.add("grad_avg")
+        if set(state) != expected_fields:
+            raise CheckpointCompatibilityError(
+                "H5 optimizer parameter-state fields mismatch"
+            )
+        step = state["step"]
+        if (
+            not isinstance(step, torch.Tensor)
+            or step.numel() != 1
+            or not bool(torch.isfinite(step).all())
+            or float(step.item()) < 1.0
+        ):
+            raise CheckpointCompatibilityError("H5 optimizer step state is invalid")
+        for name in expected_fields - {"step"}:
+            value = state[name]
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.shape != parameter.shape
+                or not bool(torch.isfinite(value).all())
+            ):
+                raise CheckpointCompatibilityError(
+                    f"H5 optimizer {name} state is invalid"
+                )
 
 
 class V3H5Learner:
@@ -679,6 +745,11 @@ class V3H5Learner:
             _validate_optimizer_param_groups(
                 optimizer["param_groups"],
                 self.cooperation_optimizer.state_dict()["param_groups"],
+            )
+            _validate_rmsprop_state(
+                optimizer["state"],
+                self.cooperation_optimizer,
+                cooperation_updates=statistics.cooperation_updates,
             )
         inner = bundle["h4_checkpoint"]
         if not isinstance(inner, Mapping):
