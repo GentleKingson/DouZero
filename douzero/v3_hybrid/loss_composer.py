@@ -259,6 +259,14 @@ class V3HybridLossComposer:
         unknown = set(terms) - set(LOSS_NAMES)
         if unknown:
             raise ValueError(f"unknown V3 loss inputs: {sorted(unknown)}")
+        disabled_inputs = sorted(
+            name for name in terms if self.config.weight(name) == 0.0
+        )
+        if disabled_inputs:
+            raise ValueError(
+                "disabled V3 loss terms reject input data: "
+                f"{disabled_inputs}"
+            )
         metrics: dict[str, LossTermMetrics] = {}
         weighted_tensors: list[torch.Tensor] = []
         eligible: list[str] = []

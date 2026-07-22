@@ -764,7 +764,8 @@ class V3HybridModel(nn.Module):
 
         if self.bidding_heads is None or self.bidding_schema is None:
             raise RuntimeError(
-                "forward_bidding requires V3HybridModelConfig(bidding_enabled=True)"
+                "V3 Hybrid H1 is card-play only; forward_bidding requires "
+                "V3HybridModelConfig(bidding_enabled=True)"
             )
         if not isinstance(observation, BiddingObservationV2):
             raise TypeError("forward_bidding requires a public BiddingObservationV2")
@@ -789,7 +790,7 @@ class V3HybridModel(nn.Module):
     ) -> BatchedBiddingOutput:
         if self.bidding_heads is None or self.bidding_schema is None:
             raise RuntimeError(
-                "forward_bidding_batched requires "
+                "V3 Hybrid H1 is card-play only; forward_bidding_batched requires "
                 "V3HybridModelConfig(bidding_enabled=True)"
             )
         if not isinstance(inputs, BatchedBiddingInput):
