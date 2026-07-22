@@ -24,7 +24,26 @@ from douzero.v3_hybrid.runtime import (
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
     V3H7RuntimeConfig,
+    V3AsyncSingleGPUTrainer,
 )
+from douzero.v3_hybrid import (
+    ADMC_SAFE_HYBRID,
+    AdaptiveDMCConfig,
+    V3H2LearnerConfig,
+    V3HybridLossComposerConfig,
+    V3HybridModel,
+    V3HybridModelConfig,
+)
+from douzero.v3_hybrid.integration_config import (
+    V3H6FeatureFlags,
+    V3H6LearnerConfig,
+    V3H6ResolvedConfig,
+    V3H6TopologyConfig,
+)
+from douzero.v3_hybrid.training.h3_learner import V3H3LearnerConfig
+from douzero.v3_hybrid.training.h4_learner import V3H4LearnerConfig
+from douzero.v3_hybrid.training.h5_learner import V3H5LearnerConfig
+from douzero.v3_hybrid.training.h6_learner import V3H6Learner
 from douzero.v3_hybrid.benchmark import (
     H7_BENCHMARK_SCHEMA,
     H7_TOPOLOGIES,
@@ -332,3 +351,79 @@ def test_h7_benchmark_requires_three_matched_repeats_per_topology():
     corrupted[0]["in_flight"] = 1
     with pytest.raises(ValueError, match="did not quiesce"):
         validate_h7_benchmark_evidence(corrupted, protocol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA host")
+def test_h7_cuda_async_update_checkpoint_resume_and_shutdown(tmp_path):
+    model_config = V3HybridModelConfig(
+        hidden_size=16,
+        history_layers=1,
+        history_heads=4,
+        shared_fusion_layers=1,
+        landlord_adapter_layers=1,
+        farmer_adapter_layers=1,
+    )
+    public = V3H2LearnerConfig(
+        batch_size=4,
+        learning_rate=1e-3,
+        max_grad_norm=10.0,
+        device="cuda",
+        adaptive_dmc=AdaptiveDMCConfig(mode=ADMC_SAFE_HYBRID),
+    )
+    h5 = V3H5LearnerConfig(
+        base=V3H4LearnerConfig(base=V3H3LearnerConfig(public=public))
+    )
+    learner_config = V3H6LearnerConfig(
+        base=h5,
+        losses=V3HybridLossComposerConfig(lambda_dmc=1.0),
+        features=V3H6FeatureFlags(adaptive_dmc=True),
+        topology=V3H6TopologyConfig(ruleset="legacy"),
+    )
+    resolved = V3H6ResolvedConfig(model=model_config, learner=learner_config)
+    runtime_config = V3H7RuntimeConfig(
+        num_actors=1,
+        games_per_actor=2,
+        batch_size=4,
+        replay_capacity=256,
+        target_microbatch=2,
+        environment_seed=123,
+        action_seed=456,
+    )
+    model = V3HybridModel(build_v2_schema(), model_config)
+    learner = V3H6Learner(
+        model, ruleset=RuleSet.legacy(), config=resolved
+    )
+    runtime = V3AsyncSingleGPUTrainer(learner, resolved, runtime_config)
+    checkpoint = tmp_path / "h7.pt"
+    try:
+        runtime.collect_episodes(1)
+        before = {
+            name: value.detach().clone() for name, value in model.state_dict().items()
+        }
+        assert runtime.step() is not None
+        assert any(
+            not torch.equal(before[name], value)
+            for name, value in model.state_dict().items()
+        )
+        runtime.save_training_checkpoint(
+            str(checkpoint), long_running_state={"cycle": 1}
+        )
+        status = runtime.quiesce_cycle_boundary()
+        assert status["active_slots"] == 0
+        assert status["in_flight_slots"] == 0
+        assert status["pending_requests"] == 0
+    finally:
+        runtime.shutdown()
+
+    resumed_model = V3HybridModel(build_v2_schema(), model_config)
+    resumed_learner = V3H6Learner(
+        resumed_model, ruleset=RuleSet.legacy(), config=resolved
+    )
+    resumed = V3AsyncSingleGPUTrainer(
+        resumed_learner, resolved, runtime_config
+    )
+    assert resumed.load_training_checkpoint(checkpoint) == {"cycle": 1}
+    assert resumed.policy_step == runtime.policy_step
+    assert resumed.stats.optimizer_steps == 1
+    resumed.shutdown()
+    assert not list(tmp_path.glob("*.tmp"))
