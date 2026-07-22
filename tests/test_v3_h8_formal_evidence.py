@@ -36,6 +36,15 @@ def _delta(value: float = 0.02) -> dict[str, float]:
     return {"estimate": value, "low": value, "high": value}
 
 
+def _baseline(ruleset: str) -> dict[str, str]:
+    return {
+        "variant": "legacy_a1" if ruleset == "legacy" else "model_v2",
+        "training_config_hash": ("7" if ruleset == "legacy" else "8") * 64,
+        "model_checkpoint_sha256": ("9" if ruleset == "legacy" else "a") * 64,
+        "model_package_sha256": ("b" if ruleset == "legacy" else "c") * 64,
+    }
+
+
 def _identity(*, promotion: bool = False, authorized_bc: bool = False):
     return {
         "git_sha": GIT_SHA,
@@ -53,6 +62,9 @@ def _identity(*, promotion: bool = False, authorized_bc: bool = False):
         "wall_clock_budget_seconds": 7200,
         "sample_budget": 1_000_000,
         "evaluation_deal_sets": {"legacy": "1" * 64, "standard": "2" * 64},
+        "evaluation_baselines": {
+            ruleset: _baseline(ruleset) for ruleset in ("legacy", "standard")
+        },
         "checkpoint_cadence_updates": 100,
         "authorized_bc_data": authorized_bc,
         "human_bc": (
@@ -153,6 +165,7 @@ def _evaluation(
         "training_config_hash": run["training_config_hash"],
         "model_checkpoint_sha256": run["model_checkpoint_sha256"],
         "model_package_sha256": SHA,
+        "reference": _baseline(ruleset),
         "deal_set_id": "1" * 64 if ruleset == "legacy" else "2" * 64,
         "deals": deals,
         "games": deals * 2,
@@ -193,6 +206,10 @@ def _evaluation(
                 "adp_delta": _delta(0.1),
                 "added_latency_p99_ms": 1.0,
                 "latency_budget_ms": 2.0,
+                "outcome_histogram": [
+                    {"count": deals, "wp_delta": 0.01, "adp_delta": 0.1}
+                ],
+                "bootstrap_resamples": 1000,
             }
             if tier == PROMOTION and search_enabled else None
         ),
@@ -351,6 +368,11 @@ def test_each_row_binds_complete_ruleset_and_training_identity() -> None:
     with pytest.raises(H8EvidenceError, match="ruleset identity drift"):
         validate_h8_formal_evidence(payload)
 
+    payload = _evidence()
+    payload["evaluations"][0]["reference"]["model_checkpoint_sha256"] = "f" * 64
+    with pytest.raises(H8EvidenceError, match="comparison baseline drift"):
+        validate_h8_formal_evidence(payload)
+
 
 def test_reported_strength_must_match_recomputed_outcome_counts() -> None:
     payload = _evidence(promotion=True)
@@ -364,6 +386,29 @@ def test_reported_strength_must_match_recomputed_outcome_counts() -> None:
     payload = _evidence()
     payload["evaluations"][0]["training_config_hash"] = "f" * 64
     with pytest.raises(H8EvidenceError, match="training config drift"):
+        validate_h8_formal_evidence(payload)
+
+
+def test_reported_search_effect_must_match_raw_paired_outcomes() -> None:
+    payload = _evidence(promotion=True)
+    row = next(
+        item for item in payload["evaluations"]
+        if item["tier"] == PROMOTION and item["search_enabled"]
+    )
+    row["search_effect"]["wp_delta"] = _delta(0.9)
+    with pytest.raises(H8EvidenceError, match="recomputed clustered bootstrap"):
+        validate_h8_formal_evidence(payload)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [("training_runs", "seed"), ("evaluations", "training_seed")],
+)
+def test_row_seed_rejects_bool(path: tuple[str, str]) -> None:
+    payload = _evidence()
+    collection, field = path
+    payload[collection][0][field] = True
+    with pytest.raises(H8EvidenceError, match="must be an integer"):
         validate_h8_formal_evidence(payload)
 
 

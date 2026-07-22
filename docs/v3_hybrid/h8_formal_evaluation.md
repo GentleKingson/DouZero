@@ -41,9 +41,10 @@ license, version, pseudonymization contract, and HMAC key identity hash.
 ## Evidence Contract
 
 `v3-hybrid-h8a-formal-evidence-v2` binds source, image, hardware, budgets,
-seeds, feature/trainer/replay identities, and deal sets. Every training and
-evaluation row additionally binds its complete ruleset identity, training
-configuration hash, and checkpoint hash.
+seeds, feature/trainer/replay identities, deal sets, and one immutable reference
+checkpoint/package identity per ruleset. Every training and evaluation row
+additionally binds its complete ruleset identity, training configuration hash,
+checkpoint hash, and the frozen ruleset reference used for comparison.
 
 Evaluation has two distinct tiers:
 
@@ -66,6 +67,10 @@ declared paired deals. The validator recomputes estimates and deterministic
 deal-clustered bootstrap intervals from those counts and rejects caller-reported
 statistics that differ. This keeps large evidence compact without trusting
 derived confidence intervals.
+
+Promotion search-on rows carry a separate paired search-effect histogram. Its
+counts must cover the same deals, and the validator independently recomputes
+the search-on versus search-off WP/ADP estimates and confidence intervals.
 
 ```bash
 python tools/validate_v3_h8_evidence.py evidence.json --output report.json

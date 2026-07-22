@@ -156,6 +156,11 @@ _IDENTITY_FIELDS = {
     "checkpoint_cadence_updates", "authorized_bc_data", "human_bc",
     "promotion_requested", "promotion_variant", "support_matrix_version",
     "support_matrix_hash",
+    "evaluation_baselines",
+}
+_BASELINE_FIELDS = {
+    "variant", "training_config_hash", "model_checkpoint_sha256",
+    "model_package_sha256",
 }
 
 
@@ -223,6 +228,19 @@ def _validate_identity(identity: Mapping[str, Any]) -> None:
     _exact(deal_sets, set(RULESETS), "evaluation_deal_sets")
     for ruleset, digest in deal_sets.items():
         _digest(digest, f"evaluation_deal_sets.{ruleset}")
+    baselines = _mapping(identity["evaluation_baselines"], "evaluation_baselines")
+    _exact(baselines, set(RULESETS), "evaluation_baselines")
+    for ruleset, raw_baseline in baselines.items():
+        baseline = _mapping(raw_baseline, f"evaluation_baselines.{ruleset}")
+        _exact(baseline, _BASELINE_FIELDS, f"evaluation_baselines.{ruleset}")
+        if baseline["variant"] not in H8A_VARIANT_RULESET_SUPPORT or not _supported(
+            baseline["variant"], ruleset
+        ):
+            raise H8EvidenceError(
+                f"evaluation_baselines.{ruleset}.variant is unsupported"
+            )
+        for name in _BASELINE_FIELDS - {"variant"}:
+            _digest(baseline[name], f"evaluation_baselines.{ruleset}.{name}")
 
 
 def _enabled_variants(identity: Mapping[str, Any]) -> tuple[str, ...]:
@@ -270,7 +288,7 @@ def _validate_training_run(
         )
     if variant == "v3_full_hybrid_bc" and not identity["authorized_bc_data"]:
         raise H8EvidenceError("BC evidence requires authorized_bc_data=true")
-    seed = run["seed"]
+    seed = _integer(run["seed"], f"training run {variant}.seed")
     if seed not in identity["training_seeds"]:
         raise H8EvidenceError(f"training run {variant} uses an undeclared seed")
     if run["git_sha"] != identity["git_sha"]:
@@ -359,6 +377,7 @@ _EVALUATION_FIELDS = {
     "timeouts", "model_load_failures", "public_package_validated",
     "privileged_leakage", "artifact_stale", "search_effect",
     "outcome_histogram", "bootstrap_resamples",
+    "reference",
 }
 _OUTCOME_ATOM_FIELDS = {"count", "overall", "by_role"}
 _OUTCOME_METRICS = ("wp_delta", "adp_delta")
@@ -468,6 +487,70 @@ def _assert_reported_delta(
     return values
 
 
+def _recompute_search_effect(
+    effect: Mapping[str, Any],
+    row: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    *,
+    deals: int,
+    label: str,
+) -> dict[str, dict[str, float]]:
+    raw = effect["outcome_histogram"]
+    if not isinstance(raw, list) or not raw:
+        raise H8EvidenceError(
+            f"{label}.outcome_histogram must be a non-empty list"
+        )
+    resamples = _integer(
+        effect["bootstrap_resamples"],
+        f"{label}.bootstrap_resamples",
+        minimum=1000,
+    )
+    counts: list[int] = []
+    vectors: list[list[float]] = []
+    for index, raw_atom in enumerate(raw):
+        atom_label = f"{label}.outcome_histogram[{index}]"
+        atom = _mapping(raw_atom, atom_label)
+        _exact(atom, {"count", "wp_delta", "adp_delta"}, atom_label)
+        counts.append(_integer(atom["count"], f"{atom_label}.count", minimum=1))
+        wp = _finite(atom["wp_delta"], f"{atom_label}.wp_delta")
+        adp = _finite(atom["adp_delta"], f"{atom_label}.adp_delta")
+        if not -1.0 <= wp <= 1.0:
+            raise H8EvidenceError(f"{atom_label}.wp_delta must be in [-1, 1]")
+        vectors.append([wp, adp])
+    if sum(counts) != deals:
+        raise H8EvidenceError(
+            f"{label} outcome histogram count does not equal deals"
+        )
+    count_array = np.asarray(counts, dtype=np.int64)
+    value_array = np.asarray(vectors, dtype=np.float64)
+    estimate = count_array @ value_array / float(deals)
+    if len(counts) == 1:
+        low = high = estimate
+    else:
+        seed_material = {
+            "evaluation_seed": identity["evaluation_seed"],
+            "variant": row["variant"],
+            "ruleset": row["ruleset"]["ruleset_id"],
+            "training_seed": row["training_seed"],
+            "tier": row["tier"],
+            "search_effect": True,
+        }
+        rng = np.random.default_rng(int(canonical_hash(seed_material)[:16], 16))
+        sampled = rng.multinomial(
+            deals, count_array.astype(np.float64) / float(deals), size=resamples
+        )
+        bootstrap = sampled @ value_array / float(deals)
+        low, high = np.quantile(bootstrap, (0.025, 0.975), axis=0)
+    return {
+        metric: {
+            "estimate": float(estimate[index]),
+            "low": float(low[index]),
+            "high": float(high[index]),
+        }
+        for index, metric in enumerate(_OUTCOME_METRICS)
+    }
+
+
 def _validate_evaluation(
     row: Mapping[str, Any],
     identity: Mapping[str, Any],
@@ -485,7 +568,7 @@ def _validate_evaluation(
         )
     if variant == "v3_full_hybrid_bc" and not identity["authorized_bc_data"]:
         raise H8EvidenceError("BC evidence requires authorized_bc_data=true")
-    seed = row["training_seed"]
+    seed = _integer(row["training_seed"], f"evaluation {variant}.training_seed")
     training_key = (variant, ruleset, seed)
     if training_key not in training:
         raise H8EvidenceError(
@@ -509,6 +592,10 @@ def _validate_evaluation(
         raise H8EvidenceError(f"evaluation {variant} ruleset identity drift")
     if row["deal_set_id"] != identity["evaluation_deal_sets"][ruleset]:
         raise H8EvidenceError(f"evaluation {variant} deal-set identity drift")
+    reference = _mapping(row["reference"], f"evaluation {variant}.reference")
+    _exact(reference, _BASELINE_FIELDS, f"evaluation {variant}.reference")
+    if reference != identity["evaluation_baselines"][ruleset]:
+        raise H8EvidenceError(f"evaluation {variant} comparison baseline drift")
     tier = row["tier"]
     if tier not in {DEVELOPMENT, PROMOTION}:
         raise H8EvidenceError(f"evaluation {variant} tier is invalid")
@@ -648,16 +735,28 @@ def _validate_evaluation(
             {
                 "baseline_search_enabled", "wp_delta", "adp_delta",
                 "added_latency_p99_ms", "latency_budget_ms",
+                "outcome_histogram", "bootstrap_resamples",
             },
             f"evaluation {variant}.search_effect",
         )
         if effect["baseline_search_enabled"] is not False:
             raise H8EvidenceError("search effect baseline must be search-off")
-        _, search_wp_low, _ = _delta(
-            effect["wp_delta"], f"evaluation {variant}.search_effect.wp_delta"
+        recomputed_effect = _recompute_search_effect(
+            effect,
+            row,
+            identity,
+            deals=deals,
+            label=f"evaluation {variant}.search_effect",
         )
-        _, search_adp_low, _ = _delta(
-            effect["adp_delta"], f"evaluation {variant}.search_effect.adp_delta"
+        _, search_wp_low, _ = _assert_reported_delta(
+            effect["wp_delta"],
+            recomputed_effect["wp_delta"],
+            f"evaluation {variant}.search_effect.wp_delta",
+        )
+        _, search_adp_low, _ = _assert_reported_delta(
+            effect["adp_delta"],
+            recomputed_effect["adp_delta"],
+            f"evaluation {variant}.search_effect.adp_delta",
         )
         added_latency = _finite(
             effect["added_latency_p99_ms"],
