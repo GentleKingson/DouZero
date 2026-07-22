@@ -38,6 +38,7 @@ from douzero.v3_hybrid import (
     v3_h6_support_matrix_hash,
 )
 from douzero.v3_hybrid.integration_config import (
+    V3H6AuxiliaryConfig,
     V3H6FeatureFlags,
     V3H6LearnerConfig,
     V3H6ResolvedConfig,
@@ -491,8 +492,9 @@ def test_pure_bc_batch_updates_without_an_empty_cardplay_optimizer_step():
         topology=V3H6TopologyConfig(ruleset="legacy"),
     )
     resolved = V3H6ResolvedConfig(model=model_config, learner=learner_config)
+    model = V3HybridModel(build_v2_schema(), model_config)
     learner = V3H6Learner(
-        V3HybridModel(build_v2_schema(), model_config),
+        model,
         ruleset=RuleSet.legacy(),
         config=resolved,
     )
@@ -585,6 +587,8 @@ def test_pure_bidding_batch_uses_real_per_sample_targets():
     mismatched.obs = dataclasses.replace(
         mismatched.obs, ruleset_hash="0" * 64
     )
+    with pytest.raises(ValueError, match="ruleset does not match"):
+        learner.model.forward_bidding(mismatched.obs)
     with pytest.raises(ValueError, match="ruleset identity mismatch"):
         learner.train_batch(
             [], bidding_batch=BiddingMinibatch([mismatched])
@@ -664,6 +668,62 @@ def test_h6_strategy_labels_fail_closed_before_loss(field, value, message):
             ("strategy-label",),
             [labels],
         )
+
+
+def test_h6_fully_masked_active_strategy_component_is_a_noop():
+    baseline = _resolved()
+    model_config = _model_config(
+        strategy_features_enabled=True,
+        strategy_aux_enabled=True,
+    )
+    resolved = V3H6ResolvedConfig(
+        model=model_config,
+        learner=dataclasses.replace(
+            baseline.learner,
+            losses=dataclasses.replace(
+                baseline.learner.losses, lambda_strategy=1.0
+            ),
+            auxiliary=V3H6AuxiliaryConfig(
+                strategy_lambda_min_turns=1.0,
+                strategy_lambda_regain_initiative=0.0,
+                strategy_lambda_teammate_finish=0.0,
+                strategy_lambda_spring=0.0,
+                strategy_lambda_structure=0.0,
+            ),
+            features=dataclasses.replace(
+                baseline.learner.features, strategy=True
+            ),
+        ),
+    )
+    model = V3HybridModel(build_v2_schema(), model_config)
+    learner = V3H6Learner(
+        model,
+        ruleset=RuleSet.legacy(),
+        config=resolved,
+    )
+    labels = {
+        "min_turns_after": 1.0,
+        "min_turns_exact_mask": 0.0,
+        "regain_initiative": 0.0,
+        "teammate_finish": 0.0,
+        "teammate_finish_mask": 0.0,
+        "spring_probability": 0.0,
+        "structure_cost": 0.0,
+    }
+    pending = capture_plain_transition(
+        _observation(),
+        selected_action_index=0,
+        episode_id="masked-strategy-episode",
+        deal_id="masked-strategy-deal",
+        target_transform="raw",
+        strategy_config=model.strategy_feature_config(),
+    )
+    metrics = learner.train_batch(
+        [pending.finalize(2.0)], strategy_targets=[labels]
+    )
+    assert metrics.losses["strategy"]["phase"] == "no_valid_targets"
+    assert metrics.losses["strategy"]["valid_samples"] == 0
+    assert learner.composer.eligible_steps["strategy"] == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

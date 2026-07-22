@@ -481,11 +481,13 @@ class V3H6Learner:
         ])
         total_denominator = role_weight.sum()
         values = torch.zeros_like(component_values["min_turns"])
+        valid_samples = torch.zeros_like(masks["min_turns"])
         for name, component in component_values.items():
             valid = masks[name]
             denominator = (role_weight * valid.to(role_weight.dtype)).sum()
             if component_weights[name] == 0.0 or not bool(denominator > 0):
                 continue
+            valid_samples = valid_samples | valid
             values = values + (
                 component_weights[name]
                 * component
@@ -495,7 +497,7 @@ class V3H6Learner:
             )
         return LossTermTensor(
             values,
-            torch.ones_like(masks["min_turns"]),
+            valid_samples,
             roles,
             ids,
         )

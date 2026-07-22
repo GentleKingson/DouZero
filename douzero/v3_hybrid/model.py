@@ -771,6 +771,17 @@ class V3HybridModel(nn.Module):
             raise TypeError("forward_bidding requires a public BiddingObservationV2")
         if observation.feature_schema_hash != self.bidding_schema.stable_hash():
             raise ValueError("V3 bidding feature schema mismatch")
+        expected_ruleset = getattr(self, "expected_ruleset_identity", None)
+        if expected_ruleset is not None:
+            actual_ruleset = (
+                observation.ruleset_id,
+                observation.ruleset_version,
+                observation.ruleset_hash,
+            )
+            if actual_ruleset != expected_ruleset:
+                raise ValueError(
+                    "BiddingObservationV2 ruleset does not match the V3 checkpoint"
+                )
         parameter = next(self.bidding_heads.parameters())
         features = observation.to_tensor(parameter.device).to(parameter.dtype)
         values = self._forward_bidding_head(features)
