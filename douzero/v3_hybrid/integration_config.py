@@ -13,7 +13,7 @@ import yaml
 
 from .adaptive_dmc import ADMC_DISABLED
 from .config import V3HybridModelConfig
-from .loss_composer import V3HybridLossComposerConfig
+from .loss_composer import LossTermSchedule, V3HybridLossComposerConfig
 from .support_matrix import (
     RULESET_STANDARD,
     TOPOLOGY_SINGLE_PROCESS,
@@ -111,6 +111,10 @@ class V3H6AuxiliaryConfig:
             raise ValueError("H6 score delta and BC temperature must be positive")
         if not 0.0 <= self.bc_label_smoothing < 1.0:
             raise ValueError("H6 BC label smoothing must be in [0, 1)")
+        if self.bidding_lambda_regret != 0.0:
+            raise ValueError(
+                "H6 bidding regret is unsupported without a per-bid value head"
+            )
 
     @property
     def strategy_component_weight(self) -> float:
@@ -184,6 +188,15 @@ class V3H6LearnerConfig:
             raise ValueError("enabled H6 Oracle uses lambda_oracle=1; H3 owns annealing")
         if self.losses.role_weights != public.role_weights:
             raise ValueError("H6 role weights must exactly match the public learner")
+        # H2-H5 already own the executable schedules for their component
+        # updates. A second H6 schedule would only change reported metrics,
+        # not the gradient that the owning component applied.
+        for name in ("dmc", "oracle", "belief", "cooperation"):
+            if self.losses.schedules[name] != LossTermSchedule():
+                raise ValueError(
+                    f"H6 {name} schedule must remain constant at 1; "
+                    "the owning component controls its executable schedule"
+                )
 
     def compatibility_dict(self) -> dict[str, object]:
         return {

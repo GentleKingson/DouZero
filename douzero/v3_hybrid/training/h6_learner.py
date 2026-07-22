@@ -25,7 +25,7 @@ from douzero.models_v2.batch import (
     model_input_bundles_to_batch,
 )
 from douzero.training.bc_loss import listwise_bc_loss
-from douzero.training.bidding import BiddingMinibatch, bidding_loss
+from douzero.training.bidding import BiddingMinibatch
 from douzero.training.losses import resolve_score_target
 
 from ..config import BELIEF_FEEDBACK_NONE
@@ -321,7 +321,7 @@ class V3H6Learner:
             losses.lambda_score > 0.0,
             losses.lambda_strategy > 0.0,
         ))
-        if not need_forward:
+        if not need_forward or not transitions:
             empty = {}
             for name in ("win", "score", "strategy"):
                 if losses.weight(name) > 0.0:
@@ -534,20 +534,60 @@ class V3H6Learner:
         output = self.model.forward_bidding_batched(inputs)
         targets = batch.to_targets(output.bid_logits.device, dtype=output.bid_logits.dtype)
         aux = self.config.learner.auxiliary
-        components = bidding_loss(
-            output,
-            targets,
-            lambda_policy=aux.bidding_lambda_policy,
-            lambda_landlord_win=aux.bidding_lambda_landlord_win,
-            lambda_landlord_score=aux.bidding_lambda_landlord_score,
-            lambda_regret=aux.bidding_lambda_regret,
-            score_delta=aux.score_delta,
+        count = len(batch.transitions)
+        roles = tuple(row.actor_role for row in batch.transitions)
+        logits = output.bid_logits.float()
+        rows = torch.arange(count, device=logits.device)
+        actions = targets.actions
+        if not bool(((actions >= 0) & (actions < logits.shape[1])).all()):
+            raise ValueError("H6 bidding action is outside the action schema")
+        if not bool(output.bid_action_mask[rows, actions].all()):
+            raise ValueError("H6 bidding action is not legal")
+        masked_logits = logits.masked_fill(
+            ~output.bid_action_mask, torch.finfo(logits.dtype).min
+        )
+        imitation = F.cross_entropy(masked_logits, actions, reduction="none")
+        selected = logits.gather(1, actions[:, None]).squeeze(1)
+        behavior = F.binary_cross_entropy_with_logits(
+            selected, targets.actor_win.float(), reduction="none"
+        )
+        policy = torch.where(targets.imitation_mask, imitation, behavior)
+        credit = targets.policy_credit_mask
+        win = F.binary_cross_entropy_with_logits(
+            output.landlord_win_logit.float(),
+            targets.landlord_win.float(),
+            reduction="none",
+        )
+        score_target = resolve_score_target(
+            targets.landlord_score.float(),
             score_target_transform=aux.score_target_transform,
             score_clamp=self.model.config.score_clamp,
         )
-        count = len(batch.transitions)
-        values = components.total.expand(count)
-        roles = tuple(row.actor_role for row in batch.transitions)
+        score = F.huber_loss(
+            output.expected_landlord_score.float(),
+            score_target,
+            delta=aux.score_delta,
+            reduction="none",
+        )
+        role_weights = logits.new_tensor([
+            self.config.learner.losses.role_weights[role] for role in roles
+        ])
+        total_weight = role_weights.sum()
+        policy_weight = (role_weights * credit.to(role_weights.dtype)).sum()
+        values = (
+            aux.bidding_lambda_landlord_win * win
+            + aux.bidding_lambda_landlord_score * score
+        )
+        if aux.bidding_lambda_policy > 0.0 and bool(policy_weight > 0):
+            # The composer applies role weights once. This rescaling only
+            # gives the masked policy component its own valid denominator.
+            values = values + (
+                aux.bidding_lambda_policy
+                * policy
+                * credit.to(policy.dtype)
+                * total_weight
+                / policy_weight
+            )
         ids = tuple(
             f"bid:{row.policy_version}:{row.obs.redeal_count}:"
             f"{row.obs.current_seat}:{index}:{row.bid_action}"
@@ -559,6 +599,15 @@ class V3H6Learner:
             roles,
             ids,
         )
+
+    def _empty_base_metrics(self) -> V3H5StepMetrics:
+        h3 = self.base.base.base
+        state = h3.schedule_state()
+        h3_metrics = h3._empty_metrics(state, h3.policy_version)
+        h4_metrics = self.base.base._metrics_noop(
+            self.base.base.phase(), base=h3_metrics
+        )
+        return self.base._disabled_metrics(h4_metrics)
 
     def _rollback_snapshot(self, directory: Path) -> tuple[Path, dict[str, object]]:
         path = directory / "h5-rollback.pt"
@@ -596,8 +645,22 @@ class V3H6Learner:
         bidding_batch: BiddingMinibatch | None = None,
         strategy_targets: Sequence[Mapping[str, object]] | None = None,
     ) -> V3H6StepMetrics:
+        auxiliary_samples = len(bc_samples or ()) + (
+            0 if bidding_batch is None else len(bidding_batch.transitions)
+        )
         if not transitions:
-            raise ValueError("H6 requires a non-empty public replay batch")
+            if auxiliary_samples == 0:
+                raise ValueError("H6 requires at least one valid training target")
+            if any(value is not None for value in (
+                trajectories,
+                belief_samples,
+                oracle_samples,
+                privileged_mixer_state,
+                strategy_targets,
+            )):
+                raise ValueError(
+                    "H6 auxiliary-only batches reject card-play sidecars"
+                )
         oracle_state = self.base.base.base.schedule_state()
         belief_phase = self.base.base.phase()
         public_phase = oracle_state.public_training and belief_phase in {
@@ -614,12 +677,16 @@ class V3H6Learner:
         with tempfile.TemporaryDirectory(prefix="douzero-h6-rollback-") as temporary:
             snapshot, state = self._rollback_snapshot(Path(temporary))
             try:
-                base_metrics = self.base.train_batch(
-                    transitions,
-                    trajectories=trajectories,
-                    belief_samples=belief_samples,
-                    oracle_samples=oracle_samples,
-                    privileged_mixer_state=privileged_mixer_state,
+                base_metrics = (
+                    self.base.train_batch(
+                        transitions,
+                        trajectories=trajectories,
+                        belief_samples=belief_samples,
+                        oracle_samples=oracle_samples,
+                        privileged_mixer_state=privileged_mixer_state,
+                    )
+                    if transitions
+                    else self._empty_base_metrics()
                 )
                 terms = self._base_terms(transitions, base_metrics)
                 public_terms, _output = self._public_value_terms(
@@ -658,7 +725,7 @@ class V3H6Learner:
                 }
                 metrics = V3H6StepMetrics(
                     eligible_update=self.eligible_updates,
-                    samples=len(transitions),
+                    samples=len(transitions) + auxiliary_samples,
                     public_aux_updated=aux_required,
                     public_aux_gradient_norm=gradient_norm,
                     policy_version=self.policy_version,
@@ -667,7 +734,7 @@ class V3H6Learner:
                     base=base_metrics,
                 )
                 self.eligible_updates += 1
-                self.samples_consumed += len(transitions)
+                self.samples_consumed += len(transitions) + auxiliary_samples
                 self.statistics.update(metrics)
                 return metrics
             except Exception:

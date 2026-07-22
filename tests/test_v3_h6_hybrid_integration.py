@@ -14,9 +14,11 @@ import torch
 
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
+from douzero.human_data.sample import BCSample
 from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.v3_hybrid import (
     LossTermTensor,
+    LossTermSchedule,
     V3H2LearnerConfig,
     V3H6ReplayBuffer,
     V3HybridLossComposer,
@@ -135,6 +137,16 @@ def test_support_matrix_is_stable_and_unsupported_topologies_fail_closed():
                     base.learner.topology, topology="async_single_gpu"
                 ),
             ),
+        )
+
+    schedules = dict(base.learner.losses.schedules)
+    schedules["dmc"] = LossTermSchedule(
+        kind="linear", start=1.0, end=0.5, updates=2
+    )
+    with pytest.raises(ValueError, match="owning component"):
+        dataclasses.replace(
+            base.learner,
+            losses=dataclasses.replace(base.learner.losses, schedules=schedules),
         )
     with pytest.raises(ValueError, match="does not support search"):
         dataclasses.replace(
@@ -317,6 +329,47 @@ def test_h6_train_checkpoint_resume_and_failed_batch_are_atomic(tmp_path):
         restored.public_aux_updates,
         dict(restored.composer.eligible_steps),
     )
+
+
+def test_pure_bc_batch_updates_without_an_empty_cardplay_optimizer_step():
+    observation = _observation()
+    model_config = _model_config(human_prior_enabled=True)
+    public = V3H2LearnerConfig(
+        batch_size=4,
+        learning_rate=1e-3,
+        max_grad_norm=10.0,
+        lambda_dmc=0.0,
+        device="cpu",
+    )
+    base = V3H5LearnerConfig(
+        base=V3H4LearnerConfig(base=V3H3LearnerConfig(public=public))
+    )
+    learner_config = V3H6LearnerConfig(
+        base=base,
+        losses=V3HybridLossComposerConfig(lambda_bc=1.0),
+        features=V3H6FeatureFlags(human_bc=True),
+        topology=V3H6TopologyConfig(ruleset="legacy"),
+    )
+    resolved = V3H6ResolvedConfig(model=model_config, learner=learner_config)
+    learner = V3H6Learner(
+        V3HybridModel(build_v2_schema(), model_config),
+        ruleset=RuleSet.legacy(),
+        config=resolved,
+    )
+    sample = BCSample(
+        obs=observation,
+        human_action_index=0,
+        position=observation.public.acting_role,
+        game_id="h6-pure-bc",
+        num_legal_actions=len(observation.actions.legal_actions),
+    )
+    metrics = learner.train_batch([], bc_samples=[sample])
+    assert metrics.samples == 1
+    assert metrics.public_aux_updated
+    assert metrics.policy_version == 1
+    assert metrics.base.base.base.samples == 0
+    assert metrics.losses["bc"]["valid_samples"] == 1
+    assert metrics.losses["dmc"]["phase"] == "disabled"
 
 
 def test_public_output_is_independent_of_training_only_hidden_hand_objects():
