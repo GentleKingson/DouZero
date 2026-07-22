@@ -113,6 +113,7 @@ class V3H7RuntimeStats:
     transitions_collected: int = 0
     decisions_collected: int = 0
     optimizer_steps: int = 0
+    amp_fallbacks: int = 0
     episodes_per_team: dict[str, int] = field(
         default_factory=lambda: {"landlord": 0, "farmer": 0}
     )
@@ -546,12 +547,14 @@ class V3AsyncSingleGPUTrainer:
         if not isinstance(stats_payload, dict) or set(stats_payload) != {
             "games_collected", "episodes_completed", "transitions_collected",
             "decisions_collected", "optimizer_steps", "episodes_per_team",
+            "amp_fallbacks",
         }:
             raise ValueError("H7 checkpoint statistics fields mismatch")
         candidate_stats = V3H7RuntimeStats(**stats_payload)
         for name in (
             "games_collected", "episodes_completed", "transitions_collected",
             "decisions_collected", "optimizer_steps",
+            "amp_fallbacks",
         ):
             value = getattr(candidate_stats, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
