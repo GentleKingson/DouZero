@@ -482,3 +482,14 @@ checkpoint-enabled end-to-end measurements compare single-process, 4x4 async,
 and 8x4 async under the same SHA/image/config/hardware identity. Centralized
 inference is not promoted from a forward microbenchmark. Release candidate:
 NONE. Release status: NOT READY. Playing strength not measured.
+
+### H8 formal-evidence and release contract
+
+H8 adds no training or decision algorithm. The canonical evidence schema,
+promotion validator, strict public-package allow-list, and remaining empirical
+gates are defined in [h8_formal_evaluation.md](h8_formal_evaluation.md).
+Release evidence is recomputed from raw counts and confidence intervals rather
+than trusting reported rates or a caller-supplied readiness flag. Missing gates
+produce `NOT READY`; malformed, contradictory, stale, or identity-drifting
+evidence fails closed. In the absence of formal weights and matched evaluation,
+the release candidate remains NONE and playing strength is not measured.

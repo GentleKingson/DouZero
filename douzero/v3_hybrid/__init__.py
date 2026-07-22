@@ -99,6 +99,18 @@ from .selective_search import (
     V3H7SearchRecord,
     V3SelectiveSearch,
 )
+from .formal_evidence import (
+    H8_EVIDENCE_SCHEMA_VERSION,
+    H8_REPORT_SCHEMA_VERSION,
+    H8EvidenceError,
+    validate_h8_formal_evidence,
+)
+from .release_package import (
+    V3_H8_PACKAGE_FORMAT,
+    V3ModelPackageError,
+    create_v3_public_model_package,
+    verify_v3_public_model_package,
+)
 
 __all__ = [
     "V3_HYBRID_CHECKPOINT_KIND",
@@ -179,4 +191,12 @@ __all__ = [
     "V3H7SearchMetrics",
     "V3H7SearchRecord",
     "V3SelectiveSearch",
+    "H8_EVIDENCE_SCHEMA_VERSION",
+    "H8_REPORT_SCHEMA_VERSION",
+    "H8EvidenceError",
+    "validate_h8_formal_evidence",
+    "V3_H8_PACKAGE_FORMAT",
+    "V3ModelPackageError",
+    "create_v3_public_model_package",
+    "verify_v3_public_model_package",
 ]
