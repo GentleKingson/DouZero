@@ -118,6 +118,19 @@ def test_package_rejects_tamper_unknown_files_and_runtime_drift(tmp_path) -> Non
         )
 
 
+def test_package_rejects_symlinked_assets(tmp_path) -> None:
+    package, _, schema, config, ruleset = _package(tmp_path)
+    external = tmp_path / "external.json"
+    external.write_text("{}", encoding="utf-8")
+    asset = package / "formal_evidence.json"
+    asset.unlink()
+    asset.symlink_to(external)
+    with pytest.raises(V3ModelPackageError, match="must be regular files"):
+        verify_v3_public_model_package(
+            package, schema=schema, ruleset=ruleset, model_config=config
+        )
+
+
 def test_package_rejects_false_ready_claim_even_with_recomputed_checksums(tmp_path) -> None:
     package, _, schema, config, ruleset = _package(tmp_path)
     manifest_path = package / "manifest.json"

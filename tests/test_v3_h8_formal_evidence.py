@@ -401,6 +401,34 @@ def test_reported_search_effect_must_match_raw_paired_outcomes() -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("bootstrap_resamples", 100_001, "exceeds the maximum"),
+        ("outcome_histogram", [None] * 4_097, "histogram is too large"),
+    ],
+)
+def test_bootstrap_work_is_bounded(field: str, value: object, message: str) -> None:
+    payload = _evidence()
+    payload["evaluations"][0][field] = value
+    with pytest.raises(H8EvidenceError, match=message):
+        validate_h8_formal_evidence(payload)
+
+
+def test_distinct_training_seeds_require_distinct_checkpoints() -> None:
+    payload = _evidence()
+    first = payload["training_runs"][0]
+    duplicate = next(
+        row for row in payload["training_runs"]
+        if row["variant"] == first["variant"]
+        and row["ruleset"] == first["ruleset"]
+        and row["seed"] != first["seed"]
+    )
+    duplicate["model_checkpoint_sha256"] = first["model_checkpoint_sha256"]
+    with pytest.raises(H8EvidenceError, match="must use distinct checkpoints"):
+        validate_h8_formal_evidence(payload)
+
+
+@pytest.mark.parametrize(
     "path",
     [("training_runs", "seed"), ("evaluations", "training_seed")],
 )

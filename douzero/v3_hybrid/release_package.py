@@ -385,9 +385,17 @@ def verify_v3_public_model_package(
     """Verify exact contents, checksums, identities, and strict reloadability."""
 
     root = Path(package_dir)
-    if not root.is_dir():
+    if root.is_symlink() or not root.is_dir():
         raise V3ModelPackageError(f"package is not a directory: {root}")
-    names = {path.name for path in root.iterdir()}
+    entries = list(root.iterdir())
+    unsafe = sorted(
+        path.name for path in entries if path.is_symlink() or not path.is_file()
+    )
+    if unsafe:
+        raise V3ModelPackageError(
+            f"package assets must be regular files: {unsafe}"
+        )
+    names = {path.name for path in entries}
     if names != _FILES:
         raise V3ModelPackageError(
             f"package files mismatch: missing={sorted(_FILES - names)}, "

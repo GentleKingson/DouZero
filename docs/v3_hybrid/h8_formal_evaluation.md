@@ -45,6 +45,8 @@ seeds, feature/trainer/replay identities, deal sets, and one immutable reference
 checkpoint/package identity per ruleset. Every training and evaluation row
 additionally binds its complete ruleset identity, training configuration hash,
 checkpoint hash, and the frozen ruleset reference used for comparison.
+Resulting checkpoint digests must be distinct across the three training seeds
+for each variant/ruleset experiment.
 
 Evaluation has two distinct tiers:
 
@@ -71,6 +73,9 @@ derived confidence intervals.
 Promotion search-on rows carry a separate paired search-effect histogram. Its
 counts must cover the same deals, and the validator independently recomputes
 the search-on versus search-off WP/ADP estimates and confidence intervals.
+Histogram cardinality, bootstrap resamples, and their allocation product are
+bounded before NumPy allocation so untrusted package evidence cannot request
+unbounded verification work.
 
 ```bash
 python tools/validate_v3_h8_evidence.py evidence.json --output report.json
@@ -96,7 +101,7 @@ arbitrary path- or credential-bearing metadata is rejected.
 
 The exact allow-list excludes Oracle, teacher, cooperation mixer, optimizer,
 replay, privileged labels, trajectories, human identifiers, caches, local
-paths, and secrets. A package without promotion evidence is deliberately a
+paths, secrets, symlinks, and non-regular assets. A package without promotion evidence is deliberately a
 non-release research artifact with playing strength not measured.
 
 ```bash

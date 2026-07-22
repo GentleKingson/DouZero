@@ -381,6 +381,29 @@ _EVALUATION_FIELDS = {
 }
 _OUTCOME_ATOM_FIELDS = {"count", "overall", "by_role"}
 _OUTCOME_METRICS = ("wp_delta", "adp_delta")
+_MIN_BOOTSTRAP_RESAMPLES = 1_000
+_MAX_BOOTSTRAP_RESAMPLES = 100_000
+_MAX_OUTCOME_HISTOGRAM_ATOMS = 4_096
+_MAX_BOOTSTRAP_CELLS = 10_000_000
+
+
+def _bootstrap_shape(
+    raw: object, resamples_value: object, *, label: str
+) -> tuple[list[object], int]:
+    if not isinstance(raw, list) or not raw:
+        raise H8EvidenceError(f"{label}.outcome_histogram must be a non-empty list")
+    if len(raw) > _MAX_OUTCOME_HISTOGRAM_ATOMS:
+        raise H8EvidenceError(f"{label}.outcome_histogram is too large")
+    resamples = _integer(
+        resamples_value,
+        f"{label}.bootstrap_resamples",
+        minimum=_MIN_BOOTSTRAP_RESAMPLES,
+    )
+    if resamples > _MAX_BOOTSTRAP_RESAMPLES:
+        raise H8EvidenceError(f"{label}.bootstrap_resamples exceeds the maximum")
+    if len(raw) > 1 and len(raw) * resamples > _MAX_BOOTSTRAP_CELLS:
+        raise H8EvidenceError(f"{label} bootstrap allocation exceeds the maximum")
+    return raw, resamples
 
 
 def _delta(value: object, label: str) -> tuple[float, float, float]:
@@ -401,11 +424,8 @@ def _recompute_clustered_deltas(
     deals: int,
     label: str,
 ) -> dict[str, dict[str, dict[str, float]] | dict[str, float]]:
-    raw = row["outcome_histogram"]
-    if not isinstance(raw, list) or not raw:
-        raise H8EvidenceError(f"{label}.outcome_histogram must be a non-empty list")
-    resamples = _integer(
-        row["bootstrap_resamples"], f"{label}.bootstrap_resamples", minimum=1000
+    raw, resamples = _bootstrap_shape(
+        row["outcome_histogram"], row["bootstrap_resamples"], label=label
     )
     counts: list[int] = []
     vectors: list[list[float]] = []
@@ -495,15 +515,8 @@ def _recompute_search_effect(
     deals: int,
     label: str,
 ) -> dict[str, dict[str, float]]:
-    raw = effect["outcome_histogram"]
-    if not isinstance(raw, list) or not raw:
-        raise H8EvidenceError(
-            f"{label}.outcome_histogram must be a non-empty list"
-        )
-    resamples = _integer(
-        effect["bootstrap_resamples"],
-        f"{label}.bootstrap_resamples",
-        minimum=1000,
+    raw, resamples = _bootstrap_shape(
+        effect["outcome_histogram"], effect["bootstrap_resamples"], label=label
     )
     counts: list[int] = []
     vectors: list[list[float]] = []
@@ -867,6 +880,18 @@ def validate_h8_formal_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     unknown_training = sorted(set(training) - expected_training)
     if unknown_training:
         raise H8EvidenceError(f"undeclared training rows: {unknown_training}")
+    for variant, ruleset in {
+        (variant, ruleset) for variant, ruleset, _seed in expected_training
+    }:
+        checkpoints = [
+            row["model_checkpoint_sha256"]
+            for (row_variant, row_ruleset, _seed), row in training.items()
+            if row_variant == variant and row_ruleset == ruleset
+        ]
+        if len(checkpoints) != len(set(checkpoints)):
+            raise H8EvidenceError(
+                f"{variant}/{ruleset} training seeds must use distinct checkpoints"
+            )
     for seed in identity["training_seeds"]:
         if len(samples_by_seed[seed]) > 1 or len(wall_by_seed[seed]) > 1:
             raise H8EvidenceError(f"seed {seed} does not use matched budgets")
