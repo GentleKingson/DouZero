@@ -113,10 +113,58 @@ class V3H7RuntimeStats:
     transitions_collected: int = 0
     decisions_collected: int = 0
     optimizer_steps: int = 0
+    learner_cardplay_samples: int = 0
     amp_fallbacks: int = 0
     episodes_per_team: dict[str, int] = field(
         default_factory=lambda: {"landlord": 0, "farmer": 0}
     )
+
+
+def validate_v3_h7_runtime_config(
+    resolved_config: V3H6ResolvedConfig,
+    runtime_config: V3H7RuntimeConfig,
+) -> None:
+    """Validate H7 support before model construction, CUDA, or worker startup."""
+    topology = resolved_config.learner.topology
+    features = resolved_config.learner.features
+    if topology.topology != TOPOLOGY_SINGLE_PROCESS:
+        raise ValueError(
+            "H7 runtime requires a validated single_process learner; "
+            "the outer runtime owns async topology identity"
+        )
+    if topology.ruleset != RULESET_LEGACY:
+        raise NotImplementedError(
+            "H7 async runtime currently supports legacy card-play rules only"
+        )
+    enabled = set(features.enabled_capabilities())
+    unsupported = enabled - {"role_model", "adaptive_dmc", "public_export"}
+    if unsupported:
+        raise NotImplementedError(
+            "H7 async runtime rejects unsupported capabilities before worker "
+            f"startup: {sorted(unsupported)}"
+        )
+    for capability in enabled:
+        validate_capability_support(
+            capability,
+            topology=TOPOLOGY_ASYNC_SINGLE_GPU,
+            ruleset=topology.ruleset,
+            checkpoint_resume=topology.checkpoint_resume,
+            export=topology.export,
+            deployment=topology.deployment,
+            search=False,
+        )
+    if not features.adaptive_dmc:
+        raise ValueError("H7 async replay requires Adaptive DMC q_old provenance")
+    if (
+        resolved_config.learner.base.base.base.public.adaptive_dmc.mode
+        == ADMC_DISABLED
+    ):
+        raise ValueError("H7 async runtime cannot use disabled Adaptive DMC")
+    learner_batch_size = resolved_config.learner.base.base.base.public.batch_size
+    if runtime_config.batch_size > learner_batch_size:
+        raise ValueError(
+            "H7 runtime batch_size cannot exceed the learner batch_size"
+        )
 
 
 class V3AsyncSingleGPUTrainer:
@@ -132,41 +180,7 @@ class V3AsyncSingleGPUTrainer:
             raise TypeError("H7 runtime requires V3H6Learner")
         if learner.config != resolved_config:
             raise ValueError("H7 learner and resolved config disagree")
-        topology = resolved_config.learner.topology
-        features = resolved_config.learner.features
-        if topology.topology != TOPOLOGY_SINGLE_PROCESS:
-            raise ValueError(
-                "H7 runtime requires a validated single_process learner; "
-                "the outer runtime owns async topology identity"
-            )
-        if topology.ruleset != RULESET_LEGACY:
-            raise NotImplementedError(
-                "H7 async runtime currently supports legacy card-play rules only"
-            )
-        enabled = set(features.enabled_capabilities())
-        unsupported = enabled - {"role_model", "adaptive_dmc", "public_export"}
-        if unsupported:
-            raise NotImplementedError(
-                "H7 async runtime rejects unsupported capabilities before worker "
-                f"startup: {sorted(unsupported)}"
-            )
-        for capability in enabled:
-            validate_capability_support(
-                capability,
-                topology=TOPOLOGY_ASYNC_SINGLE_GPU,
-                ruleset=topology.ruleset,
-                checkpoint_resume=topology.checkpoint_resume,
-                export=topology.export,
-                deployment=topology.deployment,
-                search=False,
-            )
-        if not features.adaptive_dmc:
-            raise ValueError("H7 async replay requires Adaptive DMC q_old provenance")
-        if (
-            resolved_config.learner.base.base.base.public.adaptive_dmc.mode
-            == ADMC_DISABLED
-        ):
-            raise ValueError("H7 async runtime cannot use disabled Adaptive DMC")
+        validate_v3_h7_runtime_config(resolved_config, runtime_config)
         if learner.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("H7 async runtime requires CUDA and never falls back")
         self.learner = learner
@@ -441,6 +455,7 @@ class V3AsyncSingleGPUTrainer:
             rows = [self.buffer[index] for index in indices]
             self.learner.train_batch(rows)
             self.stats.optimizer_steps += 1
+            self.stats.learner_cardplay_samples += len(rows)
             self._segments["learner"] += time.perf_counter() - started
 
     def step(self):
@@ -452,8 +467,25 @@ class V3AsyncSingleGPUTrainer:
         started = time.perf_counter()
         metrics = self.learner.train_batch(rows)
         self.stats.optimizer_steps += 1
+        self.stats.learner_cardplay_samples += len(rows)
         self._segments["learner"] += time.perf_counter() - started
         return metrics
+
+    def _parameter_update_snapshot(self) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            parameter.detach().clone() for parameter in self.model.parameters()
+        )
+
+    def _parameters_changed_since(
+        self, snapshots: tuple[torch.Tensor, ...]
+    ) -> bool:
+        parameters = tuple(self.model.parameters())
+        if len(snapshots) != len(parameters):
+            raise ValueError("H7 parameter update snapshot shape changed")
+        return any(
+            not torch.equal(snapshot, parameter.detach())
+            for snapshot, parameter in zip(snapshots, parameters)
+        )
 
     def quiesce_cycle_boundary(self) -> dict[str, object]:
         if self._runtime_started:
@@ -547,14 +579,14 @@ class V3AsyncSingleGPUTrainer:
         if not isinstance(stats_payload, dict) or set(stats_payload) != {
             "games_collected", "episodes_completed", "transitions_collected",
             "decisions_collected", "optimizer_steps", "episodes_per_team",
-            "amp_fallbacks",
+            "amp_fallbacks", "learner_cardplay_samples",
         }:
             raise ValueError("H7 checkpoint statistics fields mismatch")
         candidate_stats = V3H7RuntimeStats(**stats_payload)
         for name in (
             "games_collected", "episodes_completed", "transitions_collected",
             "decisions_collected", "optimizer_steps",
-            "amp_fallbacks",
+            "amp_fallbacks", "learner_cardplay_samples",
         ):
             value = getattr(candidate_stats, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -647,4 +679,5 @@ __all__ = [
     "V3AsyncSingleGPUTrainer",
     "V3H7RuntimeConfig",
     "V3H7RuntimeStats",
+    "validate_v3_h7_runtime_config",
 ]

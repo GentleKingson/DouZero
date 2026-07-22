@@ -25,6 +25,7 @@ from douzero.v3_hybrid.runtime import (
     V3_H7_REQUEST_PROTOCOL,
     V3H7RuntimeConfig,
     V3AsyncSingleGPUTrainer,
+    validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid import (
     ADMC_SAFE_HYBRID,
@@ -112,6 +113,29 @@ def test_h7_support_matrix_enables_only_base_async_capabilities():
             export=False,
             deployment=False,
             search=False,
+        )
+
+
+def test_h7_preflight_rejects_batch_mismatch_before_cuda_or_workers():
+    public = V3H2LearnerConfig(
+        batch_size=4,
+        device="cpu",
+        adaptive_dmc=AdaptiveDMCConfig(mode=ADMC_SAFE_HYBRID),
+    )
+    resolved = V3H6ResolvedConfig(
+        model=V3HybridModelConfig(),
+        learner=V3H6LearnerConfig(
+            base=V3H5LearnerConfig(
+                base=V3H4LearnerConfig(base=V3H3LearnerConfig(public=public))
+            ),
+            losses=V3HybridLossComposerConfig(lambda_dmc=1.0),
+            features=V3H6FeatureFlags(adaptive_dmc=True),
+            topology=V3H6TopologyConfig(ruleset="legacy"),
+        ),
+    )
+    with pytest.raises(ValueError, match="cannot exceed the learner batch_size"):
+        validate_v3_h7_runtime_config(
+            resolved, V3H7RuntimeConfig(batch_size=5)
         )
 
 
@@ -428,6 +452,9 @@ def test_h7_cuda_async_update_checkpoint_resume_and_shutdown(tmp_path):
             name: value.detach().clone() for name, value in model.state_dict().items()
         }
         assert runtime.step() is not None
+        assert runtime.stats.learner_cardplay_samples == 4
+        snapshot = runtime._parameter_update_snapshot()
+        assert runtime._parameters_changed_since(snapshot) is False
         assert any(
             not torch.equal(before[name], value)
             for name, value in model.state_dict().items()
@@ -466,5 +493,6 @@ def test_h7_cuda_async_update_checkpoint_resume_and_shutdown(tmp_path):
     assert resumed.load_training_checkpoint(checkpoint) == {"cycle": 1}
     assert resumed.policy_step == runtime.policy_step
     assert resumed.stats.optimizer_steps == 1
+    assert resumed.stats.learner_cardplay_samples == 4
     resumed.shutdown()
     assert not list(tmp_path.glob("*.tmp"))

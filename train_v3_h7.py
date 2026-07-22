@@ -34,6 +34,7 @@ from douzero.v3_hybrid.integration_config import (
 from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
+    validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.training.h3_learner import V3H3LearnerConfig
 from douzero.v3_hybrid.training.h4_learner import V3H4LearnerConfig
@@ -51,7 +52,7 @@ def _smoke_config() -> V3H6ResolvedConfig:
         farmer_adapter_layers=1,
     )
     public = V3H2LearnerConfig(
-        batch_size=4,
+        batch_size=32,
         learning_rate=1e-3,
         max_grad_norm=10.0,
         device="cuda",
@@ -125,6 +126,7 @@ def main() -> None:
         action_seed=args.action_seed,
         epsilon=args.epsilon,
     )
+    validate_v3_h7_runtime_config(resolved, runtime_config)
     model = V3HybridModel(build_v2_schema(), resolved.model)
     learner = V3H6Learner(
         model, ruleset=RuleSet.legacy(), config=resolved
@@ -170,6 +172,7 @@ def main() -> None:
         long_config,
         checkpoint_series,
         state=state,
+        collect_records=True,
     )
     final_state, reason, records = runner.run()
     print(json.dumps({
