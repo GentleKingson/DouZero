@@ -370,7 +370,7 @@ def test_team_value_only_updates_sidecar_and_farmer_public_paths():
     assert metrics.mixer_weight_min is None
     assert _changed(sidecar_before, learner.cooperation)
     assert _changed(model_before, learner.model, "role_adapters.landlord_up")
-    assert not _changed(model_before, learner.model, "role_adapters.landlord")
+    assert not _changed(model_before, learner.model, "role_adapters.landlord.")
     # Team-value heads are a training sidecar; the public local-Q heads stay
     # independent and are changed only by the ordinary DMC base loss.
     assert learner.cooperation.team_value_heads["landlord_up"] is not learner.model.role_heads["landlord_up"].dmc_head
@@ -513,7 +513,7 @@ def test_nonfinite_and_padding_contracts_fail_closed():
         dataclasses.replace(trajectories[0], public_features=broken)
     with pytest.raises(ValueError, match="increasing"):
         dataclasses.replace(trajectories[0], decision_indices=(2, 1))
-    with pytest.raises(ValueError, match="complete farmer"):
+    with pytest.raises(ValueError, match="both farmer trajectories"):
         _learner().train_batch(
             trajectories[0].transitions, trajectories=(trajectories[0],)
         )
