@@ -75,6 +75,10 @@ def _validate_provenance(args, environment):
     git_sha = environment["git_sha"]
     git_status = environment["git_status_porcelain"]
     if args.formal:
+        if environment.get("git_toplevel") != environment.get("source_root"):
+            raise RuntimeError(
+                "formal benchmark source_root must be the Git worktree top level"
+            )
         if (
             not isinstance(git_sha, str)
             or not GIT_SHA_PATTERN.fullmatch(git_sha)
@@ -145,6 +149,8 @@ def _checkpoint_cli_args(enabled):
 def _environment(source_root=ROOT):
     import torch
 
+    source_root = source_root.resolve()
+
     try:
         gpu = subprocess.check_output(
             [
@@ -169,9 +175,23 @@ def _environment(source_root=ROOT):
         ).splitlines()
     except (OSError, subprocess.SubprocessError):
         git_status = None
+    try:
+        git_toplevel = str(
+            Path(
+                subprocess.check_output(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    cwd=source_root,
+                    text=True,
+                ).strip()
+            ).resolve()
+        )
+    except (OSError, subprocess.SubprocessError):
+        git_toplevel = None
     return {
         "git_sha": git,
         "git_status_porcelain": git_status,
+        "source_root": str(source_root),
+        "git_toplevel": git_toplevel,
         "python": platform.python_version(),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,

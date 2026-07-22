@@ -407,25 +407,33 @@ def test_formal_benchmark_provenance_fails_closed():
     args = SimpleNamespace(
         formal=True, allow_dirty=False, expected_git_sha=git_sha,
     )
+    provenance = {
+        "git_sha": git_sha,
+        "git_status_porcelain": [],
+        "source_root": "/checkout",
+        "git_toplevel": "/checkout",
+    }
     with pytest.raises(RuntimeError, match="verify the Git SHA"):
-        bench_legacy_training._validate_provenance(args, {
-            "git_sha": None, "git_status_porcelain": [],
-        })
+        bench_legacy_training._validate_provenance(
+            args, {**provenance, "git_sha": None}
+        )
     with pytest.raises(RuntimeError, match="worktree status"):
-        bench_legacy_training._validate_provenance(args, {
-            "git_sha": git_sha, "git_status_porcelain": None,
-        })
+        bench_legacy_training._validate_provenance(
+            args, {**provenance, "git_status_porcelain": None}
+        )
     with pytest.raises(RuntimeError, match="clean Git worktree"):
-        bench_legacy_training._validate_provenance(args, {
-            "git_sha": git_sha, "git_status_porcelain": [" M train.py"],
-        })
+        bench_legacy_training._validate_provenance(
+            args, {**provenance, "git_status_porcelain": [" M train.py"]}
+        )
     with pytest.raises(RuntimeError, match="Git SHA mismatch"):
-        bench_legacy_training._validate_provenance(args, {
-            "git_sha": "c" * 40, "git_status_porcelain": [],
-        })
-    bench_legacy_training._validate_provenance(args, {
-        "git_sha": git_sha, "git_status_porcelain": [],
-    })
+        bench_legacy_training._validate_provenance(
+            args, {**provenance, "git_sha": "c" * 40}
+        )
+    with pytest.raises(RuntimeError, match="worktree top level"):
+        bench_legacy_training._validate_provenance(
+            args, {**provenance, "source_root": "/checkout/nested"}
+        )
+    bench_legacy_training._validate_provenance(args, provenance)
 
 
 def test_benchmark_environment_reads_requested_source_root(monkeypatch, tmp_path):
@@ -437,6 +445,8 @@ def test_benchmark_environment_reads_requested_source_root(monkeypatch, tmp_path
             return "0, uuid, gpu, driver, 1000\n"
         if command[1:3] == ["rev-parse", "HEAD"]:
             return "a" * 40 + "\n"
+        if command[1:3] == ["rev-parse", "--show-toplevel"]:
+            return str(tmp_path) + "\n"
         if command[1:3] == ["status", "--porcelain"]:
             return ""
         raise AssertionError(command)
@@ -450,6 +460,8 @@ def test_benchmark_environment_reads_requested_source_root(monkeypatch, tmp_path
     environment = bench_legacy_training._environment(tmp_path)
 
     assert environment["git_sha"] == "a" * 40
+    assert environment["source_root"] == str(tmp_path.resolve())
+    assert environment["git_toplevel"] == str(tmp_path.resolve())
     git_calls = [call for call in calls if call[0][0] == "git"]
     assert git_calls
     assert all(cwd == tmp_path for _, cwd in git_calls)
