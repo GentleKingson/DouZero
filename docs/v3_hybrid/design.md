@@ -248,8 +248,9 @@ The coupled H4 public checkpoint contains only the V3 student, public belief
 model, strict configs, ruleset/schema identities, and public feedback contract.
 The H1 loader rejects it, and the H4 loader rejects training checkpoints or
 partial model pairs. Public imports lazily exclude belief labels, privileged
-observations, Oracle code, and H4 trainer code. Oracle plus belief feedback is
-deliberately rejected until H6 integrates the full loss graph.
+observations, Oracle code, and H4 trainer code. The standalone H4 identity
+continues to reject Oracle plus belief feedback; the H6 wrapper admits that
+combination under its distinct integration identity and atomic rollback.
 
 | H4 combination | Status |
 |---|---|
@@ -259,8 +260,8 @@ deliberately rejected until H6 integrates the full loss graph.
 | Independent belief encoder updates | Supported |
 | Belief updates to shared V3 state/history encoders | Supported by explicit phase |
 | Policy gradient through exact DP | Rejected |
-| H3 Oracle plus H4 belief in one learner | Rejected until H6 |
-| Bidding/BC/strategy/cooperation integration | Deferred to H6 |
+| H3 Oracle plus H4 belief in one learner | Supported only through H6 |
+| Bidding/BC/strategy/cooperation integration | Supported combinations are owned by H6 |
 
 H4 playing strength not measured. Feedback is not a default until paired
 farmer/landlord evaluation demonstrates benefit without role regression.
@@ -416,6 +417,10 @@ whole nested learner, optimizers, counters, schedules, and policy version back
 if a later phase fails or becomes non-finite. Checkpoints persist the nested
 H5 artifact, composer state, H6 counters, resolved-config identity,
 support-matrix hash, and the sum of H3, H5, and H6 public policy updates.
+Externally applied DMC, Oracle, belief, and cooperation terms reject a second
+H6 weight schedule because their owning H2-H5 component controls the
+executable cadence. Pure BC and pure bidding batches bypass the card-play
+optimizer phase rather than performing an empty optimizer step.
 
 The public sidecar contains only public policy and optional public belief,
 style, prior, strategy, and bidding modules. Oracle and cooperation/mixer
