@@ -408,6 +408,7 @@ def test_ready_package_selects_matching_checkpoint_and_search_mode(
             {
                 "variant": "v3_full_hybrid",
                 "tier": "promotion",
+                "training_seed": 22,
                 "search_enabled": False,
                 "ruleset": ruleset.identity(),
                 "model_checkpoint_sha256": "e" * 64,
@@ -415,6 +416,7 @@ def test_ready_package_selects_matching_checkpoint_and_search_mode(
             {
                 "variant": "v3_full_hybrid",
                 "tier": "promotion",
+                "training_seed": 22,
                 "search_enabled": False,
                 "ruleset": ruleset.identity(),
                 "model_checkpoint_sha256": checkpoint_sha,
