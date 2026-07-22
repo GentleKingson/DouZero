@@ -197,9 +197,18 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
+    def reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for name, member in pairs:
+            if name in result:
+                raise ValueError(f"duplicate JSON object member {name!r}")
+            result[name] = member
+        return result
+
     try:
         value = json.loads(
             path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_members,
             parse_constant=lambda token: (_ for _ in ()).throw(
                 ValueError(f"non-finite JSON constant {token!r}")
             ),

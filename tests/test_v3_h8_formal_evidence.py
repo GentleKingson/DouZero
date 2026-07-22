@@ -36,12 +36,14 @@ def _delta(value: float = 0.02) -> dict[str, float]:
     return {"estimate": value, "low": value, "high": value}
 
 
-def _baseline(ruleset: str) -> dict[str, str]:
+def _baseline(ruleset: str) -> dict[str, object]:
     return {
         "variant": "legacy_a1" if ruleset == "legacy" else "model_v2",
         "training_config_hash": ("7" if ruleset == "legacy" else "8") * 64,
         "model_checkpoint_sha256": ("9" if ruleset == "legacy" else "a") * 64,
         "model_package_sha256": ("b" if ruleset == "legacy" else "c") * 64,
+        "policy_latency_p99_ms": 5.0,
+        "search_added_latency_p99_ms": 2.0,
     }
 
 
@@ -376,6 +378,40 @@ def test_each_row_binds_complete_ruleset_and_training_identity() -> None:
     payload = _evidence()
     payload["evaluations"][0]["reference"]["model_checkpoint_sha256"] = "f" * 64
     with pytest.raises(H8EvidenceError, match="comparison baseline drift"):
+        validate_h8_formal_evidence(payload)
+
+
+def test_promotion_baseline_must_differ_from_candidate() -> None:
+    payload = _evidence(promotion=True)
+    row = next(item for item in payload["evaluations"] if item["tier"] == PROMOTION)
+    ruleset = row["ruleset"]["ruleset_id"]
+    baseline = payload["experiment_identity"]["evaluation_baselines"][ruleset]
+    baseline.update(
+        variant=row["variant"],
+        model_checkpoint_sha256=row["model_checkpoint_sha256"],
+        model_package_sha256=row["model_package_sha256"],
+    )
+    for evaluation in payload["evaluations"]:
+        if evaluation["ruleset"]["ruleset_id"] == ruleset:
+            evaluation["reference"] = copy.deepcopy(baseline)
+    with pytest.raises(H8EvidenceError, match="must differ from the candidate"):
+        validate_h8_formal_evidence(payload)
+
+
+def test_promotion_latency_budgets_are_frozen_in_baseline_identity() -> None:
+    payload = _evidence(promotion=True)
+    row = next(item for item in payload["evaluations"] if item["tier"] == PROMOTION)
+    row["latency_ms"]["budget_p99"] = 999.0
+    with pytest.raises(H8EvidenceError, match="policy latency budget drift"):
+        validate_h8_formal_evidence(payload)
+
+    payload = _evidence(promotion=True)
+    row = next(
+        item for item in payload["evaluations"]
+        if item["tier"] == PROMOTION and item["search_enabled"]
+    )
+    row["search_effect"]["latency_budget_ms"] = 999.0
+    with pytest.raises(H8EvidenceError, match="search latency budget drift"):
         validate_h8_formal_evidence(payload)
 
 

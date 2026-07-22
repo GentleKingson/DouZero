@@ -170,7 +170,8 @@ _IDENTITY_FIELDS = {
 }
 _BASELINE_FIELDS = {
     "variant", "training_config_hash", "model_checkpoint_sha256",
-    "model_package_sha256",
+    "model_package_sha256", "policy_latency_p99_ms",
+    "search_added_latency_p99_ms",
 }
 
 
@@ -247,8 +248,21 @@ def _validate_identity(identity: Mapping[str, Any]) -> None:
             raise H8EvidenceError(
                 f"evaluation_baselines.{ruleset}.variant is unsupported"
             )
-        for name in _BASELINE_FIELDS - {"variant"}:
+        for name in (
+            "training_config_hash", "model_checkpoint_sha256",
+            "model_package_sha256",
+        ):
             _digest(baseline[name], f"evaluation_baselines.{ruleset}.{name}")
+        _finite(
+            baseline["policy_latency_p99_ms"],
+            f"evaluation_baselines.{ruleset}.policy_latency_p99_ms",
+            minimum=0.0,
+        )
+        _finite(
+            baseline["search_added_latency_p99_ms"],
+            f"evaluation_baselines.{ruleset}.search_added_latency_p99_ms",
+            minimum=0.0,
+        )
 
 
 def _enabled_variants(identity: Mapping[str, Any]) -> tuple[str, ...]:
@@ -626,6 +640,15 @@ def _validate_evaluation(
         or variant != identity["promotion_variant"]
     ):
         raise H8EvidenceError("promotion evidence does not match frozen candidate")
+    if tier == PROMOTION and (
+        reference["variant"] == variant
+        or reference["model_checkpoint_sha256"]
+        == row["model_checkpoint_sha256"]
+        or reference["model_package_sha256"] == row["model_package_sha256"]
+    ):
+        raise H8EvidenceError(
+            "promotion comparison baseline must differ from the candidate"
+        )
     deals = _integer(row["deals"], f"evaluation {variant}.deals", minimum=1)
     if deals > _MAX_PAIRED_DEALS:
         raise H8EvidenceError(f"evaluation {variant}.deals exceeds the maximum")
@@ -697,6 +720,10 @@ def _validate_evaluation(
         latency["budget_p99"], f"evaluation {variant}.latency.budget_p99",
         minimum=0.0,
     )
+    if budget != float(reference["policy_latency_p99_ms"]):
+        raise H8EvidenceError(
+            f"evaluation {variant} policy latency budget drift"
+        )
     if not p50 <= p95 <= p99:
         raise H8EvidenceError(f"evaluation {variant} latency percentiles are unordered")
     _finite(
@@ -797,6 +824,10 @@ def _validate_evaluation(
             f"evaluation {variant}.search_effect.latency_budget_ms",
             minimum=0.0,
         )
+        if latency_budget != float(reference["search_added_latency_p99_ms"]):
+            raise H8EvidenceError(
+                f"evaluation {variant} search latency budget drift"
+            )
         if search_wp_low <= 0.0 or search_adp_low <= 0.0:
             issues.append(
                 f"{variant}/{ruleset}/seed-{seed}: search benefit CI failed"

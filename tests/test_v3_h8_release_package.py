@@ -132,6 +132,21 @@ def test_package_rejects_non_boolean_search_compatibility(tmp_path) -> None:
         )
 
 
+def test_package_rejects_duplicate_json_object_members(tmp_path) -> None:
+    package, _, schema, config, ruleset = _package(tmp_path)
+    manifest_path = package / "manifest.json"
+    contents = manifest_path.read_text(encoding="utf-8")
+    manifest_path.write_text(
+        contents.replace("{", '{"search_compatible":"forged",', 1),
+        encoding="utf-8",
+    )
+    _refresh_checksums(package)
+    with pytest.raises(V3ModelPackageError, match="duplicate JSON object member"):
+        verify_v3_public_model_package(
+            package, schema=schema, ruleset=ruleset, model_config=config
+        )
+
+
 def test_package_rejects_symlinked_assets(tmp_path) -> None:
     package, _, schema, config, ruleset = _package(tmp_path)
     external = tmp_path / "external.json"
