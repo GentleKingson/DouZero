@@ -120,6 +120,8 @@ class V3H5StepMetrics:
     farmer_samples: int
     episodes: int
     cooperation_updated: bool
+    public_updated: bool
+    policy_version: int
     schedule_weight: float
     loss_team_value: float
     loss_trajectory_consistency: float
@@ -147,6 +149,7 @@ class H5CumulativeStats:
         "farmer_samples",
         "episodes",
         "cooperation_updates",
+        "public_updates",
         "team_value_loss_sum",
         "trajectory_loss_sum",
         "mixer_loss_sum",
@@ -159,6 +162,7 @@ class H5CumulativeStats:
         self.farmer_samples = 0
         self.episodes = 0
         self.cooperation_updates = 0
+        self.public_updates = 0
         self.team_value_loss_sum = 0.0
         self.trajectory_loss_sum = 0.0
         self.mixer_loss_sum = 0.0
@@ -170,6 +174,7 @@ class H5CumulativeStats:
         self.farmer_samples += metrics.farmer_samples
         self.episodes += metrics.episodes
         self.cooperation_updates += int(metrics.cooperation_updated)
+        self.public_updates += int(metrics.public_updated)
         self.team_value_loss_sum += metrics.loss_team_value
         self.trajectory_loss_sum += metrics.loss_trajectory_consistency
         self.mixer_loss_sum += metrics.loss_mixer
@@ -185,7 +190,7 @@ class H5CumulativeStats:
         result = cls()
         integer = {
             "steps", "samples", "farmer_samples", "episodes",
-            "cooperation_updates",
+            "cooperation_updates", "public_updates",
         }
         for name in cls._FIELDS:
             value = payload[name]
@@ -202,6 +207,8 @@ class H5CumulativeStats:
             setattr(result, name, value)
         if result.cooperation_updates > result.steps:
             raise ValueError("H5 cooperation updates exceed learner steps")
+        if result.public_updates > result.cooperation_updates:
+            raise ValueError("H5 public updates exceed cooperation updates")
         return result
 
 
@@ -226,6 +233,8 @@ def h5_training_identity(
         "trajectory": "ordered_unequal_public_sequence_gru_v1",
         "mixer_export": "forbidden_from_public_artifacts_v1",
         "replay_protocol": "h2_public_rows_plus_h5_public_side_channel_v1",
+        "policy_version": "nested_h3_public_updates_plus_h5_public_updates_v1",
+        "rng_resume": "strict_nested_h3_python_numpy_torch_cuda_state_v1",
         "topology": "single_process_h5_reference_v1",
     }
 
@@ -380,6 +389,12 @@ class V3H5Learner:
     @property
     def _public_optimizer(self):
         return self.base.base.student_optimizer
+
+    @property
+    def policy_version(self) -> int:
+        """Version every public parameter update, including the H5 sidecar step."""
+
+        return self.base.base.policy_version + self.statistics.public_updates
 
     @staticmethod
     def _gradient_norm(parameters: Sequence[torch.nn.Parameter]) -> float:
@@ -599,6 +614,8 @@ class V3H5Learner:
             farmer_samples=len(farmer_rows),
             episodes=len(pairs),
             cooperation_updated=True,
+            public_updated=bool(public_parameters),
+            policy_version=self.policy_version + int(bool(public_parameters)),
             schedule_weight=schedule_weight,
             loss_team_value=float(loss_team.detach().cpu()),
             loss_trajectory_consistency=float(loss_trajectory.detach().cpu()),
@@ -634,6 +651,8 @@ class V3H5Learner:
             farmer_samples=0,
             episodes=0,
             cooperation_updated=False,
+            public_updated=False,
+            policy_version=self.policy_version,
             schedule_weight=0.0,
             loss_team_value=0.0,
             loss_trajectory_consistency=0.0,
@@ -662,6 +681,8 @@ class V3H5Learner:
             farmer_samples=sum(role_samples.values()),
             episodes=len(pairs),
             cooperation_updated=False,
+            public_updated=False,
+            policy_version=self.policy_version,
             schedule_weight=0.0,
             loss_team_value=0.0,
             loss_trajectory_consistency=0.0,
@@ -731,6 +752,7 @@ class V3H5Learner:
             "counters": {
                 "eligible_updates": self.eligible_updates,
                 "samples_consumed": self.samples_consumed,
+                "policy_version": self.policy_version,
             },
             "statistics": self.statistics.state_dict(),
         }
@@ -771,14 +793,15 @@ class V3H5Learner:
                 raise CheckpointCompatibilityError(f"H5 checkpoint {name} mismatch")
         counters = bundle["counters"]
         if not isinstance(counters, Mapping) or set(counters) != {
-            "eligible_updates", "samples_consumed"
+            "eligible_updates", "samples_consumed", "policy_version"
         }:
             raise CheckpointCompatibilityError("H5 checkpoint counters mismatch")
         eligible = counters["eligible_updates"]
         consumed = counters["samples_consumed"]
+        policy_version = counters["policy_version"]
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
-            for value in (eligible, consumed)
+            for value in (eligible, consumed, policy_version)
         ):
             raise CheckpointCompatibilityError("H5 checkpoint counters are invalid")
         try:
@@ -789,6 +812,13 @@ class V3H5Learner:
             ) from exc
         if statistics.steps != eligible or statistics.samples != consumed:
             raise CheckpointCompatibilityError("H5 checkpoint progress mismatch")
+        expected_h5_public_updates = (
+            statistics.cooperation_updates
+            if self.config.cooperation.update_public_model
+            else 0
+        )
+        if statistics.public_updates != expected_h5_public_updates:
+            raise CheckpointCompatibilityError("H5 checkpoint public update drift")
         state = bundle["cooperation_state_dict"]
         optimizer = bundle["cooperation_optimizer_state_dict"]
         if self.cooperation is None:
@@ -822,6 +852,8 @@ class V3H5Learner:
             self._load_inner_bundle(inner)
             if self.base.eligible_updates != eligible or self.base.samples_consumed != consumed:
                 raise ValueError("nested H4 progress does not match H5")
+            if self.base.base.policy_version + statistics.public_updates != policy_version:
+                raise ValueError("nested H4/H5 policy version does not match H5")
             if self.cooperation is not None:
                 self.cooperation.load_state_dict(state, strict=True)
                 self.cooperation_optimizer.load_state_dict(optimizer)

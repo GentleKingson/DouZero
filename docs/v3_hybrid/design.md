@@ -339,10 +339,12 @@ intervals; no H1 result is a strength claim.
 
 H5 does not apply synchronous QMIX to alternating Dou Dizhu actions. Replay
 rows remain the H2 public rows and are grouped by exact episode/deal identity
-into an ordered `landlord_up`/`landlord_down` pair. Each trajectory carries
-strictly increasing trace indices, may have a different number of decisions,
-and keeps its league policy and teammate-policy identities. False padded rows
-are zeroed and excluded from every loss and statistic.
+into an ordered `landlord_up`/`landlord_down` pair. Every trajectory decision
+atomically binds one trace index, replay transition, public-feature row, and
+pass flag before the sequence is sorted by trace index. A trajectory may have
+a different number of decisions and keeps its league policy and
+teammate-policy identities. False padded rows are zeroed and excluded from
+every loss and statistic.
 
 The public V3 policy retains its three independent role-specific local DMC Q
 heads. A training-only sidecar consumes the selected public role-adapted action
@@ -370,7 +372,9 @@ and H4 checkpoint writers serialize only the V3 model (and public belief model
 where applicable), so the H5 sidecar and mixer cannot enter a deployment
 artifact. H5 training checkpoints are separately marked `training_only` and
 strictly bind the nested H4 state, sidecar graph, optimizer, counters, schedule,
-statistics, and RNG continuity.
+statistics, and nested H3 RNG continuity. The actor-visible policy version is
+the nested H3 version plus every H5 public optimizer step, so Adaptive DMC
+provenance cannot lag behind parameters changed by the cooperation loss.
 
 H5 currently provides the single-process reference topology and correctness
 contract. Long-running async workers, SIGTERM manifests, bounded policy lag,

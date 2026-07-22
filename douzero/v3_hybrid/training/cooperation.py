@@ -261,18 +261,44 @@ def build_h5_public_features(
 
 
 @dataclass(frozen=True)
+class V3H5FarmerDecision:
+    """One trace-indexed replay row with its inseparable public side channel."""
+
+    trace_index: int
+    transition: V3ReplayTransition
+    public_features: torch.Tensor
+    selected_action_is_pass: bool
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.trace_index, bool)
+            or not isinstance(self.trace_index, int)
+            or self.trace_index < 0
+        ):
+            raise ValueError("H5 trace index must be a non-negative int")
+        if not isinstance(self.transition, V3ReplayTransition):
+            raise TypeError("H5 decision contains an invalid replay row")
+        if (
+            not isinstance(self.public_features, torch.Tensor)
+            or self.public_features.shape != (H5_PUBLIC_FEATURE_DIM,)
+            or self.public_features.device.type != "cpu"
+            or not bool(torch.isfinite(self.public_features).all())
+        ):
+            raise ValueError("H5 decision public features must be a finite CPU row")
+        if not isinstance(self.selected_action_is_pass, bool):
+            raise TypeError("H5 decision pass flag must be bool")
+
+
+@dataclass(frozen=True)
 class V3H5FarmerTrajectory:
-    """One ordered farmer trajectory and public-only auxiliary side channel."""
+    """One ordered farmer trajectory of atomically trace-bound decisions."""
 
     episode_id: str
     deal_id: str
     role: str
     policy_id: str
     teammate_policy_id: str
-    decision_indices: tuple[int, ...]
-    transitions: tuple[V3ReplayTransition, ...]
-    public_features: torch.Tensor
-    selected_action_is_pass: torch.Tensor
+    decisions: tuple[V3H5FarmerDecision, ...]
     team_return: float
 
     def __post_init__(self) -> None:
@@ -281,51 +307,18 @@ class V3H5FarmerTrajectory:
         for name in ("episode_id", "deal_id", "policy_id", "teammate_policy_id"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"{name} must be a non-empty string")
-        count = len(self.transitions)
-        if count < 1 or len(self.decision_indices) != count:
-            raise ValueError("H5 trajectory lengths must match and be non-empty")
-        if any(
-            isinstance(index, bool) or not isinstance(index, int) or index < 0
-            for index in self.decision_indices
-        ) or len(set(self.decision_indices)) != count:
-            raise ValueError("H5 decision indices must be unique and non-negative")
-        if self.public_features.shape != (count, H5_PUBLIC_FEATURE_DIM):
-            raise ValueError("H5 public feature shape mismatch")
-        if self.public_features.device.type != "cpu" or not bool(
-            torch.isfinite(self.public_features).all()
-        ):
-            raise ValueError("H5 public features must be finite CPU tensors")
-        if (
-            self.selected_action_is_pass.shape != (count,)
-            or self.selected_action_is_pass.dtype != torch.bool
-            or self.selected_action_is_pass.device.type != "cpu"
-        ):
-            raise ValueError("H5 pass flags must be a bool CPU vector")
-        order = tuple(
-            sorted(range(count), key=lambda position: self.decision_indices[position])
+        if not isinstance(self.decisions, tuple) or not self.decisions:
+            raise ValueError("H5 trajectory decisions must be a non-empty tuple")
+        if any(not isinstance(item, V3H5FarmerDecision) for item in self.decisions):
+            raise TypeError("H5 trajectory contains an invalid decision")
+        indices = tuple(item.trace_index for item in self.decisions)
+        if len(set(indices)) != len(indices):
+            raise ValueError("H5 decision trace indices must be unique")
+        object.__setattr__(
+            self,
+            "decisions",
+            tuple(sorted(self.decisions, key=lambda item: item.trace_index)),
         )
-        if order != tuple(range(count)):
-            tensor_order = torch.tensor(order, dtype=torch.long)
-            object.__setattr__(
-                self,
-                "decision_indices",
-                tuple(self.decision_indices[position] for position in order),
-            )
-            object.__setattr__(
-                self,
-                "transitions",
-                tuple(self.transitions[position] for position in order),
-            )
-            object.__setattr__(
-                self,
-                "public_features",
-                self.public_features.index_select(0, tensor_order),
-            )
-            object.__setattr__(
-                self,
-                "selected_action_is_pass",
-                self.selected_action_is_pass.index_select(0, tensor_order),
-            )
         if (
             isinstance(self.team_return, bool)
             or not isinstance(self.team_return, (int, float))
@@ -333,8 +326,6 @@ class V3H5FarmerTrajectory:
         ):
             raise ValueError("H5 farmer team return must be finite")
         for transition in self.transitions:
-            if not isinstance(transition, V3ReplayTransition):
-                raise TypeError("H5 trajectory contains an invalid replay row")
             if (
                 transition.episode_id != self.episode_id
                 or transition.deal_id != self.deal_id
@@ -345,6 +336,24 @@ class V3H5FarmerTrajectory:
                 transition.mc_return, self.team_return, rel_tol=0.0, abs_tol=1e-7
             ):
                 raise ValueError("H5 farmer decisions do not share one team return")
+
+    @property
+    def decision_indices(self) -> tuple[int, ...]:
+        return tuple(item.trace_index for item in self.decisions)
+
+    @property
+    def transitions(self) -> tuple[V3ReplayTransition, ...]:
+        return tuple(item.transition for item in self.decisions)
+
+    @property
+    def public_features(self) -> torch.Tensor:
+        return torch.stack([item.public_features for item in self.decisions])
+
+    @property
+    def selected_action_is_pass(self) -> torch.Tensor:
+        return torch.tensor(
+            [item.selected_action_is_pass for item in self.decisions], dtype=torch.bool
+        )
 
 
 def validate_farmer_pairs(
@@ -558,6 +567,7 @@ __all__ = [
     "FarmerCooperationOutput",
     "MonotonicSequentialMixer",
     "V3H5CooperationConfig",
+    "V3H5FarmerDecision",
     "V3H5FarmerTrajectory",
     "build_h5_public_features",
     "teammate_belief_summary",

@@ -37,6 +37,7 @@ from douzero.v3_hybrid.training.cooperation import (
     FarmerCooperationModule,
     MonotonicSequentialMixer,
     V3H5CooperationConfig,
+    V3H5FarmerDecision,
     V3H5FarmerTrajectory,
     build_h5_public_features,
     teammate_belief_summary,
@@ -145,11 +146,23 @@ def _pair(
             role=role,
             policy_id=policies[role],
             teammate_policy_id=policies[teammate],
-            decision_indices=tuple(range(0 if role == "landlord_up" else 1, count * 2, 2)),
-            transitions=rows,
-            public_features=features,
-            selected_action_is_pass=torch.tensor(
-                [index % 2 == 0 for index in range(count)], dtype=torch.bool
+            decisions=tuple(
+                V3H5FarmerDecision(
+                    trace_index=trace_index,
+                    transition=transition,
+                    public_features=features[index],
+                    selected_action_is_pass=index % 2 == 0,
+                )
+                for index, (trace_index, transition) in enumerate(
+                    zip(
+                        range(
+                            0 if role == "landlord_up" else 1,
+                            count * 2,
+                            2,
+                        ),
+                        rows,
+                    )
+                )
             ),
             team_return=team_return,
         )
@@ -328,10 +341,7 @@ def test_farmer_pair_contract_binds_reward_perspective_and_league_teammates():
     original = trajectories[0]
     canonical = dataclasses.replace(
         original,
-        decision_indices=tuple(reversed(original.decision_indices)),
-        transitions=tuple(reversed(original.transitions)),
-        public_features=original.public_features.flip(0),
-        selected_action_is_pass=original.selected_action_is_pass.flip(0),
+        decisions=tuple(reversed(original.decisions)),
     )
     assert canonical.decision_indices == original.decision_indices
     assert all(
@@ -403,6 +413,10 @@ def test_team_value_only_updates_sidecar_and_farmer_public_paths():
     sidecar_before = _state(learner.cooperation)
     metrics = learner.train_batch(rows, trajectories=trajectories)
     assert metrics.cooperation_updated
+    assert metrics.public_updated
+    assert learner.base.base.policy_version == 1
+    assert learner.policy_version == 2
+    assert metrics.policy_version == learner.policy_version
     assert metrics.farmer_samples == 3 and metrics.episodes == 1
     assert metrics.role_samples == {"landlord_up": 2, "landlord_down": 1}
     assert metrics.pass_samples == 2
@@ -482,6 +496,7 @@ def test_checkpoint_resume_is_strict_and_schedule_continues(tmp_path):
     restored = _learner(warmup_updates=1, ramp_updates=2)
     restored.load_checkpoint(path)
     assert restored.eligible_updates == learner.eligible_updates == 2
+    assert restored.policy_version == learner.policy_version == 3
     assert restored.samples_consumed == learner.samples_consumed
     assert restored.statistics.state_dict() == learner.statistics.state_dict()
     for name, value in restored.cooperation.state_dict().items():
@@ -489,6 +504,7 @@ def test_checkpoint_resume_is_strict_and_schedule_continues(tmp_path):
     third_left = learner.train_batch(rows, trajectories=trajectories)
     third_right = restored.train_batch(rows, trajectories=trajectories)
     assert third_left.schedule_weight == third_right.schedule_weight == pytest.approx(0.5)
+    assert restored.policy_version == learner.policy_version == 5
     for name, value in restored.cooperation.state_dict().items():
         assert torch.equal(value, learner.cooperation.state_dict()[name])
 
@@ -521,6 +537,27 @@ def test_checkpoint_accepts_only_the_enabled_sidecar_parameter_state(tmp_path):
     assert restored.eligible_updates == 2
 
 
+def test_checkpoint_resume_replays_multilayer_gru_dropout_rng(tmp_path):
+    rows, trajectories = _pair()
+    learner = _learner(trajectory_layers=2, dropout=0.25)
+    learner.train_batch(rows, trajectories=trajectories)
+    path = tmp_path / "dropout-rng.pt"
+    learner.save_checkpoint(path)
+
+    learner.train_batch(rows, trajectories=trajectories)
+    uninterrupted_model = _state(learner.model)
+    uninterrupted_sidecar = _state(learner.cooperation)
+
+    restored = _learner(trajectory_layers=2, dropout=0.25)
+    restored.load_checkpoint(path)
+    restored.train_batch(rows, trajectories=trajectories)
+    assert restored.policy_version == learner.policy_version
+    for name, value in restored.model.state_dict().items():
+        assert torch.equal(value, uninterrupted_model[name])
+    for name, value in restored.cooperation.state_dict().items():
+        assert torch.equal(value, uninterrupted_sidecar[name])
+
+
 def test_checkpoint_identity_drift_and_public_package_exclusion(tmp_path):
     rows, trajectories = _pair()
     learner = _learner(mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0)
@@ -544,6 +581,14 @@ def test_checkpoint_identity_drift_and_public_package_exclusion(tmp_path):
             _learner(mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0).load_checkpoint(
                 corrupted_path
             )
+    corrupted = copy.deepcopy(checkpoint)
+    corrupted["counters"]["policy_version"] += 1
+    policy_path = tmp_path / "training-policy-version.pt"
+    torch.save(corrupted, policy_path)
+    with pytest.raises(CheckpointCompatibilityError, match="policy version"):
+        _learner(mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0).load_checkpoint(
+            policy_path
+        )
     sidecar_name = next(iter(checkpoint["cooperation_state_dict"]))
     sidecar_value = checkpoint["cooperation_state_dict"][sidecar_name]
     invalid_sidecar_values = {
@@ -632,12 +677,18 @@ def test_cuda_parameter_update_checkpoint_resume_and_second_update(tmp_path):
 
 def test_nonfinite_and_padding_contracts_fail_closed():
     rows, trajectories = _pair()
-    broken = trajectories[0].public_features.clone()
-    broken[0, 0] = float("inf")
-    with pytest.raises(ValueError, match="finite CPU"):
-        dataclasses.replace(trajectories[0], public_features=broken)
-    with pytest.raises(ValueError, match="unique and non-negative"):
-        dataclasses.replace(trajectories[0], decision_indices=(2, 2))
+    decision = trajectories[0].decisions[0]
+    broken = decision.public_features.clone()
+    broken[0] = float("inf")
+    with pytest.raises(ValueError, match="finite CPU row"):
+        dataclasses.replace(decision, public_features=broken)
+    duplicate = dataclasses.replace(
+        trajectories[0].decisions[1], trace_index=decision.trace_index
+    )
+    with pytest.raises(ValueError, match="trace indices must be unique"):
+        dataclasses.replace(
+            trajectories[0], decisions=(decision, duplicate)
+        )
     with pytest.raises(ValueError, match="both farmer trajectories"):
         _learner().train_batch(
             trajectories[0].transitions, trajectories=(trajectories[0],)
