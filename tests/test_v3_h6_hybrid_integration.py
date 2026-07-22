@@ -33,6 +33,8 @@ from douzero.v3_hybrid import (
     V3HybridModelConfig,
     assert_public_replay_payload,
     capture_plain_transition,
+    load_v3_hybrid_public_checkpoint,
+    save_v3_hybrid_public_checkpoint,
     v3_h6_support_matrix_hash,
 )
 from douzero.v3_hybrid.integration_config import (
@@ -249,6 +251,45 @@ def test_h6_model_graph_is_optional_public_and_identity_bound():
     assert all(torch.isfinite(value).all() for value in (
         output.dmc_q, output.prior_logit, output.min_turns_after
     ))
+
+
+def test_h6_public_checkpoint_binds_enabled_public_graph_and_strictly_reloads(
+    tmp_path,
+):
+    config = _model_config(
+        human_prior_enabled=True,
+        strategy_features_enabled=True,
+        strategy_aux_enabled=True,
+        style_enabled=True,
+    )
+    model = V3HybridModel(build_v2_schema(), config).eval()
+    path = tmp_path / "h6-public.pt"
+    save_v3_hybrid_public_checkpoint(path, model, ruleset=RuleSet.legacy())
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    flags = payload["compatibility_identity"]["feature_flags"]
+    assert flags["human_bc"]
+    assert flags["strategy"]
+    assert flags["style"]
+    assert not flags["oracle"]
+    assert not flags["cooperation"]
+    forbidden = ("oracle", "teacher", "privileged", "hidden_hand", "mixer")
+    assert not any(
+        token in name.lower()
+        for name in payload["state_dict"]
+        for token in forbidden
+    )
+    restored = load_v3_hybrid_public_checkpoint(
+        path,
+        schema=build_v2_schema(),
+        ruleset=RuleSet.legacy(),
+        config=config,
+    ).eval()
+    observation = _observation()
+    with torch.inference_mode():
+        expected = model.forward_observation(observation)
+        actual = restored.forward_observation(observation)
+    assert torch.equal(expected.dmc_q, actual.dmc_q)
+    assert torch.equal(expected.prior_logit, actual.prior_logit)
 
 
 def test_h6_public_replay_round_trip_and_privileged_negative_guard():

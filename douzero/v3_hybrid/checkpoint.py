@@ -58,32 +58,61 @@ def h1_compatibility_identity(
     """Build the complete frozen H0 identity for the H1 public sidecar."""
 
     disabled = {"version": "disabled_h1"}
+    feature_flags = {
+        "adaptive_dmc": False,
+        "belief": False,
+        "bidding": False,
+        "cooperation": False,
+        "human_bc": False,
+        "league": False,
+        "oracle": False,
+        "strategy": False,
+        "style": False,
+    }
+    output_semantics = {
+        "dmc_q": {
+            "perspective": "acting_team",
+            "target": "monte_carlo_return",
+            "transform": config.dmc_target_transform,
+            "clamp": config.dmc_target_clamp,
+        },
+        "win": "acting_team_probability",
+        "score_if_win": "acting_team_conditional_signed_score",
+        "score_if_loss": "acting_team_conditional_signed_score",
+        "bidding": "not_integrated_h1",
+    }
+    if config.h6_graph_enabled:
+        feature_flags.update({
+            "bidding": config.bidding_enabled,
+            "human_bc": config.human_prior_enabled,
+            "strategy": (
+                config.strategy_features_enabled or config.strategy_aux_enabled
+            ),
+            "style": config.style_enabled,
+        })
+        output_semantics.update({
+            "prior": (
+                "public_legal_action_list_logit"
+                if config.human_prior_enabled else "disabled"
+            ),
+            "strategy": (
+                "public_action_conditioned_auxiliary_v1"
+                if config.strategy_aux_enabled else "disabled"
+            ),
+            "style": (
+                "public_history_conditioning_v1"
+                if config.style_enabled else "disabled"
+            ),
+            "bidding": (
+                "separate_public_score_bidding_head_v2"
+                if config.bidding_enabled else "disabled"
+            ),
+        })
     return V3HybridCompatibilityIdentity(
         ruleset=ruleset.identity(),
-        feature_flags={
-            "adaptive_dmc": False,
-            "belief": False,
-            "bidding": False,
-            "cooperation": False,
-            "human_bc": False,
-            "league": False,
-            "oracle": False,
-            "strategy": False,
-            "style": False,
-        },
+        feature_flags=feature_flags,
         model_graph=config.compatibility_dict(),
-        output_semantics={
-            "dmc_q": {
-                "perspective": "acting_team",
-                "target": "monte_carlo_return",
-                "transform": config.dmc_target_transform,
-                "clamp": config.dmc_target_clamp,
-            },
-            "win": "acting_team_probability",
-            "score_if_win": "acting_team_conditional_signed_score",
-            "score_if_loss": "acting_team_conditional_signed_score",
-            "bidding": "not_integrated_h1",
-        },
+        output_semantics=output_semantics,
         optimizer_config={"version": "not_integrated_h1"},
         loss_config={
             "version": "not_integrated_h1",
