@@ -98,7 +98,7 @@ def _training(variant: str, ruleset: str, seed: int):
         "git_sha": GIT_SHA,
         "docker_image_digest": IMAGE,
         "ruleset": _ruleset(ruleset),
-        "training_config_hash": suffix,
+        "training_config_hash": hashlib_token(variant, ruleset, 0),
         "model_identity_hash": SHA,
         "initial_checkpoint_sha256": SHA,
         "model_checkpoint_sha256": suffix,
@@ -443,6 +443,27 @@ def test_distinct_training_seeds_require_distinct_checkpoints() -> None:
     different_seed["model_identity_hash"] = "f" * 64
     with pytest.raises(H8EvidenceError, match="must share one model identity"):
         validate_h8_formal_evidence(payload)
+
+    payload = _evidence()
+    payload["training_runs"][1]["training_config_hash"] = "f" * 64
+    with pytest.raises(H8EvidenceError, match="must share one training config"):
+        validate_h8_formal_evidence(payload)
+
+    payload = _evidence()
+    payload["training_runs"][1]["ruleset"]["ruleset_version"] = "legacy-v2"
+    payload["training_runs"][1]["ruleset"]["ruleset_hash"] = "f" * 64
+    with pytest.raises(H8EvidenceError, match="must share one ruleset identity"):
+        validate_h8_formal_evidence(payload)
+
+
+def test_search_promotion_requires_non_fallback_decision() -> None:
+    payload = _evidence(promotion=True)
+    for row in payload["evaluations"]:
+        if row["tier"] == PROMOTION and row["search_enabled"]:
+            row["search_triggers"] = row["search_fallbacks"] = 0
+    report = validate_h8_formal_evidence(payload)
+    assert report["release_status"] == "NOT READY"
+    assert any("no non-fallback decisions" in issue for issue in report["issues"])
 
 
 @pytest.mark.parametrize(

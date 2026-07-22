@@ -753,6 +753,11 @@ def _validate_evaluation(
                 f"{variant}/{ruleset}/seed-{seed}: public package was not validated"
             )
     if is_promotion and search_enabled:
+        if row["search_triggers"] <= row["search_fallbacks"]:
+            issues.append(
+                f"{variant}/{ruleset}/seed-{seed}: "
+                "search produced no non-fallback decisions"
+            )
         effect = _mapping(row["search_effect"], f"evaluation {variant}.search_effect")
         _exact(
             effect,
@@ -911,6 +916,28 @@ def validate_h8_formal_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
         if len(model_identities) > 1:
             raise H8EvidenceError(
                 f"{variant}/{ruleset} training seeds must share one model identity"
+            )
+        training_configs = {
+            row["training_config_hash"]
+            for (row_variant, row_ruleset, _seed), row in training.items()
+            if row_variant == variant and row_ruleset == ruleset
+        }
+        if len(training_configs) > 1:
+            raise H8EvidenceError(
+                f"{variant}/{ruleset} training seeds must share one training config"
+            )
+        ruleset_identities = {
+            (
+                row["ruleset"]["ruleset_id"],
+                row["ruleset"]["ruleset_version"],
+                row["ruleset"]["ruleset_hash"],
+            )
+            for (row_variant, row_ruleset, _seed), row in training.items()
+            if row_variant == variant and row_ruleset == ruleset
+        }
+        if len(ruleset_identities) > 1:
+            raise H8EvidenceError(
+                f"{variant}/{ruleset} training seeds must share one ruleset identity"
             )
     for seed in identity["training_seeds"]:
         if len(samples_by_seed[seed]) > 1 or len(wall_by_seed[seed]) > 1:

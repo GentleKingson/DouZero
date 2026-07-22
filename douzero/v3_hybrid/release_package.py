@@ -123,9 +123,21 @@ def _assert_ready_checkpoint_binding(
     report: Mapping[str, Any],
     *,
     checkpoint_sha256: str,
+    feature_schema_hash: str,
+    model_identity_hash: str,
     ruleset: RuleSet,
     search_compatible: bool,
 ) -> None:
+    identity = evidence.get("experiment_identity")
+    if not isinstance(identity, Mapping) or identity.get(
+        "feature_schema_hash"
+    ) != feature_schema_hash:
+        raise V3ModelPackageError(
+            "formal candidate evidence is not bound to the packaged feature schema"
+        )
+    training_runs = evidence.get("training_runs")
+    if not isinstance(training_runs, list):
+        raise V3ModelPackageError("READY evidence has no training rows")
     evaluations = evidence.get("evaluations")
     if not isinstance(evaluations, list):
         raise V3ModelPackageError("READY evidence has no evaluation rows")
@@ -137,14 +149,29 @@ def _assert_ready_checkpoint_binding(
         and row.get("search_enabled") is search_compatible
         and row.get("ruleset") == ruleset.identity()
     ]
-    if not any(
-        row.get("model_checkpoint_sha256") == checkpoint_sha256
-        for row in candidate_rows
-    ):
+    matching_rows = [
+        row for row in candidate_rows
+        if row.get("model_checkpoint_sha256") == checkpoint_sha256
+    ]
+    if not matching_rows:
         raise V3ModelPackageError(
             "formal candidate evidence for the packaged search mode is not "
             "bound to the packaged checkpoint"
         )
+    for evaluation in matching_rows:
+        if any(
+            isinstance(run, Mapping)
+            and run.get("variant") == evaluation.get("variant")
+            and run.get("seed") == evaluation.get("training_seed")
+            and run.get("ruleset") == ruleset.identity()
+            and run.get("model_checkpoint_sha256") == checkpoint_sha256
+            and run.get("model_identity_hash") == model_identity_hash
+            for run in training_runs
+        ):
+            return
+    raise V3ModelPackageError(
+        "formal candidate evidence is not bound to the packaged model identity"
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -322,6 +349,8 @@ def create_v3_public_model_package(
                 formal_evidence,
                 report,
                 checkpoint_sha256=_sha256(source),
+                feature_schema_hash=schema.stable_hash(),
+                model_identity_hash=model_config.stable_hash(),
                 ruleset=ruleset,
                 search_compatible=search_compatible,
             )
@@ -576,6 +605,8 @@ def verify_v3_public_model_package(
             evidence_payload,
             report,
             checkpoint_sha256=_sha256(root / "public_checkpoint.pt"),
+            feature_schema_hash=schema.stable_hash(),
+            model_identity_hash=model_config.stable_hash(),
             ruleset=ruleset,
             search_compatible=manifest["search_compatible"],
         )

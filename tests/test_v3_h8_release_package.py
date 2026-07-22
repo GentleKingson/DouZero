@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import subprocess
@@ -390,7 +391,19 @@ def test_ready_package_selects_matching_checkpoint_and_search_mode(
         lambda _payload: report,
     )
     evidence = {
-        "experiment_identity": {"git_sha": "a" * 40},
+        "experiment_identity": {
+            "git_sha": "a" * 40,
+            "feature_schema_hash": schema.stable_hash(),
+        },
+        "training_runs": [
+            {
+                "variant": "v3_full_hybrid",
+                "seed": 22,
+                "ruleset": ruleset.identity(),
+                "model_checkpoint_sha256": checkpoint_sha,
+                "model_identity_hash": config.stable_hash(),
+            }
+        ],
         "evaluations": [
             {
                 "variant": "v3_full_hybrid",
@@ -458,4 +471,19 @@ def test_ready_package_selects_matching_checkpoint_and_search_mode(
             decision_config={"action_selection": "argmax_dmc_q"},
             search_compatible=True,
             formal_evidence=evidence,
+        )
+
+    wrong_model = copy.deepcopy(evidence)
+    wrong_model["training_runs"][0]["model_identity_hash"] = "f" * 64
+    with pytest.raises(V3ModelPackageError, match="packaged model identity"):
+        create_v3_public_model_package(
+            tmp_path / "wrong-model-package",
+            checkpoint,
+            schema=schema,
+            ruleset=ruleset,
+            model_config=config,
+            source_git_sha="a" * 40,
+            decision_config={"action_selection": "argmax_dmc_q"},
+            search_compatible=False,
+            formal_evidence=wrong_model,
         )
