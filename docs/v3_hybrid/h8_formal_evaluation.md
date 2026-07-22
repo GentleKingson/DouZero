@@ -60,6 +60,13 @@ The validator recomputes readiness from raw rows. Malformed identities,
 duplicates, unsupported combinations, non-finite values, contradictory counts,
 stale identities, and ruleset or checkpoint drift are rejected.
 
+Each evaluation row carries a deal-cluster outcome histogram: exact counts of
+identical overall and per-role WP/ADP delta vectors. Counts must sum to the
+declared paired deals. The validator recomputes estimates and deterministic
+deal-clustered bootstrap intervals from those counts and rejects caller-reported
+statistics that differ. This keeps large evidence compact without trusting
+derived confidence intervals.
+
 ```bash
 python tools/validate_v3_h8_evidence.py evidence.json --output report.json
 ```

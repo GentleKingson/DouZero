@@ -102,6 +102,35 @@ def _empty_formal_report() -> dict[str, Any]:
     }
 
 
+def _assert_ready_checkpoint_binding(
+    evidence: Mapping[str, Any],
+    report: Mapping[str, Any],
+    *,
+    checkpoint_sha256: str,
+    ruleset: RuleSet,
+    search_compatible: bool,
+) -> None:
+    evaluations = evidence.get("evaluations")
+    if not isinstance(evaluations, list):
+        raise V3ModelPackageError("READY evidence has no evaluation rows")
+    candidate_rows = [
+        row for row in evaluations
+        if isinstance(row, Mapping)
+        and row.get("variant") == report["release_candidate"]
+        and row.get("tier") == "promotion"
+        and row.get("search_enabled") is search_compatible
+        and row.get("ruleset") == ruleset.identity()
+    ]
+    if not any(
+        row.get("model_checkpoint_sha256") == checkpoint_sha256
+        for row in candidate_rows
+    ):
+        raise V3ModelPackageError(
+            "formal candidate evidence for the packaged search mode is not "
+            "bound to the packaged checkpoint"
+        )
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -273,22 +302,13 @@ def create_v3_public_model_package(
         if formal_evidence["experiment_identity"]["git_sha"] != source_git_sha:
             raise V3ModelPackageError("formal evidence source SHA does not match package")
         if report["release_status"] == "READY":
-            checkpoint_digest = _sha256(source)
-            candidate_rows = [
-                row for row in formal_evidence["evaluations"]
-                if row["variant"] == report["release_candidate"]
-                and row["tier"] == "promotion"
-                and row["search_enabled"] is search_compatible
-                and row["ruleset"] == ruleset.identity()
-            ]
-            if not candidate_rows or not any(
-                row["model_checkpoint_sha256"] == checkpoint_digest
-                for row in candidate_rows
-            ):
-                raise V3ModelPackageError(
-                    "formal candidate evidence for the packaged search mode is not "
-                    "bound to the packaged checkpoint"
-                )
+            _assert_ready_checkpoint_binding(
+                formal_evidence,
+                report,
+                checkpoint_sha256=_sha256(source),
+                ruleset=ruleset,
+                search_compatible=search_compatible,
+            )
     shutil.copyfile(source, root / "public_checkpoint.pt")
     _write_json(root / "ruleset.json", ruleset.to_dict())
     _write_json(root / "feature_schema.json", schema.to_dict())
@@ -508,6 +528,16 @@ def verify_v3_public_model_package(
         or "not measured" not in str(manifest["playing_strength"]).lower()
     ):
         raise V3ModelPackageError("non-ready package makes a release/strength claim")
+    if manifest["release_status"] == "READY":
+        if not evidence_wrapper["supplied"]:
+            raise V3ModelPackageError("READY package must carry formal evidence")
+        _assert_ready_checkpoint_binding(
+            evidence_payload,
+            report,
+            checkpoint_sha256=_sha256(root / "public_checkpoint.pt"),
+            ruleset=ruleset,
+            search_compatible=manifest["search_compatible"],
+        )
     return manifest
 
 

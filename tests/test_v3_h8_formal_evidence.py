@@ -33,7 +33,7 @@ def _ruleset(name: str) -> dict[str, str]:
 
 
 def _delta(value: float = 0.02) -> dict[str, float]:
-    return {"estimate": value, "low": value / 2.0, "high": value * 1.5}
+    return {"estimate": value, "low": value, "high": value}
 
 
 def _identity(*, promotion: bool = False, authorized_bc: bool = False):
@@ -134,6 +134,14 @@ def _evaluation(
     deals = 20_000 if tier == DEVELOPMENT else 100_000
     variant = run["variant"]
     ruleset = run["ruleset"]["ruleset_id"]
+    outcome_atom = {
+        "count": deals,
+        "overall": {"wp_delta": 0.02, "adp_delta": 0.2},
+        "by_role": {
+            role: {"wp_delta": 0.02, "adp_delta": 0.2}
+            for role in ("landlord", "landlord_up", "landlord_down")
+        },
+    }
     return {
         "variant": variant,
         "ruleset": copy.deepcopy(run["ruleset"]),
@@ -150,6 +158,8 @@ def _evaluation(
         "games": deals * 2,
         "bootstrap_unit": "deal",
         "confidence_level": 0.95,
+        "outcome_histogram": [outcome_atom],
+        "bootstrap_resamples": 1000,
         "overall": {"wp_delta": _delta(), "adp_delta": _delta(0.2)},
         "by_role": {
             role: {
@@ -255,8 +265,9 @@ def test_promotion_gates_search_off_and_search_on_rows() -> None:
         row for row in payload["evaluations"]
         if row["tier"] == PROMOTION and not row["search_enabled"]
     )
+    search_off["outcome_histogram"][0]["overall"]["wp_delta"] = -0.01
     search_off["overall"]["wp_delta"] = {
-        "estimate": -0.01, "low": -0.02, "high": 0.0
+        "estimate": -0.01, "low": -0.01, "high": -0.01
     }
     report = validate_h8_formal_evidence(payload)
     assert report["release_status"] == "NOT READY"
@@ -267,6 +278,7 @@ def test_development_and_promotion_have_distinct_deal_gates() -> None:
     development = _evidence()
     development["evaluations"][0]["deals"] = 19_999
     development["evaluations"][0]["games"] = 39_998
+    development["evaluations"][0]["outcome_histogram"][0]["count"] = 19_999
     for metrics in development["evaluations"][0]["by_role"].values():
         metrics["games"] = 19_999
     report = validate_h8_formal_evidence(development)
@@ -277,6 +289,7 @@ def test_development_and_promotion_have_distinct_deal_gates() -> None:
     row = next(item for item in promotion["evaluations"] if item["tier"] == PROMOTION)
     row["deals"] = 99_999
     row["games"] = 199_998
+    row["outcome_histogram"][0]["count"] = 99_999
     for metrics in row["by_role"].values():
         metrics["games"] = 99_999
     report = validate_h8_formal_evidence(promotion)
@@ -336,6 +349,16 @@ def test_each_row_binds_complete_ruleset_and_training_identity() -> None:
     payload = _evidence()
     payload["evaluations"][0]["ruleset"]["ruleset_hash"] = "f" * 64
     with pytest.raises(H8EvidenceError, match="ruleset identity drift"):
+        validate_h8_formal_evidence(payload)
+
+
+def test_reported_strength_must_match_recomputed_outcome_counts() -> None:
+    payload = _evidence(promotion=True)
+    row = next(item for item in payload["evaluations"] if item["tier"] == PROMOTION)
+    row["overall"]["wp_delta"] = {
+        "estimate": 0.9, "low": 0.8, "high": 1.0
+    }
+    with pytest.raises(H8EvidenceError, match="recomputed clustered bootstrap"):
         validate_h8_formal_evidence(payload)
 
     payload = _evidence()

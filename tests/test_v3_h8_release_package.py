@@ -358,6 +358,28 @@ def test_ready_package_selects_matching_checkpoint_and_search_mode(
         (package / "formal_evidence.json").read_text(encoding="utf-8")
     )["payload"] == evidence
 
+    alternate = tmp_path / "alternate-public.pt"
+    save_v3_hybrid_public_checkpoint(
+        alternate, V3HybridModel(schema, config), ruleset=ruleset
+    )
+    (package / "public_checkpoint.pt").write_bytes(alternate.read_bytes())
+    manifest_path = package / "manifest.json"
+    tampered_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    tampered_manifest["checkpoint_sha256"] = hashlib.sha256(
+        alternate.read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(
+        json.dumps(tampered_manifest, sort_keys=True), encoding="utf-8"
+    )
+    _refresh_checksums(package)
+    with pytest.raises(V3ModelPackageError, match="packaged checkpoint"):
+        verify_v3_public_model_package(
+            package,
+            schema=schema,
+            ruleset=ruleset,
+            model_config=config,
+        )
+
     with pytest.raises(V3ModelPackageError, match="packaged search mode"):
         create_v3_public_model_package(
             tmp_path / "wrong-search-package",

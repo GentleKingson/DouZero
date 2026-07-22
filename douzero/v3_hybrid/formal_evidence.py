@@ -16,6 +16,8 @@ from collections import Counter
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
+import numpy as np
+
 H8_EVIDENCE_SCHEMA_VERSION = "v3-hybrid-h8a-formal-evidence-v2"
 H8_REPORT_SCHEMA_VERSION = "v3-hybrid-h8a-release-report-v2"
 H8A_SUPPORT_MATRIX_VERSION = "v3-hybrid-h8a-variant-ruleset-v1"
@@ -356,7 +358,10 @@ _EVALUATION_FIELDS = {
     "bidding_games", "search_triggers", "search_fallbacks", "invalid_actions",
     "timeouts", "model_load_failures", "public_package_validated",
     "privileged_leakage", "artifact_stale", "search_effect",
+    "outcome_histogram", "bootstrap_resamples",
 }
+_OUTCOME_ATOM_FIELDS = {"count", "overall", "by_role"}
+_OUTCOME_METRICS = ("wp_delta", "adp_delta")
 
 
 def _delta(value: object, label: str) -> tuple[float, float, float]:
@@ -368,6 +373,99 @@ def _delta(value: object, label: str) -> tuple[float, float, float]:
     if not low <= estimate <= high:
         raise H8EvidenceError(f"{label} CI must contain its estimate")
     return estimate, low, high
+
+
+def _recompute_clustered_deltas(
+    row: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    *,
+    deals: int,
+    label: str,
+) -> dict[str, dict[str, dict[str, float]] | dict[str, float]]:
+    raw = row["outcome_histogram"]
+    if not isinstance(raw, list) or not raw:
+        raise H8EvidenceError(f"{label}.outcome_histogram must be a non-empty list")
+    resamples = _integer(
+        row["bootstrap_resamples"], f"{label}.bootstrap_resamples", minimum=1000
+    )
+    counts: list[int] = []
+    vectors: list[list[float]] = []
+    for index, raw_atom in enumerate(raw):
+        atom_label = f"{label}.outcome_histogram[{index}]"
+        atom = _mapping(raw_atom, atom_label)
+        _exact(atom, _OUTCOME_ATOM_FIELDS, atom_label)
+        counts.append(_integer(atom["count"], f"{atom_label}.count", minimum=1))
+        overall = _mapping(atom["overall"], f"{atom_label}.overall")
+        _exact(overall, set(_OUTCOME_METRICS), f"{atom_label}.overall")
+        by_role = _mapping(atom["by_role"], f"{atom_label}.by_role")
+        _exact(by_role, set(ROLES), f"{atom_label}.by_role")
+        values: list[float] = []
+        for metrics, metric_label in ((overall, f"{atom_label}.overall"), *(
+            (_mapping(by_role[role], f"{atom_label}.{role}"), f"{atom_label}.{role}")
+            for role in ROLES
+        )):
+            _exact(metrics, set(_OUTCOME_METRICS), metric_label)
+            wp = _finite(metrics["wp_delta"], f"{metric_label}.wp_delta")
+            adp = _finite(metrics["adp_delta"], f"{metric_label}.adp_delta")
+            if not -1.0 <= wp <= 1.0:
+                raise H8EvidenceError(f"{metric_label}.wp_delta must be in [-1, 1]")
+            values.extend((wp, adp))
+        vectors.append(values)
+    if sum(counts) != deals:
+        raise H8EvidenceError(f"{label} outcome histogram count does not equal deals")
+
+    count_array = np.asarray(counts, dtype=np.int64)
+    value_array = np.asarray(vectors, dtype=np.float64)
+    estimate = count_array @ value_array / float(deals)
+    if len(counts) == 1:
+        low = high = estimate
+    else:
+        seed_material = {
+            "evaluation_seed": identity["evaluation_seed"],
+            "variant": row["variant"],
+            "ruleset": row["ruleset"]["ruleset_id"],
+            "training_seed": row["training_seed"],
+            "tier": row["tier"],
+            "search_enabled": row["search_enabled"],
+        }
+        seed = int(canonical_hash(seed_material)[:16], 16)
+        rng = np.random.default_rng(seed)
+        sampled = rng.multinomial(
+            deals, count_array.astype(np.float64) / float(deals), size=resamples
+        )
+        bootstrap = sampled @ value_array / float(deals)
+        low, high = np.quantile(bootstrap, (0.025, 0.975), axis=0)
+
+    def result(offset: int) -> dict[str, float]:
+        return {
+            "estimate": float(estimate[offset]),
+            "low": float(low[offset]),
+            "high": float(high[offset]),
+        }
+
+    return {
+        "overall": {metric: result(index) for index, metric in enumerate(_OUTCOME_METRICS)},
+        "by_role": {
+            role: {
+                metric: result(2 + role_index * 2 + metric_index)
+                for metric_index, metric in enumerate(_OUTCOME_METRICS)
+            }
+            for role_index, role in enumerate(ROLES)
+        },
+    }
+
+
+def _assert_reported_delta(
+    reported: object, recomputed: Mapping[str, float], label: str
+) -> tuple[float, float, float]:
+    values = _delta(reported, label)
+    expected = tuple(recomputed[name] for name in ("estimate", "low", "high"))
+    if any(
+        not math.isclose(actual, target, rel_tol=1e-12, abs_tol=1e-12)
+        for actual, target in zip(values, expected)
+    ):
+        raise H8EvidenceError(f"{label} does not match recomputed clustered bootstrap")
+    return values
 
 
 def _validate_evaluation(
@@ -425,6 +523,12 @@ def _validate_evaluation(
         raise H8EvidenceError(f"evaluation {variant} games/deals are inconsistent")
     if row["bootstrap_unit"] != "deal" or row["confidence_level"] != 0.95:
         raise H8EvidenceError(f"evaluation {variant} must use deal-clustered 95% CI")
+    recomputed = _recompute_clustered_deltas(
+        row,
+        identity,
+        deals=deals,
+        label=f"evaluation {variant}",
+    )
     search_enabled = _boolean(
         row["search_enabled"], f"evaluation {variant}.search_enabled"
     )
@@ -436,11 +540,15 @@ def _validate_evaluation(
         )
     overall = _mapping(row["overall"], f"evaluation {variant}.overall")
     _exact(overall, {"wp_delta", "adp_delta"}, f"evaluation {variant}.overall")
-    _, wp_low, _ = _delta(
-        overall["wp_delta"], f"evaluation {variant}.overall.wp_delta"
+    _, wp_low, _ = _assert_reported_delta(
+        overall["wp_delta"],
+        recomputed["overall"]["wp_delta"],
+        f"evaluation {variant}.overall.wp_delta",
     )
-    _, adp_low, _ = _delta(
-        overall["adp_delta"], f"evaluation {variant}.overall.adp_delta"
+    _, adp_low, _ = _assert_reported_delta(
+        overall["adp_delta"],
+        recomputed["overall"]["adp_delta"],
+        f"evaluation {variant}.overall.adp_delta",
     )
     by_role = _mapping(row["by_role"], f"evaluation {variant}.by_role")
     _exact(by_role, set(ROLES), f"evaluation {variant}.by_role")
@@ -455,11 +563,15 @@ def _validate_evaluation(
             raise H8EvidenceError(
                 f"evaluation {variant} role/deal counts are inconsistent"
             )
-        _, role_wp_low, _ = _delta(
-            metrics["wp_delta"], f"evaluation {variant}.{role}.wp_delta"
+        _, role_wp_low, _ = _assert_reported_delta(
+            metrics["wp_delta"],
+            recomputed["by_role"][role]["wp_delta"],
+            f"evaluation {variant}.{role}.wp_delta",
         )
-        _, role_adp_low, _ = _delta(
-            metrics["adp_delta"], f"evaluation {variant}.{role}.adp_delta"
+        _, role_adp_low, _ = _assert_reported_delta(
+            metrics["adp_delta"],
+            recomputed["by_role"][role]["adp_delta"],
+            f"evaluation {variant}.{role}.adp_delta",
         )
         role_regressed |= role_wp_low < 0.0 or role_adp_low < 0.0
     latency = _mapping(row["latency_ms"], f"evaluation {variant}.latency_ms")
