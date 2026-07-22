@@ -110,7 +110,11 @@ def _evaluation(variant: str, ruleset: str, seed: int) -> dict[str, object]:
         "confidence_level": 0.95,
         "overall": {"wp_delta": _delta(), "adp_delta": _delta(0.2)},
         "by_role": {
-            role: {"wp_delta": _delta(), "adp_delta": _delta(0.2)}
+            role: {
+                "games": 100_000,
+                "wp_delta": _delta(),
+                "adp_delta": _delta(0.2),
+            }
             for role in ("landlord", "landlord_up", "landlord_down")
         },
         "calibration_error": 0.02,
@@ -128,6 +132,16 @@ def _evaluation(variant: str, ruleset: str, seed: int) -> dict[str, object]:
         "public_package_validated": True,
         "privileged_leakage": False,
         "artifact_stale": False,
+        "search_effect": (
+            {
+                "baseline_variant": "v3_full_hybrid_search_off",
+                "wp_delta": _delta(0.01),
+                "adp_delta": _delta(0.1),
+                "added_latency_p99_ms": 1.0,
+                "latency_budget_ms": 2.0,
+            }
+            if variant == "v3_full_hybrid_search_on" else None
+        ),
     }
 
 
@@ -193,6 +207,7 @@ def test_control_arms_are_reported_without_becoming_promotion_candidates() -> No
     [
         (lambda value: value["training_runs"].append(copy.deepcopy(value["training_runs"][0])), "duplicate training"),
         (lambda value: value["evaluations"][0].update(games=199_999), "games/deals"),
+        (lambda value: value["evaluations"][0]["by_role"]["landlord"].update(games=99_999), "role/deal"),
         (lambda value: value["evaluations"][0].update(deal_set_id="f" * 64), "deal-set identity drift"),
         (lambda value: value["evaluations"][0]["latency_ms"].update(p50=4.0), "percentiles are unordered"),
         (lambda value: value["experiment_identity"].update(surprise=True), "fields mismatch"),

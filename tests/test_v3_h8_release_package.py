@@ -120,7 +120,7 @@ def test_package_rejects_false_ready_claim_even_with_recomputed_checksums(tmp_pa
     manifest["release_candidate"] = "v3_full_hybrid_search_on"
     path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
     _refresh_checksums(package)
-    with pytest.raises(V3ModelPackageError, match="release/strength claim"):
+    with pytest.raises(V3ModelPackageError, match="formal report does not match manifest"):
         verify_v3_public_model_package(
             package, schema=schema, ruleset=ruleset, model_config=config
         )

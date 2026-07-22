@@ -29,7 +29,11 @@ from .checkpoint import (
 )
 from .config import BELIEF_FEEDBACK_NONE, V3HybridModelConfig
 from .contract import V3_HYBRID_MODEL_VERSION
-from .formal_evidence import validate_h8_formal_evidence
+from .formal_evidence import (
+    H8_REPORT_SCHEMA_VERSION,
+    REQUIRED_VARIANTS,
+    validate_h8_formal_evidence,
+)
 
 V3_H8_PACKAGE_FORMAT = "v3-hybrid-h8-public-package-v1"
 _HEX40 = re.compile(r"[0-9a-f]{40}\Z")
@@ -39,7 +43,7 @@ _FILES = frozenset({
     "feature_schema.json", "model_config.json", "decision_config.json",
     "model_card.md", "training_summary.md", "benchmark_summary.md",
     "evaluation_summary.md", "known_limitations.md", "rollback.md",
-    "LICENSE", "THIRD_PARTY_NOTICES", "SHA256SUMS",
+    "formal_report.json", "LICENSE", "THIRD_PARTY_NOTICES", "SHA256SUMS",
 })
 _FORBIDDEN_FILE_TOKENS = (
     "oracle", "teacher", "privileged", "hidden", "replay", "optimizer",
@@ -214,9 +218,13 @@ def create_v3_public_model_package(
     root.mkdir(parents=True, exist_ok=True)
     if formal_evidence is None:
         report = {
+            "schema_version": H8_REPORT_SCHEMA_VERSION,
+            "evidence_sha256": "0" * 64,
             "release_candidate": "NONE", "release_status": "NOT READY",
             "playing_strength": "not measured", "training_run_count": 0,
-            "evaluation_count": 0, "issues": ["formal evidence was not supplied"],
+            "evaluation_count": 0,
+            "required_variants": list(REQUIRED_VARIANTS),
+            "issues": ["formal evidence was not supplied"],
         }
         evidence_hash = "0" * 64
     else:
@@ -226,6 +234,19 @@ def create_v3_public_model_package(
             "experiment_identity"
         ]["git_sha"] != source_git_sha:
             raise V3ModelPackageError("formal evidence source SHA does not match package")
+        if report["release_status"] == "READY":
+            checkpoint_digest = _sha256(source)
+            candidate_rows = [
+                row for row in formal_evidence["evaluations"]
+                if row["variant"] == "v3_full_hybrid_search_on"
+            ]
+            if not candidate_rows or any(
+                row["model_checkpoint_sha256"] != checkpoint_digest
+                for row in candidate_rows
+            ):
+                raise V3ModelPackageError(
+                    "formal candidate evidence is not bound to the packaged checkpoint"
+                )
     shutil.copyfile(source, root / "public_checkpoint.pt")
     _write_json(root / "ruleset.json", ruleset.to_dict())
     _write_json(root / "feature_schema.json", schema.to_dict())
@@ -241,6 +262,7 @@ def create_v3_public_model_package(
         "decision_config_hash": _canonical_hash(decision_config),
         "config": dict(decision_config),
     })
+    _write_json(root / "formal_report.json", report)
     for name, contents in _default_documents(report).items():
         (root / name).write_text(contents, encoding="utf-8")
     repository_root = Path(__file__).resolve().parents[2]
@@ -351,6 +373,14 @@ def verify_v3_public_model_package(
         raise V3ModelPackageError("runtime belief identity mismatch")
     if manifest["ruleset"] != ruleset.identity():
         raise V3ModelPackageError("runtime ruleset identity mismatch")
+    if _read_json(root / "ruleset.json") != ruleset.to_dict():
+        raise V3ModelPackageError("ruleset.json identity mismatch")
+    if _read_json(root / "feature_schema.json") != schema.to_dict():
+        raise V3ModelPackageError("feature_schema.json identity mismatch")
+    if not _HEX40.fullmatch(str(manifest["source_git_sha"])):
+        raise V3ModelPackageError("manifest source Git SHA is malformed")
+    if not _HEX64.fullmatch(str(manifest["formal_evidence_sha256"])):
+        raise V3ModelPackageError("manifest formal evidence hash is malformed")
     if expected_source_git_sha is not None and manifest["source_git_sha"] != expected_source_git_sha:
         raise V3ModelPackageError("source Git SHA mismatch")
     if expected_search_compatible is not None and manifest["search_compatible"] is not expected_search_compatible:
@@ -366,6 +396,26 @@ def verify_v3_public_model_package(
     decision = _read_json(root / "decision_config.json")
     if set(decision) != {"decision_config_hash", "config"} or decision["decision_config_hash"] != _canonical_hash(decision["config"]):
         raise V3ModelPackageError("decision_config.json identity mismatch")
+    if decision["decision_config_hash"] != manifest["decision_config_hash"]:
+        raise V3ModelPackageError("decision config does not match manifest")
+    report = _read_json(root / "formal_report.json")
+    expected_report_fields = {
+        "schema_version", "evidence_sha256", "release_candidate",
+        "release_status", "playing_strength", "required_variants",
+        "training_run_count", "evaluation_count", "issues",
+    }
+    if set(report) != expected_report_fields:
+        raise V3ModelPackageError("formal_report.json fields mismatch")
+    for report_name, manifest_name in (
+        ("evidence_sha256", "formal_evidence_sha256"),
+        ("release_candidate", "release_candidate"),
+        ("release_status", "release_status"),
+        ("playing_strength", "playing_strength"),
+    ):
+        if report[report_name] != manifest[manifest_name]:
+            raise V3ModelPackageError("formal report does not match manifest")
+    if report["schema_version"] != H8_REPORT_SCHEMA_VERSION:
+        raise V3ModelPackageError("formal report schema mismatch")
     checkpoint_format = _strict_load_checkpoint(
         root / "public_checkpoint.pt", schema=schema, ruleset=ruleset,
         model_config=model_config, belief_config=belief_config,

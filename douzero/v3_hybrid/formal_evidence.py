@@ -214,7 +214,7 @@ _EVALUATION_FIELDS = {
     "anti_spring_count", "bomb_count", "rocket_count", "bidding_games",
     "search_triggers", "search_fallbacks", "invalid_actions", "timeouts",
     "model_load_failures", "public_package_validated", "privileged_leakage",
-    "artifact_stale",
+    "artifact_stale", "search_effect",
 }
 
 
@@ -248,7 +248,7 @@ def _validate_evaluation(row: Mapping[str, Any], identity: Mapping[str, Any]) ->
         raise H8EvidenceError(f"evaluation {variant} deal-set identity drift")
     deals = _integer(row["deals"], f"evaluation {variant}.deals", minimum=1)
     games = _integer(row["games"], f"evaluation {variant}.games", minimum=1)
-    if games < deals * 2 or games % deals:
+    if games != deals * 2:
         raise H8EvidenceError(f"evaluation {variant} games/deals are inconsistent")
     if row["bootstrap_unit"] != "deal" or row["confidence_level"] != 0.95:
         raise H8EvidenceError(f"evaluation {variant} must use deal-clustered 95% CI")
@@ -265,7 +265,11 @@ def _validate_evaluation(row: Mapping[str, Any], identity: Mapping[str, Any]) ->
     role_regressed = False
     for role in ROLES:
         metrics = _mapping(by_role[role], f"evaluation {variant}.{role}")
-        _exact(metrics, {"wp_delta", "adp_delta"}, f"evaluation {variant}.{role}")
+        _exact(metrics, {"games", "wp_delta", "adp_delta"}, f"evaluation {variant}.{role}")
+        if _integer(metrics["games"], f"evaluation {variant}.{role}.games") != deals:
+            raise H8EvidenceError(
+                f"evaluation {variant} role/deal counts are inconsistent"
+            )
         _, role_wp_low, _ = _delta(metrics["wp_delta"], f"evaluation {variant}.{role}.wp_delta")
         _, role_adp_low, _ = _delta(metrics["adp_delta"], f"evaluation {variant}.{role}.adp_delta")
         role_regressed |= role_wp_low < 0.0 or role_adp_low < 0.0
@@ -304,6 +308,49 @@ def _validate_evaluation(row: Mapping[str, Any], identity: Mapping[str, Any]) ->
         issues.append(f"{variant}/{ruleset}/seed-{seed}: runtime correctness failures observed")
     if row["search_fallbacks"] > row["search_triggers"]:
         raise H8EvidenceError(f"evaluation {variant} search fallback count exceeds triggers")
+    search_effect = row["search_effect"]
+    if promotion_candidate:
+        effect = _mapping(search_effect, f"evaluation {variant}.search_effect")
+        _exact(
+            effect,
+            {
+                "baseline_variant", "wp_delta", "adp_delta",
+                "added_latency_p99_ms", "latency_budget_ms",
+            },
+            f"evaluation {variant}.search_effect",
+        )
+        if effect["baseline_variant"] != "v3_full_hybrid_search_off":
+            raise H8EvidenceError(
+                f"evaluation {variant} search baseline identity mismatch"
+            )
+        _, search_wp_low, _ = _delta(
+            effect["wp_delta"], f"evaluation {variant}.search_effect.wp_delta"
+        )
+        _, search_adp_low, _ = _delta(
+            effect["adp_delta"], f"evaluation {variant}.search_effect.adp_delta"
+        )
+        added_latency = _finite(
+            effect["added_latency_p99_ms"],
+            f"evaluation {variant}.search_effect.added_latency_p99_ms",
+            minimum=0.0,
+        )
+        latency_budget = _finite(
+            effect["latency_budget_ms"],
+            f"evaluation {variant}.search_effect.latency_budget_ms",
+            minimum=0.0,
+        )
+        if search_wp_low <= 0.0 or search_adp_low <= 0.0:
+            issues.append(
+                f"{variant}/{ruleset}/seed-{seed}: search benefit CI failed"
+            )
+        if added_latency > latency_budget:
+            issues.append(
+                f"{variant}/{ruleset}/seed-{seed}: search latency budget failed"
+            )
+    elif search_effect is not None:
+        raise H8EvidenceError(
+            f"evaluation {variant} must not carry search-effect evidence"
+        )
     if row["artifact_stale"]:
         issues.append(f"{variant}/{ruleset}/seed-{seed}: artifact is stale")
     return issues
