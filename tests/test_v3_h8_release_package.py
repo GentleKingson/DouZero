@@ -22,7 +22,7 @@ from douzero.v3_hybrid import (
 
 
 def _runtime():
-    schema = build_v2_schema(max_history_len=8)
+    schema = build_v2_schema()
     config = V3HybridModelConfig(
         hidden_size=16,
         history_layers=1,
