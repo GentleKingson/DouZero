@@ -23,7 +23,7 @@ implementation-facing module and interface contract.
 | Public belief search | Budgeted component exists | Deferred to H7 |
 | Release package | Strict V2 package exists | H1 supplies a strict V3 public sidecar, not a formal release package |
 | Role residual V3 policy | H1 implemented | Current stage |
-| Adaptive DMC, online Oracle, cooperation mixer | H2 Adaptive DMC and H3 Oracle implemented; cooperation absent | H2, H3, H5 |
+| Adaptive DMC, online Oracle, cooperation mixer | H2 Adaptive DMC, H3 Oracle, and H5 training-only sequential farmer cooperation implemented | H2, H3, H5 |
 | Formal V3 long-run and playing strength | Missing | H8 |
 
 ## Data boundary
@@ -335,6 +335,52 @@ failed correctness or performance gate stops later stages. Playing-strength
 promotion requires paired evaluation and role-specific WP/ADP confidence
 intervals; no H1 result is a strength claim.
 
+### H5 sequential farmer cooperation contract
+
+H5 does not apply synchronous QMIX to alternating Dou Dizhu actions. Replay
+rows remain the H2 public rows and are grouped by exact episode/deal identity
+into an ordered `landlord_up`/`landlord_down` pair. Every trajectory decision
+atomically binds one trace index, replay transition, public-feature row, and
+pass flag before the sequence is sorted by trace index. A trajectory may have
+a different number of decisions and keeps its league policy and
+teammate-policy identities. False padded rows are zeroed and excluded from
+every loss and statistic.
+
+The public V3 policy retains its three independent role-specific local DMC Q
+heads. A training-only sidecar consumes the selected public role-adapted action
+embedding, detached conservative-belief teammate summary, and the existing
+public strategy quantities for pressure, initiative, teammate feed, and bomb
+opportunity cost. It contains role-specific farmer team-value heads and a
+shared GRU trajectory encoder. The per-decision team-value loss and the two
+trajectory terminal-return/consistency losses start from the raw farmer-team
+terminal return, then apply the public DMC head's identity-bound target
+transform and clamp. Landlord samples never enter these losses.
+
+The optional mixer first reduces each unequal trajectory to its masked mean
+selected local Q. Two non-negative `softplus` weights and a bias then predict
+the common farmer return. Weights may be conditioned on public trajectory
+state, or on an explicit privileged training-only state for ablation. The
+privileged state is a caller-owned loss side channel: it is not replayed and is
+never passed to the public model. Mixer mode, dimensions, alignment, reward,
+padding, optimizer, schedule, and loss weights are all compatibility identity
+axes. H3 Oracle plus H5, H4 joint-belief plus H5, and public belief feedback
+plus H5 fail before graph construction; their combined topology belongs to H6.
+
+When H5 is disabled, no team head, trajectory encoder, mixer, optimizer, or
+data dependency is created and the learner delegates exactly to H4. Public H1
+and H4 checkpoint writers serialize only the V3 model (and public belief model
+where applicable), so the H5 sidecar and mixer cannot enter a deployment
+artifact. H5 training checkpoints are separately marked `training_only` and
+strictly bind the nested H4 state, sidecar graph, optimizer, counters, schedule,
+statistics, and nested H3 RNG continuity. The actor-visible policy version is
+the nested H3 version plus every H5 public optimizer step, so Adaptive DMC
+provenance cannot lag behind parameters changed by the cooperation loss.
+
+H5 currently provides the single-process reference topology and correctness
+contract. Long-running async workers, SIGTERM manifests, bounded policy lag,
+and selective search remain H7. No formal paired evaluation or multi-seed
+wall-clock ablation has been run: playing strength not measured.
+
 ## Implementation order
 
 | Stage | Packages and interfaces |
@@ -343,7 +389,7 @@ intervals; no H1 result is a strength claim.
 | H2 | new V3 replay transition and learner loss/metrics; checkpoint resume state; no V2 loss mutation |
 | H3 | extend existing `douzero.distillation` alignment/cache safety into a training-only V3 Oracle service and schedules |
 | H4 | extend `douzero.belief` joint/alternating interfaces and V3 public feature injection; preserve exact DP |
-| H5 | V3 farmer team mixer, counterfactual credit labels, and masked cooperation loss |
+| H5 | `douzero.v3_hybrid.training.{cooperation,h5_learner}`; public action-embedding training API; sequential farmer pair alignment, sidecar checkpoint, masked losses |
 | H6 | adapters for existing BC, strategy, style, league, curriculum, and bidding contracts into one V3 trainer |
 | H7 | extend existing async/long-running runtime, policy snapshots, checkpoint manifests, and search ranker |
 | H8 | extend paired evaluation, ablation reports, release manifest/package, and rollback evidence |

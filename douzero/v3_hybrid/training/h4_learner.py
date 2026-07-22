@@ -620,7 +620,8 @@ class V3H4Learner:
         base_metrics = None
         if policy_phase:
             base_metrics = self.base.train_batch(
-                transitions, belief_features=features
+                transitions,
+                belief_features=features,
             )
 
         belief_total = next(self.model.parameters()).sum() * 0.0

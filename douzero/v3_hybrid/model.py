@@ -331,21 +331,22 @@ class V3HybridModel(nn.Module):
     ) -> BatchedV3HybridModelOutput:
         """Score a padded heterogeneous-role batch with independent adapters."""
 
-        batch, actions = self._validate_batched(
-            action_features, action_mask, acting_role
+        adapted = self._encode_batched_actions(
+            state_card_vectors,
+            state_context_flat,
+            context_card_vectors,
+            context_flat,
+            history_tokens,
+            history_key_padding_mask,
+            action_features,
+            action_mask,
+            acting_role,
+            belief_features,
         )
-        cards = state_card_vectors + context_card_vectors
-        context = torch.cat((state_context_flat, context_flat), dim=-1)
-        state = self.state_encoder(cards, context)
-        history = self.history_encoder(history_tokens, history_key_padding_mask)
-        action_embeddings = self.action_encoder(action_features)
-        shared = self.shared_fusion.forward_batched(state, history, action_embeddings)
-        shared = self._apply_batched_belief(
-            shared, acting_role, belief_features
-        )
+        batch, actions = action_mask.shape
 
         outputs = {
-            name: shared.new_zeros((batch, actions, 1))
+            name: adapted.new_zeros((batch, actions, 1))
             for name in (
                 "dmc_q",
                 "win_logit",
@@ -359,13 +360,51 @@ class V3HybridModel(nn.Module):
             rows = torch.nonzero(acting_role == role_index, as_tuple=False).squeeze(-1)
             if rows.numel() == 0:
                 continue
-            adapted = self.role_adapters[role](shared.index_select(0, rows))
-            role_values = self.role_heads[role](adapted)
+            role_values = self.role_heads[role](adapted.index_select(0, rows))
             role_mask = action_mask.index_select(0, rows)
             self._check_finite(role_values, role_mask, prefix=f"{role}_")
             for name, value in role_values.items():
                 outputs[name] = outputs[name].index_copy(0, rows, value)
         return BatchedV3HybridModelOutput(**outputs, action_mask=action_mask)
+
+    def _encode_batched_actions(
+        self,
+        state_card_vectors: tuple[torch.Tensor, ...],
+        state_context_flat: torch.Tensor,
+        context_card_vectors: tuple[torch.Tensor, ...],
+        context_flat: torch.Tensor,
+        history_tokens: torch.Tensor,
+        history_key_padding_mask: torch.Tensor,
+        action_features: torch.Tensor,
+        action_mask: torch.Tensor,
+        acting_role: torch.Tensor,
+        belief_features: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return role-adapted public action embeddings for training auxiliaries."""
+
+        batch, _actions = self._validate_batched(
+            action_features, action_mask, acting_role
+        )
+        cards = state_card_vectors + context_card_vectors
+        context = torch.cat((state_context_flat, context_flat), dim=-1)
+        state = self.state_encoder(cards, context)
+        history = self.history_encoder(history_tokens, history_key_padding_mask)
+        action_embeddings = self.action_encoder(action_features)
+        shared = self.shared_fusion.forward_batched(state, history, action_embeddings)
+        shared = self._apply_batched_belief(
+            shared, acting_role, belief_features
+        )
+
+        adapted = torch.zeros_like(shared)
+        for role_index, role in enumerate(V3_HYBRID_ROLES):
+            rows = torch.nonzero(acting_role == role_index, as_tuple=False).squeeze(-1)
+            if rows.numel() == 0:
+                continue
+            role_adapted = self.role_adapters[role](shared.index_select(0, rows))
+            adapted = adapted.index_copy(0, rows, role_adapted)
+        if self.config.nan_guard and not bool(torch.isfinite(adapted[action_mask]).all()):
+            raise NumericalError("role-adapted action embedding contains NaN or Inf")
+        return adapted
 
     def _check_public_observation(self, observation: object) -> ObservationV2:
         if getattr(observation, "kind", None) == "privileged" or (
@@ -507,6 +546,40 @@ class V3HybridModel(nn.Module):
             inputs.history_key_padding_mask,
         )
         return (state + history) * 0.5
+
+    def encode_input_batch_actions(
+        self,
+        inputs: BatchedModelInputBundle,
+        *,
+        belief_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Encode padded public actions through their role-specific adapters.
+
+        This parameter-free API is consumed only by training auxiliaries. It
+        preserves the public model graph and the authoritative action mask.
+        """
+
+        if not isinstance(inputs, BatchedModelInputBundle):
+            raise TypeError("V3 action encoding requires BatchedModelInputBundle")
+        expected_hash = self.schema.stable_hash()
+        if not inputs.feature_schema_hashes or any(
+            value != expected_hash for value in inputs.feature_schema_hashes
+        ):
+            raise ValueError("V3 action encoding feature schema mismatch")
+        parameter = next(self.parameters())
+        inputs.to(parameter.device)
+        return self._encode_batched_actions(
+            tuple(value.to(dtype=parameter.dtype) for value in inputs.state_card_vectors),
+            inputs.state_context_flat.to(dtype=parameter.dtype),
+            tuple(value.to(dtype=parameter.dtype) for value in inputs.context_card_vectors),
+            inputs.context_flat.to(dtype=parameter.dtype),
+            inputs.history_tokens.to(dtype=parameter.dtype),
+            inputs.history_key_padding_mask,
+            inputs.action_features.to(dtype=parameter.dtype),
+            inputs.action_mask,
+            inputs.acting_role,
+            belief_features,
+        )
 
     def act(self, observation: object, *, output: str = "dmc_q") -> tuple[int, ...]:
         obs = self._check_public_observation(observation)

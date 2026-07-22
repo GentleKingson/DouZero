@@ -9,6 +9,7 @@ import math
 import os
 import random
 import tempfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
@@ -87,6 +88,29 @@ def _nonnegative(name: str, value: float) -> None:
         or value < 0.0
     ):
         raise ValueError(f"{name} must be finite and non-negative")
+
+
+def _validate_module_state(
+    payload: Mapping[object, object],
+    module: torch.nn.Module,
+    *,
+    label: str,
+) -> None:
+    expected = module.state_dict()
+    if not isinstance(payload, Mapping) or set(payload) != set(expected):
+        raise CheckpointCompatibilityError(f"H3 {label} state keys mismatch")
+    for name, reference in expected.items():
+        value = payload[name]
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.shape != reference.shape
+            or value.dtype != reference.dtype
+            or value.layout != reference.layout
+            or not bool(torch.isfinite(value).all())
+        ):
+            raise CheckpointCompatibilityError(
+                f"H3 {label} parameter {name} is incompatible or non-finite"
+            )
 
 
 def _select_real_actions(
@@ -446,6 +470,8 @@ class V3H3Learner:
         self.learner_updates = 0
         self.samples_consumed = 0
         self.policy_version = public.initial_policy_version
+        self._h5_policy_version_owner = None
+        self._h5_policy_version_offset = 0
         self.statistics = H3CumulativeStats()
         self.compatibility_identity = h3_training_identity(
             self.model, self.ruleset, self.config
@@ -454,6 +480,26 @@ class V3H3Learner:
 
     def schedule_state(self) -> OracleScheduleState:
         return self.config.schedule.at(self.learner_updates)
+
+    def _bind_h5_policy_version_owner(self, owner: object) -> None:
+        if owner is None or self._h5_policy_version_owner is not None:
+            raise RuntimeError("H3 H5 policy-version owner binding is invalid")
+        self._h5_policy_version_owner = owner
+
+    @contextmanager
+    def _h5_policy_version_scope(self, owner: object):
+        if owner is not self._h5_policy_version_owner:
+            raise RuntimeError("H3 H5 policy-version owner mismatch")
+        if self._h5_policy_version_offset != 0:
+            raise RuntimeError("H3 H5 policy-version scope cannot be nested")
+        offset = owner.statistics.public_updates
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise RuntimeError("H3 H5 policy-version offset is invalid")
+        self._h5_policy_version_offset = offset
+        try:
+            yield
+        finally:
+            self._h5_policy_version_offset = 0
 
     def _guidance_enabled(self) -> bool:
         guidance = self.config.guidance
@@ -477,6 +523,7 @@ class V3H3Learner:
         transitions: Sequence[V3ReplayTransition],
         oracle_samples: Sequence["OfflineDistillationSample"] | None,
         state: OracleScheduleState,
+        effective_policy_version: int,
     ) -> tuple[list[float], Sequence["OfflineDistillationSample"] | None]:
         if not transitions or len(transitions) > self.config.public.batch_size:
             raise ValueError("H3 requires a non-empty batch within configured batch_size")
@@ -501,7 +548,7 @@ class V3H3Learner:
             )
             if adaptive_consumed:
                 version = transition.adaptive_provenance.policy_version
-                if version > self.policy_version:
+                if version > effective_policy_version:
                     raise ValueError("H3 replay policy version is newer than learner")
         if self._privileged_needed(state):
             from douzero.distillation.dataset import OfflineDistillationSample
@@ -528,13 +575,18 @@ class V3H3Learner:
         oracle_samples: Sequence["OfflineDistillationSample"] | None = None,
         belief_features: torch.Tensor | None = None,
     ) -> V3H3StepMetrics:
+        effective_policy_version = (
+            self.policy_version + self._h5_policy_version_offset
+        )
         state = self.schedule_state()
         if state.phase == ORACLE_PHASE_COMPLETE:
             raise RuntimeError("H3 training schedule is complete")
-        role_weights, samples = self._validate_batch(transitions, oracle_samples, state)
+        role_weights, samples = self._validate_batch(
+            transitions, oracle_samples, state, effective_policy_version
+        )
         effective_weight = math.fsum(role_weights)
         if effective_weight == 0.0:
-            return self._empty_metrics(state)
+            return self._empty_metrics(state, effective_policy_version)
         normalized = torch.tensor(
             [weight / effective_weight for weight in role_weights],
             device=self.device,
@@ -678,7 +730,7 @@ class V3H3Learner:
             and not oracle_updated
             and not self.config.schedule.enabled
         ):
-            return self._empty_metrics(state)
+            return self._empty_metrics(state, effective_policy_version)
         count = len(transitions)
         self.learner_updates += 1
         self.samples_consumed += count
@@ -695,7 +747,7 @@ class V3H3Learner:
         }
         metrics = V3H3StepMetrics(
             learner_update=self.learner_updates,
-            policy_version=self.policy_version,
+            policy_version=self.policy_version + self._h5_policy_version_offset,
             phase=state.phase,
             temperature=state.temperature,
             privileged_gate=state.privileged_gate,
@@ -722,10 +774,12 @@ class V3H3Learner:
         )
         return metrics
 
-    def _empty_metrics(self, state: OracleScheduleState) -> V3H3StepMetrics:
+    def _empty_metrics(
+        self, state: OracleScheduleState, policy_version: int
+    ) -> V3H3StepMetrics:
         return V3H3StepMetrics(
             learner_update=self.learner_updates,
-            policy_version=self.policy_version,
+            policy_version=policy_version,
             phase=state.phase,
             temperature=state.temperature,
             privileged_gate=state.privileged_gate,
@@ -878,8 +932,7 @@ class V3H3Learner:
         except (TypeError, ValueError) as exc:
             raise CheckpointCompatibilityError(f"H3 checkpoint state mismatch: {exc}") from exc
         student_state = bundle["student_state_dict"]
-        if not isinstance(student_state, dict) or set(student_state) != set(self.model.state_dict()):
-            raise CheckpointCompatibilityError("H3 student state keys mismatch")
+        _validate_module_state(student_state, self.model, label="student")
         if any(
             token in name.lower()
             for name in student_state
@@ -891,12 +944,12 @@ class V3H3Learner:
         if self.oracle is None:
             if oracle_state is not None or oracle_optimizer_state is not None:
                 raise CheckpointCompatibilityError("disabled H3 checkpoint contains Oracle state")
-        elif (
-            not isinstance(oracle_state, dict)
-            or set(oracle_state) != set(self.oracle.state_dict())
-            or not isinstance(oracle_optimizer_state, dict)
-        ):
-            raise CheckpointCompatibilityError("enabled H3 checkpoint Oracle state mismatch")
+        else:
+            _validate_module_state(oracle_state, self.oracle, label="Oracle")
+            if not isinstance(oracle_optimizer_state, dict):
+                raise CheckpointCompatibilityError(
+                    "enabled H3 checkpoint Oracle optimizer state mismatch"
+                )
         student_optimizer_state = bundle["student_optimizer_state_dict"]
         if not isinstance(student_optimizer_state, dict) or set(student_optimizer_state) != {
             "state", "param_groups"
