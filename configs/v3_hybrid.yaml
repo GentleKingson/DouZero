@@ -1,0 +1,170 @@
+format: v3-hybrid-h6-config-v1
+
+# Dedicated V3 configuration. Legacy A1 and V2 loaders do not read this file.
+model:
+  hidden_size: 256
+  history_encoder: lstm
+  history_layers: 2
+  history_heads: 8
+  history_dropout: 0.0
+  shared_fusion_layers: 2
+  landlord_adapter_layers: 2
+  farmer_adapter_layers: 4
+  farmer_channel_gate: none
+  farmer_channel_gate_reduction: 4
+  adapter_dropout: 0.0
+  attention_type: none
+  score_clamp: 32.0
+  dmc_target_transform: raw
+  dmc_target_clamp: 32.0
+  nan_guard: true
+  belief_feedback: none
+  human_prior_enabled: false
+  strategy_features_enabled: false
+  strategy_hand_enabled: true
+  strategy_structure_enabled: true
+  strategy_control_enabled: true
+  strategy_cooperation_enabled: true
+  strategy_risk_enabled: true
+  strategy_aux_enabled: false
+  strategy_node_budget: 500
+  strategy_time_budget_ms: 0
+  style_enabled: false
+  style_embedding_dim: 64
+  bidding_enabled: false
+  bidding_hidden_size: 128
+  bidding_uncertainty_enabled: false
+
+learner:
+  base:
+    base:
+      base:
+        public:
+          batch_size: 32
+          learning_rate: 0.0001
+          rmsprop_alpha: 0.99
+          rmsprop_momentum: 0.0
+          rmsprop_epsilon: 0.00001
+          max_grad_norm: 40.0
+          lambda_dmc: 1.0
+          landlord_weight: 1.0
+          landlord_up_weight: 1.0
+          landlord_down_weight: 1.0
+          device: cpu
+          seed: 0
+          initial_policy_version: 0
+          adaptive_dmc:
+            mode: disabled
+            gamma_start: 0.2
+            gamma_end: 0.05
+            gamma_schedule_updates: 100000
+            epsilon: 0.001
+            delta: 0.1
+        schedule:
+          enabled: false
+          warmup_updates: 0
+          guided_updates: 0
+          finetune_updates: 0
+          oracle_weight_start: 1.0
+          oracle_weight_end: 0.0
+          guidance_weight_start: 1.0
+          guidance_weight_end: 0.0
+          temperature_start: 2.0
+          temperature_end: 1.0
+          privileged_gate_start: 1.0
+          privileged_gate_end: 0.0
+        guidance:
+          top_k: 4
+          ranking_margin: 0.1
+          lambda_kl: 1.0
+          lambda_ranking: 0.25
+          lambda_chosen_value: 0.0
+        oracle_hidden_size: 128
+        oracle_value_delta_clamp: 32.0
+        oracle_learning_rate: 0.0001
+      belief:
+        enabled: false
+        mode: disabled
+        lambda_belief: 0.0
+        learning_rate: 0.0001
+        max_grad_norm: 40.0
+        lambda_count_reg: 0.0
+        lambda_entropy_reg: 0.0
+        policy_updates_per_cycle: 1
+        belief_updates_per_cycle: 1
+        shared_updates_per_cycle: 0
+        shared_encoder_updates: false
+    cooperation:
+      enabled: false
+      hidden_size: 64
+      trajectory_layers: 1
+      dropout: 0.0
+      lambda_coop: 0.0
+      lambda_team_value: 1.0
+      lambda_trajectory_consistency: 0.25
+      lambda_mixer: 0.0
+      warmup_updates: 0
+      ramp_updates: 0
+      mixer_mode: disabled
+      privileged_state_dim: 0
+      learning_rate: 0.0001
+      max_grad_norm: 10.0
+      update_public_model: true
+  losses:
+    lambda_dmc: 1.0
+    lambda_win: 1.0
+    lambda_score: 0.5
+    lambda_oracle: 0.0
+    lambda_belief: 0.0
+    lambda_coop: 0.0
+    lambda_bc: 0.0
+    lambda_strategy: 0.0
+    lambda_bidding: 0.0
+    landlord_weight: 1.0
+    landlord_up_weight: 1.0
+    landlord_down_weight: 1.0
+    schedules:
+      dmc: {kind: constant, start: 1.0, end: 1.0, updates: 0}
+      win: {kind: constant, start: 1.0, end: 1.0, updates: 0}
+      score: {kind: constant, start: 1.0, end: 1.0, updates: 0}
+      oracle: {kind: constant, start: 1.0, end: 1.0, updates: 0}
+      belief: {kind: constant, start: 1.0, end: 1.0, updates: 0}
+      cooperation: {kind: constant, start: 1.0, end: 1.0, updates: 0}
+      bc: {kind: constant, start: 1.0, end: 1.0, updates: 0}
+      strategy: {kind: constant, start: 1.0, end: 1.0, updates: 0}
+      bidding: {kind: constant, start: 1.0, end: 1.0, updates: 0}
+  auxiliary:
+    score_delta: 1.0
+    score_target_transform: raw
+    bc_temperature: 1.0
+    bc_label_smoothing: 0.0
+    strategy_lambda_min_turns: 1.0
+    strategy_lambda_regain_initiative: 1.0
+    strategy_lambda_teammate_finish: 1.0
+    strategy_lambda_spring: 1.0
+    strategy_lambda_structure: 1.0
+    bidding_lambda_policy: 1.0
+    bidding_lambda_landlord_win: 1.0
+    bidding_lambda_landlord_score: 0.5
+    bidding_lambda_regret: 0.0
+  features:
+    role_model: true
+    adaptive_dmc: false
+    oracle: false
+    belief: false
+    cooperation: false
+    human_bc: false
+    strategy: false
+    style: false
+    league: false
+    curriculum: false
+    bidding: false
+    selective_search: false
+    public_export: true
+  topology:
+    topology: single_process
+    ruleset: standard
+    checkpoint_resume: true
+    export: true
+    deployment: true
+    search: false

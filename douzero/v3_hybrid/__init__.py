@@ -70,6 +70,28 @@ from .replay import (
     capture_adaptive_transition,
     capture_plain_transition,
 )
+from .integration_replay import (
+    V3_H6_REPLAY_SCHEMA_VERSION,
+    V3_H6_REPLAY_SEMANTICS,
+    V3H6ReplayBuffer,
+    assert_public_replay_payload,
+)
+from .loss_composer import (
+    LOSS_NAMES,
+    LossComposition,
+    LossTermMetrics,
+    LossTermSchedule,
+    LossTermTensor,
+    V3HybridLossComposer,
+    V3HybridLossComposerConfig,
+)
+from .support_matrix import (
+    V3_H6_SUPPORT_MATRIX,
+    V3_H6_SUPPORT_MATRIX_VERSION,
+    v3_h6_support_matrix_dict,
+    v3_h6_support_matrix_hash,
+    validate_capability_support,
+)
 
 __all__ = [
     "V3_HYBRID_CHECKPOINT_KIND",
@@ -129,4 +151,20 @@ __all__ = [
     "V3H2StepMetrics",
     "V3H2Learner",
     "h2_training_identity",
+    "V3_H6_REPLAY_SCHEMA_VERSION",
+    "V3_H6_REPLAY_SEMANTICS",
+    "V3H6ReplayBuffer",
+    "assert_public_replay_payload",
+    "LOSS_NAMES",
+    "LossComposition",
+    "LossTermMetrics",
+    "LossTermSchedule",
+    "LossTermTensor",
+    "V3HybridLossComposer",
+    "V3HybridLossComposerConfig",
+    "V3_H6_SUPPORT_MATRIX",
+    "V3_H6_SUPPORT_MATRIX_VERSION",
+    "v3_h6_support_matrix_dict",
+    "v3_h6_support_matrix_hash",
+    "validate_capability_support",
 ]

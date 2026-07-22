@@ -415,10 +415,6 @@ class V3H3Learner:
                 raise ValueError(
                     "belief-feedback models require the H4 learner"
                 )
-            if self.config.schedule.enabled:
-                raise ValueError(
-                    "H4 belief feedback and H3 Oracle combine only in H6"
-                )
         self.device = torch.device(self.config.public.device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA H3 learner requested but CUDA is unavailable")
@@ -492,7 +488,9 @@ class V3H3Learner:
             raise RuntimeError("H3 H5 policy-version owner mismatch")
         if self._h5_policy_version_offset != 0:
             raise RuntimeError("H3 H5 policy-version scope cannot be nested")
-        offset = owner.statistics.public_updates
+        offset = getattr(owner, "_policy_version_offset", None)
+        if offset is None:
+            offset = owner.statistics.public_updates
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise RuntimeError("H3 H5 policy-version offset is invalid")
         self._h5_policy_version_offset = offset
@@ -545,6 +543,8 @@ class V3H3Learner:
                 expected_target_transform=self.model.config.dmc_target_transform,
                 expected_ruleset_identity=self.ruleset.identity(),
                 adaptive_required=adaptive_required,
+                strategy_features_allowed=self.model.config.strategy_features_enabled,
+                style_features_allowed=self.model.config.style_enabled,
             )
             if adaptive_consumed:
                 version = transition.adaptive_provenance.policy_version
@@ -640,6 +640,9 @@ class V3H3Learner:
                     sample.privileged_observation,
                     action_keys=sample.action_keys,
                     privileged_gate=state.privileged_gate,
+                    belief_features=(
+                        None if belief_features is None else belief_features[index]
+                    ),
                 )
                 target, _ = transform_dmc_target(
                     oracle_output.action_logits.new_tensor([sample.target_score]),
@@ -842,7 +845,7 @@ class V3H3Learner:
                 None if self.oracle_optimizer is None else self.oracle_optimizer.state_dict()
             ),
             "feature_schema_hash": self.model.schema.stable_hash(),
-            "model_config": asdict(self.model.config),
+            "model_config": self.model.config.to_dict(),
             "model_config_hash": self.model.config.stable_hash(),
             "ruleset_identity": self.ruleset.identity(),
             "learner_config": asdict(self.config),
@@ -890,7 +893,7 @@ class V3H3Learner:
             "artifact_access": "privileged_training_only",
             "source_git_sha": git_sha(),
             "feature_schema_hash": self.model.schema.stable_hash(),
-            "model_config": asdict(self.model.config),
+            "model_config": self.model.config.to_dict(),
             "model_config_hash": self.model.config.stable_hash(),
             "ruleset_identity": self.ruleset.identity(),
             "learner_config": asdict(self.config),

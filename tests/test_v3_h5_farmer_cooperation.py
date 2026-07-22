@@ -291,27 +291,27 @@ def test_config_is_identity_bound_scheduled_and_fail_closed():
         _coop(lambda_team_value=0.0, lambda_trajectory_consistency=0.0)
 
 
-def test_unsupported_cross_stage_combinations_fail_before_graph_creation():
-    with pytest.raises(ValueError, match="deferred to H6"):
-        V3H5LearnerConfig(
-            base=dataclasses.replace(
-                _base(), belief=V3H4BeliefTrainingConfig(
-                    enabled=True, mode=BELIEF_MODE_AUXILIARY, lambda_belief=1.0
-                )
-            ),
-            cooperation=_coop(),
-        )
+def test_h6_combination_identity_and_remaining_graph_guards():
+    belief_combined = V3H5LearnerConfig(
+        base=dataclasses.replace(
+            _base(), belief=V3H4BeliefTrainingConfig(
+                enabled=True, mode=BELIEF_MODE_AUXILIARY, lambda_belief=1.0
+            )
+        ),
+        cooperation=_coop(),
+    )
+    assert belief_combined.compatibility_dict()["identity_version"] == 2
     oracle = dataclasses.replace(
         _base().base,
         schedule=OracleGuidingScheduleConfig(
             enabled=True, guided_updates=1, finetune_updates=1
         ),
     )
-    with pytest.raises(ValueError, match="deferred to H6"):
-        V3H5LearnerConfig(
-            base=V3H4LearnerConfig(base=oracle), cooperation=_coop()
-        )
-    with pytest.raises(ValueError, match="belief feedback"):
+    oracle_combined = V3H5LearnerConfig(
+        base=V3H4LearnerConfig(base=oracle), cooperation=_coop()
+    )
+    assert oracle_combined.compatibility_dict()["identity_version"] == 2
+    with pytest.raises(ValueError, match="disabled H4"):
         V3H5Learner(
             _model(belief_feedback=BELIEF_FEEDBACK_FARMERS),
             ruleset=RuleSet.legacy(),

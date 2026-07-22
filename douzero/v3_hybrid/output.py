@@ -16,6 +16,15 @@ _VALUE_NAMES = (
     "score_mean",
 )
 
+_OPTIONAL_ACTION_NAMES = (
+    "prior_logit",
+    "min_turns_after",
+    "regain_initiative_logit",
+    "teammate_finish_logit",
+    "spring_probability_logit",
+    "structure_cost",
+)
+
 
 @dataclass(frozen=True)
 class V3HybridModelOutput:
@@ -28,6 +37,12 @@ class V3HybridModelOutput:
     p_win: torch.Tensor
     score_mean: torch.Tensor
     action_mask: torch.Tensor
+    prior_logit: torch.Tensor | None = None
+    min_turns_after: torch.Tensor | None = None
+    regain_initiative_logit: torch.Tensor | None = None
+    teammate_finish_logit: torch.Tensor | None = None
+    spring_probability_logit: torch.Tensor | None = None
+    structure_cost: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.dmc_q.ndim != 2 or self.dmc_q.shape[-1] != 1:
@@ -37,6 +52,10 @@ class V3HybridModelOutput:
             raise ValueError("V3 output requires at least one action")
         for name in _VALUE_NAMES[1:]:
             if getattr(self, name).shape != self.dmc_q.shape:
+                raise ValueError(f"{name} shape must match dmc_q")
+        for name in _OPTIONAL_ACTION_NAMES:
+            value = getattr(self, name)
+            if value is not None and value.shape != self.dmc_q.shape:
                 raise ValueError(f"{name} shape must match dmc_q")
         if self.action_mask.shape != (count,) or self.action_mask.dtype != torch.bool:
             raise ValueError("action_mask must be bool with shape (A,)")
@@ -69,6 +88,12 @@ class BatchedV3HybridModelOutput:
     p_win: torch.Tensor
     score_mean: torch.Tensor
     action_mask: torch.Tensor
+    prior_logit: torch.Tensor | None = None
+    min_turns_after: torch.Tensor | None = None
+    regain_initiative_logit: torch.Tensor | None = None
+    teammate_finish_logit: torch.Tensor | None = None
+    spring_probability_logit: torch.Tensor | None = None
+    structure_cost: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.dmc_q.ndim != 3 or self.dmc_q.shape[-1] != 1:
@@ -78,6 +103,10 @@ class BatchedV3HybridModelOutput:
             raise ValueError("batched V3 output must not be empty")
         for name in _VALUE_NAMES[1:]:
             if getattr(self, name).shape != self.dmc_q.shape:
+                raise ValueError(f"{name} shape must match dmc_q")
+        for name in _OPTIONAL_ACTION_NAMES:
+            value = getattr(self, name)
+            if value is not None and value.shape != self.dmc_q.shape:
                 raise ValueError(f"{name} shape must match dmc_q")
         if self.action_mask.shape != (batch, actions):
             raise ValueError("batched action_mask must have shape (B, A)")
@@ -95,9 +124,14 @@ class BatchedV3HybridModelOutput:
             raise TypeError("batch index must be an int")
         if not 0 <= index < self.batch_size:
             raise IndexError("batch index is outside the output")
+        optional = {
+            name: None if getattr(self, name) is None else getattr(self, name)[index]
+            for name in _OPTIONAL_ACTION_NAMES
+        }
         return V3HybridModelOutput(
             **{name: getattr(self, name)[index] for name in _VALUE_NAMES},
             action_mask=self.action_mask[index],
+            **optional,
         )
 
     def gather_chosen(self, indices: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -110,7 +144,13 @@ class BatchedV3HybridModelOutput:
             raise ValueError("chosen index is outside padded action range")
         if not bool(self.action_mask[rows, indices].all()):
             raise ValueError("chosen index references a padded action")
-        return {
+        gathered = {
             name: getattr(self, name)[rows, indices]
             for name in _VALUE_NAMES
         }
+        gathered.update({
+            name: getattr(self, name)[rows, indices]
+            for name in _OPTIONAL_ACTION_NAMES
+            if getattr(self, name) is not None
+        })
+        return gathered

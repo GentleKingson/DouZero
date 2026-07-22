@@ -26,6 +26,10 @@ class ExportableV3HybridModel(nn.Module):
             raise ValueError(
                 "H1 tensor export cannot omit an enabled H4 belief model"
             )
+        if model.config.strategy_features_enabled or model.config.style_enabled:
+            raise ValueError(
+                "H1 tensor export cannot omit enabled H6 strategy/style inputs"
+            )
         model.role_index(acting_role)
         self.model = model
         self.acting_role = acting_role
@@ -52,6 +56,8 @@ class ExportableV3HybridModel(nn.Module):
             history_tokens,
             history_key_padding_mask,
             action_features,
+            None,
+            None,
         )
         adapted = self.model.role_adapters[self.acting_role](shared)
         output = self.model.role_heads[self.acting_role](adapted)

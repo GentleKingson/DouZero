@@ -9,13 +9,16 @@ from torch import nn
 
 from douzero.models_v2.action_encoder import ActionEncoder
 from douzero.models_v2.batch import (
+    BatchedBiddingInput,
     BatchedModelInputBundle,
     ModelInputBundle,
     observation_batch_to_model_inputs,
     observation_to_model_inputs,
 )
 from douzero.models_v2.history_encoder import build_history_encoder
+from douzero.models_v2.heads import BiddingHeads, PriorHead, StrategyAuxiliaryHeads
 from douzero.models_v2.numerical import NumericalError
+from douzero.models_v2.output import BatchedBiddingOutput, BiddingModelOutput
 from douzero.models_v2.state_encoder import StateEncoder
 from douzero.observation.encode_v2 import ObservationV2
 from douzero.observation.schema import (
@@ -94,10 +97,15 @@ class V3HybridModel(nn.Module):
             num_heads=cfg.history_heads,
             dropout=cfg.history_dropout,
         )
+        strategy_width = 0
+        if cfg.strategy_features_enabled:
+            from douzero.strategy.features import STRATEGY_FEATURE_WIDTH
+
+            strategy_width = STRATEGY_FEATURE_WIDTH
         self.action_encoder = ActionEncoder(
             action_width=self._action_width,
             hidden_size=cfg.hidden_size,
-            strategy_width=0,
+            strategy_width=strategy_width,
         )
         self.shared_fusion = SharedStateActionFusion(
             cfg.hidden_size,
@@ -146,6 +154,35 @@ class V3HybridModel(nn.Module):
                 nn.Linear(BELIEF_FEATURE_DIM, cfg.hidden_size, bias=False),
                 nn.LayerNorm(cfg.hidden_size),
             )
+        self.style_encoder: nn.Module | None = None
+        if cfg.style_enabled:
+            from douzero.style.encoder import StyleEncoder
+
+            self.style_encoder = StyleEncoder(
+                output_dim=cfg.hidden_size,
+                hidden_dim=cfg.style_embedding_dim,
+            )
+        self.prior_head: PriorHead | None = (
+            PriorHead(cfg.hidden_size) if cfg.human_prior_enabled else None
+        )
+        self.strategy_aux_heads: StrategyAuxiliaryHeads | None = (
+            StrategyAuxiliaryHeads(cfg.hidden_size)
+            if cfg.strategy_aux_enabled
+            else None
+        )
+        self.bidding_schema = None
+        self.bidding_heads: BiddingHeads | None = None
+        if cfg.bidding_enabled:
+            from douzero.observation.bidding import BIDDING_ACTIONS, build_bidding_schema
+
+            self.bidding_schema = build_bidding_schema()
+            self.bidding_heads = BiddingHeads(
+                self.bidding_schema.input_width,
+                cfg.bidding_hidden_size,
+                num_bid_actions=len(BIDDING_ACTIONS),
+                score_clamp=cfg.score_clamp,
+                uncertainty_enabled=cfg.bidding_uncertainty_enabled,
+            )
 
     def role_index(self, role: str) -> int:
         try:
@@ -154,6 +191,43 @@ class V3HybridModel(nn.Module):
             raise ValueError(
                 f"unsupported V3 role {role!r}; expected {V3_HYBRID_ROLES}"
             ) from exc
+
+    def strategy_feature_config(self):
+        if not self.config.strategy_features_enabled:
+            return None
+        from douzero.strategy.config import StrategyFeatureConfig
+
+        return StrategyFeatureConfig(
+            hand_enabled=self.config.strategy_hand_enabled,
+            structure_enabled=self.config.strategy_structure_enabled,
+            control_enabled=self.config.strategy_control_enabled,
+            cooperation_enabled=self.config.strategy_cooperation_enabled,
+            risk_enabled=self.config.strategy_risk_enabled,
+            node_budget=self.config.strategy_node_budget,
+            time_budget_ms=self.config.strategy_time_budget_ms,
+        )
+
+    def _apply_style(
+        self, state: torch.Tensor, style_features: torch.Tensor | None
+    ) -> torch.Tensor:
+        if self.style_encoder is None:
+            if style_features is not None:
+                raise ValueError("style features were passed to a style-disabled V3 model")
+            return state
+        from douzero.style.features import STYLE_FEATURE_WIDTH
+
+        expected = (
+            (STYLE_FEATURE_WIDTH,)
+            if state.ndim == 1
+            else (state.shape[0], STYLE_FEATURE_WIDTH)
+        )
+        if style_features is None or tuple(style_features.shape) != expected:
+            raise ValueError(f"style_features must have shape {expected}")
+        parameter = next(self.style_encoder.parameters())
+        encoded = self.style_encoder(
+            style_features.to(device=state.device, dtype=parameter.dtype)
+        ).to(state.dtype)
+        return state + encoded
 
     def _shared_scalar(
         self,
@@ -164,12 +238,15 @@ class V3HybridModel(nn.Module):
         history_tokens: torch.Tensor,
         history_key_padding_mask: torch.Tensor,
         action_features: torch.Tensor,
+        strategy_features: torch.Tensor | None,
+        style_features: torch.Tensor | None,
     ) -> torch.Tensor:
         cards = state_card_vectors + context_card_vectors
         context = torch.cat((state_context_flat, context_flat), dim=-1)
         state = self.state_encoder(cards, context)
+        state = self._apply_style(state, style_features)
         history = self.history_encoder(history_tokens, history_key_padding_mask)
-        actions = self.action_encoder(action_features)
+        actions = self.action_encoder(action_features, strategy_features)
         return self.shared_fusion(state, history, actions)
 
     def _validate_scalar_mask(
@@ -271,6 +348,8 @@ class V3HybridModel(nn.Module):
         action_mask: torch.Tensor,
         acting_role: str,
         belief_features: torch.Tensor | None = None,
+        strategy_features: torch.Tensor | None = None,
+        style_features: torch.Tensor | None = None,
     ) -> V3HybridModelOutput:
         """Score one public decision without assuming a maximum action count."""
 
@@ -284,6 +363,8 @@ class V3HybridModel(nn.Module):
             history_tokens,
             history_key_padding_mask,
             action_features,
+            strategy_features,
+            style_features,
         )
         shared = self._apply_scalar_belief(
             shared, acting_role, belief_features
@@ -291,7 +372,26 @@ class V3HybridModel(nn.Module):
         adapted = self.role_adapters[acting_role](shared)
         values = self.role_heads[acting_role](adapted)
         self._check_finite(values, action_mask, prefix="")
-        return V3HybridModelOutput(**values, action_mask=action_mask)
+        optional: dict[str, torch.Tensor | None] = {
+            "prior_logit": None,
+            "min_turns_after": None,
+            "regain_initiative_logit": None,
+            "teammate_finish_logit": None,
+            "spring_probability_logit": None,
+            "structure_cost": None,
+        }
+        if self.prior_head is not None:
+            optional["prior_logit"] = self.prior_head(adapted)
+        if self.strategy_aux_heads is not None:
+            optional.update(self.strategy_aux_heads(adapted))
+        self._check_finite(
+            {name: value for name, value in optional.items() if value is not None},
+            action_mask,
+            prefix="",
+        )
+        return V3HybridModelOutput(
+            **values, action_mask=action_mask, **optional
+        )
 
     def _validate_batched(
         self,
@@ -328,6 +428,8 @@ class V3HybridModel(nn.Module):
         action_mask: torch.Tensor,
         acting_role: torch.Tensor,
         belief_features: torch.Tensor | None = None,
+        strategy_features: torch.Tensor | None = None,
+        style_features: torch.Tensor | None = None,
     ) -> BatchedV3HybridModelOutput:
         """Score a padded heterogeneous-role batch with independent adapters."""
 
@@ -342,6 +444,8 @@ class V3HybridModel(nn.Module):
             action_mask,
             acting_role,
             belief_features,
+            strategy_features,
+            style_features,
         )
         batch, actions = action_mask.shape
 
@@ -365,7 +469,26 @@ class V3HybridModel(nn.Module):
             self._check_finite(role_values, role_mask, prefix=f"{role}_")
             for name, value in role_values.items():
                 outputs[name] = outputs[name].index_copy(0, rows, value)
-        return BatchedV3HybridModelOutput(**outputs, action_mask=action_mask)
+        optional: dict[str, torch.Tensor | None] = {
+            "prior_logit": None,
+            "min_turns_after": None,
+            "regain_initiative_logit": None,
+            "teammate_finish_logit": None,
+            "spring_probability_logit": None,
+            "structure_cost": None,
+        }
+        if self.prior_head is not None:
+            optional["prior_logit"] = self.prior_head(adapted)
+        if self.strategy_aux_heads is not None:
+            optional.update(self.strategy_aux_heads(adapted))
+        self._check_finite(
+            {name: value for name, value in optional.items() if value is not None},
+            action_mask,
+            prefix="batched_",
+        )
+        return BatchedV3HybridModelOutput(
+            **outputs, action_mask=action_mask, **optional
+        )
 
     def _encode_batched_actions(
         self,
@@ -379,6 +502,8 @@ class V3HybridModel(nn.Module):
         action_mask: torch.Tensor,
         acting_role: torch.Tensor,
         belief_features: torch.Tensor | None,
+        strategy_features: torch.Tensor | None,
+        style_features: torch.Tensor | None,
     ) -> torch.Tensor:
         """Return role-adapted public action embeddings for training auxiliaries."""
 
@@ -388,8 +513,9 @@ class V3HybridModel(nn.Module):
         cards = state_card_vectors + context_card_vectors
         context = torch.cat((state_context_flat, context_flat), dim=-1)
         state = self.state_encoder(cards, context)
+        state = self._apply_style(state, style_features)
         history = self.history_encoder(history_tokens, history_key_padding_mask)
-        action_embeddings = self.action_encoder(action_features)
+        action_embeddings = self.action_encoder(action_features, strategy_features)
         shared = self.shared_fusion.forward_batched(state, history, action_embeddings)
         shared = self._apply_batched_belief(
             shared, acting_role, belief_features
@@ -455,7 +581,11 @@ class V3HybridModel(nn.Module):
         belief_features: torch.Tensor | None = None,
     ) -> V3HybridModelOutput:
         obs = self._check_public_observation(observation)
-        bundle = self._move_bundle(observation_to_model_inputs(obs))
+        bundle = self._move_bundle(observation_to_model_inputs(
+            obs,
+            self.strategy_feature_config(),
+            style_enabled=self.config.style_enabled,
+        ))
         return self(
             bundle.state_card_vectors,
             bundle.state_context_flat,
@@ -467,6 +597,8 @@ class V3HybridModel(nn.Module):
             bundle.action_mask,
             bundle.acting_role,
             belief_features,
+            bundle.strategy_features,
+            bundle.style_features,
         )
 
     def forward_observation_batch(
@@ -480,7 +612,10 @@ class V3HybridModel(nn.Module):
         if not public:
             raise ValueError("observation batch must not be empty")
         inputs = observation_batch_to_model_inputs(
-            public, pad_to_actions=pad_to_actions
+            public,
+            strategy_config=self.strategy_feature_config(),
+            style_enabled=self.config.style_enabled,
+            pad_to_actions=pad_to_actions,
         )
         return self.forward_input_batch(inputs, belief_features=belief_features)
 
@@ -512,6 +647,16 @@ class V3HybridModel(nn.Module):
             inputs.action_mask,
             inputs.acting_role,
             belief_features=belief_features,
+            strategy_features=(
+                None
+                if inputs.strategy_features is None
+                else inputs.strategy_features.to(dtype=parameter.dtype)
+            ),
+            style_features=(
+                None
+                if inputs.style_features is None
+                else inputs.style_features.to(dtype=parameter.dtype)
+            ),
         )
 
     def encode_input_batch_context(
@@ -579,6 +724,16 @@ class V3HybridModel(nn.Module):
             inputs.action_mask,
             inputs.acting_role,
             belief_features,
+            (
+                None
+                if inputs.strategy_features is None
+                else inputs.strategy_features.to(dtype=parameter.dtype)
+            ),
+            (
+                None
+                if inputs.style_features is None
+                else inputs.style_features.to(dtype=parameter.dtype)
+            ),
         )
 
     def act(self, observation: object, *, output: str = "dmc_q") -> tuple[int, ...]:
@@ -592,8 +747,65 @@ class V3HybridModel(nn.Module):
             selected = self.forward_observation(obs).argmax(output)
         return legal_actions[selected]
 
-    def forward_bidding(self, observation: object) -> None:
-        raise RuntimeError("V3 H1 is card-play only; bidding integration is not enabled")
+    def _forward_bidding_head(
+        self, features: torch.Tensor
+    ) -> dict[str, torch.Tensor | None]:
+        if self.bidding_heads is None:
+            raise RuntimeError("V3 bidding heads are disabled")
+        values = self.bidding_heads(features)
+        if self.config.nan_guard:
+            tensors = [value for value in values.values() if value is not None]
+            if not all(bool(torch.isfinite(value).all()) for value in tensors):
+                raise NumericalError("V3 bidding output contains NaN or Inf")
+        return values
+
+    def forward_bidding(self, observation: object) -> BiddingModelOutput:
+        from douzero.observation.bidding import BiddingObservationV2
+
+        if self.bidding_heads is None or self.bidding_schema is None:
+            raise RuntimeError(
+                "forward_bidding requires V3HybridModelConfig(bidding_enabled=True)"
+            )
+        if not isinstance(observation, BiddingObservationV2):
+            raise TypeError("forward_bidding requires a public BiddingObservationV2")
+        if observation.feature_schema_hash != self.bidding_schema.stable_hash():
+            raise ValueError("V3 bidding feature schema mismatch")
+        parameter = next(self.bidding_heads.parameters())
+        features = observation.to_tensor(parameter.device).to(parameter.dtype)
+        values = self._forward_bidding_head(features)
+        mask = torch.from_numpy(observation.bid_action_mask.copy()).to(
+            device=parameter.device, dtype=torch.bool
+        )
+        return BiddingModelOutput(
+            bid_logits=values["bid_logits"],
+            bid_action_mask=mask,
+            landlord_win_logit=values["landlord_win_logit"],
+            expected_landlord_score=values["expected_landlord_score"],
+            uncertainty=values["uncertainty"],
+        )
+
+    def forward_bidding_batched(
+        self, inputs: BatchedBiddingInput
+    ) -> BatchedBiddingOutput:
+        if self.bidding_heads is None or self.bidding_schema is None:
+            raise RuntimeError(
+                "forward_bidding_batched requires "
+                "V3HybridModelConfig(bidding_enabled=True)"
+            )
+        if not isinstance(inputs, BatchedBiddingInput):
+            raise TypeError("forward_bidding_batched requires BatchedBiddingInput")
+        if inputs.feature_schema_hash != self.bidding_schema.stable_hash():
+            raise ValueError("V3 batched bidding feature schema mismatch")
+        parameter = next(self.bidding_heads.parameters())
+        features = inputs.features.to(device=parameter.device, dtype=parameter.dtype)
+        values = self._forward_bidding_head(features)
+        return BatchedBiddingOutput(
+            bid_logits=values["bid_logits"],
+            bid_action_mask=inputs.legal_mask.to(parameter.device),
+            landlord_win_logit=values["landlord_win_logit"],
+            expected_landlord_score=values["expected_landlord_score"],
+            uncertainty=values["uncertainty"],
+        )
 
     def parameter_count(self) -> dict[str, int]:
         modules: list[tuple[str, nn.Module]] = [
@@ -612,6 +824,14 @@ class V3HybridModel(nn.Module):
         )
         if self.belief_projection is not None:
             modules.append(("belief_projection", self.belief_projection))
+        if self.style_encoder is not None:
+            modules.append(("style_encoder", self.style_encoder))
+        if self.prior_head is not None:
+            modules.append(("prior_head", self.prior_head))
+        if self.strategy_aux_heads is not None:
+            modules.append(("strategy_aux_heads", self.strategy_aux_heads))
+        if self.bidding_heads is not None:
+            modules.append(("bidding_heads", self.bidding_heads))
         counts = {
             name: sum(parameter.numel() for parameter in module.parameters())
             for name, module in modules

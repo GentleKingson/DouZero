@@ -83,10 +83,6 @@ class V3H5LearnerConfig:
         if not isinstance(self.cooperation, V3H5CooperationConfig):
             raise TypeError("H5 cooperation must be V3H5CooperationConfig")
         if self.cooperation.enabled:
-            if self.base.belief.enabled:
-                raise ValueError("H4 joint-belief/H5 integration is deferred to H6")
-            if self.base.base.schedule.enabled:
-                raise ValueError("H3 Oracle/H5 integration is deferred to H6")
             if self.base.base.public.lambda_dmc <= 0.0:
                 raise ValueError("enabled H5 requires ordinary public DMC updates")
             farmer_weights = self.base.base.public.role_weights
@@ -94,11 +90,19 @@ class V3H5LearnerConfig:
                 raise ValueError("enabled H5 requires positive weights for both farmers")
 
     def compatibility_dict(self) -> dict[str, object]:
-        return {
-            "identity_version": self.IDENTITY_VERSION,
+        combined = self.cooperation.enabled and (
+            self.base.belief.enabled or self.base.base.schedule.enabled
+        )
+        payload = {
+            "identity_version": 2 if combined else self.IDENTITY_VERSION,
             "base": self.base.compatibility_dict(),
             "cooperation": self.cooperation.compatibility_dict(),
         }
+        if combined:
+            payload["h6_optimizer_phase"] = (
+                "h3_public_oracle_then_h4_belief_then_h5_cooperation_v1"
+            )
+        return payload
 
     def stable_hash(self) -> str:
         return _canonical_hash(self.compatibility_dict())
@@ -352,15 +356,19 @@ class V3H5Learner:
         *,
         ruleset: RuleSet,
         config: V3H5LearnerConfig | None = None,
+        belief_model=None,
     ) -> None:
         if not isinstance(model, V3HybridModel):
             raise TypeError("H5 learner requires V3HybridModel")
         if not isinstance(ruleset, RuleSet):
             raise TypeError("H5 learner requires RuleSet")
         self.config = config or V3H5LearnerConfig()
-        if self.config.cooperation.enabled and model.config.belief_feedback != BELIEF_FEEDBACK_NONE:
-            raise ValueError("H5 policy belief feedback integration is deferred to H6")
-        self.base = V3H4Learner(model, ruleset=ruleset, config=self.config.base)
+        self.base = V3H4Learner(
+            model,
+            ruleset=ruleset,
+            config=self.config.base,
+            belief_model=belief_model,
+        )
         self.model = self.base.model
         self.ruleset = ruleset
         self.device = self.base.device
@@ -381,6 +389,7 @@ class V3H5Learner:
         self.eligible_updates = 0
         self.samples_consumed = 0
         self.statistics = H5CumulativeStats()
+        self._h6_policy_version_owner = None
         if self.config.cooperation.enabled:
             self.base.base._bind_h5_policy_version_owner(self)
         self.compatibility_identity = h5_training_identity(
@@ -396,7 +405,21 @@ class V3H5Learner:
     def policy_version(self) -> int:
         """Version every public parameter update, including the H5 sidecar step."""
 
-        return self.base.base.policy_version + self.statistics.public_updates
+        return self.base.base.policy_version + self._policy_version_offset
+
+    @property
+    def _policy_version_offset(self) -> int:
+        h6_updates = (
+            0
+            if self._h6_policy_version_owner is None
+            else self._h6_policy_version_owner.public_aux_updates
+        )
+        return self.statistics.public_updates + h6_updates
+
+    def _bind_h6_policy_version_owner(self, owner: object) -> None:
+        if owner is None or self._h6_policy_version_owner is not None:
+            raise RuntimeError("H5 H6 policy-version owner binding is invalid")
+        self._h6_policy_version_owner = owner
 
     @staticmethod
     def _gradient_norm(parameters: Sequence[torch.nn.Parameter]) -> float:
@@ -413,6 +436,7 @@ class V3H5Learner:
         *,
         trajectories: Sequence[V3H5FarmerTrajectory] | None = None,
         belief_samples: Sequence[V3H4BeliefSample] | None = None,
+        oracle_samples: Sequence["OfflineDistillationSample"] | None = None,
         privileged_mixer_state: torch.Tensor | None = None,
     ) -> V3H5StepMetrics:
         if not transitions or len(transitions) > self.config.base.base.public.batch_size:
@@ -422,7 +446,9 @@ class V3H5Learner:
             if trajectories is not None or privileged_mixer_state is not None:
                 raise ValueError("disabled H5 rejects cooperation data")
             base_metrics = self.base.train_batch(
-                transitions, belief_samples=belief_samples
+                transitions,
+                belief_samples=belief_samples,
+                oracle_samples=oracle_samples,
             )
             metrics = self._disabled_metrics(base_metrics)
             if base_metrics.samples:
@@ -430,8 +456,6 @@ class V3H5Learner:
                 self.samples_consumed += len(transitions)
                 self.statistics.update(metrics)
             return metrics
-        if belief_samples is not None:
-            raise ValueError("enabled H5 does not consume privileged belief labels")
         if trajectories is None:
             raise ValueError("enabled H5 requires complete farmer trajectories")
         pairs = validate_farmer_pairs(trajectories)
@@ -466,8 +490,13 @@ class V3H5Learner:
             kind = "disabled" if cfg.mixer_mode == MIXER_DISABLED else "public"
             raise ValueError(f"{kind} mixer rejects privileged state")
 
+        oracle_state = self.base.base.schedule_state()
         with self.base.base._h5_policy_version_scope(self):
-            base_metrics = self.base.train_batch(transitions)
+            base_metrics = self.base.train_batch(
+                transitions,
+                belief_samples=belief_samples,
+                oracle_samples=oracle_samples,
+            )
         schedule_weight = cfg.schedule_weight(self.eligible_updates)
         if schedule_weight == 0.0:
             metrics = self._scheduled_noop(base_metrics, ordered, pairs)
@@ -493,7 +522,8 @@ class V3H5Learner:
             )["dmc_q"].squeeze(-1)
             local_q[offset : offset + count] = role_values
             offset += count
-        if not cfg.update_public_model:
+        update_public_model = cfg.update_public_model and oracle_state.public_training
+        if not update_public_model:
             chosen_embedding = chosen_embedding.detach()
             local_q = local_q.detach()
 
@@ -580,11 +610,11 @@ class V3H5Learner:
         if not bool(torch.isfinite(total)):
             raise FloatingPointError("H5 cooperation loss is NaN or Inf")
         self.cooperation_optimizer.zero_grad(set_to_none=True)
-        if cfg.update_public_model:
+        if update_public_model:
             self._public_optimizer.zero_grad(set_to_none=True)
         total.backward()
         cooperation_parameters = list(self.cooperation.parameters())
-        public_parameters = list(self.model.parameters()) if cfg.update_public_model else []
+        public_parameters = list(self.model.parameters()) if update_public_model else []
         cooperation_grad = self._gradient_norm(cooperation_parameters)
         public_grad = self._gradient_norm(public_parameters)
         torch.nn.utils.clip_grad_norm_(
@@ -755,7 +785,9 @@ class V3H5Learner:
             "counters": {
                 "eligible_updates": self.eligible_updates,
                 "samples_consumed": self.samples_consumed,
-                "policy_version": self.policy_version,
+                "policy_version": (
+                    self.base.base.policy_version + self.statistics.public_updates
+                ),
             },
             "statistics": self.statistics.state_dict(),
         }

@@ -1,8 +1,8 @@
 # DouZero V3 Hybrid Design
 
-Status: H0 contract frozen; H1 public card-play model, H2 Adaptive DMC, and H3
-online privileged Oracle guiding components implemented. H4-H8 are not
-implemented. Playing strength not measured.
+Status: H0 contract frozen; H1-H5 components and the H6 single-process Hybrid
+integration contract are implemented. H7 runtime/search and H8 formal
+evaluation are not implemented. Playing strength not measured.
 
 The repository audit and PR #28/#29/#30 file dispositions live in
 [`docs/v3_hybrid_contract.md`](../v3_hybrid_contract.md). This document is the
@@ -16,13 +16,14 @@ implementation-facing module and interface contract.
 | Model V2 encoders and variable-action batching | Complete | Encoder and batching primitives reused |
 | Belief exact constrained posterior | Component complete; joint/alternating paths exist; long-run and strength evidence missing | Disabled, no parameters |
 | Offline privileged teacher/distillation | Component complete | P10 action alignment and cache identity reused by H3 |
-| Human BC, strategy, style, league, curriculum | Components integrated with V2 | Deferred to H6 |
-| Learned bidding | V2 component complete with distributed limitations | H1 fails closed |
+| Human BC, strategy, style | V2 components adapted to the H6 public model/loss graph | Single-process only |
+| League and curriculum | Components integrated with V2 | V3 runtime integration deferred to H7 and fails closed |
+| Learned bidding | Existing separate public bid space adapted in H6 | Standard rules, single-process only |
 | Async/long-running single-GPU trainer | V2 implementation exists; topology-specific gaps remain | Deferred to H7 |
 | Paired evaluation and clustered bootstrap | Complete infrastructure | Reused at H8 |
 | Public belief search | Budgeted component exists | Deferred to H7 |
 | Release package | Strict V2 package exists | H1 supplies a strict V3 public sidecar, not a formal release package |
-| Role residual V3 policy | H1 implemented | Current stage |
+| Role residual V3 policy | H1 implemented | Integrated by H6 |
 | Adaptive DMC, online Oracle, cooperation mixer | H2 Adaptive DMC, H3 Oracle, and H5 training-only sequential farmer cooperation implemented | H2, H3, H5 |
 | Formal V3 long-run and playing strength | Missing | H8 |
 
@@ -363,8 +364,9 @@ state, or on an explicit privileged training-only state for ablation. The
 privileged state is a caller-owned loss side channel: it is not replayed and is
 never passed to the public model. Mixer mode, dimensions, alignment, reward,
 padding, optimizer, schedule, and loss weights are all compatibility identity
-axes. H3 Oracle plus H5, H4 joint-belief plus H5, and public belief feedback
-plus H5 fail before graph construction; their combined topology belongs to H6.
+axes. H6 admits the previously rejected H3 Oracle/H4 belief/H5 cooperation
+combination under a conditional identity and an outer atomic rollback
+boundary; standalone H3-H5 identities remain unchanged for their old graphs.
 
 When H5 is disabled, no team head, trajectory encoder, mixer, optimizer, or
 data dependency is created and the learner delegates exactly to H4. Public H1
@@ -381,6 +383,47 @@ contract. Long-running async workers, SIGTERM manifests, bounded policy lag,
 and selective search remain H7. No formal paired evaluation or multi-seed
 wall-clock ablation has been run: playing strength not measured.
 
+### H6 Hybrid integration contract
+
+`douzero.v3_hybrid.support_matrix` is the stable machine-readable authority for
+capability, ruleset, topology, checkpoint, export, deployment, and search
+support. The dedicated `configs/v3_hybrid.yaml` is loaded only by
+`douzero.v3_hybrid.integration_config`; Legacy A1 and V2 allowlists remain
+unchanged. Validation runs before model construction, CUDA initialization,
+checkpoint I/O, replay allocation, or worker creation. H6 supports the
+single-process topology. V3 async, DDP, league, curriculum, and selective
+search fail closed and remain H7 work. Human BC is restricted to the existing
+legacy-rules validated dataset; learned bidding is restricted to the standard
+ruleset and its separate public bid action space.
+
+The H6 public graph conditionally reuses the existing V2 listwise prior,
+strategy auxiliary, style encoder, and bidding heads. Disabled flags preserve
+the H1-H5 parameter graph, config hash, serialized config, and checkpoint load
+contract. Enabled public features are serialized by the versioned H6 public
+replay format. Belief labels, Oracle samples, human labels, privileged mixer
+state, and training trajectories remain separate sidecars and cannot enter
+public replay or a public checkpoint.
+
+`V3HybridLossComposer` owns the canonical nine-term ordering. Each enabled
+term supplies an unreduced tensor, authoritative valid mask, physical role,
+and unique sample identity. It applies role weights once, divides by real
+effective weight rather than padding, records per-role counts, and advances a
+term schedule only after the owning update succeeds. H3 DMC/Oracle, H4 belief,
+and H5 cooperation remain component-owned optimizer phases and are reported as
+externally applied terms; win, conditional score, BC, strategy, and bidding
+share the H6 public auxiliary phase. A strict pre-update snapshot rolls the
+whole nested learner, optimizers, counters, schedules, and policy version back
+if a later phase fails or becomes non-finite. Checkpoints persist the nested
+H5 artifact, composer state, H6 counters, resolved-config identity,
+support-matrix hash, and the sum of H3, H5, and H6 public policy updates.
+
+The public sidecar contains only public policy and optional public belief,
+style, prior, strategy, and bidding modules. Oracle and cooperation/mixer
+parameters, optimizer state, replay, and privileged labels remain
+training-only. H6 has no formal wall-clock, multi-seed, or paired-strength
+evidence: playing strength not measured; release candidate remains NONE and
+release status NOT READY.
+
 ## Implementation order
 
 | Stage | Packages and interfaces |
@@ -390,6 +433,6 @@ wall-clock ablation has been run: playing strength not measured.
 | H3 | extend existing `douzero.distillation` alignment/cache safety into a training-only V3 Oracle service and schedules |
 | H4 | extend `douzero.belief` joint/alternating interfaces and V3 public feature injection; preserve exact DP |
 | H5 | `douzero.v3_hybrid.training.{cooperation,h5_learner}`; public action-embedding training API; sequential farmer pair alignment, sidecar checkpoint, masked losses |
-| H6 | adapters for existing BC, strategy, style, league, curriculum, and bidding contracts into one V3 trainer |
+| H6 | implemented in `support_matrix`, `integration_config`, `loss_composer`, `integration_replay`, optional public graph adapters, and `training.h6_learner`; runtime-only league/curriculum remain explicitly unsupported |
 | H7 | extend existing async/long-running runtime, policy snapshots, checkpoint manifests, and search ranker |
 | H8 | extend paired evaluation, ablation reports, release manifest/package, and rollback evidence |

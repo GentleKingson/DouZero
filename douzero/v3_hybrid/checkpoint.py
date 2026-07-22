@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -163,7 +162,7 @@ def save_v3_hybrid_public_checkpoint(
         "manifest": manifest.to_dict(),
         "state_dict": state_dict,
         "feature_schema_hash": model.schema.stable_hash(),
-        "model_config": asdict(model.config),
+        "model_config": model.config.to_dict(),
         "model_config_hash": model.config.stable_hash(),
         "compatibility_identity": identity.compatibility_dict(),
         "compatibility_hash": identity.stable_hash(),
@@ -247,7 +246,7 @@ def load_v3_hybrid_public_checkpoint(
             )
     if bundle["feature_schema_hash"] != schema.stable_hash():
         raise CheckpointCompatibilityError("V3 checkpoint feature schema mismatch")
-    if bundle["model_config"] != asdict(config):
+    if bundle["model_config"] != config.to_dict():
         raise CheckpointCompatibilityError("V3 checkpoint model config mismatch")
     if bundle["model_config_hash"] != config.stable_hash():
         raise CheckpointCompatibilityError("V3 checkpoint model config hash mismatch")

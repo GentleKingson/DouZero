@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 HISTORY_ENCODER_LSTM = "lstm"
 HISTORY_ENCODER_TRANSFORMER = "transformer"
@@ -53,8 +53,43 @@ class V3HybridModelConfig:
     dmc_target_clamp: float = 32.0
     nan_guard: bool = True
     belief_feedback: str = BELIEF_FEEDBACK_NONE
+    # H6 public auxiliaries. All defaults are graph-exact no-ops so H1-H5
+    # checkpoint identities remain byte compatible.
+    human_prior_enabled: bool = False
+    strategy_features_enabled: bool = False
+    strategy_hand_enabled: bool = True
+    strategy_structure_enabled: bool = True
+    strategy_control_enabled: bool = True
+    strategy_cooperation_enabled: bool = True
+    strategy_risk_enabled: bool = True
+    strategy_aux_enabled: bool = False
+    strategy_node_budget: int = 500
+    strategy_time_budget_ms: int = 0
+    style_enabled: bool = False
+    style_embedding_dim: int = 64
+    bidding_enabled: bool = False
+    bidding_hidden_size: int = 128
+    bidding_uncertainty_enabled: bool = False
 
     IDENTITY_VERSION = 2
+
+    _H6_FIELDS = frozenset({
+        "human_prior_enabled",
+        "strategy_features_enabled",
+        "strategy_hand_enabled",
+        "strategy_structure_enabled",
+        "strategy_control_enabled",
+        "strategy_cooperation_enabled",
+        "strategy_risk_enabled",
+        "strategy_aux_enabled",
+        "strategy_node_budget",
+        "strategy_time_budget_ms",
+        "style_enabled",
+        "style_embedding_dim",
+        "bidding_enabled",
+        "bidding_hidden_size",
+        "bidding_uncertainty_enabled",
+    })
 
     def __post_init__(self) -> None:
         for name in (
@@ -126,11 +161,73 @@ class V3HybridModelConfig:
                 raise ValueError(f"{name} must be positive, got {value!r}")
         if not isinstance(self.nan_guard, bool):
             raise TypeError("nan_guard must be bool")
+        for name in (
+            "human_prior_enabled",
+            "strategy_features_enabled",
+            "strategy_hand_enabled",
+            "strategy_structure_enabled",
+            "strategy_control_enabled",
+            "strategy_cooperation_enabled",
+            "strategy_risk_enabled",
+            "strategy_aux_enabled",
+            "style_enabled",
+            "bidding_enabled",
+            "bidding_uncertainty_enabled",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be bool")
+        for name in (
+            "strategy_node_budget",
+            "style_embedding_dim",
+            "bidding_hidden_size",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive int")
+        if (
+            isinstance(self.strategy_time_budget_ms, bool)
+            or not isinstance(self.strategy_time_budget_ms, int)
+            or self.strategy_time_budget_ms < 0
+        ):
+            raise ValueError("strategy_time_budget_ms must be a non-negative int")
+        if self.strategy_aux_enabled and not self.strategy_features_enabled:
+            raise ValueError(
+                "strategy_aux_enabled requires strategy_features_enabled=True"
+            )
+        if self.bidding_uncertainty_enabled and not self.bidding_enabled:
+            raise ValueError(
+                "bidding_uncertainty_enabled requires bidding_enabled=True"
+            )
+
+    @property
+    def h6_graph_enabled(self) -> bool:
+        """Whether any H6-only module or public-input path changes the graph."""
+
+        return any((
+            self.human_prior_enabled,
+            self.strategy_features_enabled,
+            self.strategy_aux_enabled,
+            self.style_enabled,
+            self.bidding_enabled,
+        ))
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize without drifting disabled H1-H5 checkpoint payloads."""
+
+        payload = asdict(self)
+        if not self.h6_graph_enabled:
+            for name in self._H6_FIELDS:
+                payload.pop(name)
+        return payload
 
     def compatibility_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "identity_version": self.IDENTITY_VERSION,
-            **asdict(self),
+            **{
+                name: value
+                for name, value in asdict(self).items()
+                if name not in self._H6_FIELDS
+            },
             "role_layout": {
                 "landlord": "independent_adapter_and_heads",
                 "landlord_up": "independent_adapter_and_heads",
@@ -150,6 +247,42 @@ class V3HybridModelConfig:
                 ),
             },
         }
+        if self.h6_graph_enabled:
+            strategy_version = None
+            strategy_layout_hash = None
+            if self.strategy_features_enabled:
+                from douzero.strategy.features import (
+                    STRATEGY_FEATURE_LAYOUT_HASH,
+                    STRATEGY_FEATURE_VERSION,
+                )
+
+                strategy_version = STRATEGY_FEATURE_VERSION
+                strategy_layout_hash = STRATEGY_FEATURE_LAYOUT_HASH
+            style_version = None
+            style_layout_hash = None
+            if self.style_enabled:
+                from douzero.style.features import STYLE_FEATURE_VERSION, STYLE_LAYOUT_HASH
+
+                style_version = STYLE_FEATURE_VERSION
+                style_layout_hash = STYLE_LAYOUT_HASH
+            bidding_schema_hash = None
+            if self.bidding_enabled:
+                from douzero.observation.bidding import build_bidding_schema
+
+                bidding_schema_hash = build_bidding_schema().stable_hash()
+            payload["identity_version"] = 3
+            payload["h6_public_graph"] = {
+                **{name: getattr(self, name) for name in sorted(self._H6_FIELDS)},
+                "strategy_feature_version": strategy_version,
+                "strategy_feature_layout_hash": strategy_layout_hash,
+                "style_feature_version": style_version,
+                "style_feature_layout_hash": style_layout_hash,
+                "bidding_schema_hash": bidding_schema_hash,
+                "bc_output": "independent_public_listwise_prior_v1",
+                "strategy_output": "five_public_action_auxiliary_heads_v1",
+                "bidding_output": "separate_public_standard_bid_space_v1",
+            }
+        return payload
 
     def stable_hash(self) -> str:
         payload = json.dumps(
@@ -164,11 +297,18 @@ class V3HybridModelConfig:
     def from_dict(cls, payload: dict[str, object]) -> "V3HybridModelConfig":
         if not isinstance(payload, dict):
             raise TypeError("V3 Hybrid model config must be a dict")
-        expected = set(cls.__dataclass_fields__)
+        expected = {item.name for item in fields(cls)}
         unknown = set(payload) - expected
         if unknown:
             raise ValueError(f"unknown V3 Hybrid model config keys: {sorted(unknown)}")
-        missing = expected - set(payload)
+        legacy_required = expected - cls._H6_FIELDS
+        missing = legacy_required - set(payload)
         if missing:
             raise ValueError(f"missing V3 Hybrid model config keys: {sorted(missing)}")
+        h6_present = set(payload) & cls._H6_FIELDS
+        if h6_present and h6_present != cls._H6_FIELDS:
+            raise ValueError(
+                "partial H6 V3 model config is forbidden: missing="
+                f"{sorted(cls._H6_FIELDS - h6_present)}"
+            )
         return cls(**payload)
