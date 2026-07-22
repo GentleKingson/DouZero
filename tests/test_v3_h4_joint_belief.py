@@ -244,6 +244,13 @@ def test_h6_unlocks_oracle_belief_identity_but_invalid_phases_still_fail():
     combined = V3H4LearnerConfig(base=oracle, belief=_belief_config())
     assert combined.compatibility_dict()["identity_version"] == 4
     assert "h6_optimizer_phase" in combined.compatibility_dict()
+    with pytest.raises(ValueError, match="atomic H6 learner"):
+        V3H4Learner(
+            _model(),
+            ruleset=RuleSet.legacy(),
+            config=combined,
+            belief_model=BeliefModel(BeliefConfig(hidden_size=16, num_layers=1)),
+        )
     no_public_policy = dataclasses.replace(
         _base(), public=dataclasses.replace(_base().public, lambda_dmc=0.0)
     )

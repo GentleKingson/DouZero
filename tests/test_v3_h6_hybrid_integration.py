@@ -541,6 +541,22 @@ def test_pure_bc_batch_updates_without_an_empty_cardplay_optimizer_step():
     assert metrics.losses["bc"]["valid_samples"] == 1
     assert metrics.losses["dmc"]["phase"] == "disabled"
 
+    before = _state(learner.model)
+    zero_weight = dataclasses.replace(
+        sample,
+        game_id="h6-zero-weight-bc",
+        sample_weight=0.0,
+    )
+    zero_metrics = learner.train_batch([], bc_samples=[zero_weight])
+    assert not zero_metrics.public_aux_updated
+    assert zero_metrics.policy_version == 1
+    assert zero_metrics.losses["bc"]["phase"] == "no_valid_targets"
+    assert learner.composer.eligible_steps["bc"] == 1
+    assert all(
+        torch.equal(before[name], value)
+        for name, value in learner.model.state_dict().items()
+    )
+
 
 def test_belief_feedback_and_bc_use_public_posterior_features_together():
     observation = _observation()

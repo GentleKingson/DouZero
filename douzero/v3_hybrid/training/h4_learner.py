@@ -429,6 +429,7 @@ class V3H4Learner:
         ruleset: RuleSet,
         config: V3H4LearnerConfig | None = None,
         belief_model: BeliefModel | None = None,
+        _allow_h6_combination: bool = False,
     ) -> None:
         if not isinstance(model, V3HybridModel):
             raise TypeError("H4 learner requires V3HybridModel")
@@ -436,6 +437,16 @@ class V3H4Learner:
             raise TypeError("H4 learner requires RuleSet")
         self.config = config or V3H4LearnerConfig()
         cfg = self.config.belief
+        if not isinstance(_allow_h6_combination, bool):
+            raise TypeError("H4 H6-combination gate must be bool")
+        if (
+            cfg.enabled
+            and self.config.base.schedule.enabled
+            and not _allow_h6_combination
+        ):
+            raise ValueError(
+                "combined H3 Oracle and H4 belief require the atomic H6 learner"
+            )
         if not cfg.enabled:
             if belief_model is not None:
                 raise ValueError("disabled H4 must not construct a belief model")

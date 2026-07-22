@@ -208,6 +208,7 @@ class V3H6Learner:
             ruleset=ruleset,
             config=config.learner.base,
             belief_model=belief_model,
+            _allow_h6_combination=True,
         )
         self.model = self.base.model
         self.ruleset = ruleset
@@ -553,7 +554,11 @@ class V3H6Learner:
         values = torch.stack(terms)
         return LossTermTensor(
             values,
-            torch.ones(len(terms), device=values.device, dtype=torch.bool),
+            torch.tensor(
+                [sample.sample_weight > 0.0 for sample in samples],
+                device=values.device,
+                dtype=torch.bool,
+            ),
             tuple(roles),
             tuple(ids),
         )

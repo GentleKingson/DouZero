@@ -32,7 +32,10 @@ from douzero.v3_hybrid import (
 )
 from douzero.v3_hybrid.replay import AdaptiveSnapshotProvenance
 from douzero.v3_hybrid.training.belief_config import V3H4BeliefTrainingConfig
-from douzero.v3_hybrid.training.belief_config import BELIEF_MODE_AUXILIARY
+from douzero.v3_hybrid.training.belief_config import (
+    BELIEF_MODE_ALTERNATING,
+    BELIEF_MODE_AUXILIARY,
+)
 from douzero.v3_hybrid.training.cooperation import (
     FARMER_ROLES,
     H5_PUBLIC_FEATURE_DIM,
@@ -452,6 +455,55 @@ def test_h6_belief_feedback_and_cooperation_train_and_resume(tmp_path):
     restored.load_checkpoint(checkpoint)
     assert restored.eligible_updates == learner.eligible_updates == 1
     assert restored.policy_version == learner.policy_version
+
+
+def test_alternating_belief_only_phase_skips_cooperation_and_public_updates():
+    rows, trajectories, belief_samples, _oracle_samples = (
+        _pair_with_training_sidecars()
+    )
+    config = V3H5LearnerConfig(
+        base=dataclasses.replace(
+            _base(),
+            belief=V3H4BeliefTrainingConfig(
+                enabled=True,
+                mode=BELIEF_MODE_ALTERNATING,
+                lambda_belief=0.5,
+                learning_rate=1e-3,
+                policy_updates_per_cycle=1,
+                belief_updates_per_cycle=1,
+            ),
+        ),
+        cooperation=_coop(),
+    )
+    learner = V3H5Learner(
+        _model(belief_feedback=BELIEF_FEEDBACK_FARMERS),
+        ruleset=RuleSet.legacy(),
+        config=config,
+        belief_model=BeliefModel(BeliefConfig(hidden_size=16, num_layers=1)),
+    )
+    first = learner.train_batch(
+        rows,
+        trajectories=trajectories,
+        belief_samples=belief_samples,
+    )
+    assert first.cooperation_updated
+    cooperation_before = _state(learner.cooperation)
+    public_before = _state(learner.model)
+    policy_version = learner.policy_version
+
+    second = learner.train_batch(
+        rows,
+        trajectories=trajectories,
+        belief_samples=belief_samples,
+    )
+    assert second.base.phase == "belief"
+    assert second.base.belief_updated
+    assert not second.cooperation_updated
+    assert not second.public_updated
+    assert second.schedule_weight == 0.0
+    assert learner.policy_version == policy_version
+    assert not _changed(cooperation_before, learner.cooperation)
+    assert not _changed(public_before, learner.model)
 
 
 def test_h6_oracle_warmup_cooperation_checkpoint_accepts_distinct_counters(

@@ -33,6 +33,11 @@ from .cooperation import (
     V3H5FarmerTrajectory,
     validate_farmer_pairs,
 )
+from .belief_config import (
+    BELIEF_PHASE_AUXILIARY,
+    BELIEF_PHASE_DISABLED,
+    BELIEF_PHASE_POLICY,
+)
 from .h4_learner import (
     V3H4BeliefSample,
     V3H4Learner,
@@ -357,6 +362,7 @@ class V3H5Learner:
         ruleset: RuleSet,
         config: V3H5LearnerConfig | None = None,
         belief_model=None,
+        _allow_h6_combination: bool = False,
     ) -> None:
         if not isinstance(model, V3HybridModel):
             raise TypeError("H5 learner requires V3HybridModel")
@@ -368,6 +374,7 @@ class V3H5Learner:
             ruleset=ruleset,
             config=self.config.base,
             belief_model=belief_model,
+            _allow_h6_combination=_allow_h6_combination,
         )
         self.model = self.base.model
         self.ruleset = ruleset
@@ -497,6 +504,16 @@ class V3H5Learner:
                 belief_samples=belief_samples,
                 oracle_samples=oracle_samples,
             )
+        if base_metrics.phase not in {
+            BELIEF_PHASE_DISABLED,
+            BELIEF_PHASE_AUXILIARY,
+            BELIEF_PHASE_POLICY,
+        }:
+            metrics = self._scheduled_noop(base_metrics, ordered, pairs)
+            self.eligible_updates += 1
+            self.samples_consumed += len(transitions)
+            self.statistics.update(metrics)
+            return metrics
         schedule_weight = cfg.schedule_weight(self.eligible_updates)
         if schedule_weight == 0.0:
             metrics = self._scheduled_noop(base_metrics, ordered, pairs)
