@@ -544,20 +544,56 @@ class V3H4Learner:
         transitions: Sequence[V3ReplayTransition],
         samples: Sequence[V3H4BeliefSample],
     ) -> tuple[torch.Tensor, float]:
+        return self._policy_features_from_public_inputs(
+            [sample.public_inputs for sample in samples],
+            [sample.belief_input for sample in samples],
+        )
+
+    def policy_features_from_public_observations(
+        self,
+        observations: Sequence[ObservationV2],
+    ) -> tuple[torch.Tensor, float]:
+        """Build detached, conservation-safe policy features from public data."""
+        checked = [self.model._check_public_observation(obs) for obs in observations]
+        return self._policy_features_from_public_inputs(
+            [
+                observation_to_model_inputs(
+                    obs,
+                    self.model.strategy_feature_config(),
+                    style_enabled=self.model.config.style_enabled,
+                )
+                for obs in checked
+            ],
+            [build_belief_input(obs.public) for obs in checked],
+        )
+
+    def _policy_features_from_public_inputs(
+        self,
+        public_inputs: Sequence[ModelInputBundle],
+        belief_inputs: Sequence[BeliefInput],
+    ) -> tuple[torch.Tensor, float]:
         assert self.belief_model is not None
         training = self.belief_model.training
         self.belief_model.eval()
         try:
             with torch.no_grad():
-                output, latency_ms = self._belief_forward(
-                    transitions, samples, shared_gradient=False
+                shared_context = None
+                if self.belief_model.config.shared_context_dim:
+                    batch = model_input_bundles_to_batch(
+                        public_inputs,
+                        [0] * len(public_inputs),
+                    )
+                    shared_context = self.model.encode_input_batch_context(batch).detach()
+                started = time.perf_counter()
+                output = self.belief_model(
+                    belief_inputs,
+                    shared_context=shared_context,
                 )
+                latency_ms = (time.perf_counter() - started) * 1000.0
                 features = belief_features_from_probs(
                     output.constrained_probs,
                     output.opponent_a_total,
-                    np.stack([
-                        sample.belief_input.unseen_counts for sample in samples
-                    ]),
+                    np.stack([item.unseen_counts for item in belief_inputs]),
                 )
         finally:
             self.belief_model.train(training)

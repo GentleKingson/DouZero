@@ -479,20 +479,25 @@ class V3H6Learner:
         role_weight = component_values["min_turns"].new_tensor([
             self.config.learner.losses.role_weights[role] for role in roles
         ])
-        total_denominator = role_weight.sum()
         values = torch.zeros_like(component_values["min_turns"])
         valid_samples = torch.zeros_like(masks["min_turns"])
+        active: list[tuple[float, torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for name, component in component_values.items():
             valid = masks[name]
             denominator = (role_weight * valid.to(role_weight.dtype)).sum()
             if component_weights[name] == 0.0 or not bool(denominator > 0):
                 continue
             valid_samples = valid_samples | valid
+            active.append((component_weights[name], component, valid, denominator))
+        valid_denominator = (
+            role_weight * valid_samples.to(role_weight.dtype)
+        ).sum()
+        for weight, component, valid, denominator in active:
             values = values + (
-                component_weights[name]
+                weight
                 * component
                 * valid.to(component.dtype)
-                * total_denominator
+                * valid_denominator
                 / denominator
             )
         return LossTermTensor(
@@ -511,14 +516,27 @@ class V3H6Learner:
                 (),
                 (),
             )
+        for sample in samples:
+            if not isinstance(sample, BCSample):
+                raise TypeError("H6 BC input must reuse BCSample")
+            sample.validate()
+        belief_features = None
+        if self.model.config.belief_feedback != BELIEF_FEEDBACK_NONE:
+            belief_features, _latency = (
+                self.base.base.policy_features_from_public_observations(
+                    [sample.obs for sample in samples]
+                )
+            )
         terms = []
         roles = []
         ids = []
         for index, sample in enumerate(samples):
-            if not isinstance(sample, BCSample):
-                raise TypeError("H6 BC input must reuse BCSample")
-            sample.validate()
-            output = self.model.forward_observation(sample.obs)
+            output = self.model.forward_observation(
+                sample.obs,
+                belief_features=(
+                    None if belief_features is None else belief_features[index]
+                ),
+            )
             if output.prior_logit is None:
                 raise RuntimeError("H6 BC prior head is absent")
             loss, _correct = listwise_bc_loss(
@@ -610,12 +628,23 @@ class V3H6Learner:
         role_weights = logits.new_tensor([
             self.config.learner.losses.role_weights[role] for role in roles
         ])
-        total_weight = role_weights.sum()
         policy_weight = (role_weights * credit.to(role_weights.dtype)).sum()
-        values = (
-            aux.bidding_lambda_landlord_win * win
-            + aux.bidding_lambda_landlord_score * score
-        )
+        valid_samples = torch.zeros(count, device=logits.device, dtype=torch.bool)
+        if (
+            aux.bidding_lambda_landlord_win > 0.0
+            or aux.bidding_lambda_landlord_score > 0.0
+        ):
+            valid_samples[:] = True
+        if aux.bidding_lambda_policy > 0.0:
+            valid_samples = valid_samples | credit
+        valid_weight = (
+            role_weights * valid_samples.to(role_weights.dtype)
+        ).sum()
+        values = torch.zeros_like(win)
+        if aux.bidding_lambda_landlord_win > 0.0:
+            values = values + aux.bidding_lambda_landlord_win * win
+        if aux.bidding_lambda_landlord_score > 0.0:
+            values = values + aux.bidding_lambda_landlord_score * score
         if aux.bidding_lambda_policy > 0.0 and bool(policy_weight > 0):
             # The composer applies role weights once. This rescaling only
             # gives the masked policy component its own valid denominator.
@@ -623,7 +652,7 @@ class V3H6Learner:
                 aux.bidding_lambda_policy
                 * policy
                 * credit.to(policy.dtype)
-                * total_weight
+                * valid_weight
                 / policy_weight
             )
         ids = tuple(
@@ -633,7 +662,7 @@ class V3H6Learner:
         )
         return LossTermTensor(
             values,
-            torch.ones(count, device=values.device, dtype=torch.bool),
+            valid_samples,
             roles,
             ids,
         )
@@ -656,6 +685,7 @@ class V3H6Learner:
             "samples_consumed": self.samples_consumed,
             "public_aux_updates": self.public_aux_updates,
             "statistics": copy.deepcopy(self.statistics.state_dict()),
+            "model_training": self.model.training,
         }
         return path, state
 
@@ -669,7 +699,7 @@ class V3H6Learner:
         self.base._h6_policy_version_owner = self
         for parameter in self.model.parameters():
             parameter.grad = None
-        self.model.train()
+        self.model.train(bool(state["model_training"]))
 
     def train_batch(
         self,
@@ -864,23 +894,31 @@ class V3H6Learner:
         composer = V3HybridLossComposer(self.config.learner.losses)
         composer.load_state_dict(bundle["loss_composer"])
         inner = bundle["h5_checkpoint"]
-        with tempfile.TemporaryDirectory(prefix="douzero-h6-load-") as temporary:
-            inner_path = Path(temporary) / "h5.pt"
-            torch.save(inner, inner_path)
-            self.base.load_checkpoint(inner_path)
-        expected_policy = (
-            self.base.base.base.policy_version
-            + self.base.statistics.public_updates
-            + counters["public_aux_updates"]
-        )
-        if expected_policy != counters["policy_version"]:
-            raise CheckpointCompatibilityError("H6 checkpoint policy version mismatch")
-        self.composer = composer
-        self.eligible_updates = counters["eligible_updates"]
-        self.samples_consumed = counters["samples_consumed"]
-        self.public_aux_updates = counters["public_aux_updates"]
-        self.statistics = statistics
-        self.base._h6_policy_version_owner = self
+        with tempfile.TemporaryDirectory(prefix="douzero-h6-load-rollback-") as rollback:
+            snapshot, state = self._rollback_snapshot(Path(rollback))
+            try:
+                with tempfile.TemporaryDirectory(prefix="douzero-h6-load-") as temporary:
+                    inner_path = Path(temporary) / "h5.pt"
+                    torch.save(inner, inner_path)
+                    self.base.load_checkpoint(inner_path)
+                expected_policy = (
+                    self.base.base.base.policy_version
+                    + self.base.statistics.public_updates
+                    + counters["public_aux_updates"]
+                )
+                if expected_policy != counters["policy_version"]:
+                    raise CheckpointCompatibilityError(
+                        "H6 checkpoint policy version mismatch"
+                    )
+                self.composer = composer
+                self.eligible_updates = counters["eligible_updates"]
+                self.samples_consumed = counters["samples_consumed"]
+                self.public_aux_updates = counters["public_aux_updates"]
+                self.statistics = statistics
+                self.base._h6_policy_version_owner = self
+            except Exception:
+                self._restore_rollback(snapshot, state)
+                raise
 
 
 __all__ = [
