@@ -89,6 +89,29 @@ def _nonnegative(name: str, value: float) -> None:
         raise ValueError(f"{name} must be finite and non-negative")
 
 
+def _validate_module_state(
+    payload: Mapping[object, object],
+    module: torch.nn.Module,
+    *,
+    label: str,
+) -> None:
+    expected = module.state_dict()
+    if not isinstance(payload, Mapping) or set(payload) != set(expected):
+        raise CheckpointCompatibilityError(f"H3 {label} state keys mismatch")
+    for name, reference in expected.items():
+        value = payload[name]
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.shape != reference.shape
+            or value.dtype != reference.dtype
+            or value.layout != reference.layout
+            or not bool(torch.isfinite(value).all())
+        ):
+            raise CheckpointCompatibilityError(
+                f"H3 {label} parameter {name} is incompatible or non-finite"
+            )
+
+
 def _select_real_actions(
     output: BatchedV3HybridModelOutput, index: int, action_count: int
 ) -> V3HybridModelOutput:
@@ -893,8 +916,7 @@ class V3H3Learner:
         except (TypeError, ValueError) as exc:
             raise CheckpointCompatibilityError(f"H3 checkpoint state mismatch: {exc}") from exc
         student_state = bundle["student_state_dict"]
-        if not isinstance(student_state, dict) or set(student_state) != set(self.model.state_dict()):
-            raise CheckpointCompatibilityError("H3 student state keys mismatch")
+        _validate_module_state(student_state, self.model, label="student")
         if any(
             token in name.lower()
             for name in student_state
@@ -906,12 +928,12 @@ class V3H3Learner:
         if self.oracle is None:
             if oracle_state is not None or oracle_optimizer_state is not None:
                 raise CheckpointCompatibilityError("disabled H3 checkpoint contains Oracle state")
-        elif (
-            not isinstance(oracle_state, dict)
-            or set(oracle_state) != set(self.oracle.state_dict())
-            or not isinstance(oracle_optimizer_state, dict)
-        ):
-            raise CheckpointCompatibilityError("enabled H3 checkpoint Oracle state mismatch")
+        else:
+            _validate_module_state(oracle_state, self.oracle, label="Oracle")
+            if not isinstance(oracle_optimizer_state, dict):
+                raise CheckpointCompatibilityError(
+                    "enabled H3 checkpoint Oracle optimizer state mismatch"
+                )
         student_optimizer_state = bundle["student_optimizer_state_dict"]
         if not isinstance(student_optimizer_state, dict) or set(student_optimizer_state) != {
             "state", "param_groups"

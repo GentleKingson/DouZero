@@ -671,6 +671,29 @@ def test_checkpoint_identity_drift_and_public_package_exclusion(tmp_path):
             _learner(mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0).load_checkpoint(
                 corrupted_path
             )
+    student_state = checkpoint["h4_checkpoint"]["h3_checkpoint"][
+        "student_state_dict"
+    ]
+    student_name = next(iter(student_state))
+    student_value = student_state[student_name]
+    invalid_student_values = {
+        "nonfinite": torch.full_like(student_value, float("inf")),
+        "shape": student_value.reshape(-1)[:-1],
+        "dtype": student_value.to(torch.float64),
+    }
+    for suffix, invalid in invalid_student_values.items():
+        corrupted = copy.deepcopy(checkpoint)
+        corrupted["h4_checkpoint"]["h3_checkpoint"]["student_state_dict"][
+            student_name
+        ] = invalid
+        corrupted_path = tmp_path / f"training-student-{suffix}.pt"
+        torch.save(corrupted, corrupted_path)
+        with pytest.raises(
+            CheckpointCompatibilityError, match="incompatible or non-finite"
+        ):
+            _learner(mixer_mode=MIXER_PUBLIC, lambda_mixer=1.0).load_checkpoint(
+                corrupted_path
+            )
     drifted = _learner(
         mixer_mode=MIXER_PUBLIC,
         lambda_mixer=1.0,
