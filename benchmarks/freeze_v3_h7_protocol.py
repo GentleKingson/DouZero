@@ -9,13 +9,13 @@ from pathlib import Path
 
 from douzero._version import git_sha
 from douzero.v3_hybrid.benchmark import V3H7BenchmarkProtocol
+from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
 from douzero.v3_hybrid.runtime import (
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
     V3_H7_RUNTIME_VERSION,
 )
-from train_v3_h7 import _smoke_config
 
 
 def _hash(payload: object) -> str:
@@ -37,7 +37,7 @@ def main() -> None:
     parser.add_argument("--warmup-seconds", type=float, default=30.0)
     parser.add_argument("--measurement-seconds", type=float, default=300.0)
     args = parser.parse_args()
-    resolved = _smoke_config()
+    resolved = build_v3_h7_smoke_config()
     protocol = V3H7BenchmarkProtocol(
         source_git_sha=git_sha(),
         image_digest=args.image_digest,

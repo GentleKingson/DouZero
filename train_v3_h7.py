@@ -16,21 +16,9 @@ from douzero.training.long_running import (
     LongRunningState,
     LongRunningTrainer,
 )
-from douzero.v3_hybrid import (
-    ADMC_SAFE_HYBRID,
-    AdaptiveDMCConfig,
-    V3H2LearnerConfig,
-    V3HybridLossComposerConfig,
-    V3HybridModel,
-    V3HybridModelConfig,
-)
-from douzero.v3_hybrid.integration_config import (
-    V3H6FeatureFlags,
-    V3H6LearnerConfig,
-    V3H6ResolvedConfig,
-    V3H6TopologyConfig,
-    load_v3_hybrid_config,
-)
+from douzero.v3_hybrid import V3HybridModel
+from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
+from douzero.v3_hybrid.integration_config import load_v3_hybrid_config
 from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
@@ -41,38 +29,7 @@ from douzero.v3_hybrid.support_matrix import (
     TOPOLOGY_ASYNC_SINGLE_GPU,
     TOPOLOGY_SINGLE_PROCESS,
 )
-from douzero.v3_hybrid.training.h3_learner import V3H3LearnerConfig
-from douzero.v3_hybrid.training.h4_learner import V3H4LearnerConfig
-from douzero.v3_hybrid.training.h5_learner import V3H5LearnerConfig
 from douzero.v3_hybrid.training.h6_learner import V3H6Learner
-
-
-def _smoke_config() -> V3H6ResolvedConfig:
-    model = V3HybridModelConfig(
-        hidden_size=16,
-        history_layers=1,
-        history_heads=4,
-        shared_fusion_layers=1,
-        landlord_adapter_layers=1,
-        farmer_adapter_layers=1,
-    )
-    public = V3H2LearnerConfig(
-        batch_size=32,
-        learning_rate=1e-3,
-        max_grad_norm=10.0,
-        device="cuda",
-        adaptive_dmc=AdaptiveDMCConfig(mode=ADMC_SAFE_HYBRID),
-    )
-    base = V3H5LearnerConfig(
-        base=V3H4LearnerConfig(base=V3H3LearnerConfig(public=public))
-    )
-    learner = V3H6LearnerConfig(
-        base=base,
-        losses=V3HybridLossComposerConfig(lambda_dmc=1.0),
-        features=V3H6FeatureFlags(adaptive_dmc=True),
-        topology=V3H6TopologyConfig(ruleset="legacy"),
-    )
-    return V3H6ResolvedConfig(model=model, learner=learner)
 
 
 def _resolve_checkpoint(path: str) -> Path:
@@ -124,7 +81,11 @@ def main() -> None:
     args = _parser().parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("H7 async runtime requires CUDA")
-    resolved = _smoke_config() if args.smoke_config else load_v3_hybrid_config(args.config)
+    resolved = (
+        build_v3_h7_smoke_config()
+        if args.smoke_config
+        else load_v3_hybrid_config(args.config)
+    )
     runtime_config = V3H7RuntimeConfig(
         topology=args.topology,
         num_actors=args.num_actors,

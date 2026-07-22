@@ -19,6 +19,7 @@ from douzero.v3_hybrid.benchmark import (
     H7_BENCHMARK_SCHEMA,
     V3H7BenchmarkProtocol,
 )
+from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
 from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
@@ -29,7 +30,6 @@ from douzero.v3_hybrid.support_matrix import (
     TOPOLOGY_SINGLE_PROCESS,
 )
 from douzero.v3_hybrid.training.h6_learner import V3H6Learner
-from train_v3_h7 import _smoke_config
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -96,7 +96,7 @@ def main() -> None:
     args = _parser().parse_args()
     protocol = _load_protocol(args.protocol)
     seed = protocol.seeds[args.repeat]
-    resolved = _smoke_config()
+    resolved = build_v3_h7_smoke_config()
     if resolved.stable_hash() != protocol.config_hash:
         raise ValueError("H7 benchmark config hash mismatch")
     if resolved.model.stable_hash() != protocol.model_identity_hash:
