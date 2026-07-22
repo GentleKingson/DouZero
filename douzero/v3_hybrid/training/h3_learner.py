@@ -378,13 +378,18 @@ def _same_public_bundle(left: ModelInputBundle, right: ModelInputBundle) -> bool
         "state_context_flat", "context_flat", "history_tokens",
         "history_key_padding_mask", "action_features", "action_mask",
     )
+    def optional_tensor_equal(name: str) -> bool:
+        left_value = getattr(left, name)
+        right_value = getattr(right, name)
+        if left_value is None or right_value is None:
+            return left_value is None and right_value is None
+        return torch.equal(left_value, right_value)
+
     return (
         left.acting_role == right.acting_role
         and left.feature_schema_hash == right.feature_schema_hash
-        and left.strategy_features is None
-        and right.strategy_features is None
-        and left.style_features is None
-        and right.style_features is None
+        and optional_tensor_equal("strategy_features")
+        and optional_tensor_equal("style_features")
         and len(left.state_card_vectors) == len(right.state_card_vectors)
         and len(left.context_card_vectors) == len(right.context_card_vectors)
         and all(torch.equal(a, b) for a, b in zip(left.state_card_vectors, right.state_card_vectors))

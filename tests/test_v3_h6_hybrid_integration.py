@@ -45,6 +45,7 @@ from douzero.v3_hybrid.integration_config import (
     load_v3_hybrid_config,
 )
 from douzero.v3_hybrid.training.h3_learner import V3H3LearnerConfig
+from douzero.v3_hybrid.training.h3_learner import _same_public_bundle
 from douzero.v3_hybrid.training.h4_learner import V3H4LearnerConfig
 from douzero.v3_hybrid.training.h5_learner import V3H5LearnerConfig
 from douzero.v3_hybrid.training.h6_learner import V3H6Learner
@@ -332,6 +333,42 @@ def test_h6_public_replay_round_trip_and_privileged_negative_guard():
     assert len(restored) == 1
     with pytest.raises(ValueError, match="privileged"):
         assert_public_replay_payload({**payload, "all_handcards": {}})
+
+
+def test_h6_sidecar_alignment_compares_optional_public_feature_tensors():
+    config = _model_config(
+        strategy_features_enabled=True,
+        style_enabled=True,
+    )
+    model = V3HybridModel(build_v2_schema(), config)
+    observation = _observation()
+    pending = capture_plain_transition(
+        observation,
+        selected_action_index=0,
+        episode_id="episode-sidecar",
+        deal_id="deal-sidecar",
+        target_transform="raw",
+        strategy_config=model.strategy_feature_config(),
+        style_enabled=True,
+    )
+    bundle = pending.model_inputs
+    aligned = dataclasses.replace(
+        bundle,
+        strategy_features=bundle.strategy_features.clone(),
+        style_features=bundle.style_features.clone(),
+    )
+    assert _same_public_bundle(bundle, aligned)
+
+    changed_strategy = bundle.strategy_features.clone()
+    changed_strategy[0, 0] += 1.0
+    assert not _same_public_bundle(
+        bundle,
+        dataclasses.replace(aligned, strategy_features=changed_strategy),
+    )
+    assert not _same_public_bundle(
+        bundle,
+        dataclasses.replace(aligned, style_features=None),
+    )
 
 
 def test_h6_train_checkpoint_resume_and_failed_batch_are_atomic(tmp_path):
