@@ -464,7 +464,10 @@ class V3H5Learner:
             kind = "disabled" if cfg.mixer_mode == MIXER_DISABLED else "public"
             raise ValueError(f"{kind} mixer rejects privileged state")
 
-        base_metrics = self.base.train_batch(transitions)
+        base_metrics = self.base.train_batch(
+            transitions,
+            external_policy_version_offset=self.statistics.public_updates,
+        )
         schedule_weight = cfg.schedule_weight(self.eligible_updates)
         if schedule_weight == 0.0:
             metrics = self._scheduled_noop(base_metrics, ordered, pairs)

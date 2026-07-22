@@ -18,6 +18,7 @@ from douzero.env.rules import RuleSet
 from douzero.models_v2 import ModelV2Config
 from douzero.observation import build_v2_schema, get_obs_v2
 from douzero.v3_hybrid import (
+    ADMC_SAFE_HYBRID,
     AdaptiveDMCConfig,
     BELIEF_FEEDBACK_FARMERS,
     V3H2LearnerConfig,
@@ -27,6 +28,7 @@ from douzero.v3_hybrid import (
     load_v3_hybrid_public_checkpoint,
     save_v3_hybrid_public_checkpoint,
 )
+from douzero.v3_hybrid.replay import AdaptiveSnapshotProvenance
 from douzero.v3_hybrid.training.belief_config import V3H4BeliefTrainingConfig
 from douzero.v3_hybrid.training.belief_config import BELIEF_MODE_AUXILIARY
 from douzero.v3_hybrid.training.cooperation import (
@@ -169,6 +171,37 @@ def _pair(
         trajectories.append(trajectory)
         all_rows.extend(rows)
     return tuple(all_rows), tuple(trajectories)
+
+
+def _stamp_policy_version(rows, trajectories, version: int):
+    replacements = {}
+    stamped_rows = []
+    for index, row in enumerate(rows):
+        stamped = dataclasses.replace(
+            row,
+            adaptive_provenance=AdaptiveSnapshotProvenance(
+                q_old=0.1,
+                policy_version=version,
+                snapshot_slot=index,
+                owner_id=1,
+                generation=version,
+            ),
+        )
+        replacements[id(row)] = stamped
+        stamped_rows.append(stamped)
+    stamped_trajectories = tuple(
+        dataclasses.replace(
+            trajectory,
+            decisions=tuple(
+                dataclasses.replace(
+                    decision, transition=replacements[id(decision.transition)]
+                )
+                for decision in trajectory.decisions
+            ),
+        )
+        for trajectory in trajectories
+    )
+    return tuple(stamped_rows), stamped_trajectories
 
 
 def _base(*, batch_size: int = 8, device: str = "cpu") -> V3H4LearnerConfig:
@@ -431,6 +464,34 @@ def test_team_value_only_updates_sidecar_and_farmer_public_paths():
     # Team-value heads are a training sidecar; the public local-Q heads stay
     # independent and are changed only by the ordinary DMC base loss.
     assert learner.cooperation.team_value_heads["landlord_up"] is not learner.model.role_heads["landlord_up"].dmc_head
+
+
+def test_adaptive_replay_accepts_the_aggregate_h5_policy_version():
+    public = dataclasses.replace(
+        _base().base.public,
+        adaptive_dmc=AdaptiveDMCConfig(mode=ADMC_SAFE_HYBRID),
+    )
+    learner = V3H5Learner(
+        _model(),
+        ruleset=RuleSet.legacy(),
+        config=V3H5LearnerConfig(
+            base=V3H4LearnerConfig(
+                base=dataclasses.replace(_base().base, public=public)
+            ),
+            cooperation=_coop(),
+        ),
+    )
+    rows, trajectories = _pair()
+    rows, trajectories = _stamp_policy_version(rows, trajectories, 0)
+    first = learner.train_batch(rows, trajectories=trajectories)
+    assert first.policy_version == learner.policy_version == 2
+
+    rows, trajectories = _pair(episode_id="episode-2", deal_id="deal-2")
+    rows, trajectories = _stamp_policy_version(rows, trajectories, 2)
+    second = learner.train_batch(rows, trajectories=trajectories)
+    assert learner.base.base.policy_version == 2
+    assert second.base.base.policy_version == 3
+    assert second.policy_version == learner.policy_version == 4
 
 
 def test_mixer_training_uses_unequal_local_q_and_public_or_privileged_state():

@@ -477,6 +477,7 @@ class V3H3Learner:
         transitions: Sequence[V3ReplayTransition],
         oracle_samples: Sequence["OfflineDistillationSample"] | None,
         state: OracleScheduleState,
+        effective_policy_version: int,
     ) -> tuple[list[float], Sequence["OfflineDistillationSample"] | None]:
         if not transitions or len(transitions) > self.config.public.batch_size:
             raise ValueError("H3 requires a non-empty batch within configured batch_size")
@@ -501,7 +502,7 @@ class V3H3Learner:
             )
             if adaptive_consumed:
                 version = transition.adaptive_provenance.policy_version
-                if version > self.policy_version:
+                if version > effective_policy_version:
                     raise ValueError("H3 replay policy version is newer than learner")
         if self._privileged_needed(state):
             from douzero.distillation.dataset import OfflineDistillationSample
@@ -527,14 +528,26 @@ class V3H3Learner:
         *,
         oracle_samples: Sequence["OfflineDistillationSample"] | None = None,
         belief_features: torch.Tensor | None = None,
+        external_policy_version_offset: int = 0,
     ) -> V3H3StepMetrics:
+        if (
+            isinstance(external_policy_version_offset, bool)
+            or not isinstance(external_policy_version_offset, int)
+            or external_policy_version_offset < 0
+        ):
+            raise ValueError("external policy version offset must be non-negative")
+        effective_policy_version = (
+            self.policy_version + external_policy_version_offset
+        )
         state = self.schedule_state()
         if state.phase == ORACLE_PHASE_COMPLETE:
             raise RuntimeError("H3 training schedule is complete")
-        role_weights, samples = self._validate_batch(transitions, oracle_samples, state)
+        role_weights, samples = self._validate_batch(
+            transitions, oracle_samples, state, effective_policy_version
+        )
         effective_weight = math.fsum(role_weights)
         if effective_weight == 0.0:
-            return self._empty_metrics(state)
+            return self._empty_metrics(state, effective_policy_version)
         normalized = torch.tensor(
             [weight / effective_weight for weight in role_weights],
             device=self.device,
@@ -678,7 +691,7 @@ class V3H3Learner:
             and not oracle_updated
             and not self.config.schedule.enabled
         ):
-            return self._empty_metrics(state)
+            return self._empty_metrics(state, effective_policy_version)
         count = len(transitions)
         self.learner_updates += 1
         self.samples_consumed += count
@@ -695,7 +708,7 @@ class V3H3Learner:
         }
         metrics = V3H3StepMetrics(
             learner_update=self.learner_updates,
-            policy_version=self.policy_version,
+            policy_version=self.policy_version + external_policy_version_offset,
             phase=state.phase,
             temperature=state.temperature,
             privileged_gate=state.privileged_gate,
@@ -722,10 +735,12 @@ class V3H3Learner:
         )
         return metrics
 
-    def _empty_metrics(self, state: OracleScheduleState) -> V3H3StepMetrics:
+    def _empty_metrics(
+        self, state: OracleScheduleState, policy_version: int
+    ) -> V3H3StepMetrics:
         return V3H3StepMetrics(
             learner_update=self.learner_updates,
-            policy_version=self.policy_version,
+            policy_version=policy_version,
             phase=state.phase,
             temperature=state.temperature,
             privileged_gate=state.privileged_gate,
