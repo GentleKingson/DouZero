@@ -216,8 +216,7 @@ def _validate_identity(identity: Mapping[str, Any]) -> None:
         for name in ("dataset_identity", "hmac_key_id_hash"):
             _digest(bc[name], f"human_bc.{name}")
         for name in ("license", "dataset_version", "pseudonymization_contract"):
-            if not isinstance(bc[name], str) or not bc[name].strip():
-                raise H8EvidenceError(f"human_bc.{name} must be non-empty")
+            _public_metadata(bc[name], f"human_bc.{name}")
     elif any(value is not None for value in bc.values()):
         raise H8EvidenceError(
             "human_bc identity must be null when authorized_bc_data=false"
@@ -903,6 +902,15 @@ def validate_h8_formal_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
         if len(checkpoints) != len(set(checkpoints)):
             raise H8EvidenceError(
                 f"{variant}/{ruleset} training seeds must use distinct checkpoints"
+            )
+        model_identities = {
+            row["model_identity_hash"]
+            for (row_variant, row_ruleset, _seed), row in training.items()
+            if row_variant == variant and row_ruleset == ruleset
+        }
+        if len(model_identities) > 1:
+            raise H8EvidenceError(
+                f"{variant}/{ruleset} training seeds must share one model identity"
             )
     for seed in identity["training_seeds"]:
         if len(samples_by_seed[seed]) > 1 or len(wall_by_seed[seed]) > 1:

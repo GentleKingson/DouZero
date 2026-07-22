@@ -332,6 +332,11 @@ def test_unauthorized_bc_identity_and_rows_fail_closed() -> None:
     with pytest.raises(H8EvidenceError, match="must be null"):
         validate_h8_formal_evidence(payload)
 
+    payload = _evidence(authorized_bc=True)
+    payload["experiment_identity"]["human_bc"]["license"] = "/private/license"
+    with pytest.raises(H8EvidenceError, match="public metadata"):
+        validate_h8_formal_evidence(payload)
+
     payload = _evidence()
     payload["training_runs"].append(_training("v3_full_hybrid_bc", "legacy", 11))
     with pytest.raises(H8EvidenceError, match="requires authorized"):
@@ -425,6 +430,18 @@ def test_distinct_training_seeds_require_distinct_checkpoints() -> None:
     )
     duplicate["model_checkpoint_sha256"] = first["model_checkpoint_sha256"]
     with pytest.raises(H8EvidenceError, match="must use distinct checkpoints"):
+        validate_h8_formal_evidence(payload)
+
+    payload = _evidence()
+    first = payload["training_runs"][0]
+    different_seed = next(
+        row for row in payload["training_runs"]
+        if row["variant"] == first["variant"]
+        and row["ruleset"] == first["ruleset"]
+        and row["seed"] != first["seed"]
+    )
+    different_seed["model_identity_hash"] = "f" * 64
+    with pytest.raises(H8EvidenceError, match="must share one model identity"):
         validate_h8_formal_evidence(payload)
 
 
