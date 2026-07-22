@@ -500,13 +500,16 @@ def _validate_evaluation(
             f"{variant}/{ruleset}/seed-{seed}/{tier}: fewer than {minimum_deals} paired deals"
         )
     if row["privileged_leakage"]:
-        issues.append(f"{variant}/{ruleset}/seed-{seed}: privileged leakage detected")
+        issues.append(
+            f"{variant}/{ruleset}/seed-{seed}/{tier}: privileged leakage detected"
+        )
     if row["invalid_actions"] or row["timeouts"] or row["model_load_failures"]:
         issues.append(
-            f"{variant}/{ruleset}/seed-{seed}: runtime correctness failures observed"
+            f"{variant}/{ruleset}/seed-{seed}/{tier}: "
+            "runtime correctness failures observed"
         )
     if row["artifact_stale"]:
-        issues.append(f"{variant}/{ruleset}/seed-{seed}: artifact is stale")
+        issues.append(f"{variant}/{ruleset}/seed-{seed}/{tier}: artifact is stale")
 
     is_promotion_search = tier == PROMOTION and search_enabled
     if is_promotion_search:

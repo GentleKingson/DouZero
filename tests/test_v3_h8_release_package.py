@@ -74,7 +74,7 @@ def test_not_ready_package_is_public_only_strict_and_truthful(tmp_path) -> None:
     assert manifest["access"] == "public"
     assert manifest["release_candidate"] == "NONE"
     assert manifest["release_status"] == "NOT READY"
-    assert "not measured" in manifest["playing_strength"]
+    assert "not measured" in manifest["playing_strength"].lower()
     assert verify_v3_public_model_package(
         package,
         schema=schema,

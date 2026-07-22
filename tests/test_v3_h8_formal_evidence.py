@@ -253,6 +253,8 @@ def test_development_and_promotion_have_distinct_deal_gates() -> None:
     development = _evidence()
     development["evaluations"][0]["deals"] = 19_999
     development["evaluations"][0]["games"] = 39_998
+    for metrics in development["evaluations"][0]["by_role"].values():
+        metrics["games"] = 19_999
     report = validate_h8_formal_evidence(development)
     assert any("fewer than 20000" in issue for issue in report["issues"])
     assert not any("fewer than 100000" in issue for issue in report["issues"])
