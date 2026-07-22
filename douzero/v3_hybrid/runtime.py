@@ -576,8 +576,13 @@ class V3AsyncSingleGPUTrainer:
             alive = [process.name for process in self._workers if process.is_alive()]
             if alive:
                 error = RuntimeError(f"H7 actor shutdown timed out: {alive}")
-            counts = self._coordinator.quiesce()
-            if any(counts[name] for name in ("writing", "ready", "running")):
+            from douzero.training.async_single_gpu import SlotState
+
+            active_slots = sum(
+                int((self._coordinator.states == int(state)).sum().item())
+                for state in (SlotState.WRITING, SlotState.READY, SlotState.RUNNING)
+            )
+            if active_slots:
                 error = RuntimeError("H7 shutdown left active inference slots")
             if self._scheduler.pending_count:
                 error = RuntimeError("H7 shutdown left pending requests")
