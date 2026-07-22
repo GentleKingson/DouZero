@@ -12,10 +12,16 @@ import numpy as np
 import pytest
 import torch
 
+from douzero.coach.records import CANONICAL_DECK
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.human_data.sample import BCSample
 from douzero.observation import build_v2_schema, get_obs_v2
+from douzero.observation.bidding import get_bidding_obs_v2
+from douzero.training.bidding import (
+    BiddingMinibatch,
+    BiddingTransition,
+)
 from douzero.v3_hybrid import (
     LossTermTensor,
     LossTermSchedule,
@@ -370,6 +376,76 @@ def test_pure_bc_batch_updates_without_an_empty_cardplay_optimizer_step():
     assert metrics.base.base.base.samples == 0
     assert metrics.losses["bc"]["valid_samples"] == 1
     assert metrics.losses["dmc"]["phase"] == "disabled"
+
+
+def test_pure_bidding_batch_uses_real_per_sample_targets():
+    ruleset = RuleSet.standard()
+    observation = get_bidding_obs_v2(
+        {
+            "phase": "bidding",
+            "position": "0",
+            "my_handcards": list(CANONICAL_DECK[:17]),
+            "current_highest_bid": 0,
+            "bidding_history": [],
+            "bidding_order": ["0", "1", "2"],
+            "first_bidder": "0",
+            "legal_bids": [0, 1, 2, 3],
+        },
+        ruleset=ruleset,
+    )
+    transition = BiddingTransition(
+        obs=observation,
+        bid_action=1,
+        policy_version="h6-bidding-policy",
+        source_policy="learned",
+    )
+    transition.assign_actor_role({
+        "0": "landlord",
+        "1": "landlord_down",
+        "2": "landlord_up",
+    })
+    transition.label_from_terminal({
+        "team_targets": {
+            "landlord": {"target_win": 1.0, "target_score": 2.0},
+            "landlord_down": {"target_win": 0.0, "target_score": -2.0},
+            "landlord_up": {"target_win": 0.0, "target_score": -2.0},
+        }
+    })
+    model_config = _model_config(bidding_enabled=True, bidding_hidden_size=12)
+    public = V3H2LearnerConfig(
+        batch_size=4,
+        learning_rate=1e-3,
+        max_grad_norm=10.0,
+        lambda_dmc=0.0,
+        device="cpu",
+    )
+    base = V3H5LearnerConfig(
+        base=V3H4LearnerConfig(base=V3H3LearnerConfig(public=public))
+    )
+    learner_config = V3H6LearnerConfig(
+        base=base,
+        losses=V3HybridLossComposerConfig(lambda_bidding=1.0),
+        features=V3H6FeatureFlags(bidding=True),
+        topology=V3H6TopologyConfig(ruleset="standard"),
+    )
+    resolved = V3H6ResolvedConfig(model=model_config, learner=learner_config)
+    learner = V3H6Learner(
+        V3HybridModel(build_v2_schema(), model_config),
+        ruleset=ruleset,
+        config=resolved,
+    )
+    metrics = learner.train_batch(
+        [], bidding_batch=BiddingMinibatch([transition])
+    )
+    assert metrics.samples == 1
+    assert metrics.public_aux_updated
+    assert metrics.policy_version == 1
+    assert metrics.losses["bidding"]["valid_samples"] == 1
+    assert metrics.losses["bidding"]["role_valid_samples"] == {
+        "landlord": 1,
+        "landlord_up": 0,
+        "landlord_down": 0,
+    }
 
 
 def test_public_output_is_independent_of_training_only_hidden_hand_objects():
