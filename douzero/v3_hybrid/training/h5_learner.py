@@ -19,6 +19,7 @@ from douzero.checkpoint.io import CheckpointCompatibilityError
 from douzero.env.rules import RuleSet
 from douzero.models_v2.batch import model_input_bundles_to_batch
 
+from ..adaptive_dmc import transform_dmc_target
 from ..config import BELIEF_FEEDBACK_NONE
 from ..h2_learner import _validate_optimizer_param_groups
 from ..model import V3HybridModel
@@ -214,6 +215,11 @@ def h5_training_identity(
         "learner": config.compatibility_dict(),
         "local_q": "independent_role_specific_dmc_head_v1",
         "team_value": "training_sidecar_farmer_role_heads_v1",
+        "team_target": {
+            "source": "raw_farmer_team_terminal_return_v1",
+            "transform": model.config.dmc_target_transform,
+            "clamp": model.config.dmc_target_clamp,
+        },
         "trajectory": "ordered_unequal_public_sequence_gru_v1",
         "mixer_export": "forbidden_from_public_artifacts_v1",
         "replay_protocol": "h2_public_rows_plus_h5_public_side_channel_v1",
@@ -369,8 +375,13 @@ class V3H5Learner:
         role_index = torch.tensor(
             [0, 1] * len(pairs), device=self.device, dtype=torch.long
         )
-        targets = chosen_embedding.new_tensor(
+        raw_targets = chosen_embedding.new_tensor(
             [trajectory.team_return for trajectory in ordered]
+        )
+        targets, _target_clamped = transform_dmc_target(
+            raw_targets,
+            transform=self.model.config.dmc_target_transform,
+            clamp=self.model.config.dmc_target_clamp,
         )
         offset = 0
         for index, trajectory in enumerate(ordered):

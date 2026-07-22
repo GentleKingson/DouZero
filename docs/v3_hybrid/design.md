@@ -350,8 +350,9 @@ embedding, detached conservative-belief teammate summary, and the existing
 public strategy quantities for pressure, initiative, teammate feed, and bomb
 opportunity cost. It contains role-specific farmer team-value heads and a
 shared GRU trajectory encoder. The per-decision team-value loss and the two
-trajectory terminal-return/consistency losses use the raw farmer-team terminal
-return. Landlord samples never enter these losses.
+trajectory terminal-return/consistency losses start from the raw farmer-team
+terminal return, then apply the public DMC head's identity-bound target
+transform and clamp. Landlord samples never enter these losses.
 
 The optional mixer first reduces each unequal trajectory to its masked mean
 selected local Q. Two non-negative `softplus` weights and a bias then predict
