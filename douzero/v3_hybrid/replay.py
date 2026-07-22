@@ -55,12 +55,17 @@ def _normalize_ruleset_identity(identity: Mapping[str, object]) -> dict[str, str
     return normalized
 
 
-def _clone_public_bundle(observation: ObservationV2) -> ModelInputBundle:
+def _clone_public_bundle(
+    observation: ObservationV2,
+    *,
+    strategy_config=None,
+    style_enabled: bool = False,
+) -> ModelInputBundle:
     if not isinstance(observation, ObservationV2):
         raise TypeError("V3 replay capture requires a public ObservationV2")
-    source = observation_to_model_inputs(observation)
-    if source.strategy_features is not None or source.style_features is not None:
-        raise ValueError("H2 replay does not support strategy or style features")
+    source = observation_to_model_inputs(
+        observation, strategy_config, style_enabled=style_enabled
+    )
     return ModelInputBundle(
         state_card_vectors=tuple(value.detach().cpu().clone() for value in source.state_card_vectors),
         state_context_flat=source.state_context_flat.detach().cpu().clone(),
@@ -72,10 +77,26 @@ def _clone_public_bundle(observation: ObservationV2) -> ModelInputBundle:
         action_mask=source.action_mask.detach().cpu().clone(),
         acting_role=source.acting_role,
         feature_schema_hash=source.feature_schema_hash,
+        strategy_features=(
+            None
+            if source.strategy_features is None
+            else source.strategy_features.detach().cpu().clone()
+        ),
+        style_features=(
+            None
+            if source.style_features is None
+            else source.style_features.detach().cpu().clone()
+        ),
     )
 
 
-def _validate_bundle(bundle: ModelInputBundle, expected_schema_hash: str) -> None:
+def _validate_bundle(
+    bundle: ModelInputBundle,
+    expected_schema_hash: str,
+    *,
+    strategy_features_allowed: bool = False,
+    style_features_allowed: bool = False,
+) -> None:
     if not isinstance(bundle, ModelInputBundle):
         raise TypeError("V3 replay model_inputs must be a ModelInputBundle")
     if bundle.feature_schema_hash != expected_schema_hash:
@@ -84,8 +105,10 @@ def _validate_bundle(bundle: ModelInputBundle, expected_schema_hash: str) -> Non
         raise ValueError("V3 replay requires the frozen Observation V2 schema")
     if bundle.acting_role not in V3_HYBRID_ROLES:
         raise ValueError("V3 replay contains an unsupported acting role")
-    if bundle.strategy_features is not None or bundle.style_features is not None:
-        raise ValueError("H2 replay cannot contain later-stage feature tensors")
+    if not strategy_features_allowed and bundle.strategy_features is not None:
+        raise ValueError("H2 replay cannot contain later-stage strategy tensors")
+    if not style_features_allowed and bundle.style_features is not None:
+        raise ValueError("H2 replay cannot contain later-stage style tensors")
     if not isinstance(bundle.state_card_vectors, tuple) or not isinstance(
         bundle.context_card_vectors, tuple
     ):
@@ -154,6 +177,24 @@ def _validate_bundle(bundle: ModelInputBundle, expected_schema_hash: str) -> Non
         or not bool(bundle.action_mask.all())
     ):
         raise ValueError("V3 replay action mask shape, dtype, or validity mismatch")
+    if strategy_features_allowed:
+        from douzero.strategy.features import STRATEGY_FEATURE_WIDTH
+
+        if (
+            not isinstance(bundle.strategy_features, torch.Tensor)
+            or bundle.strategy_features.shape != (count, STRATEGY_FEATURE_WIDTH)
+            or bundle.strategy_features.dtype != torch.float32
+        ):
+            raise ValueError("H6 replay strategy feature layout mismatch")
+    if style_features_allowed:
+        from douzero.style.features import STYLE_FEATURE_WIDTH
+
+        if (
+            not isinstance(bundle.style_features, torch.Tensor)
+            or bundle.style_features.shape != (STYLE_FEATURE_WIDTH,)
+            or bundle.style_features.dtype != torch.float32
+        ):
+            raise ValueError("H6 replay style feature layout mismatch")
 
     tensors = (
         *card_vectors,
@@ -164,6 +205,10 @@ def _validate_bundle(bundle: ModelInputBundle, expected_schema_hash: str) -> Non
         bundle.action_features,
         bundle.action_mask,
     )
+    if bundle.strategy_features is not None:
+        tensors += (bundle.strategy_features,)
+    if bundle.style_features is not None:
+        tensors += (bundle.style_features,)
     for value in tensors:
         if not isinstance(value, torch.Tensor):
             raise TypeError("V3 replay public inputs must be tensors")
@@ -262,6 +307,8 @@ class PendingV3Transition:
             expected_target_transform=self.target_transform,
             expected_ruleset_identity=self.ruleset_identity,
             adaptive_required=self.adaptive_provenance is not None,
+            strategy_features_allowed=self.model_inputs.strategy_features is not None,
+            style_features_allowed=self.model_inputs.style_features is not None,
         )
         return transition
 
@@ -274,8 +321,14 @@ def _pending_from_observation(
     deal_id: str,
     target_transform: str,
     provenance: AdaptiveSnapshotProvenance | None,
+    strategy_config=None,
+    style_enabled: bool = False,
 ) -> PendingV3Transition:
-    bundle = _clone_public_bundle(observation)
+    bundle = _clone_public_bundle(
+        observation,
+        strategy_config=strategy_config,
+        style_enabled=style_enabled,
+    )
     ruleset_identity = _normalize_ruleset_identity({
         "ruleset_id": observation.public.ruleset_id,
         "ruleset_version": observation.public.ruleset_version,
@@ -312,6 +365,8 @@ def capture_plain_transition(
     episode_id: str,
     deal_id: str,
     target_transform: str,
+    strategy_config=None,
+    style_enabled: bool = False,
 ) -> PendingV3Transition:
     """Capture ordinary DMC replay without any Adaptive-DMC dependency."""
 
@@ -322,6 +377,8 @@ def capture_plain_transition(
         deal_id=deal_id,
         target_transform=target_transform,
         provenance=None,
+        strategy_config=strategy_config,
+        style_enabled=style_enabled,
     )
 
 
@@ -371,6 +428,8 @@ def capture_adaptive_transition(
         deal_id=deal_id,
         target_transform=target_transform,
         provenance=provenance,
+        strategy_config=student.strategy_feature_config(),
+        style_enabled=student.config.style_enabled,
     )
 
 
@@ -407,8 +466,15 @@ class V3ReplayTransition:
         expected_target_transform: str,
         expected_ruleset_identity: Mapping[str, object],
         adaptive_required: bool,
+        strategy_features_allowed: bool = False,
+        style_features_allowed: bool = False,
     ) -> None:
-        _validate_bundle(self.model_inputs, expected_schema_hash)
+        _validate_bundle(
+            self.model_inputs,
+            expected_schema_hash,
+            strategy_features_allowed=strategy_features_allowed,
+            style_features_allowed=style_features_allowed,
+        )
         actual_ruleset = _normalize_ruleset_identity(self.ruleset_identity)
         expected_ruleset = _normalize_ruleset_identity(expected_ruleset_identity)
         if actual_ruleset != expected_ruleset:
@@ -439,6 +505,8 @@ class V3ReplayTransition:
 
     def state_dict(self) -> dict[str, object]:
         bundle = self.model_inputs
+        if bundle.strategy_features is not None or bundle.style_features is not None:
+            raise ValueError("H6-enriched replay requires the H6 replay serializer")
         return {
             "schema_version": self.SCHEMA_VERSION,
             "semantics": V3_H2_REPLAY_SEMANTICS,

@@ -378,13 +378,18 @@ def _same_public_bundle(left: ModelInputBundle, right: ModelInputBundle) -> bool
         "state_context_flat", "context_flat", "history_tokens",
         "history_key_padding_mask", "action_features", "action_mask",
     )
+    def optional_tensor_equal(name: str) -> bool:
+        left_value = getattr(left, name)
+        right_value = getattr(right, name)
+        if left_value is None or right_value is None:
+            return left_value is None and right_value is None
+        return torch.equal(left_value, right_value)
+
     return (
         left.acting_role == right.acting_role
         and left.feature_schema_hash == right.feature_schema_hash
-        and left.strategy_features is None
-        and right.strategy_features is None
-        and left.style_features is None
-        and right.style_features is None
+        and optional_tensor_equal("strategy_features")
+        and optional_tensor_equal("style_features")
         and len(left.state_card_vectors) == len(right.state_card_vectors)
         and len(left.context_card_vectors) == len(right.context_card_vectors)
         and all(torch.equal(a, b) for a, b in zip(left.state_card_vectors, right.state_card_vectors))
@@ -414,10 +419,6 @@ class V3H3Learner:
             if not _allow_h4_belief_feedback:
                 raise ValueError(
                     "belief-feedback models require the H4 learner"
-                )
-            if self.config.schedule.enabled:
-                raise ValueError(
-                    "H4 belief feedback and H3 Oracle combine only in H6"
                 )
         self.device = torch.device(self.config.public.device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
@@ -492,7 +493,9 @@ class V3H3Learner:
             raise RuntimeError("H3 H5 policy-version owner mismatch")
         if self._h5_policy_version_offset != 0:
             raise RuntimeError("H3 H5 policy-version scope cannot be nested")
-        offset = owner.statistics.public_updates
+        offset = getattr(owner, "_policy_version_offset", None)
+        if offset is None:
+            offset = owner.statistics.public_updates
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise RuntimeError("H3 H5 policy-version offset is invalid")
         self._h5_policy_version_offset = offset
@@ -545,6 +548,8 @@ class V3H3Learner:
                 expected_target_transform=self.model.config.dmc_target_transform,
                 expected_ruleset_identity=self.ruleset.identity(),
                 adaptive_required=adaptive_required,
+                strategy_features_allowed=self.model.config.strategy_features_enabled,
+                style_features_allowed=self.model.config.style_enabled,
             )
             if adaptive_consumed:
                 version = transition.adaptive_provenance.policy_version
@@ -640,6 +645,9 @@ class V3H3Learner:
                     sample.privileged_observation,
                     action_keys=sample.action_keys,
                     privileged_gate=state.privileged_gate,
+                    belief_features=(
+                        None if belief_features is None else belief_features[index]
+                    ),
                 )
                 target, _ = transform_dmc_target(
                     oracle_output.action_logits.new_tensor([sample.target_score]),
@@ -842,7 +850,7 @@ class V3H3Learner:
                 None if self.oracle_optimizer is None else self.oracle_optimizer.state_dict()
             ),
             "feature_schema_hash": self.model.schema.stable_hash(),
-            "model_config": asdict(self.model.config),
+            "model_config": self.model.config.to_dict(),
             "model_config_hash": self.model.config.stable_hash(),
             "ruleset_identity": self.ruleset.identity(),
             "learner_config": asdict(self.config),
@@ -890,7 +898,7 @@ class V3H3Learner:
             "artifact_access": "privileged_training_only",
             "source_git_sha": git_sha(),
             "feature_schema_hash": self.model.schema.stable_hash(),
-            "model_config": asdict(self.model.config),
+            "model_config": self.model.config.to_dict(),
             "model_config_hash": self.model.config.stable_hash(),
             "ruleset_identity": self.ruleset.identity(),
             "learner_config": asdict(self.config),

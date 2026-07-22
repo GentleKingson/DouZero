@@ -101,6 +101,12 @@ def _copy_bundle_to_model(bundle: ModelInputBundle, model: V3HybridModel) -> Mod
         action_mask=move(bundle.action_mask),
         acting_role=bundle.acting_role,
         feature_schema_hash=bundle.feature_schema_hash,
+        strategy_features=(
+            None if bundle.strategy_features is None else move(bundle.strategy_features)
+        ),
+        style_features=(
+            None if bundle.style_features is None else move(bundle.style_features)
+        ),
     )
 
 
@@ -176,6 +182,7 @@ class V3PrivilegedOracle(nn.Module):
         *,
         action_keys: tuple[ActionKey, ...] | None = None,
         privileged_gate: float = 1.0,
+        belief_features: torch.Tensor | None = None,
     ) -> TeacherOutput:
         if not isinstance(privileged_observation, PrivilegedObservation):
             raise TypeError("V3 Oracle requires a PrivilegedObservation")
@@ -188,7 +195,11 @@ class V3PrivilegedOracle(nn.Module):
             raise ValueError("privileged_gate must be finite and in [0, 1]")
         if isinstance(public_input, ObservationV2):
             keys = canonical_action_keys(public_input.actions.legal_actions)
-            bundle = observation_to_model_inputs(public_input)
+            bundle = observation_to_model_inputs(
+                public_input,
+                self.public_backbone.strategy_feature_config(),
+                style_enabled=self.public_backbone.config.style_enabled,
+            )
         elif isinstance(public_input, ModelInputBundle):
             if action_keys is None:
                 raise ValueError("tensorized Oracle input requires action_keys")
@@ -221,6 +232,9 @@ class V3PrivilegedOracle(nn.Module):
             moved.action_features,
             moved.action_mask,
             moved.acting_role,
+            belief_features,
+            moved.strategy_features,
+            moved.style_features,
         )
         parameter = next(self.parameters())
         hidden = self.privileged_encoder(

@@ -234,15 +234,23 @@ def test_belief_sample_source_identity_rejects_same_role_input_swap():
         dataclasses.replace(left, source_state_identity="0" * 64)
 
 
-def test_unsupported_h4_combinations_fail_before_training_initialization():
+def test_h6_unlocks_oracle_belief_identity_but_invalid_phases_still_fail():
     oracle = dataclasses.replace(
         _base(),
         schedule=OracleGuidingScheduleConfig(
             enabled=True, guided_updates=1, finetune_updates=1
         ),
     )
-    with pytest.raises(ValueError, match="deferred to H6"):
-        V3H4LearnerConfig(base=oracle, belief=_belief_config())
+    combined = V3H4LearnerConfig(base=oracle, belief=_belief_config())
+    assert combined.compatibility_dict()["identity_version"] == 4
+    assert "h6_optimizer_phase" in combined.compatibility_dict()
+    with pytest.raises(ValueError, match="atomic H6 learner"):
+        V3H4Learner(
+            _model(),
+            ruleset=RuleSet.legacy(),
+            config=combined,
+            belief_model=BeliefModel(BeliefConfig(hidden_size=16, num_layers=1)),
+        )
     no_public_policy = dataclasses.replace(
         _base(), public=dataclasses.replace(_base().public, lambda_dmc=0.0)
     )

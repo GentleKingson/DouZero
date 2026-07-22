@@ -804,7 +804,7 @@ class V3H2Learner:
             "model_state_dict": state_dict,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "feature_schema_hash": self.model.schema.stable_hash(),
-            "model_config": asdict(self.model.config),
+            "model_config": self.model.config.to_dict(),
             "model_config_hash": self.model.config.stable_hash(),
             "ruleset_identity": self.ruleset.identity(),
             "learner_config": asdict(self.config),
@@ -868,7 +868,7 @@ class V3H2Learner:
         expected_scalars = {
             "format": V3_H2_TRAINER_CHECKPOINT_FORMAT,
             "feature_schema_hash": self.model.schema.stable_hash(),
-            "model_config": asdict(self.model.config),
+            "model_config": self.model.config.to_dict(),
             "model_config_hash": self.model.config.stable_hash(),
             "ruleset_identity": self.ruleset.identity(),
             "learner_config": asdict(self.config),

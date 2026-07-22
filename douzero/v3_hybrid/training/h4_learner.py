@@ -169,10 +169,6 @@ class V3H4LearnerConfig:
             raise TypeError("H4 base must be V3H3LearnerConfig")
         if not isinstance(self.belief, V3H4BeliefTrainingConfig):
             raise TypeError("H4 belief must be V3H4BeliefTrainingConfig")
-        if self.belief.enabled and self.base.schedule.enabled:
-            raise ValueError(
-                "H4 belief and H3 Oracle integration is deferred to H6"
-            )
         if (
             self.belief.enabled
             and self.belief.mode == BELIEF_MODE_ALTERNATING
@@ -183,11 +179,17 @@ class V3H4LearnerConfig:
             )
 
     def compatibility_dict(self) -> dict[str, object]:
-        return {
-            "identity_version": self.IDENTITY_VERSION,
+        combined = self.belief.enabled and self.base.schedule.enabled
+        payload = {
+            "identity_version": 4 if combined else self.IDENTITY_VERSION,
             "base": self.base.compatibility_dict(),
             "belief": self.belief.compatibility_dict(),
         }
+        if combined:
+            payload["h6_optimizer_phase"] = (
+                "oracle_public_then_detached_belief_with_atomic_outer_rollback_v1"
+            )
+        return payload
 
     def stable_hash(self) -> str:
         return _canonical_hash(self.compatibility_dict())
@@ -252,6 +254,9 @@ class V3H4BeliefSample:
 def build_v3_h4_belief_sample(
     observation: ObservationV2,
     privileged: PrivilegedObservation | None = None,
+    *,
+    strategy_config=None,
+    style_enabled: bool = False,
 ) -> V3H4BeliefSample:
     """Bind one public policy input to an optional privileged belief label."""
 
@@ -272,7 +277,9 @@ def build_v3_h4_belief_sample(
             num_cards_left=public.num_cards_left,
             bottom_unplayed=public.bottom_cards.unplayed,
         )
-    public_inputs = observation_to_model_inputs(observation)
+    public_inputs = observation_to_model_inputs(
+        observation, strategy_config, style_enabled=style_enabled
+    )
     return V3H4BeliefSample(
         public_inputs=public_inputs,
         belief_input=binput,
@@ -422,6 +429,7 @@ class V3H4Learner:
         ruleset: RuleSet,
         config: V3H4LearnerConfig | None = None,
         belief_model: BeliefModel | None = None,
+        _allow_h6_combination: bool = False,
     ) -> None:
         if not isinstance(model, V3HybridModel):
             raise TypeError("H4 learner requires V3HybridModel")
@@ -429,6 +437,16 @@ class V3H4Learner:
             raise TypeError("H4 learner requires RuleSet")
         self.config = config or V3H4LearnerConfig()
         cfg = self.config.belief
+        if not isinstance(_allow_h6_combination, bool):
+            raise TypeError("H4 H6-combination gate must be bool")
+        if (
+            cfg.enabled
+            and self.config.base.schedule.enabled
+            and not _allow_h6_combination
+        ):
+            raise ValueError(
+                "combined H3 Oracle and H4 belief require the atomic H6 learner"
+            )
         if not cfg.enabled:
             if belief_model is not None:
                 raise ValueError("disabled H4 must not construct a belief model")
@@ -537,20 +555,56 @@ class V3H4Learner:
         transitions: Sequence[V3ReplayTransition],
         samples: Sequence[V3H4BeliefSample],
     ) -> tuple[torch.Tensor, float]:
+        return self._policy_features_from_public_inputs(
+            [sample.public_inputs for sample in samples],
+            [sample.belief_input for sample in samples],
+        )
+
+    def policy_features_from_public_observations(
+        self,
+        observations: Sequence[ObservationV2],
+    ) -> tuple[torch.Tensor, float]:
+        """Build detached, conservation-safe policy features from public data."""
+        checked = [self.model._check_public_observation(obs) for obs in observations]
+        return self._policy_features_from_public_inputs(
+            [
+                observation_to_model_inputs(
+                    obs,
+                    self.model.strategy_feature_config(),
+                    style_enabled=self.model.config.style_enabled,
+                )
+                for obs in checked
+            ],
+            [build_belief_input(obs.public) for obs in checked],
+        )
+
+    def _policy_features_from_public_inputs(
+        self,
+        public_inputs: Sequence[ModelInputBundle],
+        belief_inputs: Sequence[BeliefInput],
+    ) -> tuple[torch.Tensor, float]:
         assert self.belief_model is not None
         training = self.belief_model.training
         self.belief_model.eval()
         try:
             with torch.no_grad():
-                output, latency_ms = self._belief_forward(
-                    transitions, samples, shared_gradient=False
+                shared_context = None
+                if self.belief_model.config.shared_context_dim:
+                    batch = model_input_bundles_to_batch(
+                        public_inputs,
+                        [0] * len(public_inputs),
+                    )
+                    shared_context = self.model.encode_input_batch_context(batch).detach()
+                started = time.perf_counter()
+                output = self.belief_model(
+                    belief_inputs,
+                    shared_context=shared_context,
                 )
+                latency_ms = (time.perf_counter() - started) * 1000.0
                 features = belief_features_from_probs(
                     output.constrained_probs,
                     output.opponent_a_total,
-                    np.stack([
-                        sample.belief_input.unseen_counts for sample in samples
-                    ]),
+                    np.stack([item.unseen_counts for item in belief_inputs]),
                 )
         finally:
             self.belief_model.train(training)
@@ -578,6 +632,7 @@ class V3H4Learner:
         transitions: Sequence[V3ReplayTransition],
         *,
         belief_samples: Sequence[V3H4BeliefSample] | None = None,
+        oracle_samples: Sequence["OfflineDistillationSample"] | None = None,
     ) -> V3H4StepMetrics:
         if not transitions or len(transitions) > self.config.base.public.batch_size:
             raise ValueError("H4 requires a non-empty batch within configured size")
@@ -621,8 +676,11 @@ class V3H4Learner:
         if policy_phase:
             base_metrics = self.base.train_batch(
                 transitions,
+                oracle_samples=oracle_samples,
                 belief_features=features,
             )
+        elif oracle_samples is not None:
+            raise ValueError("belief-only H4 phase rejects Oracle samples")
 
         belief_total = next(self.model.parameters()).sum() * 0.0
         cross_entropy = 0.0

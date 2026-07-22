@@ -11,12 +11,14 @@ import numpy as np
 import pytest
 import torch
 
-from douzero.belief.model import BELIEF_FEATURE_DIM
+from douzero.belief.model import BELIEF_FEATURE_DIM, BeliefConfig, BeliefModel
 from douzero.checkpoint.io import CheckpointCompatibilityError
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.models_v2 import ModelV2Config
 from douzero.observation import build_v2_schema, get_obs_v2
+from douzero.observation.privileged import PrivilegedObservation
+from douzero.distillation.dataset import DistillationSample
 from douzero.v3_hybrid import (
     ADMC_SAFE_HYBRID,
     AdaptiveDMCConfig,
@@ -30,7 +32,10 @@ from douzero.v3_hybrid import (
 )
 from douzero.v3_hybrid.replay import AdaptiveSnapshotProvenance
 from douzero.v3_hybrid.training.belief_config import V3H4BeliefTrainingConfig
-from douzero.v3_hybrid.training.belief_config import BELIEF_MODE_AUXILIARY
+from douzero.v3_hybrid.training.belief_config import (
+    BELIEF_MODE_ALTERNATING,
+    BELIEF_MODE_AUXILIARY,
+)
 from douzero.v3_hybrid.training.cooperation import (
     FARMER_ROLES,
     H5_PUBLIC_FEATURE_DIM,
@@ -49,6 +54,7 @@ from douzero.v3_hybrid.training.h3_learner import V3H3LearnerConfig
 from douzero.v3_hybrid.training.h4_learner import (
     V3H4Learner,
     V3H4LearnerConfig,
+    build_v3_h4_belief_sample,
 )
 from douzero.v3_hybrid.training.h5_learner import (
     V3H5Learner,
@@ -173,6 +179,82 @@ def _pair(
     return tuple(all_rows), tuple(trajectories)
 
 
+def _pair_with_training_sidecars():
+    rows = []
+    trajectories = []
+    belief_samples = []
+    oracle_samples = []
+    policies = {"landlord_up": "current-v7", "landlord_down": "league-v3"}
+    for trace_index, (role, seed) in enumerate((
+        ("landlord_up", 501),
+        ("landlord_down", 502),
+    )):
+        np.random.seed(seed)
+        env = Env("adp")
+        env.reset()
+        for _ in range(120):
+            if env._acting_player_position == role:
+                infoset = copy.deepcopy(env.infoset)
+                infoset.legal_actions = infoset.legal_actions[:4]
+                break
+            action = next(
+                (item for item in env.infoset.legal_actions if item),
+                env.infoset.legal_actions[0],
+            )
+            _obs, _reward, done, _info = env.step(action)
+            if done:
+                env.reset()
+        else:
+            raise AssertionError(f"could not reach {role}")
+        observation = get_obs_v2(infoset, ruleset=RuleSet.legacy())
+        privileged = PrivilegedObservation(
+            all_handcards=infoset.all_handcards,
+            acting_role=infoset.player_position,
+        )
+        row = capture_plain_transition(
+            observation,
+            selected_action_index=0,
+            episode_id="episode-sidecars",
+            deal_id="deal-sidecars",
+            target_transform="raw",
+        ).finalize(2.0)
+        rows.append(row)
+        belief_samples.append(
+            build_v3_h4_belief_sample(observation, privileged)
+        )
+        oracle_samples.append(
+            DistillationSample(
+                public_observation=observation,
+                privileged_observation=privileged,
+                action_index=0,
+                target_win=1.0,
+                target_score=2.0,
+                sample_id=f"oracle-{role}",
+            ).tensorize()
+        )
+        teammate = "landlord_down" if role == "landlord_up" else "landlord_up"
+        trajectories.append(V3H5FarmerTrajectory(
+            episode_id="episode-sidecars",
+            deal_id="deal-sidecars",
+            role=role,
+            policy_id=policies[role],
+            teammate_policy_id=policies[teammate],
+            decisions=(V3H5FarmerDecision(
+                trace_index=trace_index,
+                transition=row,
+                public_features=torch.linspace(0.0, 1.0, H5_PUBLIC_FEATURE_DIM),
+                selected_action_is_pass=False,
+            ),),
+            team_return=2.0,
+        ))
+    return (
+        tuple(rows),
+        tuple(trajectories),
+        tuple(belief_samples),
+        tuple(oracle_samples),
+    )
+
+
 def _stamp_policy_version(rows, trajectories, version: int):
     replacements = {}
     stamped_rows = []
@@ -291,27 +373,27 @@ def test_config_is_identity_bound_scheduled_and_fail_closed():
         _coop(lambda_team_value=0.0, lambda_trajectory_consistency=0.0)
 
 
-def test_unsupported_cross_stage_combinations_fail_before_graph_creation():
-    with pytest.raises(ValueError, match="deferred to H6"):
-        V3H5LearnerConfig(
-            base=dataclasses.replace(
-                _base(), belief=V3H4BeliefTrainingConfig(
-                    enabled=True, mode=BELIEF_MODE_AUXILIARY, lambda_belief=1.0
-                )
-            ),
-            cooperation=_coop(),
-        )
+def test_h6_combination_identity_and_remaining_graph_guards():
+    belief_combined = V3H5LearnerConfig(
+        base=dataclasses.replace(
+            _base(), belief=V3H4BeliefTrainingConfig(
+                enabled=True, mode=BELIEF_MODE_AUXILIARY, lambda_belief=1.0
+            )
+        ),
+        cooperation=_coop(),
+    )
+    assert belief_combined.compatibility_dict()["identity_version"] == 2
     oracle = dataclasses.replace(
         _base().base,
         schedule=OracleGuidingScheduleConfig(
             enabled=True, guided_updates=1, finetune_updates=1
         ),
     )
-    with pytest.raises(ValueError, match="deferred to H6"):
-        V3H5LearnerConfig(
-            base=V3H4LearnerConfig(base=oracle), cooperation=_coop()
-        )
-    with pytest.raises(ValueError, match="belief feedback"):
+    oracle_combined = V3H5LearnerConfig(
+        base=V3H4LearnerConfig(base=oracle), cooperation=_coop()
+    )
+    assert oracle_combined.compatibility_dict()["identity_version"] == 2
+    with pytest.raises(ValueError, match="disabled H4"):
         V3H5Learner(
             _model(belief_feedback=BELIEF_FEEDBACK_FARMERS),
             ruleset=RuleSet.legacy(),
@@ -328,6 +410,146 @@ def test_unsupported_cross_stage_combinations_fail_before_graph_creation():
                 ),
                 cooperation=_coop(warmup_updates=1),
             )
+
+
+def test_h6_belief_feedback_and_cooperation_train_and_resume(tmp_path):
+    rows, trajectories, belief_samples, _oracle_samples = (
+        _pair_with_training_sidecars()
+    )
+    config = V3H5LearnerConfig(
+        base=dataclasses.replace(
+            _base(),
+            belief=V3H4BeliefTrainingConfig(
+                enabled=True,
+                mode=BELIEF_MODE_AUXILIARY,
+                lambda_belief=0.5,
+                learning_rate=1e-3,
+            ),
+        ),
+        cooperation=_coop(),
+    )
+
+    def build_learner():
+        return V3H5Learner(
+            _model(belief_feedback=BELIEF_FEEDBACK_FARMERS),
+            ruleset=RuleSet.legacy(),
+            config=config,
+            belief_model=BeliefModel(
+                BeliefConfig(hidden_size=16, num_layers=1)
+            ),
+        )
+
+    learner = build_learner()
+    metrics = learner.train_batch(
+        rows,
+        trajectories=trajectories,
+        belief_samples=belief_samples,
+    )
+    assert metrics.cooperation_updated
+    assert metrics.public_updated
+    assert metrics.base.belief_updated
+
+    checkpoint = tmp_path / "belief-cooperation.pt"
+    learner.save_checkpoint(checkpoint)
+    restored = build_learner()
+    restored.load_checkpoint(checkpoint)
+    assert restored.eligible_updates == learner.eligible_updates == 1
+    assert restored.policy_version == learner.policy_version
+
+
+def test_alternating_belief_only_phase_skips_cooperation_and_public_updates():
+    rows, trajectories, belief_samples, _oracle_samples = (
+        _pair_with_training_sidecars()
+    )
+    config = V3H5LearnerConfig(
+        base=dataclasses.replace(
+            _base(),
+            belief=V3H4BeliefTrainingConfig(
+                enabled=True,
+                mode=BELIEF_MODE_ALTERNATING,
+                lambda_belief=0.5,
+                learning_rate=1e-3,
+                policy_updates_per_cycle=1,
+                belief_updates_per_cycle=1,
+            ),
+        ),
+        cooperation=_coop(),
+    )
+    learner = V3H5Learner(
+        _model(belief_feedback=BELIEF_FEEDBACK_FARMERS),
+        ruleset=RuleSet.legacy(),
+        config=config,
+        belief_model=BeliefModel(BeliefConfig(hidden_size=16, num_layers=1)),
+    )
+    first = learner.train_batch(
+        rows,
+        trajectories=trajectories,
+        belief_samples=belief_samples,
+    )
+    assert first.cooperation_updated
+    cooperation_before = _state(learner.cooperation)
+    public_before = _state(learner.model)
+    policy_version = learner.policy_version
+
+    second = learner.train_batch(
+        rows,
+        trajectories=trajectories,
+        belief_samples=belief_samples,
+    )
+    assert second.base.phase == "belief"
+    assert second.base.belief_updated
+    assert not second.cooperation_updated
+    assert not second.public_updated
+    assert second.schedule_weight == 0.0
+    assert learner.policy_version == policy_version
+    assert not _changed(cooperation_before, learner.cooperation)
+    assert not _changed(public_before, learner.model)
+
+
+def test_h6_oracle_warmup_cooperation_checkpoint_accepts_distinct_counters(
+    tmp_path,
+):
+    rows, trajectories, _belief_samples, oracle_samples = (
+        _pair_with_training_sidecars()
+    )
+    oracle = dataclasses.replace(
+        _base().base,
+        schedule=OracleGuidingScheduleConfig(
+            enabled=True,
+            warmup_updates=2,
+            guided_updates=1,
+            finetune_updates=1,
+        ),
+    )
+    config = V3H5LearnerConfig(
+        base=V3H4LearnerConfig(base=oracle),
+        cooperation=_coop(),
+    )
+
+    def build_learner():
+        return V3H5Learner(
+            _model(), ruleset=RuleSet.legacy(), config=config
+        )
+
+    learner = build_learner()
+    metrics = learner.train_batch(
+        rows,
+        trajectories=trajectories,
+        oracle_samples=oracle_samples,
+    )
+    assert metrics.cooperation_updated
+    assert not metrics.public_updated
+    assert not metrics.base.policy_updated
+    assert learner.statistics.cooperation_updates == 1
+    assert learner.statistics.public_updates == 0
+
+    checkpoint = tmp_path / "oracle-warmup-cooperation.pt"
+    learner.save_checkpoint(checkpoint)
+    restored = build_learner()
+    restored.load_checkpoint(checkpoint)
+    assert restored.statistics.cooperation_updates == 1
+    assert restored.statistics.public_updates == 0
+    assert restored.policy_version == learner.policy_version
 
 
 def test_public_feature_builder_uses_existing_strategy_and_conservative_belief():
