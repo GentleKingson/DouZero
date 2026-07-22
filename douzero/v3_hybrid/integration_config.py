@@ -259,6 +259,31 @@ class V3H6ResolvedConfig:
             raise TypeError("H6 resolved learner config has an invalid type")
         features = self.learner.features
         losses = self.learner.losses
+        required_heads = (
+            (
+                "human BC",
+                losses.lambda_bc,
+                self.model.human_prior_enabled,
+                "human prior",
+            ),
+            (
+                "strategy",
+                losses.lambda_strategy,
+                self.model.strategy_aux_enabled,
+                "strategy auxiliary",
+            ),
+            (
+                "bidding",
+                losses.lambda_bidding,
+                self.model.bidding_enabled,
+                "bidding",
+            ),
+        )
+        for loss_name, weight, head_enabled, head_name in required_heads:
+            if weight > 0.0 and not head_enabled:
+                raise ValueError(
+                    f"H6 {loss_name} loss requires the public {head_name} head"
+                )
         graph_checks = {
             "human_bc": self.model.human_prior_enabled and losses.lambda_bc > 0.0,
             "strategy": self.model.strategy_aux_enabled and losses.lambda_strategy > 0.0,

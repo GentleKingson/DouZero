@@ -173,6 +173,27 @@ def test_support_matrix_is_stable_and_unsupported_topologies_fail_closed():
         )
 
 
+@pytest.mark.parametrize(
+    ("loss_name", "message"),
+    (
+        ("lambda_bc", "requires the public human prior head"),
+        ("lambda_strategy", "requires the public strategy auxiliary head"),
+        ("lambda_bidding", "requires the public bidding head"),
+    ),
+)
+def test_auxiliary_loss_requires_its_public_model_head(loss_name, message):
+    baseline = _resolved()
+    losses = dataclasses.replace(
+        baseline.learner.losses,
+        **{loss_name: 1.0},
+    )
+    with pytest.raises(ValueError, match=message):
+        V3H6ResolvedConfig(
+            model=baseline.model,
+            learner=dataclasses.replace(baseline.learner, losses=losses),
+        )
+
+
 def test_loss_composer_matches_independent_role_weighted_formula_and_masks_padding():
     config = V3HybridLossComposerConfig(
         lambda_win=2.0,
@@ -333,6 +354,18 @@ def test_h6_public_replay_round_trip_and_privileged_negative_guard():
     assert len(restored) == 1
     with pytest.raises(ValueError, match="privileged"):
         assert_public_replay_payload({**payload, "all_handcards": {}})
+    for sidecar in (
+        "privileged_mixer_state",
+        "belief_samples",
+        "oracle_samples",
+        "bc_samples",
+        "strategy_targets",
+        "bidding_batch",
+        "cooperation_trajectories",
+        "optimizer_state_dict",
+    ):
+        with pytest.raises(ValueError, match="privileged"):
+            assert_public_replay_payload({**payload, sidecar: torch.zeros(1)})
     with pytest.raises(ValueError, match="target transform"):
         V3H6ReplayBuffer(
             4,
@@ -547,6 +580,15 @@ def test_pure_bidding_batch_uses_real_per_sample_targets():
         "landlord_up": 0,
         "landlord_down": 0,
     }
+
+    mismatched = copy.deepcopy(transition)
+    mismatched.obs = dataclasses.replace(
+        mismatched.obs, ruleset_hash="0" * 64
+    )
+    with pytest.raises(ValueError, match="ruleset identity mismatch"):
+        learner.train_batch(
+            [], bidding_batch=BiddingMinibatch([mismatched])
+        )
 
 
 def test_public_output_is_independent_of_training_only_hidden_hand_objects():

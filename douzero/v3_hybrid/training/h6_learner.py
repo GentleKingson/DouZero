@@ -26,7 +26,7 @@ from douzero.models_v2.batch import (
     model_input_bundles_to_batch,
 )
 from douzero.training.bc_loss import listwise_bc_loss
-from douzero.training.bidding import BiddingMinibatch
+from douzero.training.bidding import BiddingMinibatch, BiddingTransition
 from douzero.training.losses import resolve_score_target
 
 from ..config import BELIEF_FEEDBACK_NONE
@@ -551,6 +551,19 @@ class V3H6Learner:
             )
         if not isinstance(batch, BiddingMinibatch) or not batch.transitions:
             raise ValueError("H6 bidding input must be a non-empty BiddingMinibatch")
+        expected_ruleset = self.ruleset.identity()
+        for index, row in enumerate(batch.transitions):
+            if not isinstance(row, BiddingTransition):
+                raise TypeError("H6 bidding input requires BiddingTransition rows")
+            observed_ruleset = {
+                "ruleset_id": row.obs.ruleset_id,
+                "ruleset_version": row.obs.ruleset_version,
+                "ruleset_hash": row.obs.ruleset_hash,
+            }
+            if observed_ruleset != expected_ruleset:
+                raise ValueError(
+                    f"H6 bidding transition {index} ruleset identity mismatch"
+                )
         inputs = bidding_observations_to_model_input([
             row.obs for row in batch.transitions
         ])

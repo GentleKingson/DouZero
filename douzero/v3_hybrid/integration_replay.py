@@ -223,7 +223,12 @@ def assert_public_replay_payload(payload: object) -> None:
 
     forbidden = {
         "all_handcards", "hidden_hand", "privileged_observation",
-        "belief_label", "oracle_sample", "teacher_state_dict",
+        "belief_label", "belief_labels", "belief_samples",
+        "oracle_sample", "oracle_samples", "bc_samples", "strategy_targets",
+        "bidding_batch", "trajectories", "cooperation_trajectories",
+        "privileged_mixer_state", "mixer_state", "cooperation_state_dict",
+        "optimizer", "optimizer_state", "optimizer_state_dict",
+        "teacher_state_dict",
     }
 
     def visit(value: object) -> None:
