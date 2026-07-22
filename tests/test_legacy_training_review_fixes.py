@@ -428,6 +428,52 @@ def test_formal_benchmark_provenance_fails_closed():
     })
 
 
+def test_benchmark_environment_reads_requested_source_root(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_check_output(command, **kwargs):
+        calls.append((tuple(command), kwargs.get("cwd")))
+        if command[0] == "nvidia-smi":
+            return "0, uuid, gpu, driver, 1000\n"
+        if command[1:3] == ["rev-parse", "HEAD"]:
+            return "a" * 40 + "\n"
+        if command[1:3] == ["status", "--porcelain"]:
+            return ""
+        raise AssertionError(command)
+
+    monkeypatch.setattr(
+        bench_legacy_training.subprocess, "check_output", fake_check_output
+    )
+    monkeypatch.setattr(
+        bench_legacy_training.platform, "platform", lambda: "test-platform"
+    )
+    environment = bench_legacy_training._environment(tmp_path)
+
+    assert environment["git_sha"] == "a" * 40
+    git_calls = [call for call in calls if call[0][0] == "git"]
+    assert git_calls
+    assert all(cwd == tmp_path for _, cwd in git_calls)
+
+
+def test_benchmark_checkpoint_mode_is_explicit():
+    assert bench_legacy_training._checkpoint_cli_args(False) == [
+        "--disable_checkpoint"
+    ]
+    assert bench_legacy_training._checkpoint_cli_args(True) == [
+        "--no-disable_checkpoint", "--save_interval", "1"
+    ]
+
+
+def test_benchmark_policy_lag_bound_fails_closed():
+    bench_legacy_training._validate_policy_lag(
+        {"policy_lag_max": 64}, max_updates=64
+    )
+    with pytest.raises(RuntimeError, match="observed 65 updates, allowed 64"):
+        bench_legacy_training._validate_policy_lag(
+            {"policy_lag_max": 65}, max_updates=64
+        )
+
+
 def test_production_a1_config_keeps_checkpointing_safe_defaults():
     from douzero.dmc.arguments import parse_args
 
