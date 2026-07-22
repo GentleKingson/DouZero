@@ -488,6 +488,12 @@ class FarmerCooperationModule(nn.Module):
             raise ValueError("H5 role index must be long with shape (P,)")
         if not bool((sequence_mask.sum(dim=1) > 0).all()):
             raise ValueError("each farmer trajectory requires a real decision")
+        lengths = sequence_mask.sum(dim=1)
+        prefix_mask = torch.arange(
+            steps, device=sequence_mask.device
+        ).unsqueeze(0) < lengths.unsqueeze(1)
+        if not torch.equal(sequence_mask, prefix_mask):
+            raise ValueError("H5 sequence mask must be a true prefix")
         expected_roles = torch.tensor(
             [0, 1] * (pairs // 2), device=role_index.device, dtype=torch.long
         )
@@ -498,7 +504,7 @@ class FarmerCooperationModule(nn.Module):
                 raise FloatingPointError("H5 real trajectory values contain NaN or Inf")
         step_input = torch.cat((chosen_embeddings, public_features), dim=-1)
         step_input = step_input.masked_fill(~sequence_mask.unsqueeze(-1), 0.0)
-        lengths = sequence_mask.sum(dim=1).cpu()
+        lengths = lengths.cpu()
         packed = nn.utils.rnn.pack_padded_sequence(
             step_input, lengths, batch_first=True, enforce_sorted=False
         )

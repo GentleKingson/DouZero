@@ -396,6 +396,9 @@ def test_module_handles_unequal_sequences_padding_and_early_finish():
     assert output.team_value.shape == (2, 3)
     assert torch.equal(output.team_value[1, 1:], torch.zeros(2))
     assert torch.isfinite(output.trajectory_embedding).all()
+    nonprefix = torch.tensor([[True, False, True], [True, False, False]])
+    with pytest.raises(ValueError, match="true prefix"):
+        module(embedding, features, local_q, nonprefix, torch.tensor([0, 1]))
     with pytest.raises(FloatingPointError, match="real trajectory"):
         module(
             embedding,
