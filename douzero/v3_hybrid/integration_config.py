@@ -16,6 +16,7 @@ from .config import V3HybridModelConfig
 from .loss_composer import LossTermSchedule, V3HybridLossComposerConfig
 from .support_matrix import (
     RULESET_STANDARD,
+    TOPOLOGY_ASYNC_SINGLE_GPU,
     TOPOLOGY_SINGLE_PROCESS,
     v3_h6_support_matrix_hash,
     validate_capability_support,
@@ -309,6 +310,12 @@ class V3H6ResolvedConfig:
         """Run before model/CUDA/checkpoint/replay/worker construction."""
 
         topology = self.learner.topology
+        if topology.topology == TOPOLOGY_ASYNC_SINGLE_GPU:
+            raise ValueError(
+                "H6 config does not support async_single_gpu directly; "
+                "construct the H7 runtime contract around a validated "
+                "single_process learner"
+            )
         if topology.search != self.learner.features.selective_search:
             raise ValueError("H6 search operation and feature flag disagree")
         if topology.export and not self.learner.features.public_export:

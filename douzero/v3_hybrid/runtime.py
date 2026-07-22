@@ -29,7 +29,12 @@ from douzero.training.async_single_gpu import (
 from .adaptive_dmc import ADMC_DISABLED
 from .integration_config import V3H6ResolvedConfig
 from .replay import V3ReplayTransition
-from .support_matrix import RULESET_LEGACY, TOPOLOGY_ASYNC_SINGLE_GPU
+from .support_matrix import (
+    RULESET_LEGACY,
+    TOPOLOGY_ASYNC_SINGLE_GPU,
+    TOPOLOGY_SINGLE_PROCESS,
+    validate_capability_support,
+)
 from .training.h6_learner import V3H6Learner
 
 V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-async-runtime-v1"
@@ -128,8 +133,11 @@ class V3AsyncSingleGPUTrainer:
             raise ValueError("H7 learner and resolved config disagree")
         topology = resolved_config.learner.topology
         features = resolved_config.learner.features
-        if topology.topology != TOPOLOGY_ASYNC_SINGLE_GPU:
-            raise ValueError("H7 async runtime requires async_single_gpu topology")
+        if topology.topology != TOPOLOGY_SINGLE_PROCESS:
+            raise ValueError(
+                "H7 runtime requires a validated single_process learner; "
+                "the outer runtime owns async topology identity"
+            )
         if topology.ruleset != RULESET_LEGACY:
             raise NotImplementedError(
                 "H7 async runtime currently supports legacy card-play rules only"
@@ -140,6 +148,16 @@ class V3AsyncSingleGPUTrainer:
             raise NotImplementedError(
                 "H7 async runtime rejects unsupported capabilities before worker "
                 f"startup: {sorted(unsupported)}"
+            )
+        for capability in enabled:
+            validate_capability_support(
+                capability,
+                topology=TOPOLOGY_ASYNC_SINGLE_GPU,
+                ruleset=topology.ruleset,
+                checkpoint_resume=topology.checkpoint_resume,
+                export=topology.export,
+                deployment=topology.deployment,
+                search=False,
             )
         if not features.adaptive_dmc:
             raise ValueError("H7 async replay requires Adaptive DMC q_old provenance")
