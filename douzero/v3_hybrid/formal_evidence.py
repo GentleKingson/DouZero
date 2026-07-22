@@ -511,8 +511,8 @@ def _validate_evaluation(
     if row["artifact_stale"]:
         issues.append(f"{variant}/{ruleset}/seed-{seed}/{tier}: artifact is stale")
 
-    is_promotion_search = tier == PROMOTION and search_enabled
-    if is_promotion_search:
+    is_promotion = tier == PROMOTION
+    if is_promotion:
         if wp_low <= 0.0 or adp_low <= 0.0:
             issues.append(
                 f"{variant}/{ruleset}/seed-{seed}: overall WP/ADP promotion CI failed"
@@ -529,6 +529,7 @@ def _validate_evaluation(
             issues.append(
                 f"{variant}/{ruleset}/seed-{seed}: public package was not validated"
             )
+    if is_promotion and search_enabled:
         effect = _mapping(row["search_effect"], f"evaluation {variant}.search_effect")
         _exact(
             effect,

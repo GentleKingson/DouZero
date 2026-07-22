@@ -249,6 +249,20 @@ def test_complete_promotion_recomputes_ready() -> None:
     assert report["playing_strength"] == "MEASURED"
 
 
+def test_promotion_gates_search_off_and_search_on_rows() -> None:
+    payload = _evidence(promotion=True)
+    search_off = next(
+        row for row in payload["evaluations"]
+        if row["tier"] == PROMOTION and not row["search_enabled"]
+    )
+    search_off["overall"]["wp_delta"] = {
+        "estimate": -0.01, "low": -0.02, "high": 0.0
+    }
+    report = validate_h8_formal_evidence(payload)
+    assert report["release_status"] == "NOT READY"
+    assert any("overall WP/ADP promotion CI failed" in issue for issue in report["issues"])
+
+
 def test_development_and_promotion_have_distinct_deal_gates() -> None:
     development = _evidence()
     development["evaluations"][0]["deals"] = 19_999

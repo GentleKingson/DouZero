@@ -120,14 +120,48 @@ def test_package_rejects_tamper_unknown_files_and_runtime_drift(tmp_path) -> Non
 
 def test_package_rejects_false_ready_claim_even_with_recomputed_checksums(tmp_path) -> None:
     package, _, schema, config, ruleset = _package(tmp_path)
-    path = package / "manifest.json"
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest_path = package / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["release_candidate"] = "v3_full_hybrid_search_on"
-    path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    manifest["release_status"] = "READY"
+    manifest["playing_strength"] = "MEASURED"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    report_path = package / "formal_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["release_candidate"] = manifest["release_candidate"]
+    report["release_status"] = "READY"
+    report["playing_strength"] = "MEASURED"
+    report_path.write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
     _refresh_checksums(package)
-    with pytest.raises(V3ModelPackageError, match="formal report does not match manifest"):
+    with pytest.raises(V3ModelPackageError, match="recomputed packaged evidence"):
         verify_v3_public_model_package(
             package, schema=schema, ruleset=ruleset, model_config=config
+        )
+
+
+@pytest.mark.parametrize(
+    "decision_config",
+    [
+        {"action_selection": "argmax_dmc_q", "api_token": "secret"},
+        {"action_selection": "argmax_dmc_q", "model_path": "/private/model.pt"},
+    ],
+)
+def test_package_rejects_secret_or_path_bearing_decision_config(
+    tmp_path, decision_config
+) -> None:
+    schema, config, ruleset, model = _runtime()
+    checkpoint = tmp_path / "public.pt"
+    save_v3_hybrid_public_checkpoint(checkpoint, model, ruleset=ruleset)
+    with pytest.raises(V3ModelPackageError, match="unsupported fields"):
+        create_v3_public_model_package(
+            tmp_path / "package",
+            checkpoint,
+            schema=schema,
+            ruleset=ruleset,
+            model_config=config,
+            source_git_sha="a" * 40,
+            decision_config=decision_config,
+            search_compatible=False,
         )
 
 
@@ -261,3 +295,78 @@ def test_package_round_trips_h4_public_belief_graph(tmp_path) -> None:
         belief_config=belief_config,
         expected_source_git_sha="c" * 40,
     )
+
+
+def test_ready_package_selects_matching_checkpoint_and_search_mode(
+    tmp_path, monkeypatch
+) -> None:
+    schema, config, ruleset, model = _runtime()
+    checkpoint = tmp_path / "public.pt"
+    save_v3_hybrid_public_checkpoint(checkpoint, model, ruleset=ruleset)
+    checkpoint_sha = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    report = {
+        "schema_version": release_package_module.H8_REPORT_SCHEMA_VERSION,
+        "evidence_sha256": "d" * 64,
+        "support_matrix_hash": release_package_module.h8a_support_matrix_hash(),
+        "development_status": "COMPLETE",
+        "release_candidate": "v3_full_hybrid",
+        "release_status": "READY",
+        "playing_strength": "MEASURED",
+        "training_run_count": 2,
+        "evaluation_count": 2,
+        "required_variants": ["v3_full_hybrid"],
+        "issues": [],
+    }
+    monkeypatch.setattr(
+        release_package_module,
+        "validate_h8_formal_evidence",
+        lambda _payload: report,
+    )
+    evidence = {
+        "experiment_identity": {"git_sha": "a" * 40},
+        "evaluations": [
+            {
+                "variant": "v3_full_hybrid",
+                "tier": "promotion",
+                "search_enabled": False,
+                "ruleset": ruleset.identity(),
+                "model_checkpoint_sha256": "e" * 64,
+            },
+            {
+                "variant": "v3_full_hybrid",
+                "tier": "promotion",
+                "search_enabled": False,
+                "ruleset": ruleset.identity(),
+                "model_checkpoint_sha256": checkpoint_sha,
+            },
+        ],
+    }
+    package = tmp_path / "selected-package"
+    manifest = create_v3_public_model_package(
+        package,
+        checkpoint,
+        schema=schema,
+        ruleset=ruleset,
+        model_config=config,
+        source_git_sha="a" * 40,
+        decision_config={"action_selection": "argmax_dmc_q"},
+        search_compatible=False,
+        formal_evidence=evidence,
+    )
+    assert manifest["release_status"] == "READY"
+    assert json.loads(
+        (package / "formal_evidence.json").read_text(encoding="utf-8")
+    )["payload"] == evidence
+
+    with pytest.raises(V3ModelPackageError, match="packaged search mode"):
+        create_v3_public_model_package(
+            tmp_path / "wrong-search-package",
+            checkpoint,
+            schema=schema,
+            ruleset=ruleset,
+            model_config=config,
+            source_git_sha="a" * 40,
+            decision_config={"action_selection": "argmax_dmc_q"},
+            search_compatible=True,
+            formal_evidence=evidence,
+        )

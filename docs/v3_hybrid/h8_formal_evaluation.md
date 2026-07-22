@@ -75,6 +75,13 @@ prior, and bidding modules are part of the V3 model identity and are preserved
 by the same strict checkpoint path. The package also binds decision config,
 search compatibility, ruleset identity, source SHA, and evidence identity.
 
+The package carries the raw formal-evidence bundle and recomputes its report
+during verification; a caller cannot establish `READY` by rewriting only the
+manifest and report. The packaged checkpoint must match a passing promotion
+row for the package ruleset and declared search mode. Decision configuration
+is restricted to the public `argmax_dmc_q` schema and zero temperature, so
+arbitrary path- or credential-bearing metadata is rejected.
+
 The exact allow-list excludes Oracle, teacher, cooperation mixer, optimizer,
 replay, privileged labels, trajectories, human identifiers, caches, local
 paths, and secrets. A package without promotion evidence is deliberately a

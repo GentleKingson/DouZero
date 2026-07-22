@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -31,6 +32,7 @@ from .config import BELIEF_FEEDBACK_NONE, V3HybridModelConfig
 from .contract import V3_HYBRID_MODEL_VERSION
 from .formal_evidence import (
     H8_REPORT_SCHEMA_VERSION,
+    H8EvidenceError,
     REQUIRED_VARIANTS,
     h8a_support_matrix_hash,
     validate_h8_formal_evidence,
@@ -44,7 +46,8 @@ _FILES = frozenset({
     "feature_schema.json", "model_config.json", "decision_config.json",
     "model_card.md", "training_summary.md", "benchmark_summary.md",
     "evaluation_summary.md", "known_limitations.md", "rollback.md",
-    "formal_report.json", "LICENSE", "THIRD_PARTY_NOTICES", "SHA256SUMS",
+    "formal_evidence.json", "formal_report.json", "LICENSE",
+    "THIRD_PARTY_NOTICES", "SHA256SUMS",
 })
 _FORBIDDEN_FILE_TOKENS = (
     "oracle", "teacher", "privileged", "hidden", "replay", "optimizer",
@@ -54,6 +57,49 @@ _FORBIDDEN_FILE_TOKENS = (
 
 class V3ModelPackageError(RuntimeError):
     """Raised when a V3 package is incomplete, corrupt, or incompatible."""
+
+
+def _validate_decision_config(value: Mapping[str, Any]) -> dict[str, Any]:
+    allowed = {"action_selection", "temperature"}
+    unknown = set(value) - allowed
+    if unknown:
+        raise V3ModelPackageError(
+            f"decision_config contains unsupported fields: {sorted(unknown)}"
+        )
+    if value.get("action_selection") != "argmax_dmc_q":
+        raise V3ModelPackageError(
+            "decision_config.action_selection must be 'argmax_dmc_q'"
+        )
+    temperature = value.get("temperature", 0.0)
+    if (
+        isinstance(temperature, bool)
+        or not isinstance(temperature, (int, float))
+        or not math.isfinite(float(temperature))
+        or float(temperature) != 0.0
+    ):
+        raise V3ModelPackageError(
+            "decision_config.temperature must be finite and zero for argmax_dmc_q"
+        )
+    return {
+        "action_selection": "argmax_dmc_q",
+        "temperature": float(temperature),
+    }
+
+
+def _empty_formal_report() -> dict[str, Any]:
+    return {
+        "schema_version": H8_REPORT_SCHEMA_VERSION,
+        "evidence_sha256": "0" * 64,
+        "support_matrix_hash": h8a_support_matrix_hash(),
+        "development_status": "INCOMPLETE",
+        "release_candidate": "NONE",
+        "release_status": "NOT READY",
+        "playing_strength": "NOT MEASURED",
+        "training_run_count": 0,
+        "evaluation_count": 0,
+        "required_variants": list(REQUIRED_VARIANTS),
+        "issues": ["formal evidence was not supplied"],
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -202,6 +248,7 @@ def create_v3_public_model_package(
         raise TypeError("search_compatible must be bool")
     if not isinstance(decision_config, Mapping):
         raise TypeError("decision_config must be a mapping")
+    resolved_decision_config = _validate_decision_config(decision_config)
     if model_config.belief_feedback == BELIEF_FEEDBACK_NONE and belief_config is not None:
         raise V3ModelPackageError("belief-disabled policy cannot package belief config")
     if model_config.belief_feedback != BELIEF_FEEDBACK_NONE and belief_config is None:
@@ -218,17 +265,7 @@ def create_v3_public_model_package(
         raise V3ModelPackageError(f"output directory is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
     if formal_evidence is None:
-        report = {
-            "schema_version": H8_REPORT_SCHEMA_VERSION,
-            "evidence_sha256": "0" * 64,
-            "support_matrix_hash": h8a_support_matrix_hash(),
-            "development_status": "INCOMPLETE",
-            "release_candidate": "NONE", "release_status": "NOT READY",
-            "playing_strength": "NOT MEASURED", "training_run_count": 0,
-            "evaluation_count": 0,
-            "required_variants": list(REQUIRED_VARIANTS),
-            "issues": ["formal evidence was not supplied"],
-        }
+        report = _empty_formal_report()
         evidence_hash = "0" * 64
     else:
         report = validate_h8_formal_evidence(formal_evidence)
@@ -241,14 +278,16 @@ def create_v3_public_model_package(
                 row for row in formal_evidence["evaluations"]
                 if row["variant"] == report["release_candidate"]
                 and row["tier"] == "promotion"
-                and row["search_enabled"] is True
+                and row["search_enabled"] is search_compatible
+                and row["ruleset"] == ruleset.identity()
             ]
-            if not candidate_rows or any(
-                row["model_checkpoint_sha256"] != checkpoint_digest
+            if not candidate_rows or not any(
+                row["model_checkpoint_sha256"] == checkpoint_digest
                 for row in candidate_rows
             ):
                 raise V3ModelPackageError(
-                    "formal candidate evidence is not bound to the packaged checkpoint"
+                    "formal candidate evidence for the packaged search mode is not "
+                    "bound to the packaged checkpoint"
                 )
     shutil.copyfile(source, root / "public_checkpoint.pt")
     _write_json(root / "ruleset.json", ruleset.to_dict())
@@ -262,8 +301,12 @@ def create_v3_public_model_package(
         "belief_config": asdict(belief_config) if belief_config is not None else None,
     })
     _write_json(root / "decision_config.json", {
-        "decision_config_hash": _canonical_hash(decision_config),
-        "config": dict(decision_config),
+        "decision_config_hash": _canonical_hash(resolved_decision_config),
+        "config": resolved_decision_config,
+    })
+    _write_json(root / "formal_evidence.json", {
+        "supplied": formal_evidence is not None,
+        "payload": dict(formal_evidence) if formal_evidence is not None else None,
     })
     _write_json(root / "formal_report.json", report)
     for name, contents in _default_documents(report).items():
@@ -288,7 +331,7 @@ def create_v3_public_model_package(
             belief_config.stable_hash() if belief_config is not None else "0" * 64
         ),
         "ruleset": ruleset.identity(),
-        "decision_config_hash": _canonical_hash(decision_config),
+        "decision_config_hash": _canonical_hash(resolved_decision_config),
         "search_compatible": search_compatible,
         "formal_evidence_sha256": evidence_hash,
         "release_candidate": report["release_candidate"],
@@ -397,11 +440,39 @@ def verify_v3_public_model_package(
     }:
         raise V3ModelPackageError("model_config.json identity mismatch")
     decision = _read_json(root / "decision_config.json")
-    if set(decision) != {"decision_config_hash", "config"} or decision["decision_config_hash"] != _canonical_hash(decision["config"]):
+    if set(decision) != {"decision_config_hash", "config"} or not isinstance(
+        decision["config"], dict
+    ):
+        raise V3ModelPackageError("decision_config.json identity mismatch")
+    resolved_decision = _validate_decision_config(decision["config"])
+    if resolved_decision != decision["config"] or decision[
+        "decision_config_hash"
+    ] != _canonical_hash(resolved_decision):
         raise V3ModelPackageError("decision_config.json identity mismatch")
     if decision["decision_config_hash"] != manifest["decision_config_hash"]:
         raise V3ModelPackageError("decision config does not match manifest")
     report = _read_json(root / "formal_report.json")
+    evidence_wrapper = _read_json(root / "formal_evidence.json")
+    if set(evidence_wrapper) != {"supplied", "payload"} or not isinstance(
+        evidence_wrapper["supplied"], bool
+    ):
+        raise V3ModelPackageError("formal_evidence.json envelope mismatch")
+    if evidence_wrapper["supplied"]:
+        evidence_payload = evidence_wrapper["payload"]
+        if not isinstance(evidence_payload, dict):
+            raise V3ModelPackageError("formal evidence payload must be an object")
+        try:
+            recomputed_report = validate_h8_formal_evidence(evidence_payload)
+        except (H8EvidenceError, TypeError, ValueError) as exc:
+            raise V3ModelPackageError(
+                f"packaged formal evidence is invalid: {exc}"
+            ) from exc
+    else:
+        if evidence_wrapper["payload"] is not None:
+            raise V3ModelPackageError(
+                "absent formal evidence must use a null payload"
+            )
+        recomputed_report = _empty_formal_report()
     expected_report_fields = {
         "schema_version", "evidence_sha256", "release_candidate",
         "release_status", "playing_strength", "required_variants",
@@ -410,6 +481,10 @@ def verify_v3_public_model_package(
     }
     if set(report) != expected_report_fields:
         raise V3ModelPackageError("formal_report.json fields mismatch")
+    if report != recomputed_report:
+        raise V3ModelPackageError(
+            "formal report does not match recomputed packaged evidence"
+        )
     for report_name, manifest_name in (
         ("evidence_sha256", "formal_evidence_sha256"),
         ("release_candidate", "release_candidate"),
