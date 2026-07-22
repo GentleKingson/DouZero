@@ -943,9 +943,33 @@ def validate_h8_formal_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
         if len(samples_by_seed[seed]) > 1 or len(wall_by_seed[seed]) > 1:
             raise H8EvidenceError(f"seed {seed} does not use matched budgets")
 
+    expected_development = _expected_development_keys(identity)
+    expected_promotion = _expected_promotion_keys(identity)
+    expected_evaluations = expected_development | expected_promotion
+    if len(evaluation_rows) > len(expected_evaluations):
+        raise H8EvidenceError("evaluation row count exceeds the declared matrix")
     seen: Counter[tuple[str, str, int, str, bool]] = Counter()
+    prevalidated_keys: set[tuple[object, ...]] = set()
     for index, raw in enumerate(evaluation_rows):
         row = _mapping(raw, f"evaluations[{index}]")
+        raw_ruleset = row.get("ruleset")
+        prevalidated_key = (
+            row.get("variant"),
+            raw_ruleset.get("ruleset_id")
+            if isinstance(raw_ruleset, Mapping) else None,
+            row.get("training_seed"),
+            row.get("tier"),
+            row.get("search_enabled"),
+        )
+        try:
+            if prevalidated_key in prevalidated_keys:
+                raise H8EvidenceError(
+                    f"duplicate evaluation row: {prevalidated_key}"
+                )
+            prevalidated_keys.add(prevalidated_key)
+        except TypeError:
+            # The strict row validator below produces the field-specific error.
+            pass
         row_issues = _validate_evaluation(row, identity, training)
         if row["tier"] == DEVELOPMENT:
             development_evaluation_issues.extend(row_issues)
@@ -959,9 +983,6 @@ def validate_h8_formal_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     duplicates = sorted(key for key, count in seen.items() if count != 1)
     if duplicates:
         raise H8EvidenceError(f"duplicate evaluation rows: {duplicates}")
-    expected_development = _expected_development_keys(identity)
-    expected_promotion = _expected_promotion_keys(identity)
-    expected_evaluations = expected_development | expected_promotion
     missing_development = sorted(expected_development - set(seen))
     missing_promotion = sorted(expected_promotion - set(seen))
     if missing_development:

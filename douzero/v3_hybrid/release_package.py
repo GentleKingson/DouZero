@@ -501,6 +501,8 @@ def verify_v3_public_model_package(
         raise V3ModelPackageError("manifest source Git SHA is malformed")
     if not _HEX64.fullmatch(str(manifest["formal_evidence_sha256"])):
         raise V3ModelPackageError("manifest formal evidence hash is malformed")
+    if not isinstance(manifest["search_compatible"], bool):
+        raise V3ModelPackageError("manifest search_compatible must be bool")
     if expected_source_git_sha is not None and manifest["source_git_sha"] != expected_source_git_sha:
         raise V3ModelPackageError("source Git SHA mismatch")
     if expected_search_compatible is not None and manifest["search_compatible"] is not expected_search_compatible:

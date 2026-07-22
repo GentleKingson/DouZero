@@ -508,6 +508,15 @@ def test_malformed_or_contradictory_evidence_fails_closed(mutation, message) -> 
         validate_h8_formal_evidence(payload)
 
 
+def test_duplicate_evaluation_is_rejected_before_bootstrap_validation() -> None:
+    payload = _evidence()
+    duplicate = copy.deepcopy(payload["evaluations"][0])
+    duplicate["bootstrap_resamples"] = 10**12
+    payload["evaluations"][-1] = duplicate
+    with pytest.raises(H8EvidenceError, match="duplicate evaluation row"):
+        validate_h8_formal_evidence(payload)
+
+
 @pytest.mark.parametrize("value", ["/home/user/GPU", "api_token=secret"])
 def test_public_evidence_metadata_rejects_paths_and_secrets(value: str) -> None:
     payload = _evidence()
