@@ -146,6 +146,18 @@ def _checkpoint_cli_args(enabled):
     return ["--disable_checkpoint"]
 
 
+def _remove_stale_repeat_artifacts(*paths):
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except IsADirectoryError as exc:
+            raise RuntimeError(
+                f"refusing to replace non-file repeat artifact: {path}"
+            ) from exc
+
+
 def _environment(source_root=ROOT):
     import torch
 
@@ -369,6 +381,8 @@ def main(argv=None):
             run_name = f"{config.stem}-r{repeat}"
             metrics_path = output_dir / f"{run_name}.json"
             log_path = output_dir / f"{run_name}.log"
+            checkpoint_path = output_dir / "run-logs" / run_name / "model.tar"
+            _remove_stale_repeat_artifacts(metrics_path, checkpoint_path)
             command = [
                 sys.executable, str(source_root / "train.py"),
                 "--config", str(config),
@@ -407,7 +421,6 @@ def main(argv=None):
                     f"inspect {log_path}"
                 )
             payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-            checkpoint_path = output_dir / "run-logs" / run_name / "model.tar"
             if args.checkpoint_enabled and not checkpoint_path.is_file():
                 raise RuntimeError(
                     f"{run_name} completed without {checkpoint_path}"

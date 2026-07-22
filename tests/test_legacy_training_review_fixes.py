@@ -476,6 +476,23 @@ def test_benchmark_checkpoint_mode_is_explicit():
     ]
 
 
+def test_benchmark_removes_stale_per_repeat_artifacts(tmp_path):
+    metrics = tmp_path / "repeat.json"
+    checkpoint = tmp_path / "run" / "model.tar"
+    checkpoint.parent.mkdir()
+    metrics.write_text("stale metrics", encoding="utf-8")
+    checkpoint.write_bytes(b"stale checkpoint")
+
+    bench_legacy_training._remove_stale_repeat_artifacts(metrics, checkpoint)
+
+    assert not metrics.exists()
+    assert not checkpoint.exists()
+
+    checkpoint.mkdir()
+    with pytest.raises(RuntimeError, match="non-file repeat artifact"):
+        bench_legacy_training._remove_stale_repeat_artifacts(checkpoint)
+
+
 def test_benchmark_policy_lag_bound_fails_closed():
     bench_legacy_training._validate_policy_lag(
         {"policy_lag_max": 64}, max_updates=64
