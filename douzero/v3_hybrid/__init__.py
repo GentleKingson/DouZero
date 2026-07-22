@@ -92,6 +92,13 @@ from .support_matrix import (
     v3_h6_support_matrix_hash,
     validate_capability_support,
 )
+from .selective_search import (
+    V3_H7_SEARCH_GATE_VERSION,
+    V3H7SearchGateConfig,
+    V3H7SearchMetrics,
+    V3H7SearchRecord,
+    V3SelectiveSearch,
+)
 
 __all__ = [
     "V3_HYBRID_CHECKPOINT_KIND",
@@ -167,4 +174,9 @@ __all__ = [
     "v3_h6_support_matrix_dict",
     "v3_h6_support_matrix_hash",
     "validate_capability_support",
+    "V3_H7_SEARCH_GATE_VERSION",
+    "V3H7SearchGateConfig",
+    "V3H7SearchMetrics",
+    "V3H7SearchRecord",
+    "V3SelectiveSearch",
 ]
