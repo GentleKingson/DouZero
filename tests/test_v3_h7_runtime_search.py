@@ -25,6 +25,7 @@ from douzero.v3_hybrid.runtime import (
     V3_H7_REQUEST_PROTOCOL,
     V3H7RuntimeConfig,
     V3AsyncSingleGPUTrainer,
+    V3SingleProcessTrainer,
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid import (
@@ -402,6 +403,10 @@ def test_h7_benchmark_requires_three_matched_repeats_per_topology():
     corrupted[0]["in_flight"] = 1
     with pytest.raises(ValueError, match="did not quiesce"):
         validate_h7_benchmark_evidence(corrupted, protocol)
+    corrupted = [dict(record) for record in records]
+    corrupted[0]["measurement_seconds"] = 299.0
+    with pytest.raises(ValueError, match="window is too short"):
+        validate_h7_benchmark_evidence(corrupted, protocol)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA host")
@@ -496,3 +501,59 @@ def test_h7_cuda_async_update_checkpoint_resume_and_shutdown(tmp_path):
     assert resumed.stats.learner_cardplay_samples == 4
     resumed.shutdown()
     assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA host")
+def test_h7_cuda_single_process_update_checkpoint_and_shutdown(tmp_path):
+    model_config = V3HybridModelConfig(
+        hidden_size=16,
+        history_layers=1,
+        history_heads=4,
+        shared_fusion_layers=1,
+        landlord_adapter_layers=1,
+        farmer_adapter_layers=1,
+    )
+    public = V3H2LearnerConfig(
+        batch_size=4,
+        learning_rate=1e-3,
+        max_grad_norm=10.0,
+        device="cuda",
+        adaptive_dmc=AdaptiveDMCConfig(mode=ADMC_SAFE_HYBRID),
+    )
+    resolved = V3H6ResolvedConfig(
+        model=model_config,
+        learner=V3H6LearnerConfig(
+            base=V3H5LearnerConfig(
+                base=V3H4LearnerConfig(base=V3H3LearnerConfig(public=public))
+            ),
+            losses=V3HybridLossComposerConfig(lambda_dmc=1.0),
+            features=V3H6FeatureFlags(adaptive_dmc=True),
+            topology=V3H6TopologyConfig(ruleset="legacy"),
+        ),
+    )
+    model = V3HybridModel(build_v2_schema(), model_config)
+    learner = V3H6Learner(model, ruleset=RuleSet.legacy(), config=resolved)
+    runtime = V3SingleProcessTrainer(
+        learner,
+        resolved,
+        V3H7RuntimeConfig(
+            topology="single_process",
+            num_actors=1,
+            games_per_actor=1,
+            batch_size=4,
+            replay_capacity=256,
+        ),
+    )
+    checkpoint = tmp_path / "single.pt"
+    try:
+        runtime.collect_episodes(1)
+        assert runtime.step() is not None
+        boundary = runtime.quiesce_cycle_boundary()
+        assert boundary["active_slots"] == 0
+        assert boundary["policy_lag"] == 0
+        runtime.save_training_checkpoint(
+            str(checkpoint), long_running_state={"cycle": 1}
+        )
+    finally:
+        runtime.shutdown()
+    assert checkpoint.is_file()

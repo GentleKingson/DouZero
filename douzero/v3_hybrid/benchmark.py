@@ -110,13 +110,15 @@ def validate_h7_benchmark_evidence(
         repeat = record["repeat"]
         if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 0:
             raise ValueError("H7 benchmark repeat must be non-negative")
+        if repeat >= protocol.repetitions:
+            raise ValueError("H7 benchmark repeat exceeds the frozen protocol")
         key = (topology, repeat)
         if key in seen:
             raise ValueError("duplicate H7 benchmark topology repeat")
         seen.add(key)
         counts[topology] += 1
-        if record["seed"] not in protocol.seeds:
-            raise ValueError("H7 benchmark seed is outside the frozen protocol")
+        if record["seed"] != protocol.seeds[repeat]:
+            raise ValueError("H7 benchmark seed does not match its frozen repeat")
         if record["parameter_update_observed"] is not True:
             raise ValueError("H7 benchmark did not observe a parameter update")
         if not isinstance(record["checkpoint_path"], str) or not record["checkpoint_path"]:
@@ -130,6 +132,8 @@ def validate_h7_benchmark_evidence(
                 or value < 0.0
             ):
                 raise ValueError(f"H7 benchmark metric {name} is invalid")
+        if record["measurement_seconds"] < protocol.measurement_seconds:
+            raise ValueError("H7 benchmark measurement window is too short")
         for name in ("active_slots", "in_flight", "pending"):
             if record[name] != 0:
                 raise ValueError(f"H7 benchmark did not quiesce {name}")

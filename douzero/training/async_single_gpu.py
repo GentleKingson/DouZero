@@ -980,6 +980,8 @@ def async_actor_main(
             ),
             "steps": 0,
             "pending": None,
+            "started_at": time.monotonic(),
+            "blocked_seconds": 0.0,
         }
 
     def finish_game(game) -> None:
@@ -999,6 +1001,8 @@ def async_actor_main(
             "completed", actor_id, game["episode_id"], len(episode.transitions),
             0 if team == "landlord" else 1, game["snapshot"],
             len(episode.action_trace),
+            float(game["blocked_seconds"]),
+            float(time.monotonic() - game["started_at"]),
         ))
 
     def apply_action(
@@ -1070,7 +1074,9 @@ def async_actor_main(
 
     def resolve_request(game):
         slot_id, pending_id, obs, position, legal_actions = game["pending"]
+        blocked_started = time.monotonic()
         coordinator.wait_done(slot_id, pending_id)
+        game["blocked_seconds"] += time.monotonic() - blocked_started
         count = int(coordinator.slots.action_counts[slot_id])
         mask = coordinator.slots.action_mask[slot_id, :count].clone()
         packed = coordinator.slots.output_values[slot_id, :count].clone()

@@ -12,7 +12,7 @@ import random
 import tempfile
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -37,8 +37,8 @@ from .support_matrix import (
 )
 from .training.h6_learner import V3H6Learner
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-async-runtime-v1"
-V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v1"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-runtime-v2"
+V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v2"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
 
@@ -52,6 +52,7 @@ def _stable_hash(payload: Mapping[str, object]) -> str:
 
 @dataclass(frozen=True)
 class V3H7RuntimeConfig:
+    topology: str = TOPOLOGY_ASYNC_SINGLE_GPU
     num_actors: int = 4
     games_per_actor: int = 4
     batch_size: int = 32
@@ -70,6 +71,10 @@ class V3H7RuntimeConfig:
     replay_protocol: str = V3_H7_REPLAY_PROTOCOL
 
     def __post_init__(self) -> None:
+        if self.topology not in {
+            TOPOLOGY_SINGLE_PROCESS, TOPOLOGY_ASYNC_SINGLE_GPU,
+        }:
+            raise ValueError("unknown H7 runtime topology")
         positive = (
             "num_actors", "games_per_actor", "batch_size", "replay_capacity",
             "max_actions", "target_microbatch", "max_policy_lag",
@@ -146,7 +151,7 @@ def validate_v3_h7_runtime_config(
     for capability in enabled:
         validate_capability_support(
             capability,
-            topology=TOPOLOGY_ASYNC_SINGLE_GPU,
+            topology=runtime_config.topology,
             ruleset=topology.ruleset,
             checkpoint_resume=topology.checkpoint_resume,
             export=topology.export,
@@ -181,6 +186,11 @@ class V3AsyncSingleGPUTrainer:
         if learner.config != resolved_config:
             raise ValueError("H7 learner and resolved config disagree")
         validate_v3_h7_runtime_config(resolved_config, runtime_config)
+        if (
+            type(self) is V3AsyncSingleGPUTrainer
+            and runtime_config.topology != TOPOLOGY_ASYNC_SINGLE_GPU
+        ):
+            raise ValueError("H7 async trainer requires async_single_gpu topology")
         if learner.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("H7 async runtime requires CUDA and never falls back")
         self.learner = learner
@@ -227,6 +237,8 @@ class V3AsyncSingleGPUTrainer:
         self._batch_histogram: dict[str, int] = {}
         self._bucket_histogram: dict[str, int] = {}
         self._queue_latencies_ms: list[float] = []
+        self._actor_blocked_seconds = 0.0
+        self._actor_wall_seconds = 0.0
 
     @staticmethod
     def _increment(histogram: dict[str, int], value: object) -> None:
@@ -443,6 +455,9 @@ class V3AsyncSingleGPUTrainer:
                 self.stats.decisions_collected += int(event[6])
                 team = "landlord" if int(event[4]) == 0 else "farmer"
                 self.stats.episodes_per_team[team] += 1
+                if len(event) >= 9:
+                    self._actor_blocked_seconds += float(event[7])
+                    self._actor_wall_seconds += float(event[8])
 
     def optimize(self, num_steps: int) -> None:
         if num_steps < 0:
@@ -518,6 +533,12 @@ class V3AsyncSingleGPUTrainer:
             "inference_queue_p95_ms": percentile(0.95),
             "inference_queue_p99_ms": percentile(0.99),
             "policy_lag": lag,
+            "actor_blocked_ratio": (
+                self._actor_blocked_seconds / max(self._actor_wall_seconds, 1.0e-12)
+            ),
+            "learner_data_wait_ratio": 0.0,
+            "learner_throttle_seconds": 0.0,
+            "peak_vram_bytes": int(torch.cuda.max_memory_allocated(self.device)),
             "microbatch_size_histogram": dict(self._batch_histogram),
             "inference_bucket_histogram": dict(self._bucket_histogram),
             **{f"{name}_seconds": value for name, value in self._segments.items()},
@@ -671,12 +692,130 @@ class V3AsyncSingleGPUTrainer:
             raise error
 
 
+class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
+    """Reference end-to-end V3 self-play topology without actor workers."""
+
+    def __init__(
+        self,
+        learner: V3H6Learner,
+        resolved_config: V3H6ResolvedConfig,
+        runtime_config: V3H7RuntimeConfig,
+    ) -> None:
+        if runtime_config.topology != TOPOLOGY_SINGLE_PROCESS:
+            raise ValueError("H7 single-process trainer requires single_process topology")
+        if runtime_config.num_actors != 1 or runtime_config.games_per_actor != 1:
+            raise ValueError("H7 single-process topology requires 1 actor x 1 game")
+        super().__init__(learner, resolved_config, runtime_config)
+
+    def collect_episodes(self, num_episodes: int | None = None) -> None:
+        import numpy as np
+
+        from douzero.env.env import Env
+        from douzero.observation.encode_v2 import get_obs_v2
+
+        from .replay import (
+            AdaptiveSnapshotProvenance,
+            capture_plain_transition,
+        )
+
+        target = int(num_episodes or 0)
+        if target < 0:
+            raise ValueError("H7 episode target must be non-negative")
+        self._publish_snapshot()
+        for episode_number in range(
+            self.stats.games_collected,
+            self.stats.games_collected + target,
+        ):
+            np.random.seed(
+                (self.config.environment_seed + episode_number) % (1 << 32)
+            )
+            env = Env("adp")
+            env.reset()
+            pending = []
+            decisions = 0
+            steps = 0
+            while True:
+                position = env._acting_player_position
+                legal_actions = env.infoset.legal_actions
+                decisions += 1
+                if len(legal_actions) == 1:
+                    action_index = 0
+                else:
+                    observation = get_obs_v2(env.infoset, ruleset=self.learner.ruleset)
+                    started = time.perf_counter()
+                    with torch.inference_mode():
+                        output = self.inference_model.forward_observation(observation)
+                    torch.cuda.synchronize(self.device)
+                    self._segments["forward"] += time.perf_counter() - started
+                    mask = output.action_mask.bool()
+                    q_values = output.dmc_q[:, 0].masked_fill(
+                        ~mask, float("-inf")
+                    )
+                    valid = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+                    action_index = (
+                        int(self._rng.choice(valid))
+                        if self.config.epsilon > 0.0
+                        and self._rng.random() < self.config.epsilon
+                        else int(torch.argmax(q_values).item())
+                    )
+                    captured = capture_plain_transition(
+                        observation,
+                        selected_action_index=action_index,
+                        episode_id=f"single-episode-{episode_number}",
+                        deal_id=f"single-deal-{episode_number}",
+                        target_transform=self.model.config.dmc_target_transform,
+                    )
+                    pending.append(replace(
+                        captured,
+                        adaptive_provenance=AdaptiveSnapshotProvenance(
+                            q_old=float(q_values[action_index].item()),
+                            policy_version=self._snapshot_step,
+                            snapshot_slot=0,
+                            owner_id=0,
+                            generation=episode_number + 1,
+                        ),
+                    ))
+                _obs, _reward, done, info = env.step(legal_actions[action_index])
+                steps += 1
+                if done:
+                    break
+                if steps >= self.config.max_steps_per_episode:
+                    raise RuntimeError(
+                        "H7 single-process episode exceeded max_steps_per_episode"
+                    )
+            terminal = info or {}
+            team_targets = terminal.get("team_targets")
+            if not isinstance(team_targets, dict):
+                raise ValueError("H7 terminal result is missing team_targets")
+            rows = [
+                row.finalize(float(team_targets[row.role]["target_score"]))
+                for row in pending
+            ]
+            self.buffer.extend(rows)
+            self.stats.games_collected += 1
+            self.stats.episodes_completed += 1
+            self.stats.transitions_collected += len(rows)
+            self.stats.decisions_collected += decisions
+            team = terminal.get("winner_team")
+            if team not in {"landlord", "farmer"}:
+                raise ValueError("H7 terminal winner_team is invalid")
+            self.stats.episodes_per_team[team] += 1
+
+    def quiesce_cycle_boundary(self) -> dict[str, object]:
+        self._publish_snapshot()
+        return super().quiesce_cycle_boundary()
+
+    def shutdown(self) -> None:
+        return None
+
+
 __all__ = [
     "V3_H7_CHECKPOINT_FORMAT",
     "V3_H7_REPLAY_PROTOCOL",
     "V3_H7_REQUEST_PROTOCOL",
     "V3_H7_RUNTIME_VERSION",
     "V3AsyncSingleGPUTrainer",
+    "V3SingleProcessTrainer",
     "V3H7RuntimeConfig",
     "V3H7RuntimeStats",
     "validate_v3_h7_runtime_config",

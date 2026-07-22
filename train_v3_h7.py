@@ -34,7 +34,12 @@ from douzero.v3_hybrid.integration_config import (
 from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
+    V3SingleProcessTrainer,
     validate_v3_h7_runtime_config,
+)
+from douzero.v3_hybrid.support_matrix import (
+    TOPOLOGY_ASYNC_SINGLE_GPU,
+    TOPOLOGY_SINGLE_PROCESS,
 )
 from douzero.v3_hybrid.training.h3_learner import V3H3LearnerConfig
 from douzero.v3_hybrid.training.h4_learner import V3H4LearnerConfig
@@ -107,6 +112,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-every-cycles", type=int, default=1)
     parser.add_argument("--keep-last-checkpoints", type=int, default=3)
     parser.add_argument("--resume", default="")
+    parser.add_argument(
+        "--topology",
+        choices=(TOPOLOGY_SINGLE_PROCESS, TOPOLOGY_ASYNC_SINGLE_GPU),
+        default=TOPOLOGY_ASYNC_SINGLE_GPU,
+    )
     return parser
 
 
@@ -116,6 +126,7 @@ def main() -> None:
         raise RuntimeError("H7 async runtime requires CUDA")
     resolved = _smoke_config() if args.smoke_config else load_v3_hybrid_config(args.config)
     runtime_config = V3H7RuntimeConfig(
+        topology=args.topology,
         num_actors=args.num_actors,
         games_per_actor=args.games_per_actor,
         batch_size=args.batch_size,
@@ -131,7 +142,12 @@ def main() -> None:
     learner = V3H6Learner(
         model, ruleset=RuleSet.legacy(), config=resolved
     )
-    trainer = V3AsyncSingleGPUTrainer(learner, resolved, runtime_config)
+    trainer_type = (
+        V3SingleProcessTrainer
+        if args.topology == TOPOLOGY_SINGLE_PROCESS
+        else V3AsyncSingleGPUTrainer
+    )
+    trainer = trainer_type(learner, resolved, runtime_config)
     state = None
     checkpoint_series = CheckpointSeries(
         args.checkpoint_path, args.keep_last_checkpoints
@@ -152,7 +168,7 @@ def main() -> None:
         checkpoint_every_cycles=args.checkpoint_every_cycles,
         keep_last_checkpoints=args.keep_last_checkpoints,
         save_on_interrupt=True,
-        v2_training_mode="async_single_gpu",
+        v2_training_mode=args.topology,
         num_actors=args.num_actors,
         games_per_actor=args.games_per_actor,
         replay_schema_version=3,
