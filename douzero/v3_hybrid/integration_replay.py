@@ -9,8 +9,16 @@ import torch
 
 from douzero.models_v2.batch import ModelInputBundle
 
-from .config import V3HybridModelConfig
-from .replay import AdaptiveSnapshotProvenance, V3ReplayTransition
+from .config import (
+    DMC_TARGET_RAW,
+    DMC_TARGET_SIGNED_LOG,
+    V3HybridModelConfig,
+)
+from .replay import (
+    AdaptiveSnapshotProvenance,
+    V3ReplayTransition,
+    _normalize_ruleset_identity,
+)
 
 V3_H6_REPLAY_SCHEMA_VERSION = 1
 V3_H6_REPLAY_SEMANTICS = (
@@ -133,15 +141,14 @@ class V3H6ReplayBuffer:
             raise TypeError("H6 replay requires V3HybridModelConfig")
         if not isinstance(adaptive_required, bool):
             raise TypeError("H6 replay adaptive_required must be bool")
-        if not isinstance(ruleset_identity, Mapping) or set(ruleset_identity) != {
-            "ruleset_id", "ruleset_version", "ruleset_hash"
-        }:
-            raise ValueError("H6 replay ruleset identity fields mismatch")
+        if target_transform not in {DMC_TARGET_RAW, DMC_TARGET_SIGNED_LOG}:
+            raise ValueError("H6 replay target transform is unsupported")
+        normalized_ruleset = _normalize_ruleset_identity(ruleset_identity)
         self.capacity = capacity
         self.model_config = model_config
         self.feature_schema_hash = feature_schema_hash
         self.target_transform = target_transform
-        self.ruleset_identity = dict(ruleset_identity)
+        self.ruleset_identity = normalized_ruleset
         self.adaptive_required = adaptive_required
         self._records: deque[V3ReplayTransition] = deque(maxlen=capacity)
 

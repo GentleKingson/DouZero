@@ -509,7 +509,27 @@ class V3H5Learner:
         inputs = model_input_bundles_to_batch(
             [row.model_inputs for row in farmer_rows], chosen
         )
-        adapted = self.model.encode_input_batch_actions(inputs)
+        belief_features = None
+        if self.model.config.belief_feedback != BELIEF_FEEDBACK_NONE:
+            if belief_samples is None:
+                raise ValueError(
+                    "H5 belief feedback requires aligned public belief samples"
+                )
+            sample_by_transition = {
+                id(transition): sample
+                for transition, sample in zip(transitions, belief_samples)
+            }
+            if len(sample_by_transition) != len(transitions):
+                raise ValueError("H5 belief sidecar contains duplicate transitions")
+            farmer_samples = [
+                sample_by_transition[id(transition)] for transition in farmer_rows
+            ]
+            belief_features, _latency_ms = self.base._policy_features(
+                farmer_rows, farmer_samples
+            )
+        adapted = self.model.encode_input_batch_actions(
+            inputs, belief_features=belief_features
+        )
         rows = torch.arange(len(farmer_rows), device=self.device)
         chosen_index = inputs.chosen_action_index
         chosen_embedding = adapted[rows, chosen_index]
@@ -847,12 +867,10 @@ class V3H5Learner:
             ) from exc
         if statistics.steps != eligible or statistics.samples != consumed:
             raise CheckpointCompatibilityError("H5 checkpoint progress mismatch")
-        expected_h5_public_updates = (
-            statistics.cooperation_updates
-            if self.config.cooperation.update_public_model
-            else 0
-        )
-        if statistics.public_updates != expected_h5_public_updates:
+        if (
+            not self.config.cooperation.update_public_model
+            and statistics.public_updates != 0
+        ):
             raise CheckpointCompatibilityError("H5 checkpoint public update drift")
         state = bundle["cooperation_state_dict"]
         optimizer = bundle["cooperation_optimizer_state_dict"]

@@ -333,6 +333,26 @@ def test_h6_public_replay_round_trip_and_privileged_negative_guard():
     assert len(restored) == 1
     with pytest.raises(ValueError, match="privileged"):
         assert_public_replay_payload({**payload, "all_handcards": {}})
+    with pytest.raises(ValueError, match="target transform"):
+        V3H6ReplayBuffer(
+            4,
+            model_config=config,
+            feature_schema_hash=build_v2_schema().stable_hash(),
+            target_transform="invalid-transform",
+            ruleset_identity=RuleSet.legacy().identity(),
+            adaptive_required=False,
+        )
+    invalid_ruleset = RuleSet.legacy().identity()
+    invalid_ruleset["ruleset_hash"] = "not-a-sha256"
+    with pytest.raises(ValueError, match="full SHA-256"):
+        V3H6ReplayBuffer(
+            4,
+            model_config=config,
+            feature_schema_hash=build_v2_schema().stable_hash(),
+            target_transform="raw",
+            ruleset_identity=invalid_ruleset,
+            adaptive_required=False,
+        )
 
 
 def test_h6_sidecar_alignment_compares_optional_public_feature_tensors():
@@ -559,6 +579,49 @@ def test_nonfinite_gradient_does_not_advance_composer_counter():
         })
     assert composer.eligible_steps["win"] == 0
     assert math.isfinite(float(parameter.item()))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("regain_initiative", 2.0, "binary"),
+        ("min_turns_exact_mask", 2.0, "binary"),
+        ("min_turns_after", -1.0, "non-negative"),
+        ("structure_cost", float("nan"), "finite"),
+    ),
+)
+def test_h6_strategy_labels_fail_closed_before_loss(field, value, message):
+    resolved = _resolved()
+    learner = V3H6Learner(
+        V3HybridModel(build_v2_schema(), resolved.model),
+        ruleset=RuleSet.legacy(),
+        config=resolved,
+    )
+    labels = {
+        "min_turns_after": 1.0,
+        "min_turns_exact_mask": 1.0,
+        "regain_initiative": 0.0,
+        "teammate_finish": 1.0,
+        "teammate_finish_mask": 1.0,
+        "spring_probability": 0.0,
+        "structure_cost": 0.5,
+    }
+    labels[field] = value
+    gathered = {
+        "min_turns_after": torch.zeros(1, 1),
+        "regain_initiative_logit": torch.zeros(1, 1),
+        "teammate_finish_logit": torch.zeros(1, 1),
+        "spring_probability_logit": torch.zeros(1, 1),
+        "structure_cost": torch.zeros(1, 1),
+    }
+    with pytest.raises(ValueError, match=message):
+        learner._strategy_term(
+            gathered,
+            [_transition()],
+            ("landlord",),
+            ("strategy-label",),
+            [labels],
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import math
+import numbers
 import os
 import tempfile
 from dataclasses import asdict, dataclass
@@ -406,6 +407,28 @@ class V3H6Learner:
                 raise ValueError(
                     "H6 strategy training requires aligned trajectory labels"
                 )
+            for name in target_names:
+                value = labels[name]
+                if not isinstance(value, numbers.Real) or not math.isfinite(
+                    float(value)
+                ):
+                    raise ValueError(
+                        f"H6 strategy label {name} must be finite"
+                    )
+            for name in (
+                "min_turns_exact_mask",
+                "regain_initiative",
+                "teammate_finish",
+                "teammate_finish_mask",
+                "spring_probability",
+            ):
+                if float(labels[name]) not in (0.0, 1.0):
+                    raise ValueError(f"H6 strategy label {name} must be binary")
+            for name in ("min_turns_after", "structure_cost"):
+                if float(labels[name]) < 0.0:
+                    raise ValueError(
+                        f"H6 strategy label {name} must be non-negative"
+                    )
             targets.append(labels)
         device = gathered["min_turns_after"].device
         dtype = gathered["min_turns_after"].dtype
