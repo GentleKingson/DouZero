@@ -160,6 +160,13 @@ def test_selective_search_disabled_is_exact_base_noop():
     assert record.selected_action_index == 1
     assert record.fallback_reason == "disabled"
     assert wrapper.metrics.snapshot()["trigger_rate"] == 0.0
+    changed = V3SelectiveSearch(
+        V3H7SearchGateConfig(enabled=False, max_own_cards=9),
+        SearchConfig(enabled=False),
+        RuleSet.legacy(),
+        search_compatible=True,
+    )
+    assert wrapper.stable_hash() != changed.stable_hash()
 
 
 def test_package_flag_and_global_stop_fail_to_exact_base_action():
@@ -245,6 +252,26 @@ def test_search_exception_is_reported_and_returns_base(monkeypatch):
     assert wrapper.metrics.snapshot()["fallback_counts"] == {
         "search_exception:RuntimeError:controlled": 1
     }
+
+
+def test_nonfinite_public_value_falls_back_before_search():
+    observation = _observation()
+    output = _output(len(observation.actions.legal_actions))
+    output.dmc_q[0] = float("nan")
+    wrapper = V3SelectiveSearch(
+        V3H7SearchGateConfig(enabled=True),
+        SearchConfig(enabled=True),
+        RuleSet.legacy(),
+        search_compatible=True,
+    )
+    record = wrapper.select(
+        observation=observation,
+        model_output=output,
+        base_action_index=0,
+        belief_model=object(),
+    )
+    assert record.selected_action_index == 0
+    assert record.fallback_reason == "non_finite_value"
 
 
 def test_public_gate_is_invariant_to_hidden_hand_swap():
@@ -407,6 +434,20 @@ def test_h7_cuda_async_update_checkpoint_resume_and_shutdown(tmp_path):
         )
         runtime.save_training_checkpoint(
             str(checkpoint), long_running_state={"cycle": 1}
+        )
+        corrupted = tmp_path / "corrupted.pt"
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        payload["stats"] = dict(payload["stats"])
+        payload["stats"]["optimizer_steps"] = -1
+        torch.save(payload, corrupted)
+        before_rejection = {
+            name: value.detach().clone() for name, value in model.state_dict().items()
+        }
+        with pytest.raises(ValueError, match="statistic optimizer_steps"):
+            runtime.load_training_checkpoint(corrupted)
+        assert all(
+            torch.equal(before_rejection[name], value)
+            for name, value in model.state_dict().items()
         )
         status = runtime.quiesce_cycle_boundary()
         assert status["active_slots"] == 0

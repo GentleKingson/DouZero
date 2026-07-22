@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import time
+import hashlib
+import json
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Callable
@@ -144,6 +146,21 @@ class V3SelectiveSearch:
         self.stop_requested = stop_requested or (lambda: False)
         self.metrics = V3H7SearchMetrics()
 
+    def identity(self) -> dict[str, object]:
+        return {
+            "gate": self.gate_config.identity(),
+            "search": asdict(self.search_config),
+            "search_compatible": self.search_compatible,
+            "input_access": "public_observation_and_public_belief_only",
+            "fallback_semantics": "exact_base_action_structured_reason_v1",
+        }
+
+    def stable_hash(self) -> str:
+        encoded = json.dumps(
+            self.identity(), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
     @staticmethod
     def _base_record(
         base_action_index: int,
@@ -210,6 +227,8 @@ class V3SelectiveSearch:
                 reasons.append("belief_entropy")
         if cfg.require_card_control and public.last_move:
             reasons.append("card_control")
+        if cfg.require_card_control and not public.last_move:
+            return ()
         return tuple(reasons)
 
     @staticmethod
@@ -257,6 +276,15 @@ class V3SelectiveSearch:
         if self.stop_requested():
             return self._finish(self._base_record(
                 base_action_index, reason="global_stop", started=started
+            ))
+        finite_tensors = (
+            model_output.dmc_q,
+            model_output.p_win,
+            model_output.score_mean,
+        )
+        if any(not bool(torch.isfinite(value[model_output.action_mask]).all()) for value in finite_tensors):
+            return self._finish(self._base_record(
+                base_action_index, reason="non_finite_value", started=started
             ))
         if not self._belief_is_conserved(observation, belief_output):
             return self._finish(self._base_record(

@@ -372,8 +372,6 @@ class V3AsyncSingleGPUTrainer:
         return len(rows)
 
     def _publish_snapshot(self) -> None:
-        if self.policy_step - self._snapshot_step > self.config.max_policy_lag:
-            raise RuntimeError("H7 policy lag exceeded its configured bound")
         if self._runtime_started:
             self._coordinator.quiesce()
         self.inference_model.load_state_dict(self.model.state_dict(), strict=True)
@@ -460,6 +458,10 @@ class V3AsyncSingleGPUTrainer:
         if self._runtime_started:
             self._drain_replay()
             counts = self._coordinator.quiesce()
+            # Actors are between games here. Publishing before checkpointing
+            # makes learner-to-served lag observable and exactly zero without
+            # treating idle optimizer updates as actor policy lag.
+            self._publish_snapshot()
         else:
             counts = {"writing": 0, "ready": 0, "running": 0}
         lag = self.policy_step - self._snapshot_step
@@ -540,6 +542,46 @@ class V3AsyncSingleGPUTrainer:
             raise ValueError("H7 runtime identity mismatch")
         if bundle["runtime_identity"] != self.runtime_identity:
             raise ValueError("H7 runtime identity payload mismatch")
+        stats_payload = bundle["stats"]
+        if not isinstance(stats_payload, dict) or set(stats_payload) != {
+            "games_collected", "episodes_completed", "transitions_collected",
+            "decisions_collected", "optimizer_steps", "episodes_per_team",
+        }:
+            raise ValueError("H7 checkpoint statistics fields mismatch")
+        candidate_stats = V3H7RuntimeStats(**stats_payload)
+        for name in (
+            "games_collected", "episodes_completed", "transitions_collected",
+            "decisions_collected", "optimizer_steps",
+        ):
+            value = getattr(candidate_stats, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"H7 checkpoint statistic {name} is invalid")
+        if (
+            not isinstance(candidate_stats.episodes_per_team, dict)
+            or set(candidate_stats.episodes_per_team) != {"landlord", "farmer"}
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in candidate_stats.episodes_per_team.values()
+            )
+        ):
+            raise ValueError("H7 checkpoint team statistics are invalid")
+        candidate_rng = random.Random()
+        candidate_rng.setstate(bundle["rng_state"])
+        snapshot_step = bundle["snapshot_step"]
+        if isinstance(snapshot_step, bool) or not isinstance(snapshot_step, int):
+            raise ValueError("H7 checkpoint snapshot step is invalid")
+        inner_counters = bundle["h6_checkpoint"].get("counters", {})
+        inner_policy_step = inner_counters.get("policy_version")
+        if (
+            isinstance(inner_policy_step, bool)
+            or not isinstance(inner_policy_step, int)
+            or inner_policy_step < 0
+        ):
+            raise ValueError("H7 nested learner policy version is invalid")
+        if snapshot_step < 0 or snapshot_step > inner_policy_step:
+            raise ValueError("H7 checkpoint snapshot is newer than learner")
+        if inner_policy_step - snapshot_step > self.config.max_policy_lag:
+            raise ValueError("H7 checkpoint policy lag exceeds its bound")
         previous_stats = copy.deepcopy(self.stats)
         previous_rng = self._rng.getstate()
         previous_snapshot = self._snapshot_step
@@ -548,13 +590,9 @@ class V3AsyncSingleGPUTrainer:
             torch.save(bundle["h6_checkpoint"], inner_path)
             try:
                 self.learner.load_checkpoint(inner_path)
-                self.stats = V3H7RuntimeStats(**bundle["stats"])
+                self.stats = candidate_stats
                 self._rng.setstate(bundle["rng_state"])
-                self._snapshot_step = int(bundle["snapshot_step"])
-                if self._snapshot_step > self.policy_step:
-                    raise ValueError("H7 checkpoint snapshot is newer than learner")
-                if self.policy_step - self._snapshot_step > self.config.max_policy_lag:
-                    raise ValueError("H7 checkpoint policy lag exceeds its bound")
+                self._snapshot_step = snapshot_step
             except Exception:
                 self.stats = previous_stats
                 self._rng.setstate(previous_rng)
@@ -586,6 +624,8 @@ class V3AsyncSingleGPUTrainer:
                 error = RuntimeError("H7 shutdown left active inference slots")
             if self._scheduler.pending_count:
                 error = RuntimeError("H7 shutdown left pending requests")
+            self._coordinator.active_games = 0
+            self._coordinator.completed_episodes_pending = 0
         finally:
             self._coordinator.shutdown()
             self._replay_slots.close()
