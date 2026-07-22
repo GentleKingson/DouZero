@@ -92,10 +92,13 @@ def _model_config(**changes):
     return V3HybridModelConfig(**values)
 
 
-def _resolved(*, model_config=None, win: float = 1.0, score: float = 0.5):
+def _resolved(
+    *, model_config=None, win: float = 1.0, score: float = 0.5,
+    device: str = "cpu",
+):
     model_config = model_config or _model_config()
     public = V3H2LearnerConfig(
-        batch_size=4, learning_rate=1e-3, max_grad_norm=10.0, device="cpu"
+        batch_size=4, learning_rate=1e-3, max_grad_norm=10.0, device=device
     )
     base = V3H5LearnerConfig(
         base=V3H4LearnerConfig(base=V3H3LearnerConfig(public=public))
@@ -478,3 +481,35 @@ def test_nonfinite_gradient_does_not_advance_composer_counter():
         })
     assert composer.eligible_steps["win"] == 0
     assert math.isfinite(float(parameter.item()))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_h6_cuda_parameter_update_checkpoint_and_second_update(tmp_path):
+    resolved = _resolved(device="cuda")
+    learner = V3H6Learner(
+        V3HybridModel(build_v2_schema(), resolved.model),
+        ruleset=RuleSet.legacy(),
+        config=resolved,
+    )
+    before = _state(learner.model)
+    first = learner.train_batch([_transition(seed=20260731)])
+    assert first.public_aux_updated
+    assert math.isfinite(first.loss_total)
+    assert math.isfinite(first.public_aux_gradient_norm)
+    assert any(
+        not torch.equal(before[name], value)
+        for name, value in learner.model.state_dict().items()
+    )
+    path = tmp_path / "h6-cuda.pt"
+    learner.save_checkpoint(path)
+    resumed = V3H6Learner(
+        V3HybridModel(build_v2_schema(), resolved.model),
+        ruleset=RuleSet.legacy(),
+        config=resolved,
+    )
+    resumed.load_checkpoint(path)
+    first_version = resumed.policy_version
+    second = resumed.train_batch([_transition(seed=20260801)])
+    assert second.policy_version > first_version
+    assert second.public_aux_updated
+    assert math.isfinite(second.loss_total)
