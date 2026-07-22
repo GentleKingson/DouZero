@@ -104,7 +104,7 @@ def main() -> None:
 
     if args.topology == "single_process":
         topology = TOPOLOGY_SINGLE_PROCESS
-        actors, games, episodes = 1, 1, 1
+        actors, games, episodes = 1, 1, 4
         trainer_type = V3SingleProcessTrainer
     else:
         topology = TOPOLOGY_ASYNC_SINGLE_GPU
