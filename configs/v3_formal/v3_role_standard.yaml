@@ -1,0 +1,4 @@
+extends: _defaults.yaml.inc
+metadata: {name: v3_role_standard, description: V3 role-model ablation under standard rules}
+variant: v3_role
+ruleset: {id: standard, version: standard-v1, hash: 05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f}

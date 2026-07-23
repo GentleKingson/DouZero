@@ -1,0 +1,11 @@
+extends: _defaults.yaml.inc
+metadata: {name: model_v2_standard, description: Model V2 formal control under standard rules}
+variant: model_v2
+ruleset: {id: standard, version: standard-v1, hash: 05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f}
+model:
+  family: model_v2
+  version: v2
+  config:
+    __replace__: {architecture: model_v2, observation: v2, hidden_size: 256}
+features: {role_model: false}
+initialization: {source: model-v2-seeded-fresh-v1}

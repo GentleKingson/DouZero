@@ -1,0 +1,7 @@
+extends: _defaults.yaml.inc
+metadata: {name: v3_farmer_cooperation_legacy, description: V3 farmer-cooperation ablation under legacy rules}
+variant: v3_farmer_cooperation
+features: {cooperation: true}
+losses: {weights: {cooperation: 1.0}}
+feature_configs:
+  cooperation: {enabled: true, mode: team_value_consistency, mixer: disabled}

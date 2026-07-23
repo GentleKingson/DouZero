@@ -1,0 +1,13 @@
+extends: _defaults.yaml.inc
+metadata: {name: v3_oracle_legacy, description: V3 online Oracle ablation under legacy rules}
+variant: v3_oracle
+features: {oracle: true}
+losses: {weights: {oracle: 1.0}}
+feature_configs:
+  oracle:
+    enabled: true
+    warmup_updates: 10000
+    guided_updates: 50000
+    finetune_updates: 20000
+    guidance_weight_start: 1.0
+    guidance_weight_end: 0.0

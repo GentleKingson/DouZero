@@ -1,0 +1,3 @@
+extends: _defaults.yaml.inc
+metadata: {name: v3_role_legacy, description: V3 role-model ablation under legacy rules}
+variant: v3_role

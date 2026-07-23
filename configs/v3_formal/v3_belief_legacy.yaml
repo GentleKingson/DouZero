@@ -1,0 +1,8 @@
+extends: _defaults.yaml.inc
+metadata: {name: v3_belief_legacy, description: V3 joint-belief ablation under legacy rules}
+variant: v3_belief
+model: {config: {belief_feedback: farmers}}
+features: {belief: true}
+losses: {weights: {belief: 1.0}}
+feature_configs:
+  belief: {enabled: true, mode: auxiliary, feedback: farmers}

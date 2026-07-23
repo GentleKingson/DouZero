@@ -1,0 +1,10 @@
+extends: _defaults.yaml.inc
+metadata: {name: legacy_a1_legacy, description: Legacy A1 formal control under legacy rules}
+variant: legacy_a1
+model:
+  family: legacy_a1
+  version: legacy-a1
+  config:
+    __replace__: {architecture: legacy_lstm, hidden_size: 512, observation: legacy}
+features: {role_model: false}
+initialization: {source: legacy-a1-seeded-fresh-v1}

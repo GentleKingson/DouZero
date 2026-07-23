@@ -1,0 +1,29 @@
+extends: _defaults.yaml.inc
+metadata: {name: v3_full_hybrid_standard, description: Full public V3 Hybrid under standard rules without BC}
+variant: v3_full_hybrid
+ruleset: {id: standard, version: standard-v1, hash: 05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f}
+model:
+  config:
+    belief_feedback: farmers
+    strategy_features_enabled: true
+    strategy_aux_enabled: true
+    style_enabled: true
+    bidding_enabled: true
+features:
+  adaptive_dmc: true
+  oracle: true
+  belief: true
+  cooperation: true
+  strategy: true
+  style: true
+  bidding: true
+losses:
+  weights: {oracle: 1.0, belief: 1.0, cooperation: 1.0, strategy: 0.1, bidding: 1.0}
+feature_configs:
+  adaptive_dmc: {enabled: true, mode: safe_hybrid}
+  oracle: {enabled: true, warmup_updates: 10000, guided_updates: 50000, finetune_updates: 20000, guidance_weight_start: 1.0, guidance_weight_end: 0.0}
+  belief: {enabled: true, mode: auxiliary, feedback: farmers}
+  cooperation: {enabled: true, mode: team_value_consistency, mixer: disabled}
+  strategy: {enabled: true}
+  style: {enabled: true}
+  bidding: {enabled: true}

@@ -1,0 +1,9 @@
+extends: _defaults.yaml.inc
+metadata: {name: v3_belief_standard, description: V3 joint-belief ablation under standard rules}
+variant: v3_belief
+ruleset: {id: standard, version: standard-v1, hash: 05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f}
+model: {config: {belief_feedback: farmers}}
+features: {belief: true}
+losses: {weights: {belief: 1.0}}
+feature_configs:
+  belief: {enabled: true, mode: auxiliary, feedback: farmers}
