@@ -64,8 +64,8 @@ from .training.h5_learner import V3H5LearnerConfig
 from .training.h6_learner import V3H6Learner
 from .training.oracle_schedule import OracleGuidingScheduleConfig
 
-P2_PILOT_SCHEMA = "v3-p2-pilot-evidence-v1"
-P2_PILOT_PROTOCOL = "real-env-single-process-checkpoint-resume-v1"
+P2_PILOT_SCHEMA = "v3-p2-pilot-evidence-v2"
+P2_PILOT_PROTOCOL = "real-env-single-process-checkpoint-resume-v2"
 P2_VARIANTS = (
     "v3_role",
     "v3_admc",
@@ -497,7 +497,7 @@ def create_pilot_learner(
 def validate_pilot_summary(payload: Mapping[str, object]) -> None:
     required = {
         "schema", "protocol", "source_git_sha", "formal_config_sha256",
-        "training_semantics_hash", "variant", "ruleset", "seed", "status",
+        "training_semantics_hash", "variant", "ruleset", "seed", "collection", "status",
         "started_at", "finished_at", "wall_clock_seconds", "samples",
         "optimizer_steps", "episodes", "decisions", "metrics", "resume",
         "evaluation", "checkpoint", "environment", "release_candidate",
@@ -520,6 +520,23 @@ def validate_pilot_summary(payload: Mapping[str, object]) -> None:
         raise ValueError("P2 pilot source_git_sha must be a full Git SHA")
     if payload["variant"] not in P2_VARIANTS or payload["ruleset"] != "legacy":
         raise ValueError("P2 pilot variant/ruleset mismatch")
+    collection = payload["collection"]
+    if not isinstance(collection, Mapping) or set(collection) != {
+        "environment_seed", "action_seed", "epsilon"
+    }:
+        raise ValueError("P2 pilot collection fields mismatch")
+    for field in ("environment_seed", "action_seed"):
+        value = collection[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"P2 pilot collection {field} is invalid")
+    epsilon = collection["epsilon"]
+    if (
+        isinstance(epsilon, bool)
+        or not isinstance(epsilon, (int, float))
+        or not math.isfinite(float(epsilon))
+        or not 0.0 <= float(epsilon) <= 1.0
+    ):
+        raise ValueError("P2 pilot collection epsilon is invalid")
     if payload["status"] not in {"completed", "stopped", "failed"}:
         raise ValueError("P2 pilot status is invalid")
     for field in ("wall_clock_seconds", "samples", "optimizer_steps", "episodes", "decisions"):
@@ -540,6 +557,34 @@ def validate_pilot_summary(payload: Mapping[str, object]) -> None:
     metrics = payload["metrics"]
     if not isinstance(resume, Mapping) or not isinstance(metrics, Mapping):
         raise ValueError("P2 pilot resume and metrics must be objects")
+    if set(resume) != {
+        "requested", "from_samples", "from_optimizer_steps", "from_episodes",
+        "from_decisions", "checkpoint_sha256", "continued_update", "stop_signal",
+    }:
+        raise ValueError("P2 pilot resume fields mismatch")
+    for field in (
+        "from_samples", "from_optimizer_steps", "from_episodes", "from_decisions"
+    ):
+        value = resume[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"P2 pilot resume {field} is invalid")
+    resumed_checkpoint = resume["checkpoint_sha256"]
+    if bool(resume["requested"]):
+        if (
+            not isinstance(resumed_checkpoint, str)
+            or len(resumed_checkpoint) != 64
+            or any(c not in "0123456789abcdef" for c in resumed_checkpoint)
+        ):
+            raise ValueError("P2 resumed run requires checkpoint SHA-256")
+    elif resumed_checkpoint is not None:
+        raise ValueError("fresh P2 run cannot declare a resumed checkpoint")
+    environment = payload["environment"]
+    if (
+        not isinstance(environment, Mapping)
+        or not isinstance(environment.get("container_id"), str)
+        or not environment["container_id"]
+    ):
+        raise ValueError("P2 pilot requires a container identity")
     elapsed = float(payload["wall_clock_seconds"])
     expected_samples_rate = (
         float(payload["samples"]) - float(resume["from_samples"])

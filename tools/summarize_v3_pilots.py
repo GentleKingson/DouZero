@@ -10,14 +10,9 @@ from pathlib import Path
 from douzero.v3_hybrid.pilot import P2_VARIANTS, validate_pilot_summary
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Validate P2 SIGTERM/resume evidence and summarize it."
-    )
-    parser.add_argument("--evidence-root", required=True)
-    parser.add_argument("--output", required=True)
-    args = parser.parse_args()
-    root = Path(args.evidence_root)
+def summarize_evidence(root: Path) -> dict:
+    """Validate P2 run pairs and return their compact diagnostic summary."""
+
     runs = []
     source_sha = None
     image_digest = None
@@ -37,6 +32,23 @@ def main() -> int:
             raise ValueError(f"{variant} is missing real SIGTERM evidence")
         if not after["resume"]["requested"] or not after["resume"]["continued_update"]:
             raise ValueError(f"{variant} did not update after strict resume")
+        expected_resume = {
+            "from_samples": before["samples"],
+            "from_optimizer_steps": before["optimizer_steps"],
+            "from_episodes": before["resume"]["from_episodes"] + before["episodes"],
+            "from_decisions": before["resume"]["from_decisions"] + before["decisions"],
+            "checkpoint_sha256": before["checkpoint"]["sha256"],
+        }
+        for field, expected in expected_resume.items():
+            if after["resume"][field] != expected:
+                raise ValueError(f"{variant} resume {field} does not match pre-run evidence")
+        if after["collection"] != before["collection"]:
+            raise ValueError(f"{variant} collection seeds changed across resume")
+        if (
+            after["environment"]["container_id"]
+            == before["environment"]["container_id"]
+        ):
+            raise ValueError(f"{variant} resume did not use a fresh container")
         if after["optimizer_steps"] <= before["optimizer_steps"]:
             raise ValueError(f"{variant} optimizer counter did not increase")
         observed_sha = after["source_git_sha"]
@@ -71,7 +83,7 @@ def main() -> int:
             "continued_update": True,
             "paired_evaluation": "NOT EXECUTED",
         })
-    payload = {
+    return {
         "schema": "v3-p2-pilot-summary-v1",
         "source_git_sha": source_sha,
         "docker_image_digest": image_digest,
@@ -96,6 +108,16 @@ def main() -> int:
             "search-on evaluation from the shared checkpoint",
         ],
     }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate P2 SIGTERM/resume evidence and summarize it."
+    )
+    parser.add_argument("--evidence-root", required=True)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+    payload = summarize_evidence(Path(args.evidence_root))
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(

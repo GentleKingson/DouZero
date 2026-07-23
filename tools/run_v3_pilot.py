@@ -11,6 +11,7 @@ import random
 import signal
 import socket
 import time
+import uuid
 from pathlib import Path
 
 import torch
@@ -63,6 +64,96 @@ def _finite_metrics(value):
     return _finite_metrics(vars(value))
 
 
+_RUN_STATE_SCHEMA = "v3-p2-run-state-v1"
+
+
+def _lists_to_tuples(value):
+    if isinstance(value, list):
+        return tuple(_lists_to_tuples(item) for item in value)
+    return value
+
+
+def _write_run_state(path: Path, payload: dict) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, sort_keys=True, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _save_checkpoint_and_run_state(
+    learner,
+    checkpoint: Path,
+    state_path: Path,
+    *,
+    source_sha: str,
+    formal_config_sha256: str,
+    variant: str,
+    environment_seed: int,
+    action_seed: int,
+    episodes_completed: int,
+    decisions_completed: int,
+    action_rng: random.Random,
+) -> str:
+    learner.save_checkpoint(checkpoint)
+    checkpoint_sha256 = _sha256(checkpoint)
+    _write_run_state(state_path, {
+        "schema": _RUN_STATE_SCHEMA,
+        "source_git_sha": source_sha,
+        "formal_config_sha256": formal_config_sha256,
+        "variant": variant,
+        "environment_seed": environment_seed,
+        "action_seed": action_seed,
+        "episodes_completed": episodes_completed,
+        "decisions_completed": decisions_completed,
+        "action_rng_state": action_rng.getstate(),
+        "checkpoint_sha256": checkpoint_sha256,
+    })
+    return checkpoint_sha256
+
+
+def _load_run_state(
+    path: Path,
+    *,
+    checkpoint_sha256: str,
+    source_sha: str,
+    formal_config_sha256: str,
+    variant: str,
+    environment_seed: int,
+    action_seed: int,
+) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"--resume requires a valid pilot-state.json: {exc}") from exc
+    expected = {
+        "schema": _RUN_STATE_SCHEMA,
+        "source_git_sha": source_sha,
+        "formal_config_sha256": formal_config_sha256,
+        "variant": variant,
+        "environment_seed": environment_seed,
+        "action_seed": action_seed,
+        "checkpoint_sha256": checkpoint_sha256,
+    }
+    if not isinstance(payload, dict) or set(payload) != {
+        *expected, "episodes_completed", "decisions_completed", "action_rng_state"
+    }:
+        raise SystemExit("pilot run-state envelope mismatch")
+    for field, value in expected.items():
+        if payload[field] != value:
+            raise SystemExit(f"pilot run-state {field} mismatch")
+    for field in ("episodes_completed", "decisions_completed"):
+        value = payload[field]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise SystemExit(f"pilot run-state {field} is invalid")
+    try:
+        random.Random().setstate(_lists_to_tuples(payload["action_rng_state"]))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("pilot run-state action RNG is invalid") from exc
+    return payload
+
+
 def main() -> int:
     args = _parse_args()
     formal = load_formal_config(args.config)
@@ -83,15 +174,37 @@ def main() -> int:
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = output / "latest.pt"
+    state_path = output / "pilot-state.json"
     learner, resolved = create_pilot_learner(formal)
+    formal_identity = formal.identity_dict()
+    seed = formal.seeds.training[0]
+    environment_seed = args.environment_seed if args.environment_seed is not None else seed
+    action_seed = args.action_seed if args.action_seed is not None else seed + 1
+    action_rng = random.Random(action_seed)
     resumed_from_samples = 0
     resumed_from_steps = 0
+    resumed_from_episodes = 0
+    resumed_from_decisions = 0
+    resumed_checkpoint_sha256 = None
     if args.resume:
-        if not checkpoint.is_file():
-            raise SystemExit("--resume requires the existing latest.pt manifest target")
+        if not checkpoint.is_file() or not state_path.is_file():
+            raise SystemExit("--resume requires latest.pt and pilot-state.json")
+        resumed_checkpoint_sha256 = _sha256(checkpoint)
+        run_state = _load_run_state(
+            state_path,
+            checkpoint_sha256=resumed_checkpoint_sha256,
+            source_sha=source_sha,
+            formal_config_sha256=formal_identity["config_sha256"],
+            variant=formal.variant,
+            environment_seed=environment_seed,
+            action_seed=action_seed,
+        )
         learner.load_checkpoint(checkpoint)
         resumed_from_samples = learner.samples_consumed
         resumed_from_steps = learner.eligible_updates
+        resumed_from_episodes = run_state["episodes_completed"]
+        resumed_from_decisions = run_state["decisions_completed"]
+        action_rng.setstate(_lists_to_tuples(run_state["action_rng_state"]))
     elif checkpoint.exists():
         raise SystemExit("fresh pilot refuses to overwrite an existing checkpoint")
 
@@ -105,10 +218,6 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    seed = formal.seeds.training[0]
-    environment_seed = args.environment_seed if args.environment_seed is not None else seed
-    action_seed = args.action_seed if args.action_seed is not None else seed + 1
-    action_rng = random.Random(action_seed)
     episodes = 0
     decisions = 0
     skipped_long_episodes = 0
@@ -127,7 +236,7 @@ def main() -> int:
         ):
             batch = collect_real_pilot_episode(
                 learner,
-                episode_number=episodes,
+                episode_number=resumed_from_episodes + episodes,
                 environment_seed=environment_seed,
                 action_rng=action_rng,
                 epsilon=args.epsilon,
@@ -155,7 +264,17 @@ def main() -> int:
                     break
                 last_metrics = train_pilot_batch(learner, piece).as_dict()
                 if learner.eligible_updates % checkpoint_every == 0:
-                    learner.save_checkpoint(checkpoint)
+                    _save_checkpoint_and_run_state(
+                        learner, checkpoint, state_path,
+                        source_sha=source_sha,
+                        formal_config_sha256=formal_identity["config_sha256"],
+                        variant=formal.variant,
+                        environment_seed=environment_seed,
+                        action_seed=action_seed,
+                        episodes_completed=resumed_from_episodes + episodes,
+                        decisions_completed=resumed_from_decisions + decisions,
+                        action_rng=action_rng,
+                    )
         if stopped:
             status = "stopped"
     except Exception as exc:
@@ -163,7 +282,17 @@ def main() -> int:
         failure = {"type": type(exc).__name__, "message": str(exc)}
         raise
     finally:
-        learner.save_checkpoint(checkpoint)
+        checkpoint_sha256 = _save_checkpoint_and_run_state(
+            learner, checkpoint, state_path,
+            source_sha=source_sha,
+            formal_config_sha256=formal_identity["config_sha256"],
+            variant=formal.variant,
+            environment_seed=environment_seed,
+            action_seed=action_seed,
+            episodes_completed=resumed_from_episodes + episodes,
+            decisions_completed=resumed_from_decisions + decisions,
+            action_rng=action_rng,
+        )
         elapsed = time.monotonic() - started
         env = environment_info()
         env.update({
@@ -174,16 +303,22 @@ def main() -> int:
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
             ),
             "command_record": args.command_record or None,
+            "container_id": socket.gethostname(),
         })
         summary = {
             "schema": P2_PILOT_SCHEMA,
             "protocol": P2_PILOT_PROTOCOL,
             "source_git_sha": source_sha,
-            "formal_config_sha256": formal.identity_dict()["config_sha256"],
-            "training_semantics_hash": formal.identity_dict()["training_semantics_hash"],
+            "formal_config_sha256": formal_identity["config_sha256"],
+            "training_semantics_hash": formal_identity["training_semantics_hash"],
             "variant": formal.variant,
             "ruleset": formal.ruleset["id"],
             "seed": seed,
+            "collection": {
+                "environment_seed": environment_seed,
+                "action_seed": action_seed,
+                "epsilon": args.epsilon,
+            },
             "status": status,
             "started_at": started_wall,
             "finished_at": time.time(),
@@ -211,6 +346,9 @@ def main() -> int:
                 "requested": bool(args.resume),
                 "from_samples": resumed_from_samples,
                 "from_optimizer_steps": resumed_from_steps,
+                "from_episodes": resumed_from_episodes,
+                "from_decisions": resumed_from_decisions,
+                "checkpoint_sha256": resumed_checkpoint_sha256,
                 "continued_update": learner.eligible_updates > resumed_from_steps,
                 "stop_signal": stop_signal,
             },
@@ -221,7 +359,7 @@ def main() -> int:
             },
             "checkpoint": {
                 "path": str(checkpoint),
-                "sha256": _sha256(checkpoint),
+                "sha256": checkpoint_sha256,
                 "saved": True,
             },
             "environment": env,

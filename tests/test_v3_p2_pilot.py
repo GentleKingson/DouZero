@@ -8,6 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from tools.run_v3_pilot import (
+    _load_run_state,
+    _save_checkpoint_and_run_state,
+)
+from tools.summarize_v3_pilots import summarize_evidence
+
 from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.pilot import (
     P2_PILOT_PROTOCOL,
@@ -31,6 +37,7 @@ def _summary():
         "variant": "v3_role",
         "ruleset": "legacy",
         "seed": 101,
+        "collection": {"environment_seed": 101, "action_seed": 102, "epsilon": 0.01},
         "status": "completed",
         "started_at": 1.0,
         "finished_at": 2.0,
@@ -49,10 +56,17 @@ def _summary():
             "continued_update": False,
             "from_samples": 0,
             "from_optimizer_steps": 0,
+            "from_episodes": 0,
+            "from_decisions": 0,
+            "checkpoint_sha256": None,
+            "stop_signal": None,
         },
         "evaluation": {"paired_deals": 0, "status": "not_executed"},
         "checkpoint": {"path": "latest.pt", "sha256": "4" * 64, "saved": True},
-        "environment": {"image_digest": "sha256:" + "5" * 64},
+        "environment": {
+            "image_digest": "sha256:" + "5" * 64,
+            "container_id": "container-a",
+        },
         "release_candidate": "NONE",
         "release_status": "NOT READY",
         "playing_strength": "NOT MEASURED",
@@ -156,3 +170,92 @@ def test_pilot_summary_recomputes_resume_delta_throughput():
     payload["metrics"]["samples_per_second"] = 10.0
     with pytest.raises(ValueError, match="inconsistent with raw counters"):
         validate_pilot_summary(payload)
+
+
+def test_run_state_binds_checkpoint_seeds_and_rng_continuation(tmp_path):
+    class Learner:
+        def save_checkpoint(self, path):
+            path.write_bytes(b"checkpoint")
+
+    import random
+
+    rng = random.Random(102)
+    rng.random()
+    checkpoint = tmp_path / "latest.pt"
+    state_path = tmp_path / "pilot-state.json"
+    digest = _save_checkpoint_and_run_state(
+        Learner(), checkpoint, state_path,
+        source_sha="1" * 40,
+        formal_config_sha256="2" * 64,
+        variant="v3_role",
+        environment_seed=101,
+        action_seed=102,
+        episodes_completed=7,
+        decisions_completed=99,
+        action_rng=rng,
+    )
+    state = _load_run_state(
+        state_path,
+        checkpoint_sha256=digest,
+        source_sha="1" * 40,
+        formal_config_sha256="2" * 64,
+        variant="v3_role",
+        environment_seed=101,
+        action_seed=102,
+    )
+    restored = random.Random()
+    restored.setstate(tuple([state["action_rng_state"][0], tuple(state["action_rng_state"][1]), state["action_rng_state"][2]]))
+    assert restored.random() == rng.random()
+    with pytest.raises(SystemExit, match="action_seed mismatch"):
+        _load_run_state(
+            state_path,
+            checkpoint_sha256=digest,
+            source_sha="1" * 40,
+            formal_config_sha256="2" * 64,
+            variant="v3_role",
+            environment_seed=101,
+            action_seed=999,
+        )
+
+
+def test_evidence_summary_rejects_unrelated_resume_pair(tmp_path):
+    for index, variant in enumerate(P2_VARIANTS):
+        directory = tmp_path / variant
+        directory.mkdir()
+        before = _summary()
+        before.update({"variant": variant, "status": "stopped", "samples": 4,
+                       "optimizer_steps": 1, "episodes": 2, "decisions": 4})
+        before["resume"]["stop_signal"] = "SIGTERM"
+        before["environment"]["container_id"] = f"before-{index}"
+        after = copy.deepcopy(before)
+        after.update({"status": "completed", "samples": 8, "optimizer_steps": 2,
+                      "episodes": 1, "decisions": 2})
+        after["resume"].update({
+            "requested": True,
+            "from_samples": 4,
+            "from_optimizer_steps": 1,
+            "from_episodes": 2,
+            "from_decisions": 4,
+            "checkpoint_sha256": before["checkpoint"]["sha256"],
+            "continued_update": True,
+            "stop_signal": None,
+        })
+        after["metrics"].update({"samples_per_second": 4.0,
+                                  "optimizer_steps_per_second": 1.0,
+                                  "model_hash": "6" * 64,
+                                  "resolved_config_hash": "7" * 64,
+                                  "skipped_long_cooperation_episodes": 0})
+        before["metrics"].update({"model_hash": "6" * 64,
+                                   "resolved_config_hash": "7" * 64,
+                                   "skipped_long_cooperation_episodes": 0})
+        after["environment"]["container_id"] = f"after-{index}"
+        for name, payload in (("pre-resume-summary.json", before),
+                              ("post-resume-summary.json", after)):
+            (directory / name).write_text(json.dumps(payload), encoding="utf-8")
+    summarize_evidence(tmp_path)
+    target = tmp_path / P2_VARIANTS[0] / "post-resume-summary.json"
+    changed = json.loads(target.read_text(encoding="utf-8"))
+    changed["resume"]["checkpoint_sha256"] = "8" * 64
+    target.write_text(json.dumps(changed), encoding="utf-8")
+    with pytest.raises(ValueError, match="checkpoint_sha256"):
+        summarize_evidence(tmp_path)
