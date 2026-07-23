@@ -72,6 +72,16 @@ def summarize_evidence(root: Path) -> dict:
         }
         if before["collection"] != expected_collection:
             raise ValueError(f"{variant} does not match frozen collection settings")
+        ceilings = {
+            "max_seconds": formal.budgets["pilot"].wall_clock_seconds,
+            "max_samples": formal.budgets["pilot"].sample_budget,
+            "max_optimizer_steps": formal.budgets["pilot"].optimizer_step_budget,
+            "checkpoint_every": formal.runtime.checkpoint_cadence_updates,
+        }
+        for payload in (before, after):
+            for field, ceiling in ceilings.items():
+                if payload["limits"][field] > ceiling:
+                    raise ValueError(f"{variant} {field} exceeds the frozen pilot ceiling")
         expected_resume = {
             "from_samples": before["samples"],
             "from_optimizer_steps": before["optimizer_steps"],
@@ -126,6 +136,8 @@ def summarize_evidence(root: Path) -> dict:
             "model_hash": after["metrics"]["model_hash"],
             "resolved_config_hash": after["metrics"]["resolved_config_hash"],
             "seed": after["seed"],
+            "pre_resume_limits": before["limits"],
+            "post_resume_limits": after["limits"],
             "wall_clock_seconds": before["wall_clock_seconds"] + after["wall_clock_seconds"],
             "episodes": before["episodes"] + after["episodes"],
             "decisions": before["decisions"] + after["decisions"],

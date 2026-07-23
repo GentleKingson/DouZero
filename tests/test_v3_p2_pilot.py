@@ -11,9 +11,10 @@ import pytest
 from tools.run_v3_pilot import (
     _attest_container_image,
     _attest_clean_source,
+    _episode_fits_budget,
     _fits_sample_budget,
     _load_run_state,
-    _resolve_positive_limit,
+    _resolve_bounded_limit,
     _save_checkpoint_and_run_state,
 )
 from tools.summarize_v3_pilots import summarize_evidence
@@ -43,6 +44,12 @@ def _summary():
         "variant": "v3_role",
         "ruleset": "legacy",
         "seed": 101,
+        "limits": {
+            "max_seconds": 900.0,
+            "max_samples": 1_000_000,
+            "max_optimizer_steps": 10_000,
+            "checkpoint_every": 100,
+        },
         "collection": {
             "root_seed": 101,
             "worker_id": 0,
@@ -237,15 +244,25 @@ def test_frozen_seed_derivation_separates_streams_and_episodes():
 
 
 def test_zero_budget_override_is_rejected():
-    assert _resolve_positive_limit(None, 10, "budget") == 10
+    assert _resolve_bounded_limit(None, 10, "budget") == 10
     with pytest.raises(SystemExit, match="budget must be positive"):
-        _resolve_positive_limit(0, 10, "budget")
+        _resolve_bounded_limit(0, 10, "budget")
+    with pytest.raises(SystemExit, match="exceeds the frozen pilot ceiling"):
+        _resolve_bounded_limit(11, 10, "budget")
 
 
 def test_sample_budget_stops_when_next_slice_does_not_fit():
     assert _fits_sample_budget(32, 32, 64)
     assert not _fits_sample_budget(0, 32, 1)
     assert not _fits_sample_budget(63, 2, 64)
+    learner = SimpleNamespace(samples_consumed=32, eligible_updates=4)
+    pieces = (
+        SimpleNamespace(transitions=tuple(range(32))),
+        SimpleNamespace(transitions=tuple(range(2))),
+    )
+    assert _episode_fits_budget(learner, pieces, 66, 6)
+    assert not _episode_fits_budget(learner, pieces, 65, 6)
+    assert not _episode_fits_budget(learner, pieces, 66, 5)
 
 
 def test_docker_image_identity_is_read_from_daemon(monkeypatch):
@@ -340,6 +357,11 @@ def test_evidence_summary_rejects_failed_resume_and_environment_drift(tmp_path):
     payload["environment"]["gpu"] = "different GPU"
     target.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="accelerator identity"):
+        summarize_evidence(tmp_path)
+    payload["environment"]["gpu"] = "GPU"
+    payload["limits"]["max_samples"] = 1_000_001
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="exceeds the frozen pilot ceiling"):
         summarize_evidence(tmp_path)
 
 

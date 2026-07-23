@@ -551,7 +551,8 @@ def create_pilot_learner(
 def validate_pilot_summary(payload: Mapping[str, object]) -> None:
     required = {
         "schema", "protocol", "source_git_sha", "formal_config_sha256",
-        "training_semantics_hash", "variant", "ruleset", "seed", "collection", "status",
+        "training_semantics_hash", "variant", "ruleset", "seed", "limits",
+        "collection", "status",
         "started_at", "finished_at", "wall_clock_seconds", "samples",
         "optimizer_steps", "episodes", "decisions", "metrics", "resume",
         "evaluation", "checkpoint", "environment", "release_candidate",
@@ -574,6 +575,19 @@ def validate_pilot_summary(payload: Mapping[str, object]) -> None:
         raise ValueError("P2 pilot source_git_sha must be a full Git SHA")
     if payload["variant"] not in P2_VARIANTS or payload["ruleset"] != "legacy":
         raise ValueError("P2 pilot variant/ruleset mismatch")
+    limits = payload["limits"]
+    if not isinstance(limits, Mapping) or set(limits) != {
+        "max_seconds", "max_samples", "max_optimizer_steps", "checkpoint_every"
+    }:
+        raise ValueError("P2 pilot limit fields mismatch")
+    for field, value in limits.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value <= 0
+        ):
+            raise ValueError(f"P2 pilot limit {field} is invalid")
     collection = payload["collection"]
     if not isinstance(collection, Mapping) or set(collection) != {
         "root_seed", "worker_id", "derivation", "epsilon"

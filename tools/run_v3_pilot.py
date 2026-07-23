@@ -149,15 +149,25 @@ def _attest_container_image(container_id: str, socket_path: str) -> str:
     return image_id
 
 
-def _resolve_positive_limit(override, default, label: str):
+def _resolve_bounded_limit(override, default, label: str):
     value = default if override is None else override
     if isinstance(value, bool) or not math.isfinite(float(value)) or value <= 0:
         raise SystemExit(f"{label} must be positive")
+    if value > default:
+        raise SystemExit(f"{label} exceeds the frozen pilot ceiling")
     return value
 
 
 def _fits_sample_budget(consumed: int, batch_size: int, maximum: int) -> bool:
     return consumed + batch_size <= maximum
+
+
+def _episode_fits_budget(learner, pieces, max_samples: int, max_steps: int) -> bool:
+    return (
+        learner.samples_consumed + sum(len(piece.transitions) for piece in pieces)
+        <= max_samples
+        and learner.eligible_updates + len(pieces) <= max_steps
+    )
 
 
 _RUN_STATE_SCHEMA = "v3-p2-run-state-v1"
@@ -240,16 +250,16 @@ def main() -> int:
     if formal.variant not in P2_VARIANTS:
         raise SystemExit("P2 pilot requires one of the six frozen V3 variants")
     budget = formal.budgets["pilot"]
-    max_seconds = float(_resolve_positive_limit(
+    max_seconds = float(_resolve_bounded_limit(
         args.max_seconds, budget.wall_clock_seconds, "max_seconds"
     ))
-    max_samples = int(_resolve_positive_limit(
+    max_samples = int(_resolve_bounded_limit(
         args.max_samples, budget.sample_budget, "max_samples"
     ))
-    max_steps = int(_resolve_positive_limit(
+    max_steps = int(_resolve_bounded_limit(
         args.max_optimizer_steps, budget.optimizer_step_budget, "max_optimizer_steps"
     ))
-    checkpoint_every = int(_resolve_positive_limit(
+    checkpoint_every = int(_resolve_bounded_limit(
         args.checkpoint_every, formal.runtime.checkpoint_cadence_updates,
         "checkpoint_every",
     ))
@@ -341,34 +351,24 @@ def main() -> int:
                     slice_pilot_batch(batch, index, min(index + batch_size, len(batch.transitions)))
                     for index in range(0, len(batch.transitions), batch_size)
                 )
-            sample_budget_exhausted = False
-            for piece in pieces:
-                if (
-                    stopped
-                    or not _fits_sample_budget(
-                        learner.samples_consumed, len(piece.transitions), max_samples
-                    )
-                    or learner.eligible_updates >= max_steps
-                ):
-                    sample_budget_exhausted = (
-                        not _fits_sample_budget(
-                            learner.samples_consumed, len(piece.transitions), max_samples
-                        )
-                    )
-                    break
-                last_metrics = train_pilot_batch(learner, piece).as_dict()
-                if learner.eligible_updates % checkpoint_every == 0:
-                    _save_checkpoint_and_run_state(
-                        learner, checkpoint, state_path,
-                        source_sha=source_sha,
-                        formal_config_sha256=formal_identity["config_sha256"],
-                        variant=formal.variant,
-                        root_seed=root_seed,
-                        episodes_completed=resumed_from_episodes + episodes,
-                        decisions_completed=resumed_from_decisions + decisions,
-                    )
-            if sample_budget_exhausted:
+            if not _episode_fits_budget(learner, pieces, max_samples, max_steps):
                 break
+            steps_before_episode = learner.eligible_updates
+            for piece in pieces:
+                last_metrics = train_pilot_batch(learner, piece).as_dict()
+            if (
+                learner.eligible_updates // checkpoint_every
+                > steps_before_episode // checkpoint_every
+            ):
+                _save_checkpoint_and_run_state(
+                    learner, checkpoint, state_path,
+                    source_sha=source_sha,
+                    formal_config_sha256=formal_identity["config_sha256"],
+                    variant=formal.variant,
+                    root_seed=root_seed,
+                    episodes_completed=resumed_from_episodes + episodes,
+                    decisions_completed=resumed_from_decisions + decisions,
+                )
         if stopped:
             status = "stopped"
     except Exception as exc:
@@ -410,6 +410,12 @@ def main() -> int:
             "variant": formal.variant,
             "ruleset": formal.ruleset["id"],
             "seed": seed,
+            "limits": {
+                "max_seconds": max_seconds,
+                "max_samples": max_samples,
+                "max_optimizer_steps": max_steps,
+                "checkpoint_every": checkpoint_every,
+            },
             "collection": {
                 "root_seed": root_seed,
                 "worker_id": 0,
