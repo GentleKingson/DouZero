@@ -263,6 +263,13 @@ def test_pilot_summary_rejects_stale_or_non_commit_source_identity():
         validate_pilot_summary(payload)
 
 
+def test_pilot_summary_rejects_observed_wall_clock_overrun():
+    payload = _summary()
+    payload["limits"]["max_seconds"] = 0.5
+    with pytest.raises(ValueError, match="wall_clock_seconds exceeds max_seconds"):
+        validate_pilot_summary(payload)
+
+
 def test_pilot_summary_recomputes_resume_delta_throughput():
     payload = _summary()
     payload["samples"] = 10

@@ -621,6 +621,8 @@ def validate_pilot_summary(payload: Mapping[str, object]) -> None:
         value = payload[field]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
             raise ValueError(f"P2 pilot {field} is invalid")
+    if float(payload["wall_clock_seconds"]) > float(limits["max_seconds"]):
+        raise ValueError("P2 pilot wall_clock_seconds exceeds max_seconds")
     if payload["release_candidate"] != "NONE" or payload["release_status"] != "NOT READY" or payload["playing_strength"] != "NOT MEASURED":
         raise ValueError("P2 pilot cannot declare release readiness or measured strength")
     checkpoint = payload["checkpoint"]

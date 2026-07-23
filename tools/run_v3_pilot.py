@@ -407,9 +407,6 @@ def main() -> int:
             )
             if stopped or not _before_deadline(started, max_seconds, time.monotonic()):
                 break
-            episodes += 1
-            decisions += batch.decisions
-            winners[batch.winner_team] += 1
             batch_size = formal.runtime.batch_size
             if batch.trajectories is not None:
                 if not _fits_sample_budget(
@@ -417,6 +414,9 @@ def main() -> int:
                 ):
                     break
                 if len(batch.transitions) > batch_size:
+                    episodes += 1
+                    decisions += batch.decisions
+                    winners[batch.winner_team] += 1
                     skipped_long_episodes += 1
                     continue
                 pieces = (batch,)
@@ -434,6 +434,9 @@ def main() -> int:
                 started=started,
                 max_seconds=max_seconds,
             )
+            episodes += 1
+            decisions += batch.decisions
+            winners[batch.winner_team] += 1
             if (
                 learner.eligible_updates // checkpoint_every
                 > steps_before_episode // checkpoint_every
@@ -454,15 +457,22 @@ def main() -> int:
         failure = {"type": type(exc).__name__, "message": str(exc)}
         raise
     finally:
-        checkpoint_sha256 = _save_checkpoint_and_run_state(
-            learner, checkpoint, state_path,
-            source_sha=source_sha,
-            formal_config_sha256=formal_identity["config_sha256"],
-            variant=formal.variant,
-            root_seed=root_seed,
-            episodes_completed=resumed_from_episodes + episodes,
-            decisions_completed=resumed_from_decisions + decisions,
-        )
+        if failure is None:
+            checkpoint_sha256 = _save_checkpoint_and_run_state(
+                learner, checkpoint, state_path,
+                source_sha=source_sha,
+                formal_config_sha256=formal_identity["config_sha256"],
+                variant=formal.variant,
+                root_seed=root_seed,
+                episodes_completed=resumed_from_episodes + episodes,
+                decisions_completed=resumed_from_decisions + decisions,
+            )
+            checkpoint_saved = True
+        else:
+            # A failed atomic episode may have updated only a prefix. Preserve
+            # the last boundary checkpoint instead of publishing that state.
+            checkpoint_saved = checkpoint.exists() and state_path.exists()
+            checkpoint_sha256 = _sha256(checkpoint) if checkpoint_saved else None
         elapsed = time.monotonic() - started
         env = environment_info()
         container_id, image_digest = _attest_current_container(
@@ -542,7 +552,7 @@ def main() -> int:
             "checkpoint": {
                 "path": str(checkpoint),
                 "sha256": checkpoint_sha256,
-                "saved": True,
+                "saved": checkpoint_saved,
             },
             "environment": env,
             "release_candidate": "NONE",
