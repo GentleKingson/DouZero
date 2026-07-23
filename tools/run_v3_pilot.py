@@ -71,6 +71,22 @@ def _finite_metrics(value):
     return _finite_metrics(vars(value))
 
 
+def _train_episode_before_deadline(
+    learner, pieces, *, started: float, max_seconds: float,
+    clock=time.monotonic, train_fn=train_pilot_batch,
+):
+    """Train a complete episode or fail before starting a late batch piece."""
+
+    last_metrics = None
+    for piece in pieces:
+        if not _before_deadline(started, max_seconds, clock()):
+            raise RuntimeError(
+                "pilot wall-clock deadline elapsed during an atomic episode"
+            )
+        last_metrics = train_fn(learner, piece).as_dict()
+    return last_metrics
+
+
 def _attest_clean_source(source_sha: str) -> str:
     """Require Git metadata and a clean, commit-matching runtime source tree."""
 
@@ -408,8 +424,12 @@ def main() -> int:
             if not _episode_fits_budget(learner, pieces, max_samples, max_steps):
                 break
             steps_before_episode = learner.eligible_updates
-            for piece in pieces:
-                last_metrics = train_pilot_batch(learner, piece).as_dict()
+            last_metrics = _train_episode_before_deadline(
+                learner,
+                pieces,
+                started=started,
+                max_seconds=max_seconds,
+            )
             if (
                 learner.eligible_updates // checkpoint_every
                 > steps_before_episode // checkpoint_every

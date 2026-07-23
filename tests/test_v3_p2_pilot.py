@@ -21,6 +21,7 @@ from tools.run_v3_pilot import (
     _load_run_state,
     _resolve_bounded_limit,
     _save_checkpoint_and_run_state,
+    _train_episode_before_deadline,
 )
 from tools.summarize_v3_pilots import summarize_evidence
 
@@ -39,7 +40,7 @@ from douzero.v3_hybrid.pilot import (
 )
 
 
-def test_runner_script_imports_attested_checkout_before_pythonpath(tmp_path):
+def test_pilot_scripts_import_attested_checkout_before_pythonpath(tmp_path):
     shadow = tmp_path / "shadow"
     package = shadow / "douzero"
     package.mkdir(parents=True)
@@ -52,17 +53,39 @@ def test_runner_script_imports_attested_checkout_before_pythonpath(tmp_path):
         [str(shadow), env["PYTHONPATH"]] if env.get("PYTHONPATH") else [str(shadow)]
     )
 
-    result = subprocess.run(
-        [sys.executable, str(root / "tools" / "run_v3_pilot.py"), "--help"],
-        cwd=root,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    for script in ("run_v3_pilot.py", "summarize_v3_pilots.py"):
+        result = subprocess.run(
+            [sys.executable, str(root / "tools" / script), "--help"],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
 
-    assert result.returncode == 0, result.stderr
-    assert "shadow package imported" not in result.stderr
+        assert result.returncode == 0, result.stderr
+        assert "shadow package imported" not in result.stderr
+
+
+def test_episode_training_fails_before_piece_started_after_deadline():
+    trained = []
+    times = iter((14.0, 15.0))
+
+    class _Metrics:
+        def as_dict(self):
+            return {"finite": True}
+
+    with pytest.raises(RuntimeError, match="deadline elapsed"):
+        _train_episode_before_deadline(
+            object(),
+            ("first", "second"),
+            started=10.0,
+            max_seconds=5.0,
+            clock=lambda: next(times),
+            train_fn=lambda _learner, piece: trained.append(piece) or _Metrics(),
+        )
+
+    assert trained == ["first"]
 
 
 def _summary():

@@ -5,7 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+# Script execution puts tools/ first; bind imports to this checkout.
+ROOT = Path(__file__).resolve().parents[1]
+if not sys.path or sys.path[0] != str(ROOT):
+    sys.path.insert(0, str(ROOT))
 
 from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.pilot import (
@@ -14,9 +20,6 @@ from douzero.v3_hybrid.pilot import (
     build_pilot_resolved_config,
     validate_pilot_summary,
 )
-
-ROOT = Path(__file__).resolve().parents[1]
-
 
 def summarize_evidence(root: Path) -> dict:
     """Validate P2 run pairs and return their compact diagnostic summary."""
