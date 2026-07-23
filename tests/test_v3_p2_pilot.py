@@ -270,6 +270,14 @@ def test_pilot_summary_rejects_observed_wall_clock_overrun():
         validate_pilot_summary(payload)
 
 
+def test_pilot_summary_requires_integral_progress_counters():
+    for field in ("samples", "optimizer_steps", "episodes", "decisions"):
+        payload = _summary()
+        payload[field] = float(payload[field])
+        with pytest.raises(ValueError, match="non-negative integer"):
+            validate_pilot_summary(payload)
+
+
 def test_pilot_summary_recomputes_resume_delta_throughput():
     payload = _summary()
     payload["samples"] = 10
@@ -430,6 +438,14 @@ def test_evidence_summary_rejects_unrelated_resume_pair(tmp_path):
     changed["metrics"]["samples_per_second"] = -1.0
     target.write_text(json.dumps(changed), encoding="utf-8")
     with pytest.raises(ValueError, match="sample counter did not increase"):
+        summarize_evidence(tmp_path)
+    changed["samples"] = 8
+    changed["metrics"]["samples_per_second"] = 4.0 / 3600.0
+    changed["metrics"]["optimizer_steps_per_second"] = 1.0 / 3600.0
+    changed["wall_clock_seconds"] = 3600.0
+    changed["limits"]["max_seconds"] = 3600.0
+    target.write_text(json.dumps(changed), encoding="utf-8")
+    with pytest.raises(ValueError, match="combined wall-clock"):
         summarize_evidence(tmp_path)
 
 

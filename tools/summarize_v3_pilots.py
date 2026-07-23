@@ -106,6 +106,11 @@ def summarize_evidence(root: Path) -> dict:
             raise ValueError(f"{variant} optimizer counter did not increase")
         if after["samples"] <= before["samples"]:
             raise ValueError(f"{variant} sample counter did not increase")
+        if (
+            before["wall_clock_seconds"] + after["wall_clock_seconds"]
+            > formal.budgets["pilot"].wall_clock_seconds
+        ):
+            raise ValueError(f"{variant} combined wall-clock exceeds the pilot ceiling")
         observed_sha = after["source_git_sha"]
         observed_image = after["environment"]["image_digest"]
         observed_tree = after["environment"]["source_tree"]

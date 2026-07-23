@@ -617,10 +617,18 @@ def validate_pilot_summary(payload: Mapping[str, object]) -> None:
         raise ValueError("P2 pilot collection epsilon is invalid")
     if payload["status"] not in {"completed", "stopped", "failed"}:
         raise ValueError("P2 pilot status is invalid")
-    for field in ("wall_clock_seconds", "samples", "optimizer_steps", "episodes", "decisions"):
+    elapsed_value = payload["wall_clock_seconds"]
+    if (
+        isinstance(elapsed_value, bool)
+        or not isinstance(elapsed_value, (int, float))
+        or not math.isfinite(float(elapsed_value))
+        or elapsed_value < 0
+    ):
+        raise ValueError("P2 pilot wall_clock_seconds is invalid")
+    for field in ("samples", "optimizer_steps", "episodes", "decisions"):
         value = payload[field]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value < 0:
-            raise ValueError(f"P2 pilot {field} is invalid")
+        if type(value) is not int or value < 0:
+            raise ValueError(f"P2 pilot {field} must be a non-negative integer")
     if float(payload["wall_clock_seconds"]) > float(limits["max_seconds"]):
         raise ValueError("P2 pilot wall_clock_seconds exceeds max_seconds")
     if payload["release_candidate"] != "NONE" or payload["release_status"] != "NOT READY" or payload["playing_strength"] != "NOT MEASURED":
