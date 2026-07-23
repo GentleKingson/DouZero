@@ -15,18 +15,19 @@ implement the H7.1 async stack before any P4 budget is committed.
 
 ## Provenance
 
-- Source SHA: `4b240d8753dadfd84c1759e63d797a473b933c23`
-- Source tree: `2d72a59bcb15afd6d2b67f82a010e678224eafc4`
+- Source SHA: `26313dcc629679bec6f543b3b4c5ae00bfe85658`
+- Source tree: `958561e035a778114b5a0882e41604ea53d570e4`
 - Base SHA: `51ced4e64079deba254f8c3b856e819e08cae347`
-- Docker image: `douzero-p2:4b240d8`
-- Attested image ID: `sha256:da776cbf2f74be359c11be52b600fad5a13b52e2c5529b6f40b291183fae94e7`
+- Docker image: `douzero-p2:26313dc`
+- Attested image ID: `sha256:599d600741b9dba9d3ef380ef7ddd9ee46c2a7182f90bfc94cc9b28df8c8d23f`
 - GPU/driver: NVIDIA GeForce RTX 5070 / `595.71.05`
 - PyTorch/CUDA: `2.12.1+cu132` / `13.2`
 - Topology/ruleset/seed: single process / legacy / `101`
-- Protocol: 900 seconds, real SIGTERM, strict checkpoint load in a fresh
-  container, then another 900 seconds with a post-resume optimizer update
+- Protocol: approximately 944 seconds, real SIGTERM at an episode boundary,
+  strict checkpoint load in a fresh container, then 900 seconds with a
+  post-resume optimizer update
 - Seed derivation: `sha256(root_seed,stream_name,worker_id,episode_id)-v1`
-- Raw evidence: `/tmp/douzero-p2-evidence/final-4b240d8` on `LocalServer`
+- Raw evidence: `/tmp/douzero-p2-evidence/final-26313dc` on `LocalServer`
 - Raw evidence manifest: `SHA256SUMS` in that directory
 
 The repository summary is a compact derivative of the validated raw evidence.
@@ -37,12 +38,12 @@ final evidence-only report commit; that commit does not alter executable behavio
 
 | Variant | Total wall s | Samples | Steps | Resume samples/s | Resume steps/s | Skipped long cooperation episodes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| v3_role | 1802.81 | 28,913 | 1,132 | 17.117 | 0.669 | 0 |
-| v3_admc | 1802.68 | 29,866 | 1,103 | 17.991 | 0.657 | 0 |
-| v3_oracle | 1800.23 | 16,904 | 703 | 10.013 | 0.414 | 0 |
-| v3_belief | 1802.90 | 25,581 | 957 | 15.250 | 0.576 | 0 |
-| v3_farmer_cooperation | 1797.24 | 2,997 | 112 | 1.659 | 0.063 | 3,555 |
-| v3_full_hybrid | 1799.52 | 246 | 9 | 0.079 | 0.003 | 1,496 |
+| v3_role | 1846.62 | 29,622 | 1,160 | 15.000 | 0.587 | 0 |
+| v3_admc | 1841.25 | 30,773 | 1,160 | 15.646 | 0.594 | 0 |
+| v3_oracle | 1844.77 | 18,141 | 756 | 9.368 | 0.388 | 0 |
+| v3_belief | 1846.85 | 27,321 | 1,009 | 14.257 | 0.528 | 0 |
+| v3_farmer_cooperation | 1839.94 | 3,025 | 113 | 1.667 | 0.063 | 3,679 |
+| v3_full_hybrid | 1842.08 | 246 | 9 | 0.080 | 0.003 | 1,504 |
 
 All six variants saved a checkpoint after SIGTERM, strict-loaded it in a new
 container, advanced the optimizer and policy counters, and published a new
@@ -57,7 +58,7 @@ unsuitable for the frozen P4 matrix even though the component paths train.
 
 ## Correctness fixes exposed by the pilot
 
-The pilot added regression coverage for three failures found against real
+The pilot added regression coverage for failures found against real
 environment trajectories:
 
 1. Exact duplicate legal-action feature rows are normalized without changing
@@ -66,6 +67,10 @@ environment trajectories:
    strategy targets no longer cross the warmup gate.
 3. H6 public auxiliary updates contribute to the effective policy version even
    when farmer cooperation is disabled, preserving ADMC `q_old` provenance.
+4. Effective pilot ceilings are recorded and overrides above the frozen P1
+   budgets fail before training starts.
+5. Non-cooperation episodes are trained and checkpointed atomically, so a
+   SIGTERM cannot persist a completed episode ID with only a trained prefix.
 
 Resume throughput is computed from counter deltas rather than cumulative
 counters, and the summary validator independently checks that arithmetic.
