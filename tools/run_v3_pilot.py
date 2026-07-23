@@ -30,6 +30,9 @@ from douzero.v3_hybrid.pilot import (
     write_pilot_summary,
 )
 
+_DOCKER_SOCKET = "/var/run/docker.sock"
+_HOST_PROC = "/host/proc"
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -44,8 +47,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--root-seed", type=int)
-    parser.add_argument("--docker-socket", default="/var/run/docker.sock")
-    parser.add_argument("--host-proc", default="/host/proc")
     parser.add_argument("--command-record", default="")
     return parser.parse_args()
 
@@ -435,7 +436,7 @@ def main() -> int:
         elapsed = time.monotonic() - started
         env = environment_info()
         container_id, image_digest = _attest_current_container(
-            args.docker_socket, args.host_proc
+            _DOCKER_SOCKET, _HOST_PROC
         )
         env.update({
             "hostname": socket.gethostname(),
