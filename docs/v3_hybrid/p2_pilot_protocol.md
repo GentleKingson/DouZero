@@ -10,11 +10,17 @@ it is not a second trainer.
 - Variants: `v3_role`, `v3_admc`, `v3_oracle`, `v3_belief`,
   `v3_farmer_cooperation`, and `v3_full_hybrid`.
 - Training seed: `101`; evaluation seed: `41001`; deal-set seed: `51001`.
+- Every environment, exploration, Python, NumPy, Torch, and CUDA stream is
+  derived per episode with the frozen
+  `sha256(root_seed,stream_name,worker_id,episode_id)-v1` contract. Resume
+  continues from the persisted episode counter instead of replaying streams.
 - Device/topology: one CUDA device, single process, batch size 32.
 - Per-variant ceiling: 3,600 seconds, 1,000,000 samples, or 10,000 eligible
   optimizer steps, whichever occurs first.
 - Checkpointing is enabled. Each variant must receive a real SIGTERM, load the
   same strict H6 checkpoint in a fresh container, and perform another update.
+- The runner reads its image ID from the Docker daemon using the current
+  container ID; caller-supplied image identity strings are not accepted.
 - Training decisions come from the public V3 policy and environment legal
   action list. Oracle and belief labels are captured in separate training-only
   sidecars. Farmer cooperation remains episode-atomic.

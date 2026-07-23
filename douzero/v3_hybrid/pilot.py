@@ -64,8 +64,9 @@ from .training.h5_learner import V3H5LearnerConfig
 from .training.h6_learner import V3H6Learner
 from .training.oracle_schedule import OracleGuidingScheduleConfig
 
-P2_PILOT_SCHEMA = "v3-p2-pilot-evidence-v2"
-P2_PILOT_PROTOCOL = "real-env-single-process-checkpoint-resume-v2"
+P2_PILOT_SCHEMA = "v3-p2-pilot-evidence-v3"
+P2_PILOT_PROTOCOL = "real-env-single-process-checkpoint-resume-v3"
+P2_SEED_DERIVATION = "sha256(root_seed,stream_name,worker_id,episode_id)-v1"
 P2_VARIANTS = (
     "v3_role",
     "v3_admc",
@@ -82,6 +83,35 @@ def _sha256(path: str | Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def derive_pilot_stream_seed(
+    root_seed: int,
+    stream_name: str,
+    worker_id: int,
+    episode_id: int,
+) -> int:
+    """Derive a stable 32-bit seed using the frozen P1 stream contract."""
+
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (
+        root_seed, worker_id, episode_id,
+    )):
+        raise TypeError("pilot seed coordinates must be integers")
+    if worker_id < 0 or episode_id < 0 or not stream_name:
+        raise ValueError("pilot seed coordinates must be non-negative and named")
+    envelope = json.dumps(
+        {
+            "contract": P2_SEED_DERIVATION,
+            "episode_id": episode_id,
+            "root_seed": root_seed,
+            "stream_name": stream_name,
+            "worker_id": worker_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(envelope).digest()[:4], "big")
 
 
 def build_pilot_resolved_config(
@@ -247,17 +277,41 @@ def collect_real_pilot_episode(
     learner: V3H6Learner,
     *,
     episode_number: int,
-    environment_seed: int,
-    action_rng: random.Random,
+    root_seed: int,
+    worker_id: int,
     epsilon: float,
 ) -> PilotBatch:
     """Collect one real rules-engine episode and build aligned training sidecars."""
 
     if not 0.0 <= epsilon <= 1.0:
         raise ValueError("pilot epsilon must be in [0, 1]")
-    np.random.seed((environment_seed + episode_number) % (1 << 32))
+    environment_seed = derive_pilot_stream_seed(
+        root_seed, "environment", worker_id, episode_number
+    )
+    exploration_seed = derive_pilot_stream_seed(
+        root_seed, "exploration", worker_id, episode_number
+    )
+    python_seed = derive_pilot_stream_seed(
+        root_seed, "python", worker_id, episode_number
+    )
+    numpy_seed = derive_pilot_stream_seed(
+        root_seed, "numpy", worker_id, episode_number
+    )
+    torch_seed = derive_pilot_stream_seed(
+        root_seed, "torch", worker_id, episode_number
+    )
+    cuda_seed = derive_pilot_stream_seed(
+        root_seed, "cuda", worker_id, episode_number
+    )
+    np.random.seed(environment_seed)
     env = Env("adp")
     env.reset()
+    random.seed(python_seed)
+    np.random.seed(numpy_seed)
+    torch.manual_seed(torch_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cuda_seed)
+    action_rng = random.Random(exploration_seed)
     episode_id = f"p2-episode-{episode_number}"
     deal_id = f"p2-deal-{episode_number}"
     decisions: list[PilotDecision] = []
@@ -522,13 +576,15 @@ def validate_pilot_summary(payload: Mapping[str, object]) -> None:
         raise ValueError("P2 pilot variant/ruleset mismatch")
     collection = payload["collection"]
     if not isinstance(collection, Mapping) or set(collection) != {
-        "environment_seed", "action_seed", "epsilon"
+        "root_seed", "worker_id", "derivation", "epsilon"
     }:
         raise ValueError("P2 pilot collection fields mismatch")
-    for field in ("environment_seed", "action_seed"):
+    for field in ("root_seed", "worker_id"):
         value = collection[field]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"P2 pilot collection {field} is invalid")
+    if collection["derivation"] != P2_SEED_DERIVATION:
+        raise ValueError("P2 pilot collection seed derivation is invalid")
     epsilon = collection["epsilon"]
     if (
         isinstance(epsilon, bool)
@@ -598,6 +654,14 @@ def validate_pilot_summary(payload: Mapping[str, object]) -> None:
             raise ValueError(f"P2 pilot environment {field} is invalid")
     if environment.get("cuda_available") is not True:
         raise ValueError("P2 pilot requires CUDA evidence")
+    image_digest = environment.get("image_digest")
+    if (
+        not isinstance(image_digest, str)
+        or not image_digest.startswith("sha256:")
+        or len(image_digest) != 71
+        or any(c not in "0123456789abcdef" for c in image_digest[7:])
+    ):
+        raise ValueError("P2 pilot requires an attested Docker image ID")
     elapsed = float(payload["wall_clock_seconds"])
     expected_samples_rate = (
         float(payload["samples"]) - float(resume["from_samples"])

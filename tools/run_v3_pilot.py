@@ -7,7 +7,6 @@ import argparse
 import json
 import math
 import os
-import random
 import signal
 import socket
 import subprocess
@@ -21,6 +20,7 @@ from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.pilot import (
     P2_PILOT_PROTOCOL,
     P2_PILOT_SCHEMA,
+    P2_SEED_DERIVATION,
     P2_VARIANTS,
     _sha256,
     collect_real_pilot_episode,
@@ -43,9 +43,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--epsilon", type=float, default=0.01)
-    parser.add_argument("--environment-seed", type=int)
-    parser.add_argument("--action-seed", type=int)
-    parser.add_argument("--image-digest", required=True)
+    parser.add_argument("--root-seed", type=int)
+    parser.add_argument("--docker-socket", default="/var/run/docker.sock")
     parser.add_argument("--command-record", default="")
     return parser.parse_args()
 
@@ -110,13 +109,58 @@ def _driver_version() -> str:
     return value[0]
 
 
-_RUN_STATE_SCHEMA = "v3-p2-run-state-v1"
+def _attest_container_image(container_id: str, socket_path: str) -> str:
+    """Read the current container's actual image ID from the Docker daemon."""
+
+    request = (
+        f"GET /containers/{container_id}/json HTTP/1.0\r\n"
+        "Host: docker\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(10)
+        client.connect(socket_path)
+        client.sendall(request)
+        chunks = []
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError as exc:
+        raise SystemExit(f"P2 evidence requires Docker image attestation: {exc}") from exc
+    finally:
+        client.close()
+    response = b"".join(chunks)
+    try:
+        header, body = response.split(b"\r\n\r\n", 1)
+        status = int(header.split(b"\r\n", 1)[0].split()[1])
+        payload = json.loads(body)
+    except (ValueError, IndexError, json.JSONDecodeError) as exc:
+        raise SystemExit("Docker image attestation returned an invalid response") from exc
+    image_id = payload.get("Image") if status == 200 and isinstance(payload, dict) else None
+    if (
+        not isinstance(image_id, str)
+        or not image_id.startswith("sha256:")
+        or len(image_id) != 71
+        or any(c not in "0123456789abcdef" for c in image_id[7:])
+    ):
+        raise SystemExit("Docker image attestation did not return a valid image ID")
+    return image_id
 
 
-def _lists_to_tuples(value):
-    if isinstance(value, list):
-        return tuple(_lists_to_tuples(item) for item in value)
+def _resolve_positive_limit(override, default, label: str):
+    value = default if override is None else override
+    if isinstance(value, bool) or not math.isfinite(float(value)) or value <= 0:
+        raise SystemExit(f"{label} must be positive")
     return value
+
+
+def _fits_sample_budget(consumed: int, batch_size: int, maximum: int) -> bool:
+    return consumed + batch_size <= maximum
+
+
+_RUN_STATE_SCHEMA = "v3-p2-run-state-v1"
 
 
 def _write_run_state(path: Path, payload: dict) -> None:
@@ -136,11 +180,9 @@ def _save_checkpoint_and_run_state(
     source_sha: str,
     formal_config_sha256: str,
     variant: str,
-    environment_seed: int,
-    action_seed: int,
+    root_seed: int,
     episodes_completed: int,
     decisions_completed: int,
-    action_rng: random.Random,
 ) -> str:
     learner.save_checkpoint(checkpoint)
     checkpoint_sha256 = _sha256(checkpoint)
@@ -149,11 +191,9 @@ def _save_checkpoint_and_run_state(
         "source_git_sha": source_sha,
         "formal_config_sha256": formal_config_sha256,
         "variant": variant,
-        "environment_seed": environment_seed,
-        "action_seed": action_seed,
+        "root_seed": root_seed,
         "episodes_completed": episodes_completed,
         "decisions_completed": decisions_completed,
-        "action_rng_state": action_rng.getstate(),
         "checkpoint_sha256": checkpoint_sha256,
     })
     return checkpoint_sha256
@@ -166,8 +206,7 @@ def _load_run_state(
     source_sha: str,
     formal_config_sha256: str,
     variant: str,
-    environment_seed: int,
-    action_seed: int,
+    root_seed: int,
 ) -> dict:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -178,12 +217,11 @@ def _load_run_state(
         "source_git_sha": source_sha,
         "formal_config_sha256": formal_config_sha256,
         "variant": variant,
-        "environment_seed": environment_seed,
-        "action_seed": action_seed,
+        "root_seed": root_seed,
         "checkpoint_sha256": checkpoint_sha256,
     }
     if not isinstance(payload, dict) or set(payload) != {
-        *expected, "episodes_completed", "decisions_completed", "action_rng_state"
+        *expected, "episodes_completed", "decisions_completed"
     }:
         raise SystemExit("pilot run-state envelope mismatch")
     for field, value in expected.items():
@@ -193,10 +231,6 @@ def _load_run_state(
         value = payload[field]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise SystemExit(f"pilot run-state {field} is invalid")
-    try:
-        random.Random().setstate(_lists_to_tuples(payload["action_rng_state"]))
-    except (TypeError, ValueError) as exc:
-        raise SystemExit("pilot run-state action RNG is invalid") from exc
     return payload
 
 
@@ -206,14 +240,19 @@ def main() -> int:
     if formal.variant not in P2_VARIANTS:
         raise SystemExit("P2 pilot requires one of the six frozen V3 variants")
     budget = formal.budgets["pilot"]
-    max_seconds = float(args.max_seconds or budget.wall_clock_seconds)
-    max_samples = int(args.max_samples or budget.sample_budget)
-    max_steps = int(args.max_optimizer_steps or budget.optimizer_step_budget)
-    checkpoint_every = int(
-        args.checkpoint_every or formal.runtime.checkpoint_cadence_updates
-    )
-    if min(max_seconds, max_samples, max_steps, checkpoint_every) <= 0:
-        raise SystemExit("pilot limits must be positive")
+    max_seconds = float(_resolve_positive_limit(
+        args.max_seconds, budget.wall_clock_seconds, "max_seconds"
+    ))
+    max_samples = int(_resolve_positive_limit(
+        args.max_samples, budget.sample_budget, "max_samples"
+    ))
+    max_steps = int(_resolve_positive_limit(
+        args.max_optimizer_steps, budget.optimizer_step_budget, "max_optimizer_steps"
+    ))
+    checkpoint_every = int(_resolve_positive_limit(
+        args.checkpoint_every, formal.runtime.checkpoint_cadence_updates,
+        "checkpoint_every",
+    ))
     source_sha = git_sha()
     if len(source_sha) != 40:
         raise SystemExit("P2 evidence requires a full commit-bound Git SHA")
@@ -225,9 +264,7 @@ def main() -> int:
     learner, resolved = create_pilot_learner(formal)
     formal_identity = formal.identity_dict()
     seed = formal.seeds.training[0]
-    environment_seed = args.environment_seed if args.environment_seed is not None else seed
-    action_seed = args.action_seed if args.action_seed is not None else seed + 1
-    action_rng = random.Random(action_seed)
+    root_seed = args.root_seed if args.root_seed is not None else seed
     resumed_from_samples = 0
     resumed_from_steps = 0
     resumed_from_episodes = 0
@@ -243,15 +280,13 @@ def main() -> int:
             source_sha=source_sha,
             formal_config_sha256=formal_identity["config_sha256"],
             variant=formal.variant,
-            environment_seed=environment_seed,
-            action_seed=action_seed,
+            root_seed=root_seed,
         )
         learner.load_checkpoint(checkpoint)
         resumed_from_samples = learner.samples_consumed
         resumed_from_steps = learner.eligible_updates
         resumed_from_episodes = run_state["episodes_completed"]
         resumed_from_decisions = run_state["decisions_completed"]
-        action_rng.setstate(_lists_to_tuples(run_state["action_rng_state"]))
     elif checkpoint.exists():
         raise SystemExit("fresh pilot refuses to overwrite an existing checkpoint")
 
@@ -284,8 +319,8 @@ def main() -> int:
             batch = collect_real_pilot_episode(
                 learner,
                 episode_number=resumed_from_episodes + episodes,
-                environment_seed=environment_seed,
-                action_rng=action_rng,
+                root_seed=root_seed,
+                worker_id=0,
                 epsilon=args.epsilon,
             )
             episodes += 1
@@ -293,6 +328,10 @@ def main() -> int:
             winners[batch.winner_team] += 1
             batch_size = formal.runtime.batch_size
             if batch.trajectories is not None:
+                if not _fits_sample_budget(
+                    learner.samples_consumed, len(batch.transitions), max_samples
+                ):
+                    break
                 if len(batch.transitions) > batch_size:
                     skipped_long_episodes += 1
                     continue
@@ -302,12 +341,20 @@ def main() -> int:
                     slice_pilot_batch(batch, index, min(index + batch_size, len(batch.transitions)))
                     for index in range(0, len(batch.transitions), batch_size)
                 )
+            sample_budget_exhausted = False
             for piece in pieces:
                 if (
                     stopped
-                    or learner.samples_consumed + len(piece.transitions) > max_samples
+                    or not _fits_sample_budget(
+                        learner.samples_consumed, len(piece.transitions), max_samples
+                    )
                     or learner.eligible_updates >= max_steps
                 ):
+                    sample_budget_exhausted = (
+                        not _fits_sample_budget(
+                            learner.samples_consumed, len(piece.transitions), max_samples
+                        )
+                    )
                     break
                 last_metrics = train_pilot_batch(learner, piece).as_dict()
                 if learner.eligible_updates % checkpoint_every == 0:
@@ -316,12 +363,12 @@ def main() -> int:
                         source_sha=source_sha,
                         formal_config_sha256=formal_identity["config_sha256"],
                         variant=formal.variant,
-                        environment_seed=environment_seed,
-                        action_seed=action_seed,
+                        root_seed=root_seed,
                         episodes_completed=resumed_from_episodes + episodes,
                         decisions_completed=resumed_from_decisions + decisions,
-                        action_rng=action_rng,
                     )
+            if sample_budget_exhausted:
+                break
         if stopped:
             status = "stopped"
     except Exception as exc:
@@ -334,17 +381,17 @@ def main() -> int:
             source_sha=source_sha,
             formal_config_sha256=formal_identity["config_sha256"],
             variant=formal.variant,
-            environment_seed=environment_seed,
-            action_seed=action_seed,
+            root_seed=root_seed,
             episodes_completed=resumed_from_episodes + episodes,
             decisions_completed=resumed_from_decisions + decisions,
-            action_rng=action_rng,
         )
         elapsed = time.monotonic() - started
         env = environment_info()
         env.update({
             "hostname": socket.gethostname(),
-            "image_digest": args.image_digest,
+            "image_digest": _attest_container_image(
+                socket.gethostname(), args.docker_socket
+            ),
             "cuda_runtime": torch.version.cuda,
             "gpu": (
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
@@ -364,8 +411,9 @@ def main() -> int:
             "ruleset": formal.ruleset["id"],
             "seed": seed,
             "collection": {
-                "environment_seed": environment_seed,
-                "action_seed": action_seed,
+                "root_seed": root_seed,
+                "worker_id": 0,
+                "derivation": P2_SEED_DERIVATION,
                 "epsilon": args.epsilon,
             },
             "status": status,

@@ -9,8 +9,11 @@ from types import SimpleNamespace
 import pytest
 
 from tools.run_v3_pilot import (
+    _attest_container_image,
     _attest_clean_source,
+    _fits_sample_budget,
     _load_run_state,
+    _resolve_positive_limit,
     _save_checkpoint_and_run_state,
 )
 from tools.summarize_v3_pilots import summarize_evidence
@@ -19,8 +22,10 @@ from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.pilot import (
     P2_PILOT_PROTOCOL,
     P2_PILOT_SCHEMA,
+    P2_SEED_DERIVATION,
     P2_VARIANTS,
     build_pilot_resolved_config,
+    derive_pilot_stream_seed,
     unique_legal_actions,
     train_pilot_batch,
     validate_pilot_summary,
@@ -38,7 +43,12 @@ def _summary():
         "variant": "v3_role",
         "ruleset": "legacy",
         "seed": 101,
-        "collection": {"environment_seed": 101, "action_seed": 102, "epsilon": 0.01},
+        "collection": {
+            "root_seed": 101,
+            "worker_id": 0,
+            "derivation": P2_SEED_DERIVATION,
+            "epsilon": 0.01,
+        },
         "status": "completed",
         "started_at": 1.0,
         "finished_at": 2.0,
@@ -180,15 +190,11 @@ def test_pilot_summary_recomputes_resume_delta_throughput():
         validate_pilot_summary(payload)
 
 
-def test_run_state_binds_checkpoint_seeds_and_rng_continuation(tmp_path):
+def test_run_state_binds_checkpoint_seed_and_episode_continuation(tmp_path):
     class Learner:
         def save_checkpoint(self, path):
             path.write_bytes(b"checkpoint")
 
-    import random
-
-    rng = random.Random(102)
-    rng.random()
     checkpoint = tmp_path / "latest.pt"
     state_path = tmp_path / "pilot-state.json"
     digest = _save_checkpoint_and_run_state(
@@ -196,11 +202,9 @@ def test_run_state_binds_checkpoint_seeds_and_rng_continuation(tmp_path):
         source_sha="1" * 40,
         formal_config_sha256="2" * 64,
         variant="v3_role",
-        environment_seed=101,
-        action_seed=102,
+        root_seed=101,
         episodes_completed=7,
         decisions_completed=99,
-        action_rng=rng,
     )
     state = _load_run_state(
         state_path,
@@ -208,22 +212,67 @@ def test_run_state_binds_checkpoint_seeds_and_rng_continuation(tmp_path):
         source_sha="1" * 40,
         formal_config_sha256="2" * 64,
         variant="v3_role",
-        environment_seed=101,
-        action_seed=102,
+        root_seed=101,
     )
-    restored = random.Random()
-    restored.setstate(tuple([state["action_rng_state"][0], tuple(state["action_rng_state"][1]), state["action_rng_state"][2]]))
-    assert restored.random() == rng.random()
-    with pytest.raises(SystemExit, match="action_seed mismatch"):
+    assert state["episodes_completed"] == 7
+    assert derive_pilot_stream_seed(101, "environment", 0, 7) == (
+        derive_pilot_stream_seed(101, "environment", 0, state["episodes_completed"])
+    )
+    with pytest.raises(SystemExit, match="root_seed mismatch"):
         _load_run_state(
             state_path,
             checkpoint_sha256=digest,
             source_sha="1" * 40,
             formal_config_sha256="2" * 64,
             variant="v3_role",
-            environment_seed=101,
-            action_seed=999,
+            root_seed=999,
         )
+
+
+def test_frozen_seed_derivation_separates_streams_and_episodes():
+    seed = derive_pilot_stream_seed(101, "environment", 0, 7)
+    assert seed == derive_pilot_stream_seed(101, "environment", 0, 7)
+    assert seed != derive_pilot_stream_seed(101, "exploration", 0, 7)
+    assert seed != derive_pilot_stream_seed(101, "environment", 0, 8)
+
+
+def test_zero_budget_override_is_rejected():
+    assert _resolve_positive_limit(None, 10, "budget") == 10
+    with pytest.raises(SystemExit, match="budget must be positive"):
+        _resolve_positive_limit(0, 10, "budget")
+
+
+def test_sample_budget_stops_when_next_slice_does_not_fit():
+    assert _fits_sample_budget(32, 32, 64)
+    assert not _fits_sample_budget(0, 32, 1)
+    assert not _fits_sample_budget(63, 2, 64)
+
+
+def test_docker_image_identity_is_read_from_daemon(monkeypatch):
+    image_id = "sha256:" + "a" * 64
+
+    class FakeSocket:
+        def settimeout(self, _value):
+            pass
+
+        def connect(self, path):
+            assert path == "/docker.sock"
+
+        def sendall(self, request):
+            assert b"/containers/container-a/json" in request
+
+        def recv(self, _size):
+            if hasattr(self, "sent"):
+                return b""
+            self.sent = True
+            body = json.dumps({"Image": image_id}).encode()
+            return b"HTTP/1.0 200 OK\r\n\r\n" + body
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("tools.run_v3_pilot.socket.socket", lambda *_: FakeSocket())
+    assert _attest_container_image("container-a", "/docker.sock") == image_id
 
 
 def test_evidence_summary_rejects_unrelated_resume_pair(tmp_path):

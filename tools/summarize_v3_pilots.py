@@ -9,6 +9,7 @@ from pathlib import Path
 
 from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.pilot import (
+    P2_SEED_DERIVATION,
     P2_VARIANTS,
     build_pilot_resolved_config,
     validate_pilot_summary,
@@ -64,8 +65,9 @@ def summarize_evidence(root: Path) -> dict:
             if payload["metrics"]["resolved_config_hash"] != expected_resolved:
                 raise ValueError(f"{variant} does not match the frozen resolved config")
         expected_collection = {
-            "environment_seed": formal.seeds.training[0],
-            "action_seed": formal.seeds.training[0] + 1,
+            "root_seed": formal.seeds.training[0],
+            "worker_id": 0,
+            "derivation": P2_SEED_DERIVATION,
             "epsilon": 0.01,
         }
         if before["collection"] != expected_collection:
