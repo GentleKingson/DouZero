@@ -431,6 +431,8 @@ def test_evidence_summary_rejects_failed_resume_and_environment_drift(tmp_path):
     target = tmp_path / P2_VARIANTS[0] / "post-resume-summary.json"
     payload = json.loads(target.read_text(encoding="utf-8"))
     payload["resume"]["checkpoint_sha256"] = "4" * 64
+    payload["samples"] = 8
+    payload["metrics"]["samples_per_second"] = 4.0
     payload["status"] = "failed"
     payload["failure"] = {"type": "RuntimeError", "message": "boom"}
     target.write_text(json.dumps(payload), encoding="utf-8")
