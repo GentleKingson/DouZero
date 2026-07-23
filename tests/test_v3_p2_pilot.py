@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ from douzero.v3_hybrid.pilot import (
     P2_VARIANTS,
     build_pilot_resolved_config,
     unique_legal_actions,
+    train_pilot_batch,
     validate_pilot_summary,
     write_pilot_summary,
 )
@@ -77,6 +79,36 @@ def test_pilot_removes_only_exact_duplicate_legal_rows_in_engine_order():
     ]
     with pytest.raises(ValueError, match="no legal action"):
         unique_legal_actions(())
+
+
+def test_oracle_warmup_does_not_feed_public_strategy_targets():
+    captured = {}
+
+    class Learner:
+        base = SimpleNamespace(
+            base=SimpleNamespace(
+                base=SimpleNamespace(
+                    schedule_state=lambda: SimpleNamespace(
+                        public_training=False,
+                        privileged_required=True,
+                        oracle_weight=1.0,
+                        guidance_weight=0.0,
+                    )
+                )
+            )
+        )
+
+        def train_batch(self, transitions, **sidecars):
+            captured.update(sidecars)
+            return "metrics"
+
+    batch = SimpleNamespace(
+        transitions=("row",), trajectories=None, belief_samples=None,
+        oracle_samples=("oracle",), strategy_targets=({"label": 1.0},),
+    )
+    assert train_pilot_batch(Learner(), batch) == "metrics"
+    assert captured["oracle_samples"] == ("oracle",)
+    assert captured["strategy_targets"] is None
 
 
 def test_pilot_summary_is_canonical_and_cannot_claim_strength(tmp_path):

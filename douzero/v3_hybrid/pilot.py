@@ -455,12 +455,22 @@ def slice_pilot_batch(batch: PilotBatch, start: int, end: int) -> PilotBatch:
 
 
 def train_pilot_batch(learner: V3H6Learner, batch: PilotBatch):
+    oracle_state = learner.base.base.base.schedule_state()
+    strategy_targets = (
+        batch.strategy_targets if oracle_state.public_training else None
+    )
+    oracle_samples = (
+        batch.oracle_samples
+        if oracle_state.privileged_required
+        and (oracle_state.oracle_weight > 0.0 or oracle_state.guidance_weight > 0.0)
+        else None
+    )
     return learner.train_batch(
         batch.transitions,
         trajectories=batch.trajectories,
         belief_samples=batch.belief_samples,
-        oracle_samples=batch.oracle_samples,
-        strategy_targets=batch.strategy_targets,
+        oracle_samples=oracle_samples,
+        strategy_targets=strategy_targets,
     )
 
 
