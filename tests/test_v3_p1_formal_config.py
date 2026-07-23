@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 from pathlib import Path
@@ -11,7 +10,6 @@ from douzero.v3_hybrid.formal_config import (
     FormalConfigError,
     FormalExperimentConfig,
     V3_FORMAL_INITIAL_CHECKPOINT_SCHEMA,
-    canonical_hash,
     freeze_formal_config,
     load_formal_config,
     validate_initial_checkpoint,

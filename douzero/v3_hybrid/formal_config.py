@@ -162,7 +162,7 @@ class FormalSeeds:
         _exact(data, set(cls.__dataclass_fields__), "seeds")
         training = data["training"]
         if (
-            not isinstance(training, list) or len(training) < 3
+            not isinstance(training, (list, tuple)) or len(training) < 3
             or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in training)
             or len(set(training)) != len(training)
         ):
