@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from tools.run_v3_pilot import (
+    _attest_clean_source,
     _load_run_state,
     _save_checkpoint_and_run_state,
 )
@@ -66,6 +67,13 @@ def _summary():
         "environment": {
             "image_digest": "sha256:" + "5" * 64,
             "container_id": "container-a",
+            "source_tree": "a" * 40,
+            "cuda_available": True,
+            "gpu": "GPU",
+            "driver_version": "1.2.3",
+            "torch_version": "2.0",
+            "cuda_runtime": "13.2",
+            "machine": "x86_64",
         },
         "release_candidate": "NONE",
         "release_status": "NOT READY",
@@ -223,8 +231,13 @@ def test_evidence_summary_rejects_unrelated_resume_pair(tmp_path):
         directory = tmp_path / variant
         directory.mkdir()
         before = _summary()
+        formal = load_formal_config(f"configs/v3_formal/{variant}_legacy.yaml")
+        identity = formal.identity_dict()
         before.update({"variant": variant, "status": "stopped", "samples": 4,
-                       "optimizer_steps": 1, "episodes": 2, "decisions": 4})
+                       "optimizer_steps": 1, "episodes": 2, "decisions": 4,
+                       "formal_config_sha256": identity["config_sha256"],
+                       "training_semantics_hash": identity["training_semantics_hash"],
+                       "seed": formal.seeds.training[0], "ruleset": formal.ruleset["id"]})
         before["resume"]["stop_signal"] = "SIGTERM"
         before["environment"]["container_id"] = f"before-{index}"
         after = copy.deepcopy(before)
@@ -240,13 +253,15 @@ def test_evidence_summary_rejects_unrelated_resume_pair(tmp_path):
             "continued_update": True,
             "stop_signal": None,
         })
+        model_hash = identity["model_hash"]
+        resolved_hash = build_pilot_resolved_config(formal).stable_hash()
         after["metrics"].update({"samples_per_second": 4.0,
                                   "optimizer_steps_per_second": 1.0,
-                                  "model_hash": "6" * 64,
-                                  "resolved_config_hash": "7" * 64,
+                                  "model_hash": model_hash,
+                                  "resolved_config_hash": resolved_hash,
                                   "skipped_long_cooperation_episodes": 0})
-        before["metrics"].update({"model_hash": "6" * 64,
-                                   "resolved_config_hash": "7" * 64,
+        before["metrics"].update({"model_hash": model_hash,
+                                   "resolved_config_hash": resolved_hash,
                                    "skipped_long_cooperation_episodes": 0})
         after["environment"]["container_id"] = f"after-{index}"
         for name, payload in (("pre-resume-summary.json", before),
@@ -259,3 +274,32 @@ def test_evidence_summary_rejects_unrelated_resume_pair(tmp_path):
     target.write_text(json.dumps(changed), encoding="utf-8")
     with pytest.raises(ValueError, match="checkpoint_sha256"):
         summarize_evidence(tmp_path)
+
+
+def test_evidence_summary_rejects_failed_resume_and_environment_drift(tmp_path):
+    test_evidence_summary_rejects_unrelated_resume_pair(tmp_path)
+    target = tmp_path / P2_VARIANTS[0] / "post-resume-summary.json"
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    payload["resume"]["checkpoint_sha256"] = "4" * 64
+    payload["status"] = "failed"
+    payload["failure"] = {"type": "RuntimeError", "message": "boom"}
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="did not complete successfully"):
+        summarize_evidence(tmp_path)
+    payload["status"] = "completed"
+    payload["failure"] = None
+    payload["environment"]["gpu"] = "different GPU"
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="accelerator identity"):
+        summarize_evidence(tmp_path)
+
+
+def test_clean_source_attestation_rejects_dirty_or_wrong_head(monkeypatch):
+    results = iter([
+        SimpleNamespace(stdout="1" * 40 + "\n"),
+        SimpleNamespace(stdout=" M tools/run_v3_pilot.py\n"),
+        SimpleNamespace(stdout="a" * 40 + "\n"),
+    ])
+    monkeypatch.setattr("tools.run_v3_pilot.subprocess.run", lambda *a, **k: next(results))
+    with pytest.raises(SystemExit, match="clean runtime source tree"):
+        _attest_clean_source("1" * 40)

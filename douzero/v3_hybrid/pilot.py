@@ -585,6 +585,19 @@ def validate_pilot_summary(payload: Mapping[str, object]) -> None:
         or not environment["container_id"]
     ):
         raise ValueError("P2 pilot requires a container identity")
+    for field in ("source_tree",):
+        value = environment.get(field)
+        if (
+            not isinstance(value, str) or len(value) != 40
+            or any(c not in "0123456789abcdef" for c in value)
+        ):
+            raise ValueError(f"P2 pilot environment {field} is invalid")
+    for field in ("gpu", "driver_version", "torch_version", "cuda_runtime", "machine"):
+        value = environment.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"P2 pilot environment {field} is invalid")
+    if environment.get("cuda_available") is not True:
+        raise ValueError("P2 pilot requires CUDA evidence")
     elapsed = float(payload["wall_clock_seconds"])
     expected_samples_rate = (
         float(payload["samples"]) - float(resume["from_samples"])

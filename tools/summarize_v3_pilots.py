@@ -7,7 +7,14 @@ import argparse
 import json
 from pathlib import Path
 
-from douzero.v3_hybrid.pilot import P2_VARIANTS, validate_pilot_summary
+from douzero.v3_hybrid.formal_config import load_formal_config
+from douzero.v3_hybrid.pilot import (
+    P2_VARIANTS,
+    build_pilot_resolved_config,
+    validate_pilot_summary,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def summarize_evidence(root: Path) -> dict:
@@ -16,6 +23,8 @@ def summarize_evidence(root: Path) -> dict:
     runs = []
     source_sha = None
     image_digest = None
+    source_tree = None
+    accelerator_identity = None
     for variant in P2_VARIANTS:
         directory = root / variant
         before = json.loads(
@@ -30,8 +39,37 @@ def summarize_evidence(root: Path) -> dict:
             raise ValueError(f"P2 evidence directory mismatch for {variant}")
         if before["status"] != "stopped" or before["resume"]["stop_signal"] != "SIGTERM":
             raise ValueError(f"{variant} is missing real SIGTERM evidence")
+        if before["failure"] is not None:
+            raise ValueError(f"{variant} pre-resume run failed")
         if not after["resume"]["requested"] or not after["resume"]["continued_update"]:
             raise ValueError(f"{variant} did not update after strict resume")
+        if after["status"] not in {"completed", "stopped"} or after["failure"] is not None:
+            raise ValueError(f"{variant} post-resume run did not complete successfully")
+        formal = load_formal_config(ROOT / f"configs/v3_formal/{variant}_legacy.yaml")
+        identity = formal.identity_dict()
+        expected_identity = {
+            "formal_config_sha256": identity["config_sha256"],
+            "training_semantics_hash": identity["training_semantics_hash"],
+            "seed": formal.seeds.training[0],
+            "ruleset": formal.ruleset["id"],
+        }
+        for field, expected in expected_identity.items():
+            if before[field] != expected or after[field] != expected:
+                raise ValueError(f"{variant} does not match the frozen {field}")
+        expected_model = identity["model_hash"]
+        expected_resolved = build_pilot_resolved_config(formal).stable_hash()
+        for payload in (before, after):
+            if payload["metrics"]["model_hash"] != expected_model:
+                raise ValueError(f"{variant} does not match the frozen model hash")
+            if payload["metrics"]["resolved_config_hash"] != expected_resolved:
+                raise ValueError(f"{variant} does not match the frozen resolved config")
+        expected_collection = {
+            "environment_seed": formal.seeds.training[0],
+            "action_seed": formal.seeds.training[0] + 1,
+            "epsilon": 0.01,
+        }
+        if before["collection"] != expected_collection:
+            raise ValueError(f"{variant} does not match frozen collection settings")
         expected_resume = {
             "from_samples": before["samples"],
             "from_optimizer_steps": before["optimizer_steps"],
@@ -53,12 +91,32 @@ def summarize_evidence(root: Path) -> dict:
             raise ValueError(f"{variant} optimizer counter did not increase")
         observed_sha = after["source_git_sha"]
         observed_image = after["environment"]["image_digest"]
+        observed_tree = after["environment"]["source_tree"]
+        observed_accelerator = {
+            field: after["environment"][field]
+            for field in (
+                "gpu", "driver_version", "torch_version", "cuda_runtime", "machine"
+            )
+        }
         source_sha = observed_sha if source_sha is None else source_sha
         image_digest = observed_image if image_digest is None else image_digest
+        source_tree = observed_tree if source_tree is None else source_tree
+        accelerator_identity = (
+            observed_accelerator if accelerator_identity is None else accelerator_identity
+        )
         if observed_sha != source_sha or before["source_git_sha"] != source_sha:
             raise ValueError("P2 runs do not share one source SHA")
         if observed_image != image_digest or before["environment"]["image_digest"] != image_digest:
             raise ValueError("P2 runs do not share one image digest")
+        if observed_tree != source_tree or before["environment"]["source_tree"] != source_tree:
+            raise ValueError("P2 runs do not share one source tree")
+        for payload in (before, after):
+            current = {
+                field: payload["environment"][field]
+                for field in accelerator_identity
+            }
+            if current != accelerator_identity:
+                raise ValueError("P2 runs do not share one accelerator identity")
         runs.append({
             "variant": variant,
             "formal_config_sha256": after["formal_config_sha256"],
@@ -87,6 +145,8 @@ def summarize_evidence(root: Path) -> dict:
         "schema": "v3-p2-pilot-summary-v1",
         "source_git_sha": source_sha,
         "docker_image_digest": image_digest,
+        "source_tree": source_tree,
+        "accelerator_identity": accelerator_identity,
         "ruleset": "legacy",
         "topology": "single_process",
         "seed": 101,

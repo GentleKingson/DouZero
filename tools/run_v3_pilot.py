@@ -10,8 +10,8 @@ import os
 import random
 import signal
 import socket
+import subprocess
 import time
-import uuid
 from pathlib import Path
 
 import torch
@@ -62,6 +62,52 @@ def _finite_metrics(value):
             raise FloatingPointError("pilot metrics contain NaN or Inf")
         return value
     return _finite_metrics(vars(value))
+
+
+def _attest_clean_source(source_sha: str) -> str:
+    """Require Git metadata and a clean, commit-matching runtime source tree."""
+
+    root = Path(__file__).resolve().parents[1]
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        status = subprocess.run(
+            [
+                "git", "status", "--porcelain=v1", "--untracked-files=all", "--", ".",
+                ":(exclude)artifacts/**",
+                ":(exclude)baselines/put_pretrained_models_here",
+                ":(exclude)imgs/douzero_logo.jpg",
+            ],
+            cwd=root, check=True, capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, check=True,
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+        raise SystemExit(f"P2 evidence requires readable Git metadata: {exc}") from exc
+    if head != source_sha:
+        raise SystemExit("P2 Git HEAD does not match the declared source SHA")
+    if status:
+        raise SystemExit("P2 evidence requires a clean runtime source tree")
+    if len(tree) != 40 or any(c not in "0123456789abcdef" for c in tree):
+        raise SystemExit("P2 Git tree identity is invalid")
+    return tree
+
+
+def _driver_version() -> str:
+    try:
+        value = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            check=True, capture_output=True, text=True, timeout=10,
+        ).stdout.strip().splitlines()
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as exc:
+        raise SystemExit(f"P2 CUDA evidence requires NVIDIA driver identity: {exc}") from exc
+    if len(value) != 1 or not value[0]:
+        raise SystemExit("P2 CUDA evidence requires exactly one NVIDIA GPU")
+    return value[0]
 
 
 _RUN_STATE_SCHEMA = "v3-p2-run-state-v1"
@@ -171,6 +217,7 @@ def main() -> int:
     source_sha = git_sha()
     if len(source_sha) != 40:
         raise SystemExit("P2 evidence requires a full commit-bound Git SHA")
+    source_tree = _attest_clean_source(source_sha)
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = output / "latest.pt"
@@ -304,6 +351,8 @@ def main() -> int:
             ),
             "command_record": args.command_record or None,
             "container_id": socket.gethostname(),
+            "source_tree": source_tree,
+            "driver_version": _driver_version(),
         })
         summary = {
             "schema": P2_PILOT_SCHEMA,
