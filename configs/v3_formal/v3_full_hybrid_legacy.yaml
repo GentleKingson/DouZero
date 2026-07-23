@@ -1,0 +1,25 @@
+extends: _defaults.yaml.inc
+metadata: {name: v3_full_hybrid_legacy, description: Full public V3 Hybrid under legacy rules without BC}
+variant: v3_full_hybrid
+model:
+  config:
+    belief_feedback: farmers
+    strategy_features_enabled: true
+    strategy_aux_enabled: true
+    style_enabled: true
+features:
+  adaptive_dmc: true
+  oracle: true
+  belief: true
+  cooperation: true
+  strategy: true
+  style: true
+losses:
+  weights: {oracle: 1.0, belief: 1.0, cooperation: 1.0, strategy: 0.1}
+feature_configs:
+  adaptive_dmc: {enabled: true, mode: safe_hybrid}
+  oracle: {enabled: true, warmup_updates: 10000, guided_updates: 50000, finetune_updates: 20000, guidance_weight_start: 1.0, guidance_weight_end: 0.0}
+  belief: {enabled: true, mode: auxiliary, feedback: farmers}
+  cooperation: {enabled: true, mode: team_value_consistency, mixer: disabled}
+  strategy: {enabled: true}
+  style: {enabled: true}

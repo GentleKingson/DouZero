@@ -1,0 +1,10 @@
+extends: _defaults.yaml.inc
+metadata: {name: model_v2_legacy, description: Model V2 formal control under legacy rules}
+variant: model_v2
+model:
+  family: model_v2
+  version: v2
+  config:
+    __replace__: {architecture: model_v2, observation: v2, hidden_size: 256}
+features: {role_model: false}
+initialization: {source: model-v2-seeded-fresh-v1}

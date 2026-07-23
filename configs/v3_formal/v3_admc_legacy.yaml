@@ -1,0 +1,6 @@
+extends: _defaults.yaml.inc
+metadata: {name: v3_admc_legacy, description: V3 Adaptive DMC ablation under legacy rules}
+variant: v3_admc
+features: {adaptive_dmc: true}
+feature_configs:
+  adaptive_dmc: {enabled: true, mode: safe_hybrid}
