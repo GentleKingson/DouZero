@@ -15,19 +15,19 @@ implement the H7.1 async stack before any P4 budget is committed.
 
 ## Provenance
 
-- Source SHA: `26313dcc629679bec6f543b3b4c5ae00bfe85658`
-- Source tree: `958561e035a778114b5a0882e41604ea53d570e4`
+- Source SHA: `24fac749b01ddfc551b0afdd3f797e980ad567e0`
+- Source tree: `4eacd6c8ee57430cfe14c4eb4d3c5e4796f1c08a`
 - Base SHA: `51ced4e64079deba254f8c3b856e819e08cae347`
-- Docker image: `douzero-p2:26313dc`
-- Attested image ID: `sha256:599d600741b9dba9d3ef380ef7ddd9ee46c2a7182f90bfc94cc9b28df8c8d23f`
+- Docker image: `douzero-p2:24fac74`
+- Attested image ID: `sha256:0c32f97a46a03aa05efadbb40da8feeb53379b6971eba11a57d05733159b3f46`
 - GPU/driver: NVIDIA GeForce RTX 5070 / `595.71.05`
 - PyTorch/CUDA: `2.12.1+cu132` / `13.2`
 - Topology/ruleset/seed: single process / legacy / `101`
-- Protocol: approximately 944 seconds, real SIGTERM at an episode boundary,
+- Protocol: approximately 924 seconds, real SIGTERM at an episode boundary,
   strict checkpoint load in a fresh container, then 900 seconds with a
   post-resume optimizer update
 - Seed derivation: `sha256(root_seed,stream_name,worker_id,episode_id)-v1`
-- Raw evidence: `/tmp/douzero-p2-evidence/final-26313dc` on `LocalServer`
+- Raw evidence: `/tmp/douzero-p2-evidence/final-24fac74` on `LocalServer`
 - Raw evidence manifest: `SHA256SUMS` in that directory
 
 The repository summary is a compact derivative of the validated raw evidence.
@@ -38,12 +38,12 @@ final evidence-only report commit; that commit does not alter executable behavio
 
 | Variant | Total wall s | Samples | Steps | Resume samples/s | Resume steps/s | Skipped long cooperation episodes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| v3_role | 1846.62 | 29,622 | 1,160 | 15.000 | 0.587 | 0 |
-| v3_admc | 1841.25 | 30,773 | 1,160 | 15.646 | 0.594 | 0 |
-| v3_oracle | 1844.77 | 18,141 | 756 | 9.368 | 0.388 | 0 |
-| v3_belief | 1846.85 | 27,321 | 1,009 | 14.257 | 0.528 | 0 |
-| v3_farmer_cooperation | 1839.94 | 3,025 | 113 | 1.667 | 0.063 | 3,679 |
-| v3_full_hybrid | 1842.08 | 246 | 9 | 0.080 | 0.003 | 1,504 |
+| v3_role | 1825.80 | 28,628 | 1,122 | 16.634 | 0.649 | 0 |
+| v3_admc | 1823.95 | 29,696 | 1,120 | 17.374 | 0.661 | 0 |
+| v3_oracle | 1823.04 | 17,427 | 724 | 10.099 | 0.417 | 0 |
+| v3_belief | 1825.13 | 26,344 | 974 | 15.444 | 0.570 | 0 |
+| v3_farmer_cooperation | 1824.88 | 2,997 | 112 | 1.721 | 0.065 | 3,623 |
+| v3_full_hybrid | 1823.08 | 246 | 9 | 0.080 | 0.003 | 1,501 |
 
 All six variants saved a checkpoint after SIGTERM, strict-loaded it in a new
 container, advanced the optimizer and policy counters, and published a new
@@ -71,6 +71,10 @@ environment trajectories:
    budgets fail before training starts.
 5. Non-cooperation episodes are trained and checkpointed atomically, so a
    SIGTERM cannot persist a completed episode ID with only a trained prefix.
+6. Docker image identity is bound through the container's PID namespace, not
+   its configurable hostname.
+7. A deal whose collection crosses the wall-clock deadline is discarded before
+   training and is not marked complete in resume state.
 
 Resume throughput is computed from counter deltas rather than cumulative
 counters, and the summary validator independently checks that arithmetic.
