@@ -194,8 +194,12 @@ def main() -> int:
             "decisions": decisions,
             "metrics": {
                 "last_step": _finite_metrics(last_metrics),
-                "samples_per_second": learner.samples_consumed / max(elapsed, 1e-9),
-                "optimizer_steps_per_second": learner.eligible_updates / max(elapsed, 1e-9),
+                "samples_per_second": (
+                    learner.samples_consumed - resumed_from_samples
+                ) / max(elapsed, 1e-9),
+                "optimizer_steps_per_second": (
+                    learner.eligible_updates - resumed_from_steps
+                ) / max(elapsed, 1e-9),
                 "games_per_second": episodes / max(elapsed, 1e-9),
                 "skipped_long_cooperation_episodes": skipped_long_episodes,
                 "winner_counts": winners,

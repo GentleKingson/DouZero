@@ -39,8 +39,17 @@ def _summary():
         "optimizer_steps": 1,
         "episodes": 1,
         "decisions": 4,
-        "metrics": {"loss": 1.0},
-        "resume": {"requested": False, "continued_update": False},
+        "metrics": {
+            "loss": 1.0,
+            "samples_per_second": 4.0,
+            "optimizer_steps_per_second": 1.0,
+        },
+        "resume": {
+            "requested": False,
+            "continued_update": False,
+            "from_samples": 0,
+            "from_optimizer_steps": 0,
+        },
         "evaluation": {"paired_deals": 0, "status": "not_executed"},
         "checkpoint": {"path": "latest.pt", "sha256": "4" * 64, "saved": True},
         "environment": {"image_digest": "sha256:" + "5" * 64},
@@ -134,4 +143,16 @@ def test_pilot_summary_rejects_stale_or_non_commit_source_identity():
     payload = _summary()
     payload["checkpoint"]["sha256"] = "short"
     with pytest.raises(ValueError, match="requires SHA-256"):
+        validate_pilot_summary(payload)
+
+
+def test_pilot_summary_recomputes_resume_delta_throughput():
+    payload = _summary()
+    payload["samples"] = 10
+    payload["optimizer_steps"] = 4
+    payload["resume"]["from_samples"] = 6
+    payload["resume"]["from_optimizer_steps"] = 3
+    validate_pilot_summary(payload)
+    payload["metrics"]["samples_per_second"] = 10.0
+    with pytest.raises(ValueError, match="inconsistent with raw counters"):
         validate_pilot_summary(payload)

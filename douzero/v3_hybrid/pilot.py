@@ -536,6 +536,30 @@ def validate_pilot_summary(payload: Mapping[str, object]) -> None:
         or len(checkpoint["sha256"]) != 64
     ):
         raise ValueError("P2 saved checkpoint requires SHA-256")
+    resume = payload["resume"]
+    metrics = payload["metrics"]
+    if not isinstance(resume, Mapping) or not isinstance(metrics, Mapping):
+        raise ValueError("P2 pilot resume and metrics must be objects")
+    elapsed = float(payload["wall_clock_seconds"])
+    expected_samples_rate = (
+        float(payload["samples"]) - float(resume["from_samples"])
+    ) / max(elapsed, 1e-9)
+    expected_steps_rate = (
+        float(payload["optimizer_steps"])
+        - float(resume["from_optimizer_steps"])
+    ) / max(elapsed, 1e-9)
+    for name, expected in (
+        ("samples_per_second", expected_samples_rate),
+        ("optimizer_steps_per_second", expected_steps_rate),
+    ):
+        observed = metrics.get(name)
+        if (
+            isinstance(observed, bool)
+            or not isinstance(observed, (int, float))
+            or not math.isfinite(float(observed))
+            or not math.isclose(float(observed), expected, rel_tol=1e-12)
+        ):
+            raise ValueError(f"P2 pilot {name} is inconsistent with raw counters")
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     if not encoded:
         raise AssertionError("canonical P2 summary unexpectedly empty")
