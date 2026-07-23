@@ -13,6 +13,7 @@ from douzero.v3_hybrid.pilot import (
     P2_PILOT_SCHEMA,
     P2_VARIANTS,
     build_pilot_resolved_config,
+    unique_legal_actions,
     validate_pilot_summary,
     write_pilot_summary,
 )
@@ -68,6 +69,14 @@ def test_pilot_conversion_rejects_standard_and_non_v3_controls():
         build_pilot_resolved_config(
             load_formal_config("configs/v3_formal/model_v2_legacy.yaml")
         )
+
+
+def test_pilot_removes_only_exact_duplicate_legal_rows_in_engine_order():
+    assert unique_legal_actions(([3], [4, 4], [3], [], [])) == [
+        [3], [4, 4], [],
+    ]
+    with pytest.raises(ValueError, match="no legal action"):
+        unique_legal_actions(())
 
 
 def test_pilot_summary_is_canonical_and_cannot_claim_strength(tmp_path):

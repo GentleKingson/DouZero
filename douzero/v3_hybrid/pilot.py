@@ -216,6 +216,21 @@ class PilotBatch:
     winner_team: str
 
 
+def unique_legal_actions(actions) -> list[list[int]]:
+    """Drop only rank-identical engine duplicates while preserving order."""
+
+    result: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for action in actions:
+        key = tuple(action)
+        if key not in seen:
+            seen.add(key)
+            result.append(list(action))
+    if not result:
+        raise ValueError("environment returned no legal action")
+    return result
+
+
 def _strategy_target(row: Transition) -> dict[str, float]:
     return {
         "min_turns_after": row.target_min_turns_after,
@@ -251,7 +266,13 @@ def collect_real_pilot_episode(
     strategy_config = learner.model.strategy_feature_config()
     while True:
         infoset = env.infoset
-        observation = get_obs_v2(infoset, ruleset=learner.ruleset)
+        # The legacy move generator can emit rank-identical rows through
+        # different decomposition paths. They are the same environment action,
+        # but H3's offline-compatible action keys are intentionally unique.
+        # Remove only exact duplicates, preserving first-seen engine order.
+        public_infoset = copy.deepcopy(infoset)
+        public_infoset.legal_actions = unique_legal_actions(infoset.legal_actions)
+        observation = get_obs_v2(public_infoset, ruleset=learner.ruleset)
         privileged = PrivilegedObservation(
             all_handcards=copy.deepcopy(infoset.all_handcards),
             acting_role=infoset.player_position,
@@ -526,5 +547,5 @@ __all__ = [
     "P2_PILOT_PROTOCOL", "P2_PILOT_SCHEMA", "P2_VARIANTS", "PilotBatch",
     "build_pilot_resolved_config", "collect_real_pilot_episode",
     "create_pilot_learner", "slice_pilot_batch", "train_pilot_batch",
-    "validate_pilot_summary", "write_pilot_summary",
+    "unique_legal_actions", "validate_pilot_summary", "write_pilot_summary",
 ]
