@@ -15,16 +15,17 @@ implement the H7.1 async stack before any P4 budget is committed.
 
 ## Provenance
 
-- Source SHA: `57e854c5cecd6198cb75e855392ef6ea20df229e`
+- Source SHA: `a77b5ef6238658f0cb420b117f95cbb89407d2bc`
+- Source tree: `7a34b4e5ac3c4ae693d0c15c98f5cc91e70e5331`
 - Base SHA: `51ced4e64079deba254f8c3b856e819e08cae347`
-- Docker image: `douzero-p2:57e854c`
-- Image digest: `sha256:6bd867ed39ad774195f89365b26f39e6b6d044ddf9378888ec65df2173005a55`
-- GPU: NVIDIA GeForce RTX 5070
+- Docker image: `douzero-p2:a77b5ef`
+- Image digest: `sha256:e1dad44f95d97bbc20b2ca39150c0d6687de6a7a43a3c32b7a9aa864c4cee910`
+- GPU/driver: NVIDIA GeForce RTX 5070 / `595.71.05`
 - PyTorch/CUDA: `2.12.1+cu132` / `13.2`
 - Topology/ruleset/seed: single process / legacy / `101`
 - Protocol: 900 seconds, real SIGTERM, strict checkpoint load in a fresh
   container, then another 900 seconds with a post-resume optimizer update
-- Raw evidence: `/tmp/douzero-p2-evidence/final-57e854c` on `LocalServer`
+- Raw evidence: `/tmp/douzero-p2-evidence/final-a77b5ef` on `LocalServer`
 - Raw evidence manifest: `SHA256SUMS` in that directory
 
 The repository summary is a compact derivative of the validated raw evidence.
@@ -35,12 +36,12 @@ final evidence-only report commit; that commit does not alter executable behavio
 
 | Variant | Total wall s | Samples | Steps | Resume samples/s | Resume steps/s | Skipped long cooperation episodes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| v3_role | 1799.83 | 99,284 | 3,941 | 55.202 | 2.228 | 0 |
-| v3_admc | 1803.03 | 81,753 | 3,319 | 43.041 | 1.788 | 0 |
-| v3_oracle | 1801.02 | 63,462 | 2,621 | 35.230 | 1.459 | 0 |
-| v3_belief | 1800.28 | 86,578 | 3,466 | 48.617 | 1.989 | 0 |
-| v3_farmer_cooperation | 1799.67 | 3,973 | 152 | 2.859 | 0.110 | 5,518 |
-| v3_full_hybrid | 1800.10 | 396 | 15 | 0.231 | 0.009 | 1,971 |
+| v3_role | 1800.41 | 94,040 | 3,727 | 50.965 | 2.053 | 0 |
+| v3_admc | 1801.08 | 95,313 | 3,824 | 51.784 | 2.092 | 0 |
+| v3_oracle | 1800.83 | 65,060 | 2,693 | 35.022 | 1.457 | 0 |
+| v3_belief | 1799.49 | 89,426 | 3,578 | 50.846 | 2.076 | 0 |
+| v3_farmer_cooperation | 1799.30 | 3,973 | 152 | 2.859 | 0.110 | 5,502 |
+| v3_full_hybrid | 1800.05 | 396 | 15 | 0.231 | 0.009 | 1,982 |
 
 All six variants saved a checkpoint after SIGTERM, strict-loaded it in a new
 container, advanced the optimizer and policy counters, and published a new
