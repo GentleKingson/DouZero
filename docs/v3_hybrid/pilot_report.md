@@ -15,19 +15,19 @@ implement the H7.1 async stack before any P4 budget is committed.
 
 ## Provenance
 
-- Source SHA: `d72f111c9c47517e031054169300ece7a2c94a72`
-- Source tree: `612bf88d089fd0ce5abe7a148d8ad85d2b59149e`
+- Source SHA: `7c94577159c434b285d66bf06863669fe52e1f44`
+- Source tree: `032dac0e3637ecc60e6c30757808869fac7394b2`
 - Base SHA: `51ced4e64079deba254f8c3b856e819e08cae347`
-- Docker image: `douzero-p2:d72f111`
-- Attested image ID: `sha256:b8015d07c810ea1fd33aee36623d95ccb6afa865e1c8e1f34f387be8bb9a3ac4`
+- Docker image: `douzero-p2:7c94577`
+- Attested image ID: `sha256:eb7e99d4de352653f17a0ca58d5432fcea250a50dbc811a6e23c3c970b20aad8`
 - GPU/driver: NVIDIA GeForce RTX 5070 / `595.71.05`
 - PyTorch/CUDA: `2.12.1+cu132` / `13.2`
 - Topology/ruleset/seed: single process / legacy / `101`
-- Protocol: approximately 924 seconds, real SIGTERM at an episode boundary,
-  strict checkpoint load in a fresh container, then 900 seconds with a
-  post-resume optimizer update
+- Protocol: approximately 897 seconds, real SIGTERM at an episode boundary,
+  strict checkpoint load in a fresh container, then another approximately
+  897 seconds ending with SIGTERM after a post-resume optimizer update
 - Seed derivation: `sha256(root_seed,stream_name,worker_id,episode_id)-v1`
-- Raw evidence: `/tmp/douzero-p2-evidence/final-d72f111` on `LocalServer`
+- Raw evidence: `/tmp/douzero-p2-evidence/final-7c94577` on `LocalServer`
 - Raw evidence manifest: `SHA256SUMS` in that directory
 
 The repository summary is a compact derivative of the validated raw evidence.
@@ -38,12 +38,12 @@ final evidence-only report commit; that commit does not alter executable behavio
 
 | Variant | Total wall s | Samples | Steps | Resume samples/s | Resume steps/s | Skipped long cooperation episodes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| v3_role | 1807.98 | 28,401 | 1,112 | 14.536 | 0.569 | 0 |
-| v3_admc | 1814.49 | 29,900 | 1,127 | 15.367 | 0.583 | 0 |
-| v3_oracle | 1811.60 | 18,630 | 775 | 9.473 | 0.392 | 0 |
-| v3_belief | 1809.73 | 26,736 | 988 | 13.989 | 0.518 | 0 |
-| v3_farmer_cooperation | 1808.97 | 2,797 | 104 | 1.548 | 0.059 | 3,408 |
-| v3_full_hybrid | 1811.13 | 246 | 9 | 0.105 | 0.004 | 1,355 |
+| v3_role | 1797.47 | 30,860 | 1,205 | 17.407 | 0.677 | 0 |
+| v3_admc | 1793.93 | 31,719 | 1,196 | 18.280 | 0.693 | 0 |
+| v3_oracle | 1796.15 | 18,365 | 765 | 10.547 | 0.439 | 0 |
+| v3_belief | 1797.71 | 27,884 | 1,029 | 16.140 | 0.593 | 0 |
+| v3_farmer_cooperation | 1794.12 | 2,997 | 112 | 1.742 | 0.066 | 3,626 |
+| v3_full_hybrid | 1791.65 | 246 | 9 | 0.081 | 0.003 | 1,456 |
 
 All six variants saved a checkpoint after SIGTERM, strict-loaded it in a new
 container, advanced the optimizer and policy counters, and published a new
@@ -78,6 +78,10 @@ environment trajectories:
 8. Direct script execution prepends the attested repository root before any
    project import, preventing an installed or `PYTHONPATH` package from
    shadowing the commit-bound checkout.
+9. The runner checks the monotonic deadline before every batch piece and
+   fails closed rather than starting late work inside an atomic episode.
+10. The summarizer also binds its imports to the checked-out repository before
+    loading the validation implementation.
 
 Resume throughput is computed from counter deltas rather than cumulative
 counters, and the summary validator independently checks that arithmetic.

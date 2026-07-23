@@ -11,27 +11,27 @@
     "reason": "farmer cooperation and full hybrid throughput are below the budget needed for the frozen formal matrix",
     "requires_h7_1_runtime_decision": true
   },
-  "docker_image_digest": "sha256:b8015d07c810ea1fd33aee36623d95ccb6afa865e1c8e1f34f387be8bb9a3ac4",
+  "docker_image_digest": "sha256:eb7e99d4de352653f17a0ca58d5432fcea250a50dbc811a6e23c3c970b20aad8",
   "playing_strength": "NOT MEASURED",
   "release_candidate": "NONE",
   "release_status": "NOT READY",
   "ruleset": "legacy",
   "runs": [
     {
-      "checkpoint_sha256": "7275db1e5eb46fb297bfc8e2c85eda81835fbed8bddb7309369254ffe4dbd64c",
+      "checkpoint_sha256": "3cc9cd1788a80adfae2c337d48a943f8dea970577dc2259ed18ca6e636ccd3ee",
       "continued_update": true,
-      "decisions": 28401,
-      "episodes": 459,
+      "decisions": 30860,
+      "episodes": 498,
       "formal_config_sha256": "d35630b35347d0c0d3d0b99ff60662c65409afee06a66a23c80901767cb8079e",
       "fresh_container_resume": true,
       "model_hash": "5e5975c683924dc2bbcaa17235e08c36e7f636355cc3a286f9474415971b9c6f",
-      "optimizer_steps": 1112,
+      "optimizer_steps": 1205,
       "paired_evaluation": "NOT EXECUTED",
       "post_resume_limits": {
         "checkpoint_every": 1000,
         "max_optimizer_steps": 10000,
         "max_samples": 1000000,
-        "max_seconds": 900.0
+        "max_seconds": 1200.0
       },
       "pre_resume_limits": {
         "checkpoint_every": 1000,
@@ -40,31 +40,31 @@
         "max_seconds": 1200.0
       },
       "resolved_config_hash": "6792d4a2606844aae1c9d735064c5c897a4b02549eb9d2c98a0ff8e9b4536cbd",
-      "resume_delta_optimizer_steps_per_second": 0.5685027543101248,
-      "resume_delta_samples_per_second": 14.535682727878601,
-      "samples": 28401,
+      "resume_delta_optimizer_steps_per_second": 0.6772548897500659,
+      "resume_delta_samples_per_second": 17.407129810931444,
+      "samples": 30860,
       "seed": 101,
       "sigterm": true,
       "skipped_long_cooperation_episodes": 0,
       "training_semantics_hash": "5bc35bc913ff8baa08f2615204c7d684d043ebb1b1fa0f60c1792cd513e1edcd",
       "variant": "v3_role",
-      "wall_clock_seconds": 1807.9814588380395
+      "wall_clock_seconds": 1797.46935768798
     },
     {
-      "checkpoint_sha256": "a82cecd7efeaf7c1157db931c628304a5808735d36ad3497116a851fd931004f",
+      "checkpoint_sha256": "7e8f11903a3da88182ef51532c137d139bd79f8e15e83fab43dbf6379bfc4083",
       "continued_update": true,
-      "decisions": 29900,
-      "episodes": 397,
+      "decisions": 31719,
+      "episodes": 422,
       "formal_config_sha256": "6256d23eaa950873e464b1960167064eba319ebab6a9fef0239b42639f85e521",
       "fresh_container_resume": true,
       "model_hash": "5e5975c683924dc2bbcaa17235e08c36e7f636355cc3a286f9474415971b9c6f",
-      "optimizer_steps": 1127,
+      "optimizer_steps": 1196,
       "paired_evaluation": "NOT EXECUTED",
       "post_resume_limits": {
         "checkpoint_every": 1000,
         "max_optimizer_steps": 10000,
         "max_samples": 1000000,
-        "max_seconds": 900.0
+        "max_seconds": 1200.0
       },
       "pre_resume_limits": {
         "checkpoint_every": 1000,
@@ -73,31 +73,31 @@
         "max_seconds": 1200.0
       },
       "resolved_config_hash": "c7bb4e05a4c16b6bb029b2df78d72317e22dd8170c2ec59376102e2aad11632a",
-      "resume_delta_optimizer_steps_per_second": 0.5833459244718305,
-      "resume_delta_samples_per_second": 15.366966786891458,
-      "samples": 29900,
+      "resume_delta_optimizer_steps_per_second": 0.6934817192568133,
+      "resume_delta_samples_per_second": 18.28035737175028,
+      "samples": 31719,
       "seed": 101,
       "sigterm": true,
       "skipped_long_cooperation_episodes": 0,
       "training_semantics_hash": "2f3b8adbdbd1e812fa71066a10302846f65b535ca5ad5182b371bd642526d8ba",
       "variant": "v3_admc",
-      "wall_clock_seconds": 1814.4883235029993
+      "wall_clock_seconds": 1793.9284659260302
     },
     {
-      "checkpoint_sha256": "4dab75505772b233335dfb3f3d5d303737c2af95e99fd868c6e430374390f4d9",
+      "checkpoint_sha256": "586f53e35589fc2de952f95ac4cb1066e4372d00e33d21e3e1b895b9ed1166a5",
       "continued_update": true,
-      "decisions": 18630,
-      "episodes": 382,
+      "decisions": 18365,
+      "episodes": 377,
       "formal_config_sha256": "1920113ebe8f14647ed7140668f0e2649181541d4f576c95622ceba0b9e0647c",
       "fresh_container_resume": true,
       "model_hash": "5e5975c683924dc2bbcaa17235e08c36e7f636355cc3a286f9474415971b9c6f",
-      "optimizer_steps": 775,
+      "optimizer_steps": 765,
       "paired_evaluation": "NOT EXECUTED",
       "post_resume_limits": {
         "checkpoint_every": 1000,
         "max_optimizer_steps": 10000,
         "max_samples": 1000000,
-        "max_seconds": 900.0
+        "max_seconds": 1200.0
       },
       "pre_resume_limits": {
         "checkpoint_every": 1000,
@@ -106,31 +106,31 @@
         "max_seconds": 1200.0
       },
       "resolved_config_hash": "e3c2c81ff93bbe4de6653266d4c41432166492c49fcf8ce631326e21c2ffdfba",
-      "resume_delta_optimizer_steps_per_second": 0.3919273790529297,
-      "resume_delta_samples_per_second": 9.472685466601318,
-      "samples": 18630,
+      "resume_delta_optimizer_steps_per_second": 0.4386330412532136,
+      "resume_delta_samples_per_second": 10.547385815505663,
+      "samples": 18365,
       "seed": 101,
       "sigterm": true,
       "skipped_long_cooperation_episodes": 0,
       "training_semantics_hash": "4c454e7e178ed071aa36369ded08173646c3e406e96e2e93d49296456b875474",
       "variant": "v3_oracle",
-      "wall_clock_seconds": 1811.5977297530044
+      "wall_clock_seconds": 1796.1548374990234
     },
     {
-      "checkpoint_sha256": "d0584f1d792a9185a37b9c2187a08c6e04feb99a59991dd4a942122a13f65eec",
+      "checkpoint_sha256": "3a2edc79249bd3383701477af63875d3d17f6c93b2805ed1e9cfacf90c8b6087",
       "continued_update": true,
-      "decisions": 26736,
-      "episodes": 336,
+      "decisions": 27884,
+      "episodes": 347,
       "formal_config_sha256": "41b2bb16058b5490c115a29b4a1ee09675f3e4990ad3e38a4689bf9a3fdc9005",
       "fresh_container_resume": true,
       "model_hash": "519a46e6b4322eefff1b783eeeb91dc00087fb2fcf60cf6f2ddbec52a338bf30",
-      "optimizer_steps": 988,
+      "optimizer_steps": 1029,
       "paired_evaluation": "NOT EXECUTED",
       "post_resume_limits": {
         "checkpoint_every": 1000,
         "max_optimizer_steps": 10000,
         "max_samples": 1000000,
-        "max_seconds": 900.0
+        "max_seconds": 1200.0
       },
       "pre_resume_limits": {
         "checkpoint_every": 1000,
@@ -139,31 +139,31 @@
         "max_seconds": 1200.0
       },
       "resolved_config_hash": "7ea8cc90ef954111c4bcff27d6b15e0e634e3fb07089b3c055a01ed5e6bbb15d",
-      "resume_delta_optimizer_steps_per_second": 0.518056183017357,
-      "resume_delta_samples_per_second": 13.988623899124658,
-      "samples": 26736,
+      "resume_delta_optimizer_steps_per_second": 0.593457575270322,
+      "resume_delta_samples_per_second": 16.139806584804568,
+      "samples": 27884,
       "seed": 101,
       "sigterm": true,
       "skipped_long_cooperation_episodes": 0,
       "training_semantics_hash": "b0798b11f2411f28d47c1537f2fe4db8453e34f701c67ebd5498325a0e4c512f",
       "variant": "v3_belief",
-      "wall_clock_seconds": 1809.7293160030385
+      "wall_clock_seconds": 1797.7113865979481
     },
     {
-      "checkpoint_sha256": "22122b916c2683f450784ad7a2c1b2aeea64a9458b3c9fe860ba6717c0bb047e",
+      "checkpoint_sha256": "cbb27430aa0b1956ff7c5f9478b58ed1b26effd7d0911e0623406c2f45795235",
       "continued_update": true,
-      "decisions": 188852,
-      "episodes": 3512,
+      "decisions": 200622,
+      "episodes": 3738,
       "formal_config_sha256": "64f4398f1353d0e684109c093381ff435745e3f51140702005522280b75e8e7d",
       "fresh_container_resume": true,
       "model_hash": "5e5975c683924dc2bbcaa17235e08c36e7f636355cc3a286f9474415971b9c6f",
-      "optimizer_steps": 104,
+      "optimizer_steps": 112,
       "paired_evaluation": "NOT EXECUTED",
       "post_resume_limits": {
         "checkpoint_every": 1000,
         "max_optimizer_steps": 10000,
         "max_samples": 1000000,
-        "max_seconds": 900.0
+        "max_seconds": 1200.0
       },
       "pre_resume_limits": {
         "checkpoint_every": 1000,
@@ -172,21 +172,21 @@
         "max_seconds": 1200.0
       },
       "resolved_config_hash": "e689a9021bd933061a8f717924cca7b997cd0658c0b80c79f07cc6f69186accb",
-      "resume_delta_optimizer_steps_per_second": 0.058738469415191105,
-      "resume_delta_samples_per_second": 1.548257391943811,
-      "samples": 2797,
+      "resume_delta_optimizer_steps_per_second": 0.06608774102157494,
+      "resume_delta_samples_per_second": 1.7418040218398143,
+      "samples": 2997,
       "seed": 101,
       "sigterm": true,
-      "skipped_long_cooperation_episodes": 3408,
+      "skipped_long_cooperation_episodes": 3626,
       "training_semantics_hash": "b2017b20a13bcd5f3bd914e195a103779b2edfa035b831fb9cbf009724adfdbf",
       "variant": "v3_farmer_cooperation",
-      "wall_clock_seconds": 1808.974162682949
+      "wall_clock_seconds": 1794.1210332400515
     },
     {
-      "checkpoint_sha256": "0ffc1d0413757ee81c2e0080adb04130a45e20c9d1947e9eb44d05d26f2509b9",
+      "checkpoint_sha256": "1eb58d14246ebe96a1ea6f435493c56087f51b124dc8e8bfdbb46493c80c00b8",
       "continued_update": true,
-      "decisions": 87027,
-      "episodes": 1364,
+      "decisions": 93465,
+      "episodes": 1465,
       "formal_config_sha256": "6f6733e78e48b8e58dc5cd348f897369a6b095572705e6d9984dc0f3be5f671f",
       "fresh_container_resume": true,
       "model_hash": "c6caa88a2943af53856deb7f70306e58fd6b08e370478d27966864a8663c5047",
@@ -196,7 +196,7 @@
         "checkpoint_every": 1000,
         "max_optimizer_steps": 10000,
         "max_samples": 1000000,
-        "max_seconds": 900.0
+        "max_seconds": 1200.0
       },
       "pre_resume_limits": {
         "checkpoint_every": 1000,
@@ -205,21 +205,21 @@
         "max_seconds": 1200.0
       },
       "resolved_config_hash": "f26b70e465610a4da27bb6795bca6e56a2d433997639f404e08bd709e3ccb32f",
-      "resume_delta_optimizer_steps_per_second": 0.004433464142025224,
-      "resume_delta_samples_per_second": 0.10529477337309906,
+      "resume_delta_optimizer_steps_per_second": 0.0033704007905590123,
+      "resume_delta_samples_per_second": 0.0808896189734163,
       "samples": 246,
       "seed": 101,
       "sigterm": true,
-      "skipped_long_cooperation_episodes": 1355,
+      "skipped_long_cooperation_episodes": 1456,
       "training_semantics_hash": "af19bbbd162c8b9ed77d990324e86aab3b9d25dd68ce84313b52c70606a406a5",
       "variant": "v3_full_hybrid",
-      "wall_clock_seconds": 1811.134691169951
+      "wall_clock_seconds": 1791.6471874200506
     }
   ],
   "schema": "v3-p2-pilot-summary-v1",
   "seed": 101,
-  "source_git_sha": "d72f111c9c47517e031054169300ece7a2c94a72",
-  "source_tree": "612bf88d089fd0ce5abe7a148d8ad85d2b59149e",
+  "source_git_sha": "7c94577159c434b285d66bf06863669fe52e1f44",
+  "source_tree": "032dac0e3637ecc60e6c30757808869fac7394b2",
   "topology": "single_process",
   "unexecuted": [
     "2,000-5,000 paired deals per variant",
