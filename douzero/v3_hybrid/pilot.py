@@ -273,6 +273,13 @@ def _strategy_target(row: Transition) -> dict[str, float]:
     }
 
 
+def _should_collect_strategy_targets(learner: V3H6Learner) -> bool:
+    return bool(
+        learner.config.learner.features.strategy
+        and learner.base.base.base.schedule_state().public_training
+    )
+
+
 def collect_real_pilot_episode(
     learner: V3H6Learner,
     *,
@@ -317,6 +324,7 @@ def collect_real_pilot_episode(
     decisions: list[PilotDecision] = []
     action_trace: list[tuple[str, tuple[int, ...]]] = []
     features = learner.config.learner.features
+    collect_strategy_targets = _should_collect_strategy_targets(learner)
     strategy_config = learner.model.strategy_feature_config()
     while True:
         infoset = env.infoset
@@ -401,7 +409,7 @@ def collect_real_pilot_episode(
         action_trace=action_trace,
     )
     v2_episode.label_from_terminal()
-    if features.strategy:
+    if collect_strategy_targets:
         v2_episode.label_strategy_auxiliary(
             node_budget=learner.model.config.strategy_node_budget,
             time_budget_ms=learner.model.config.strategy_time_budget_ms,
@@ -479,7 +487,7 @@ def collect_real_pilot_episode(
         trajectories=trajectories,
         strategy_targets=(
             tuple(_strategy_target(item.v2_transition) for item in decisions)
-            if features.strategy else None
+            if collect_strategy_targets else None
         ),
         decisions=len(decisions),
         winner_team=str(terminal["winner_team"]),

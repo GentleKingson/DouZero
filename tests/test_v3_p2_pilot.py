@@ -31,6 +31,7 @@ from douzero.v3_hybrid.pilot import (
     P2_PILOT_SCHEMA,
     P2_SEED_DERIVATION,
     P2_VARIANTS,
+    _should_collect_strategy_targets,
     build_pilot_resolved_config,
     derive_pilot_stream_seed,
     unique_legal_actions,
@@ -67,7 +68,7 @@ def test_pilot_scripts_import_attested_checkout_before_pythonpath(tmp_path):
         assert "shadow package imported" not in result.stderr
 
 
-def test_episode_training_fails_before_piece_started_after_deadline():
+def test_episode_training_rejects_update_finishing_at_deadline():
     trained = []
     times = iter((14.0, 15.0))
 
@@ -86,6 +87,29 @@ def test_episode_training_fails_before_piece_started_after_deadline():
         )
 
     assert trained == ["first"]
+
+
+def test_strategy_labels_are_collected_only_during_public_training():
+    def learner(public_training):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                learner=SimpleNamespace(
+                    features=SimpleNamespace(strategy=True)
+                )
+            ),
+            base=SimpleNamespace(
+                base=SimpleNamespace(
+                    base=SimpleNamespace(
+                        schedule_state=lambda: SimpleNamespace(
+                            public_training=public_training
+                        )
+                    )
+                )
+            ),
+        )
+
+    assert not _should_collect_strategy_targets(learner(False))
+    assert _should_collect_strategy_targets(learner(True))
 
 
 def _summary():
@@ -393,6 +417,12 @@ def test_evidence_summary_rejects_unrelated_resume_pair(tmp_path):
     changed["resume"]["checkpoint_sha256"] = "8" * 64
     target.write_text(json.dumps(changed), encoding="utf-8")
     with pytest.raises(ValueError, match="checkpoint_sha256"):
+        summarize_evidence(tmp_path)
+    changed["resume"]["checkpoint_sha256"] = "4" * 64
+    changed["samples"] = 3
+    changed["metrics"]["samples_per_second"] = -1.0
+    target.write_text(json.dumps(changed), encoding="utf-8")
+    with pytest.raises(ValueError, match="sample counter did not increase"):
         summarize_evidence(tmp_path)
 
 

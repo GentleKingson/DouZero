@@ -84,6 +84,10 @@ def _train_episode_before_deadline(
                 "pilot wall-clock deadline elapsed during an atomic episode"
             )
         last_metrics = train_fn(learner, piece).as_dict()
+        if not _before_deadline(started, max_seconds, clock()):
+            raise RuntimeError(
+                "pilot wall-clock deadline elapsed during an atomic episode"
+            )
     return last_metrics
 
 

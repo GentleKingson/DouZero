@@ -104,6 +104,8 @@ def summarize_evidence(root: Path) -> dict:
             raise ValueError(f"{variant} resume did not use a fresh container")
         if after["optimizer_steps"] <= before["optimizer_steps"]:
             raise ValueError(f"{variant} optimizer counter did not increase")
+        if after["samples"] <= before["samples"]:
+            raise ValueError(f"{variant} sample counter did not increase")
         observed_sha = after["source_git_sha"]
         observed_image = after["environment"]["image_digest"]
         observed_tree = after["environment"]["source_tree"]
