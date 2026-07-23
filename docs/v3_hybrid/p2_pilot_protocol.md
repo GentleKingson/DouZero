@@ -19,8 +19,9 @@ it is not a second trainer.
   optimizer steps, whichever occurs first.
 - Checkpointing is enabled. Each variant must receive a real SIGTERM, load the
   same strict H6 checkpoint in a fresh container, and perform another update.
-- The runner reads its image ID from the Docker daemon using the current
-  container ID; caller-supplied image identity strings are not accepted.
+- The runner matches its PID namespace against the read-only host `/proc`
+  mount, then reads that exact container's image ID from the Docker daemon;
+  configurable hostnames and caller-supplied image strings are not trusted.
 - Training decisions come from the public V3 policy and environment legal
   action list. Oracle and belief labels are captured in separate training-only
   sidecars. Farmer cooperation remains episode-atomic.

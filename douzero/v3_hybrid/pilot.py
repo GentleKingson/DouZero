@@ -64,8 +64,8 @@ from .training.h5_learner import V3H5LearnerConfig
 from .training.h6_learner import V3H6Learner
 from .training.oracle_schedule import OracleGuidingScheduleConfig
 
-P2_PILOT_SCHEMA = "v3-p2-pilot-evidence-v3"
-P2_PILOT_PROTOCOL = "real-env-single-process-checkpoint-resume-v3"
+P2_PILOT_SCHEMA = "v3-p2-pilot-evidence-v4"
+P2_PILOT_PROTOCOL = "real-env-single-process-checkpoint-resume-v4"
 P2_SEED_DERIVATION = "sha256(root_seed,stream_name,worker_id,episode_id)-v1"
 P2_VARIANTS = (
     "v3_role",

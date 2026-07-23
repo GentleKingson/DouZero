@@ -45,6 +45,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--root-seed", type=int)
     parser.add_argument("--docker-socket", default="/var/run/docker.sock")
+    parser.add_argument("--host-proc", default="/host/proc")
     parser.add_argument("--command-record", default="")
     return parser.parse_args()
 
@@ -109,11 +110,9 @@ def _driver_version() -> str:
     return value[0]
 
 
-def _attest_container_image(container_id: str, socket_path: str) -> str:
-    """Read the current container's actual image ID from the Docker daemon."""
-
+def _docker_api_get(path: str, socket_path: str):
     request = (
-        f"GET /containers/{container_id}/json HTTP/1.0\r\n"
+        f"GET {path} HTTP/1.0\r\n"
         "Host: docker\r\nConnection: close\r\n\r\n"
     ).encode("ascii")
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -138,7 +137,49 @@ def _attest_container_image(container_id: str, socket_path: str) -> str:
         payload = json.loads(body)
     except (ValueError, IndexError, json.JSONDecodeError) as exc:
         raise SystemExit("Docker image attestation returned an invalid response") from exc
-    image_id = payload.get("Image") if status == 200 and isinstance(payload, dict) else None
+    if status != 200:
+        raise SystemExit(f"Docker image attestation API returned status {status}")
+    return payload
+
+
+def _pid_namespace(path: str) -> str:
+    try:
+        namespace = os.readlink(path)
+    except OSError as exc:
+        raise SystemExit(f"P2 evidence cannot read PID namespace {path}") from exc
+    if not namespace.startswith("pid:[") or not namespace.endswith("]"):
+        raise SystemExit("P2 evidence found an invalid PID namespace identity")
+    return namespace
+
+
+def _attest_current_container(
+    socket_path: str,
+    host_proc: str,
+) -> tuple[str, str]:
+    """Bind evidence to the container matching this PID namespace's init."""
+
+    current_namespace = _pid_namespace("/proc/1/ns/pid")
+    containers = _docker_api_get("/containers/json?all=0", socket_path)
+    if not isinstance(containers, list):
+        raise SystemExit("Docker image attestation returned an invalid container list")
+    matches = []
+    for row in containers:
+        container_id = row.get("Id") if isinstance(row, dict) else None
+        if not isinstance(container_id, str) or len(container_id) != 64:
+            continue
+        detail = _docker_api_get(f"/containers/{container_id}/json", socket_path)
+        host_pid = (
+            detail.get("State", {}).get("Pid") if isinstance(detail, dict) else None
+        )
+        if (
+            isinstance(host_pid, int)
+            and host_pid > 0
+            and _pid_namespace(f"{host_proc}/{host_pid}/ns/pid") == current_namespace
+        ):
+            matches.append((container_id, detail.get("Image")))
+    if len(matches) != 1:
+        raise SystemExit("Docker image attestation could not uniquely bind this container")
+    container_id, image_id = matches[0]
     if (
         not isinstance(image_id, str)
         or not image_id.startswith("sha256:")
@@ -146,7 +187,7 @@ def _attest_container_image(container_id: str, socket_path: str) -> str:
         or any(c not in "0123456789abcdef" for c in image_id[7:])
     ):
         raise SystemExit("Docker image attestation did not return a valid image ID")
-    return image_id
+    return container_id, image_id
 
 
 def _resolve_bounded_limit(override, default, label: str):
@@ -168,6 +209,10 @@ def _episode_fits_budget(learner, pieces, max_samples: int, max_steps: int) -> b
         <= max_samples
         and learner.eligible_updates + len(pieces) <= max_steps
     )
+
+
+def _before_deadline(started: float, max_seconds: float, now: float) -> bool:
+    return now - started < max_seconds
 
 
 _RUN_STATE_SCHEMA = "v3-p2-run-state-v1"
@@ -333,6 +378,8 @@ def main() -> int:
                 worker_id=0,
                 epsilon=args.epsilon,
             )
+            if stopped or not _before_deadline(started, max_seconds, time.monotonic()):
+                break
             episodes += 1
             decisions += batch.decisions
             winners[batch.winner_team] += 1
@@ -387,17 +434,18 @@ def main() -> int:
         )
         elapsed = time.monotonic() - started
         env = environment_info()
+        container_id, image_digest = _attest_current_container(
+            args.docker_socket, args.host_proc
+        )
         env.update({
             "hostname": socket.gethostname(),
-            "image_digest": _attest_container_image(
-                socket.gethostname(), args.docker_socket
-            ),
+            "image_digest": image_digest,
             "cuda_runtime": torch.version.cuda,
             "gpu": (
                 torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
             ),
             "command_record": args.command_record or None,
-            "container_id": socket.gethostname(),
+            "container_id": container_id,
             "source_tree": source_tree,
             "driver_version": _driver_version(),
         })

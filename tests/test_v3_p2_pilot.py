@@ -9,9 +9,10 @@ from types import SimpleNamespace
 import pytest
 
 from tools.run_v3_pilot import (
-    _attest_container_image,
+    _attest_current_container,
     _attest_clean_source,
     _episode_fits_budget,
+    _before_deadline,
     _fits_sample_budget,
     _load_run_state,
     _resolve_bounded_limit,
@@ -263,33 +264,33 @@ def test_sample_budget_stops_when_next_slice_does_not_fit():
     assert _episode_fits_budget(learner, pieces, 66, 6)
     assert not _episode_fits_budget(learner, pieces, 65, 6)
     assert not _episode_fits_budget(learner, pieces, 66, 5)
+    assert _before_deadline(10.0, 5.0, 14.999)
+    assert not _before_deadline(10.0, 5.0, 15.0)
 
 
-def test_docker_image_identity_is_read_from_daemon(monkeypatch):
+def test_docker_image_identity_is_bound_to_current_pid_namespace(monkeypatch):
     image_id = "sha256:" + "a" * 64
+    current = "a" * 64
+    other = "b" * 64
 
-    class FakeSocket:
-        def settimeout(self, _value):
-            pass
+    def fake_get(path, socket_path):
+        assert socket_path == "/docker.sock"
+        if path == "/containers/json?all=0":
+            return [{"Id": current}, {"Id": other}]
+        if path == f"/containers/{current}/json":
+            return {"State": {"Pid": 123}, "Image": image_id}
+        return {"State": {"Pid": 456}, "Image": "sha256:" + "b" * 64}
 
-        def connect(self, path):
-            assert path == "/docker.sock"
-
-        def sendall(self, request):
-            assert b"/containers/container-a/json" in request
-
-        def recv(self, _size):
-            if hasattr(self, "sent"):
-                return b""
-            self.sent = True
-            body = json.dumps({"Image": image_id}).encode()
-            return b"HTTP/1.0 200 OK\r\n\r\n" + body
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr("tools.run_v3_pilot.socket.socket", lambda *_: FakeSocket())
-    assert _attest_container_image("container-a", "/docker.sock") == image_id
+    monkeypatch.setattr(
+        "tools.run_v3_pilot._pid_namespace",
+        lambda path: "pid:[123]" if path in {
+            "/proc/1/ns/pid", "/host/proc/123/ns/pid"
+        } else "pid:[456]",
+    )
+    monkeypatch.setattr("tools.run_v3_pilot._docker_api_get", fake_get)
+    assert _attest_current_container("/docker.sock", "/host/proc") == (
+        current, image_id
+    )
 
 
 def test_evidence_summary_rejects_unrelated_resume_pair(tmp_path):
