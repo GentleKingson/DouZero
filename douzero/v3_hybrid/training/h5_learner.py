@@ -397,7 +397,7 @@ class V3H5Learner:
         self.samples_consumed = 0
         self.statistics = H5CumulativeStats()
         self._h6_policy_version_owner = None
-        if self.config.cooperation.enabled:
+        if self.config.cooperation.enabled or _allow_h6_combination:
             self.base.base._bind_h5_policy_version_owner(self)
         self.compatibility_identity = h5_training_identity(
             self.model, ruleset, self.config
@@ -452,11 +452,19 @@ class V3H5Learner:
         if not cfg.enabled:
             if trajectories is not None or privileged_mixer_state is not None:
                 raise ValueError("disabled H5 rejects cooperation data")
-            base_metrics = self.base.train_batch(
-                transitions,
-                belief_samples=belief_samples,
-                oracle_samples=oracle_samples,
-            )
+            if self._h6_policy_version_owner is None:
+                base_metrics = self.base.train_batch(
+                    transitions,
+                    belief_samples=belief_samples,
+                    oracle_samples=oracle_samples,
+                )
+            else:
+                with self.base.base._h5_policy_version_scope(self):
+                    base_metrics = self.base.train_batch(
+                        transitions,
+                        belief_samples=belief_samples,
+                        oracle_samples=oracle_samples,
+                    )
             metrics = self._disabled_metrics(base_metrics)
             if base_metrics.samples:
                 self.eligible_updates += 1
