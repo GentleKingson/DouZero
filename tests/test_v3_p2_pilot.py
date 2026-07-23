@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +37,32 @@ from douzero.v3_hybrid.pilot import (
     validate_pilot_summary,
     write_pilot_summary,
 )
+
+
+def test_runner_script_imports_attested_checkout_before_pythonpath(tmp_path):
+    shadow = tmp_path / "shadow"
+    package = shadow / "douzero"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text(
+        "raise RuntimeError('shadow package imported')\n", encoding="utf-8"
+    )
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(shadow), env["PYTHONPATH"]] if env.get("PYTHONPATH") else [str(shadow)]
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(root / "tools" / "run_v3_pilot.py"), "--help"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "shadow package imported" not in result.stderr
 
 
 def _summary():

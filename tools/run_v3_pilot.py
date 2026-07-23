@@ -10,8 +10,14 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+# Script execution puts tools/ first; bind imports to the attested checkout.
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if not sys.path or sys.path[0] != str(_REPOSITORY_ROOT):
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
 
 import torch
 
