@@ -15,11 +15,11 @@ implement the H7.1 async stack before any P4 budget is committed.
 
 ## Provenance
 
-- Source SHA: `7c94577159c434b285d66bf06863669fe52e1f44`
-- Source tree: `032dac0e3637ecc60e6c30757808869fac7394b2`
+- Source SHA: `35f0fade2c1f237c91f84a1e20a964af04d01742`
+- Source tree: `acb9bab38ea12be453b0ff1447c38cc55fd9b79a`
 - Base SHA: `51ced4e64079deba254f8c3b856e819e08cae347`
-- Docker image: `douzero-p2:7c94577`
-- Attested image ID: `sha256:eb7e99d4de352653f17a0ca58d5432fcea250a50dbc811a6e23c3c970b20aad8`
+- Docker image: `douzero-p2:35f0fad`
+- Attested image ID: `sha256:8a389af990b775d51692b6628d5be7a153f93adfb0422a46f884cde9b11afa56`
 - GPU/driver: NVIDIA GeForce RTX 5070 / `595.71.05`
 - PyTorch/CUDA: `2.12.1+cu132` / `13.2`
 - Topology/ruleset/seed: single process / legacy / `101`
@@ -27,7 +27,7 @@ implement the H7.1 async stack before any P4 budget is committed.
   strict checkpoint load in a fresh container, then another approximately
   897 seconds ending with SIGTERM after a post-resume optimizer update
 - Seed derivation: `sha256(root_seed,stream_name,worker_id,episode_id)-v1`
-- Raw evidence: `/tmp/douzero-p2-evidence/final-7c94577` on `LocalServer`
+- Raw evidence: `/tmp/douzero-p2-evidence/final-35f0fad` on `LocalServer`
 - Raw evidence manifest: `SHA256SUMS` in that directory
 
 The repository summary is a compact derivative of the validated raw evidence.
@@ -38,12 +38,12 @@ final evidence-only report commit; that commit does not alter executable behavio
 
 | Variant | Total wall s | Samples | Steps | Resume samples/s | Resume steps/s | Skipped long cooperation episodes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| v3_role | 1797.47 | 30,860 | 1,205 | 17.407 | 0.677 | 0 |
-| v3_admc | 1793.93 | 31,719 | 1,196 | 18.280 | 0.693 | 0 |
-| v3_oracle | 1796.15 | 18,365 | 765 | 10.547 | 0.439 | 0 |
-| v3_belief | 1797.71 | 27,884 | 1,029 | 16.140 | 0.593 | 0 |
-| v3_farmer_cooperation | 1794.12 | 2,997 | 112 | 1.742 | 0.066 | 3,626 |
-| v3_full_hybrid | 1791.65 | 246 | 9 | 0.081 | 0.003 | 1,456 |
+| v3_role | 1807.49 | 30,514 | 1,193 | 16.270 | 0.634 | 0 |
+| v3_admc | 1807.28 | 31,199 | 1,176 | 16.871 | 0.640 | 0 |
+| v3_oracle | 1806.48 | 18,141 | 756 | 9.875 | 0.410 | 0 |
+| v3_belief | 1807.42 | 27,884 | 1,029 | 14.899 | 0.551 | 0 |
+| v3_farmer_cooperation | 1807.92 | 2,856 | 107 | 1.619 | 0.062 | 3,463 |
+| v3_full_hybrid | 1804.82 | 246 | 9 | 0.081 | 0.003 | 1,559 |
 
 All six variants saved a checkpoint after SIGTERM, strict-loaded it in a new
 container, advanced the optimizer and policy counters, and published a new
@@ -82,6 +82,9 @@ environment trajectories:
    fails closed rather than starting late work inside an atomic episode.
 10. The summarizer also binds its imports to the checked-out repository before
     loading the validation implementation.
+11. Strategy labels are generated only while the Oracle schedule permits
+    public training, so warmup throughput excludes unused decomposition work.
+12. Resume validation requires both optimizer and sample counters to increase.
 
 Resume throughput is computed from counter deltas rather than cumulative
 counters, and the summary validator independently checks that arithmetic.
