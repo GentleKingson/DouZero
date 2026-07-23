@@ -25,6 +25,8 @@ from douzero.training.bidding import (
     BiddingTransition,
 )
 from douzero.v3_hybrid import (
+    AdaptiveDMCConfig,
+    AdaptiveSnapshotProvenance,
     LossTermTensor,
     LossTermSchedule,
     V3H2LearnerConfig,
@@ -39,6 +41,7 @@ from douzero.v3_hybrid import (
     save_v3_hybrid_public_checkpoint,
     v3_h6_support_matrix_hash,
 )
+from douzero.v3_hybrid.adaptive_dmc import ADMC_SAFE_HYBRID
 from douzero.v3_hybrid.config import BELIEF_FEEDBACK_ALL
 from douzero.v3_hybrid.integration_config import (
     V3H6AuxiliaryConfig,
@@ -276,6 +279,50 @@ def test_loss_composer_state_and_duplicate_identity_fail_closed():
             torch.ones(2), torch.ones(2, dtype=torch.bool),
             ("landlord", "landlord"), ("same", "same"),
         )
+
+
+def test_h6_aux_updates_are_included_in_admc_snapshot_version_validation():
+    baseline = _resolved()
+    public = dataclasses.replace(
+        baseline.learner.base.base.base.public,
+        adaptive_dmc=AdaptiveDMCConfig(mode=ADMC_SAFE_HYBRID),
+    )
+    resolved = dataclasses.replace(
+        baseline,
+        learner=dataclasses.replace(
+            baseline.learner,
+            base=dataclasses.replace(
+                baseline.learner.base,
+                base=dataclasses.replace(
+                    baseline.learner.base.base,
+                    base=dataclasses.replace(
+                        baseline.learner.base.base.base, public=public
+                    ),
+                ),
+            ),
+            features=dataclasses.replace(
+                baseline.learner.features, adaptive_dmc=True
+            ),
+        ),
+    )
+    learner = V3H6Learner(
+        V3HybridModel(build_v2_schema(), resolved.model),
+        ruleset=RuleSet.legacy(),
+        config=resolved,
+    )
+    for generation in (1, 2):
+        row = dataclasses.replace(
+            _transition(seed=20260722 + generation),
+            adaptive_provenance=AdaptiveSnapshotProvenance(
+                q_old=0.0,
+                policy_version=learner.policy_version,
+                snapshot_slot=0,
+                owner_id=0,
+                generation=generation,
+            ),
+        )
+        learner.train_batch((row,))
+    assert learner.policy_version == 4
 
 
 def test_h6_model_graph_is_optional_public_and_identity_bound():
