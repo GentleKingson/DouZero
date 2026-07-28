@@ -8,9 +8,12 @@ import contextlib
 import hashlib
 import json
 import math
+import platform
 import resource
+import subprocess
 import sys
 import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from unittest.mock import patch
 
@@ -80,12 +83,93 @@ def _load_protocol(path: Path) -> P3RuntimeProtocol:
     return P3RuntimeProtocol(**payload)
 
 
-def _model_digest(model: torch.nn.Module) -> str:
+def _module_digest(components: Mapping[str, torch.nn.Module]) -> str:
     digest = hashlib.sha256()
-    for name, tensor in sorted(model.state_dict().items()):
-        digest.update(name.encode("utf-8"))
-        digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    for component, module in sorted(components.items()):
+        for name, tensor in sorted(module.state_dict().items()):
+            digest.update(component.encode("utf-8"))
+            digest.update(name.encode("utf-8"))
+            digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
     return digest.hexdigest()
+
+
+def _learner_digest(learner) -> str:
+    h5 = learner.base
+    h4 = h5.base
+    h3 = h4.base
+    components = {"public_model": learner.model}
+    for name, module in (
+        ("oracle", h3.oracle),
+        ("belief", h4.belief_model),
+        ("cooperation", h5.cooperation),
+    ):
+        if module is not None:
+            components[name] = module
+    return _module_digest(components)
+
+
+def _live_hardware_identity() -> dict[str, str]:
+    query = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=driver_version",
+            "--format=csv,noheader",
+            "-i",
+            str(torch.cuda.current_device()),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    if len(query) != 1 or not query[0].strip():
+        raise RuntimeError("P3 could not determine one live NVIDIA driver")
+    return {
+        "gpu": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "driver": query[0].strip(),
+        "pytorch": str(torch.__version__),
+        "cuda": str(torch.version.cuda),
+        "cpu": platform.machine(),
+    }
+
+
+def _verify_hardware_identity(protocol: P3RuntimeProtocol) -> None:
+    observed = _live_hardware_identity()
+    for name, value in observed.items():
+        if value != getattr(protocol, name):
+            raise SystemExit(
+                f"P3 live {name} does not match the frozen protocol: "
+                f"{value!r} != {getattr(protocol, name)!r}"
+            )
+
+
+class CheckpointCadence:
+    """Save at every crossed eligible-update boundary."""
+
+    def __init__(
+        self,
+        cadence: int,
+        initial_updates: int,
+        save: Callable[[], None],
+    ) -> None:
+        if cadence < 1 or initial_updates < 0:
+            raise ValueError("P3 checkpoint cadence state is invalid")
+        self.cadence = cadence
+        self._last_updates = initial_updates
+        self._next_update = (initial_updates // cadence + 1) * cadence
+        self._save = save
+        self.saves = 0
+        self.seconds = 0.0
+
+    def observe(self, updates: int) -> None:
+        if updates < self._last_updates:
+            raise ValueError("P3 checkpoint update counter regressed")
+        while updates >= self._next_update:
+            started = time.perf_counter()
+            self._save()
+            self.seconds += time.perf_counter() - started
+            self.saves += 1
+            self._next_update += self.cadence
+        self._last_updates = updates
 
 
 class SegmentProfiler:
@@ -110,6 +194,14 @@ class SegmentProfiler:
                 return function(*args, **kwargs)
 
         return measured
+
+
+def _episodes_per_cycle(topology: str, actors: int, games: int) -> int:
+    if topology == "base_single_process":
+        return 4
+    if topology not in {"base_async_4x4", "base_async_8x4"}:
+        raise ValueError("P3 base topology is unknown")
+    return actors * games
 
 
 def _counter_payload(stats) -> dict[str, int]:
@@ -144,11 +236,17 @@ def _shared_memory_bytes(trainer) -> int:
     return total
 
 
-def _run_runtime_until(trainer, deadline: float, episodes: int) -> int:
+def _run_runtime_until(
+    trainer,
+    deadline: float,
+    episodes: int,
+    checkpoint_cadence: CheckpointCadence,
+) -> int:
     max_lag = 0
     while time.monotonic() < deadline:
         trainer.collect_episodes(episodes)
         trainer.step()
+        checkpoint_cadence.observe(trainer.stats.optimizer_steps)
         max_lag = max(max_lag, trainer.policy_step - trainer._snapshot_step)
     return max_lag
 
@@ -178,12 +276,13 @@ def _run_base(
     if topology == "base_single_process":
         runtime_topology = TOPOLOGY_SINGLE_PROCESS
         trainer_type = V3SingleProcessTrainer
-        actors, games, episodes = 1, 1, 4
+        actors, games = 1, 1
     else:
         runtime_topology = TOPOLOGY_ASYNC_SINGLE_GPU
         trainer_type = V3AsyncSingleGPUTrainer
         actors = 4 if topology == "base_async_4x4" else 8
-        games, episodes = 4, 4
+        games = 4
+    episodes = _episodes_per_cycle(topology, actors, games)
     learner, resolved = create_pilot_learner(formal)
     runtime_config = V3H7RuntimeConfig(
         topology=runtime_topology,
@@ -199,34 +298,55 @@ def _run_base(
     trainer = trainer_type(learner, resolved, runtime_config)
     checkpoint_seconds = 0.0
     shutdown_seconds = 0.0
+    checkpoint_state = {
+        "p3_protocol_hash": protocol.stable_hash(),
+        "topology": topology,
+        "seed": seed,
+    }
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    cadence = CheckpointCadence(
+        protocol.checkpoint_cadence_updates,
+        trainer.stats.optimizer_steps,
+        lambda: trainer.save_training_checkpoint(
+            str(checkpoint),
+            long_running_state=checkpoint_state,
+        ),
+    )
     try:
         _run_runtime_until(
-            trainer, time.monotonic() + protocol.warmup_seconds, episodes
+            trainer,
+            time.monotonic() + protocol.warmup_seconds,
+            episodes,
+            cadence,
         )
         trainer.quiesce_cycle_boundary()
         torch.cuda.reset_peak_memory_stats(trainer.device)
         before = _counter_payload(trainer.stats)
-        parameter_before = _model_digest(trainer.model)
+        parameter_before = _learner_digest(trainer.learner)
+        cadence_seconds_before = cadence.seconds
         started = time.monotonic()
         max_lag = _run_runtime_until(
-            trainer, started + protocol.measurement_seconds, episodes
+            trainer,
+            started + protocol.measurement_seconds,
+            episodes,
+            cadence,
         )
         elapsed = time.monotonic() - started
         boundary = trainer.quiesce_cycle_boundary()
         after = _counter_payload(trainer.stats)
-        parameter_changed = parameter_before != _model_digest(trainer.model)
+        parameter_changed = parameter_before != _learner_digest(trainer.learner)
         shared_memory = _shared_memory_bytes(trainer)
-        checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint_started = time.perf_counter()
         trainer.save_training_checkpoint(
             str(checkpoint),
-            long_running_state={
-                "p3_protocol_hash": protocol.stable_hash(),
-                "topology": topology,
-                "seed": seed,
-            },
+            long_running_state=checkpoint_state,
         )
-        checkpoint_seconds = time.perf_counter() - checkpoint_started
+        checkpoint_seconds = (
+            cadence.seconds
+            - cadence_seconds_before
+            + time.perf_counter()
+            - checkpoint_started
+        )
         cpu_ram = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
         vram = int(torch.cuda.max_memory_allocated())
         shutdown_started = time.monotonic()
@@ -280,7 +400,15 @@ def _full_counter(state: Mapping[str, int]) -> dict[str, int]:
     }
 
 
-def _run_full_until(learner, *, seed: int, deadline: float, state, profiler) -> None:
+def _run_full_until(
+    learner,
+    *,
+    seed: int,
+    deadline: float,
+    state,
+    profiler,
+    checkpoint_cadence: CheckpointCadence,
+) -> None:
     batch_size = learner.config.learner.base.base.base.public.batch_size
     while time.monotonic() < deadline:
         with profiler.measure("collate"):
@@ -303,6 +431,7 @@ def _run_full_until(learner, *, seed: int, deadline: float, state, profiler) -> 
         train_pilot_batch(learner, batch)
         state["samples"] += learner.samples_consumed - before_samples
         state["steps"] += learner.eligible_updates - before_steps
+        checkpoint_cadence.observe(state["steps"])
 
 
 def _strict_full_reload(formal, checkpoint: Path) -> bool:
@@ -376,6 +505,12 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
         "steps": 0,
         "skipped": 0,
     }
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    cadence = CheckpointCadence(
+        protocol.checkpoint_cadence_updates,
+        state["steps"],
+        lambda: learner.save_checkpoint(checkpoint),
+    )
     try:
         _run_full_until(
             learner,
@@ -383,13 +518,15 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
             deadline=time.monotonic() + protocol.warmup_seconds,
             state=state,
             profiler=profiler,
+            checkpoint_cadence=cadence,
         )
         before = _full_counter(state)
         profiler.values = {name: 0.0 for name in P3_SEGMENTS}
         belief_total[0] = 0.0
         belief_logits[0] = 0.0
         torch.cuda.reset_peak_memory_stats(learner.device)
-        parameter_before = _model_digest(learner.model)
+        parameter_before = _learner_digest(learner)
+        cadence_seconds_before = cadence.seconds
         started = time.monotonic()
         _run_full_until(
             learner,
@@ -397,16 +534,21 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
             deadline=started + protocol.measurement_seconds,
             state=state,
             profiler=profiler,
+            checkpoint_cadence=cadence,
         )
         elapsed = time.monotonic() - started
         after = _full_counter(state)
-        parameter_changed = parameter_before != _model_digest(learner.model)
+        parameter_changed = parameter_before != _learner_digest(learner)
         profiler.values["belief_logits"] = belief_logits[0]
         profiler.values["exact_dp"] = max(0.0, belief_total[0] - belief_logits[0])
-        checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint_started = time.perf_counter()
         learner.save_checkpoint(checkpoint)
-        profiler.values["checkpoint"] = time.perf_counter() - checkpoint_started
+        profiler.values["checkpoint"] = (
+            cadence.seconds
+            - cadence_seconds_before
+            + time.perf_counter()
+            - checkpoint_started
+        )
         cpu_ram = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
         vram = int(torch.cuda.max_memory_allocated())
         strict_reload = _strict_full_reload(formal, checkpoint)
@@ -448,6 +590,7 @@ def main() -> None:
         raise SystemExit("P3 container image does not match the frozen protocol")
     if not torch.cuda.is_available():
         raise SystemExit("P3 runtime benchmark requires CUDA")
+    _verify_hardware_identity(protocol)
 
     full = args.topology == "full_hybrid_single_process"
     formal = load_formal_config(args.full_config if full else args.base_config)

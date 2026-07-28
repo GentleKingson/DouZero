@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import copy
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
 
+from benchmarks.run_v3_p3_runtime import (
+    CheckpointCadence,
+    _episodes_per_cycle,
+    _learner_digest,
+    _module_digest,
+    _verify_hardware_identity,
+)
 from douzero.v3_hybrid.runtime_decision import (
     P3_RUNTIME_SCHEMA,
     P3_SEGMENTS,
@@ -179,3 +189,68 @@ def test_p3_protocol_freezes_threshold_before_measurement() -> None:
             **changed,
             "full_hybrid_min_base_ratio": 0.0,
         })
+
+
+def test_p3_full_learner_digest_tracks_training_only_modules() -> None:
+    public = torch.nn.Linear(2, 2)
+    oracle = torch.nn.Linear(2, 2)
+    belief = torch.nn.Linear(2, 2)
+    cooperation = torch.nn.Linear(2, 2)
+    h3 = SimpleNamespace(oracle=oracle)
+    h4 = SimpleNamespace(base=h3, belief_model=belief)
+    h5 = SimpleNamespace(base=h4, cooperation=cooperation)
+    learner = SimpleNamespace(base=h5, model=public)
+    public_before = _module_digest({"public": public})
+    complete_before = _learner_digest(learner)
+
+    with torch.no_grad():
+        oracle.weight.add_(1.0)
+
+    assert _module_digest({"public": public}) == public_before
+    assert _learner_digest(learner) != complete_before
+
+
+def test_p3_checkpoint_cadence_saves_every_crossed_boundary() -> None:
+    saves = []
+    cadence = CheckpointCadence(5, 3, lambda: saves.append(len(saves)))
+    cadence.observe(4)
+    assert saves == []
+    cadence.observe(5)
+    assert len(saves) == 1
+    cadence.observe(16)
+    assert len(saves) == 3
+    with pytest.raises(ValueError, match="regressed"):
+        cadence.observe(15)
+
+
+def test_p3_async_cycle_queues_every_actor_game_slot() -> None:
+    assert _episodes_per_cycle("base_single_process", 1, 1) == 4
+    assert _episodes_per_cycle("base_async_4x4", 4, 4) == 16
+    assert _episodes_per_cycle("base_async_8x4", 8, 4) == 32
+    with pytest.raises(ValueError, match="topology"):
+        _episodes_per_cycle("unknown", 1, 1)
+
+
+def test_p3_live_hardware_must_match_every_frozen_axis() -> None:
+    protocol = _protocol()
+    live = {
+        "gpu": protocol.gpu,
+        "driver": protocol.driver,
+        "pytorch": protocol.pytorch,
+        "cuda": protocol.cuda,
+        "cpu": protocol.cpu,
+    }
+    with patch(
+        "benchmarks.run_v3_p3_runtime._live_hardware_identity",
+        return_value=live,
+    ):
+        _verify_hardware_identity(protocol)
+
+    for field in live:
+        drifted = dict(live)
+        drifted[field] = f"{drifted[field]}-different"
+        with patch(
+            "benchmarks.run_v3_p3_runtime._live_hardware_identity",
+            return_value=drifted,
+        ), pytest.raises(SystemExit, match=f"live {field}"):
+            _verify_hardware_identity(protocol)
