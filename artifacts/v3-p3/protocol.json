@@ -9,7 +9,7 @@
   "full_config_hash": "6f6733e78e48b8e58dc5cd348f897369a6b095572705e6d9984dc0f3be5f671f",
   "full_hybrid_min_base_ratio": 0.7,
   "gpu": "NVIDIA GeForce RTX 5070",
-  "image_digest": "sha256:6da0fed88d3de60814ad3cabd3c6dd93bc9b650aa145060b8a3557d109a48cb6",
+  "image_digest": "sha256:0ecbf17be9ea51961867516907e74327c8ab2a3ac9cb10d654d0ea6d8e08422c",
   "max_policy_lag": 128,
   "measurement_seconds": 300.0,
   "model_identity_hashes": {
@@ -26,8 +26,8 @@
     303
   ],
   "shared_scale_hash": "377320fb1eed846e322086b092053ffdc7b865b5c810a58555adcabef918c26e",
-  "source_git_sha": "1308e302aacfb5df2e2fec1c01c744d643347c1a",
-  "source_tree": "f2db72712bd66a2429795797c6c090e839e9bbe9",
-  "trainer_identity_hash": "06b9ae86c0cf0c58d158acc2905c1876bebe0a8158d075788e190f477e6798ec",
+  "source_git_sha": "7e2186b6dfa9c29db4f0bc0cf057e0f64adc74e8",
+  "source_tree": "af9c812b9360e71d34f94232c1c0a55703c92e7a",
+  "trainer_identity_hash": "a3a8261b97818fadcee19e7d535ce240a14b589182215a2a1656ca28d087ce3e",
   "warmup_seconds": 30.0
 }
