@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import hashlib
 import json
 import math
@@ -222,6 +223,20 @@ def _episodes_per_cycle(topology: str, actors: int, games: int) -> int:
     return actors * games
 
 
+def _learner_updates_per_cycle(
+    episodes: int, episodes_per_learner_update: int
+) -> int:
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in (episodes, episodes_per_learner_update)
+    ):
+        raise ValueError("P3 learner cadence requires positive integer counts")
+    updates, remainder = divmod(episodes, episodes_per_learner_update)
+    if remainder:
+        raise ValueError("P3 collection cycle is not divisible by learner cadence")
+    return updates
+
+
 def _counter_payload(stats) -> dict[str, int]:
     return {
         "games": int(stats.games_collected),
@@ -297,12 +312,19 @@ def _run_runtime_until(
     trainer,
     deadline: float,
     episodes: int,
+    episodes_per_learner_update: int,
     checkpoint_cadence: CheckpointCadence,
 ) -> int:
+    updates = _learner_updates_per_cycle(
+        episodes, episodes_per_learner_update
+    )
     max_lag = 0
     while time.monotonic() < deadline:
         trainer.collect_episodes(episodes)
-        trainer.step()
+        before_updates = trainer.stats.optimizer_steps
+        trainer.optimize(updates)
+        if trainer.stats.optimizer_steps - before_updates != updates:
+            raise RuntimeError("P3 runtime learner cadence did not advance exactly")
         checkpoint_cadence.observe(trainer.stats.optimizer_steps)
         max_lag = max(max_lag, trainer.policy_step - trainer._snapshot_step)
     return max_lag
@@ -313,12 +335,43 @@ def _strict_runtime_reload(
     formal,
     runtime_config,
     checkpoint: Path,
-) -> bool:
+    *,
+    episodes: int,
+    episodes_per_learner_update: int,
+    checkpoint_state: Mapping[str, object],
+) -> dict[str, bool]:
     learner, resolved = create_pilot_learner(formal)
     restored = trainer_type(learner, resolved, runtime_config)
     try:
-        restored.load_training_checkpoint(checkpoint)
-        return True
+        resumed_state = restored.load_training_checkpoint(checkpoint)
+        if resumed_state != dict(checkpoint_state):
+            raise RuntimeError("P3 runtime resume sidecar state mismatch")
+        parameter_before = _learner_digest(restored.learner)
+        updates_before = restored.stats.optimizer_steps
+        restored.collect_episodes(episodes)
+        restored.optimize(_learner_updates_per_cycle(
+            episodes, episodes_per_learner_update
+        ))
+        boundary = restored.quiesce_cycle_boundary()
+        resumed_update = (
+            restored.stats.optimizer_steps > updates_before
+            and _learner_digest(restored.learner) != parameter_before
+        )
+        resume_quiesced = all(
+            int(boundary[name]) == 0
+            for name in (
+                "active_slots",
+                "in_flight_slots",
+                "pending_requests",
+            )
+        )
+        if not resumed_update or not resume_quiesced:
+            raise RuntimeError("P3 runtime resume exercise did not complete cleanly")
+        return {
+            "strict_reload": True,
+            "resumed_update": resumed_update,
+            "resume_quiesced": resume_quiesced,
+        }
     finally:
         restored.shutdown()
 
@@ -349,6 +402,7 @@ def _run_base(
         replay_capacity=formal.runtime.replay_capacity,
         target_microbatch=4,
         environment_seed=seed,
+        environment_seed_derivation=protocol.deal_seed_derivation,
         action_seed=seed + 1,
         max_policy_lag=protocol.max_policy_lag,
     )
@@ -374,11 +428,13 @@ def _run_base(
             trainer,
             time.monotonic() + protocol.warmup_seconds,
             episodes,
+            protocol.episodes_per_learner_update,
             cadence,
         )
         trainer.quiesce_cycle_boundary()
         torch.cuda.reset_peak_memory_stats(trainer.device)
         before = _counter_payload(trainer.stats)
+        phase_before = trainer.learner.base.base.base.schedule_state()
         parameter_before = _learner_digest(trainer.learner)
         cadence_seconds_before = cadence.seconds
         started = time.monotonic()
@@ -386,11 +442,13 @@ def _run_base(
             trainer,
             started + protocol.measurement_seconds,
             episodes,
+            protocol.episodes_per_learner_update,
             cadence,
         )
         elapsed = time.monotonic() - started
         boundary = trainer.quiesce_cycle_boundary()
         after = _counter_payload(trainer.stats)
+        phase_after = trainer.learner.base.base.base.schedule_state()
         parameter_changed = parameter_before != _learner_digest(trainer.learner)
         shared_memory = _shared_memory_bytes(trainer)
         checkpoint_started = time.perf_counter()
@@ -410,8 +468,19 @@ def _run_base(
         trainer.shutdown()
         shutdown_seconds = time.monotonic() - shutdown_started
         trainer = None
-        strict_reload = _strict_runtime_reload(
-            trainer_type, formal, runtime_config, checkpoint
+        del learner
+        del resolved
+        _release_cuda_graph()
+        resume = _strict_runtime_reload(
+            trainer_type,
+            formal,
+            runtime_config,
+            checkpoint,
+            episodes=episodes,
+            episodes_per_learner_update=(
+                protocol.episodes_per_learner_update
+            ),
+            checkpoint_state=checkpoint_state,
         )
         segments = {name: 0.0 for name in P3_SEGMENTS}
         segments.update({
@@ -429,7 +498,15 @@ def _run_base(
             "elapsed": elapsed,
             "segments": segments,
             "parameter_changed": parameter_changed,
-            "checkpoint_reload": strict_reload,
+            "checkpoint_reload": resume["strict_reload"],
+            "resumed_update": resume["resumed_update"],
+            "resume_quiesced": resume["resume_quiesced"],
+            "training_phase": {
+                "before": phase_before.phase,
+                "after": phase_after.phase,
+                "learner_update_before": phase_before.learner_update,
+                "learner_update_after": phase_after.learner_update,
+            },
             "policy_lag": max_lag,
             "actor_blocked": float(boundary["actor_blocked_ratio"]),
             "data_wait": float(boundary["learner_data_wait_ratio"]),
@@ -458,6 +535,98 @@ def _full_counter(state: Mapping[str, int]) -> dict[str, int]:
     }
 
 
+def _prime_full_hybrid_phase(learner, target_update: int):
+    """Advance only schedule counters to the frozen guided-phase boundary."""
+
+    h5 = learner.base
+    h4 = h5.base
+    h3 = h4.base
+    if (
+        target_update != h3.config.schedule.warmup_updates
+        or h3.config.schedule.at(target_update).phase != "guided"
+    ):
+        raise ValueError("P3 full-hybrid guided phase boundary is invalid")
+    counters = (
+        learner.eligible_updates,
+        h5.eligible_updates,
+        h4.eligible_updates,
+        h3.learner_updates,
+        learner.samples_consumed,
+        h5.samples_consumed,
+        h4.samples_consumed,
+        h3.samples_consumed,
+    )
+    if any(value != 0 for value in counters):
+        raise RuntimeError("P3 full-hybrid phase priming requires a fresh learner")
+    if any(
+        statistics.steps != 0
+        for statistics in (
+            learner.statistics,
+            h5.statistics,
+            h4.statistics,
+            h3.statistics,
+        )
+    ):
+        raise RuntimeError("P3 full-hybrid phase statistics are not fresh")
+
+    h3.learner_updates = target_update
+    h3.statistics.steps = target_update
+    h4.eligible_updates = target_update
+    h4.statistics.steps = target_update
+    h4.statistics.base_updates = target_update
+    h5.eligible_updates = target_update
+    h5.statistics.steps = target_update
+    learner.eligible_updates = target_update
+    learner.statistics.steps = target_update
+    state = h3.schedule_state()
+    if state.phase != "guided" or state.learner_update != target_update:
+        raise RuntimeError("P3 full-hybrid phase priming did not take effect")
+    return state
+
+
+def _run_full_episode(
+    learner,
+    *,
+    seed: int,
+    state,
+    profiler,
+    checkpoint_cadence: CheckpointCadence,
+) -> bool:
+    batch_size = learner.config.learner.base.base.base.public.batch_size
+    with profiler.measure("collate"):
+        batch = collect_real_pilot_episode(
+            learner,
+            episode_number=state["games"],
+            root_seed=seed,
+            worker_id=0,
+            epsilon=0.01,
+            segment_profiler=profiler,
+            skip_forced_actions=True,
+        )
+    state["games"] += 1
+    state["decisions"] += batch.decisions
+    state["transitions"] += len(batch.transitions)
+    if batch.cooperation_skip_reason is not None:
+        if batch.cooperation_skip_reason != "missing_nonforced_farmer_role":
+            raise RuntimeError("P3 encountered an unknown cooperation skip reason")
+        state["skipped_incomplete"] += 1
+        return False
+    if batch.trajectories is not None and len(batch.transitions) > batch_size:
+        state["skipped"] += 1
+        return False
+    before_samples = learner.samples_consumed
+    before_steps = learner.eligible_updates
+    train_pilot_batch(learner, batch)
+    sample_delta = learner.samples_consumed - before_samples
+    step_delta = learner.eligible_updates - before_steps
+    if step_delta != 1 or sample_delta < 1:
+        raise RuntimeError("P3 full-hybrid batch did not advance exactly once")
+    state["samples"] += sample_delta
+    state["steps"] += step_delta
+    checkpoint_cadence.observe(learner.eligible_updates)
+    return True
+
+
 def _run_full_until(
     learner,
     *,
@@ -467,45 +636,77 @@ def _run_full_until(
     profiler,
     checkpoint_cadence: CheckpointCadence,
 ) -> None:
-    batch_size = learner.config.learner.base.base.base.public.batch_size
     while time.monotonic() < deadline:
-        with profiler.measure("collate"):
-            batch = collect_real_pilot_episode(
-                learner,
-                episode_number=state["games"],
-                root_seed=seed,
-                worker_id=0,
-                epsilon=0.01,
-                segment_profiler=profiler,
-                skip_forced_actions=True,
-            )
-        state["games"] += 1
-        state["decisions"] += batch.decisions
-        state["transitions"] += len(batch.transitions)
-        if batch.cooperation_skip_reason is not None:
-            if batch.cooperation_skip_reason != "missing_nonforced_farmer_role":
-                raise RuntimeError("P3 encountered an unknown cooperation skip reason")
-            state["skipped_incomplete"] += 1
-            continue
-        if batch.trajectories is not None and len(batch.transitions) > batch_size:
-            state["skipped"] += 1
-            continue
-        before_samples = learner.samples_consumed
-        before_steps = learner.eligible_updates
-        train_pilot_batch(learner, batch)
-        state["samples"] += learner.samples_consumed - before_samples
-        state["steps"] += learner.eligible_updates - before_steps
-        checkpoint_cadence.observe(state["steps"])
+        _run_full_episode(
+            learner,
+            seed=seed,
+            state=state,
+            profiler=profiler,
+            checkpoint_cadence=checkpoint_cadence,
+        )
 
 
-def _strict_full_reload(formal, checkpoint: Path) -> bool:
+def _strict_full_reload(
+    protocol,
+    formal,
+    checkpoint: Path,
+    *,
+    seed: int,
+    episode_number: int,
+) -> dict[str, bool]:
     restored, _resolved = create_pilot_learner(formal)
     restored.load_checkpoint(checkpoint)
-    return True
+    h3 = restored.base.base.base
+    if h3.schedule_state().phase != protocol.full_hybrid_phase:
+        raise RuntimeError("P3 restored full-hybrid phase drifted")
+    parameter_before = _learner_digest(restored)
+    updates_before = restored.eligible_updates
+    state = {
+        "games": episode_number,
+        "decisions": 0,
+        "transitions": 0,
+        "samples": 0,
+        "steps": 0,
+        "skipped": 0,
+        "skipped_incomplete": 0,
+    }
+    cadence = CheckpointCadence(
+        max(protocol.checkpoint_cadence_updates, 1000000),
+        restored.eligible_updates,
+        lambda: None,
+    )
+    profiler = SegmentProfiler(
+        synchronize=lambda: torch.cuda.synchronize(restored.device)
+    )
+    for _ in range(128):
+        if _run_full_episode(
+            restored,
+            seed=seed,
+            state=state,
+            profiler=profiler,
+            checkpoint_cadence=cadence,
+        ):
+            break
+    else:
+        raise RuntimeError("P3 full-hybrid resume found no trainable episode")
+    resumed_update = (
+        restored.eligible_updates == updates_before + 1
+        and _learner_digest(restored) != parameter_before
+    )
+    if not resumed_update:
+        raise RuntimeError("P3 full-hybrid resume did not update parameters")
+    return {
+        "strict_reload": True,
+        "resumed_update": True,
+        "resume_quiesced": True,
+    }
 
 
-def _run_full(protocol, formal, seed: int, checkpoint: Path):
+def _measure_full(protocol, formal, seed: int, checkpoint: Path):
     learner, _resolved = create_pilot_learner(formal)
+    _prime_full_hybrid_phase(
+        learner, protocol.full_hybrid_phase_update
+    )
     profiler = SegmentProfiler(
         synchronize=lambda: torch.cuda.synchronize(learner.device)
     )
@@ -573,7 +774,7 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     cadence = CheckpointCadence(
         protocol.checkpoint_cadence_updates,
-        state["steps"],
+        learner.eligible_updates,
         lambda: learner.save_checkpoint(checkpoint),
     )
     try:
@@ -586,6 +787,7 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
             checkpoint_cadence=cadence,
         )
         before = _full_counter(state)
+        phase_before = h3.schedule_state()
         profiler.values = {name: 0.0 for name in P3_SEGMENTS}
         belief_total[0] = 0.0
         belief_logits[0] = 0.0
@@ -603,6 +805,7 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
         )
         elapsed = time.monotonic() - started
         after = _full_counter(state)
+        phase_after = h3.schedule_state()
         parameter_changed = parameter_before != _learner_digest(learner)
         profiler.values["belief_logits"] = belief_logits[0]
         profiler.values["exact_dp"] = max(0.0, belief_total[0] - belief_logits[0])
@@ -616,14 +819,18 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
         )
         cpu_ram = _aggregate_runtime_rss_bytes(None)
         vram = int(torch.cuda.max_memory_allocated())
-        strict_reload = _strict_full_reload(formal, checkpoint)
         return {
             "before": before,
             "after": after,
             "elapsed": elapsed,
             "segments": dict(profiler.values),
             "parameter_changed": parameter_changed,
-            "checkpoint_reload": strict_reload,
+            "training_phase": {
+                "before": phase_before.phase,
+                "after": phase_after.phase,
+                "learner_update_before": phase_before.learner_update,
+                "learner_update_after": phase_after.learner_update,
+            },
             "policy_lag": 0,
             "actor_blocked": 0.0,
             "data_wait": 0.0,
@@ -636,9 +843,37 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
             "shutdown": 0.0,
             "skipped": state["skipped"],
             "skipped_incomplete": state["skipped_incomplete"],
+            "_resume_episode_number": state["games"],
         }
     finally:
         stack.close()
+
+
+def _release_cuda_graph() -> None:
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _run_full(protocol, formal, seed: int, checkpoint: Path):
+    result = _measure_full(protocol, formal, seed, checkpoint)
+    resume_episode_number = result.pop("_resume_episode_number")
+    cleanup_started = time.monotonic()
+    _release_cuda_graph()
+    result["shutdown"] = time.monotonic() - cleanup_started
+    try:
+        resume = _strict_full_reload(
+            protocol,
+            formal,
+            checkpoint,
+            seed=seed,
+            episode_number=resume_episode_number,
+        )
+    finally:
+        _release_cuda_graph()
+    result["checkpoint_reload"] = resume["strict_reload"]
+    result["resumed_update"] = resume["resumed_update"]
+    result["resume_quiesced"] = resume["resume_quiesced"]
+    return result
 
 
 def main() -> None:
@@ -700,17 +935,21 @@ def main() -> None:
         "image_digest": protocol.image_digest,
         "config_hash": expected_config,
         "model_identity_hash": expected_model,
+        "deal_seed_derivation": protocol.deal_seed_derivation,
         "measurement_seconds": elapsed,
         "counters_before": result["before"],
         "counters_after": result["after"],
         "rates": rates,
         "segments_seconds": result["segments"],
         "parameter_update_observed": result["parameter_changed"],
+        "training_phase": result["training_phase"],
         "checkpoint": {
             "path": str(args.checkpoint),
             "sha256": _sha256(args.checkpoint),
             "saved": True,
             "strict_reload": result["checkpoint_reload"],
+            "resumed_update": result["resumed_update"],
+            "resume_quiesced": result["resume_quiesced"],
         },
         "policy_lag_max": result["policy_lag"],
         "actor_blocked_ratio": result["actor_blocked"],

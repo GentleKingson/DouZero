@@ -25,7 +25,7 @@ from douzero.v3_hybrid.runtime import (
 )
 from douzero.v3_hybrid.runtime_decision import P3RuntimeProtocol
 
-P3_RUNNER_VERSION = "v3-p3-matched-runtime-runner-v3"
+P3_RUNNER_VERSION = "v3-p3-matched-runtime-runner-v4"
 _SCALE_FIELDS = (
     "hidden_size",
     "history_encoder",
@@ -81,6 +81,8 @@ def main() -> None:
         raise SystemExit("P3 first decision protocol is legacy-only")
     if base.runtime.batch_size != full.runtime.batch_size:
         raise SystemExit("P3 matched configs require the same batch size")
+    if base.seeds.derivation != full.seeds.derivation:
+        raise SystemExit("P3 matched configs require the same deal seed derivation")
     if (
         base.runtime.checkpoint_cadence_updates
         != full.runtime.checkpoint_cadence_updates
@@ -95,6 +97,13 @@ def main() -> None:
 
     base_resolved = build_pilot_resolved_config(base)
     full_resolved = build_pilot_resolved_config(full)
+    oracle_schedule = full_resolved.learner.base.base.base.schedule
+    guided_update = oracle_schedule.warmup_updates
+    if (
+        guided_update < 1
+        or oracle_schedule.at(guided_update).phase != "guided"
+    ):
+        raise SystemExit("P3 full-hybrid config has no guided phase boundary")
     protocol = P3RuntimeProtocol(
         source_git_sha=git_sha(),
         source_tree=_source_tree(),
@@ -115,7 +124,7 @@ def main() -> None:
         replay_protocol_hash=_hash({
             "runtime_replay": V3_H7_REPLAY_PROTOCOL,
             "full_single_replay": (
-                "v3-p3-nonforced-actions-incomplete-pair-skip-v1"
+                "v3-p3-formal-deals-guided-phase-incomplete-pair-skip-v2"
             ),
         }),
         gpu=args.gpu,
@@ -132,6 +141,10 @@ def main() -> None:
         full_hybrid_min_base_ratio=0.70,
         max_policy_lag=128,
         checkpoint_enabled=True,
+        deal_seed_derivation=base.seeds.derivation,
+        episodes_per_learner_update=4,
+        full_hybrid_phase="guided",
+        full_hybrid_phase_update=guided_update,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

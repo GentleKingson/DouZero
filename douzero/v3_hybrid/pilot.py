@@ -28,6 +28,10 @@ from douzero.env.rules import RuleSet
 from douzero.observation.encode_v2 import ObservationV2, get_obs_v2
 from douzero.observation.privileged import PrivilegedObservation
 from douzero.observation.schema import build_v2_schema
+from douzero.training.seed_stream import (
+    FORMAL_SEED_DERIVATION_V1,
+    derive_formal_stream_seed,
+)
 from douzero.training.v2_buffer import Episode, Transition
 
 from .adaptive_dmc import AdaptiveDMCConfig
@@ -67,7 +71,7 @@ from .training.oracle_schedule import OracleGuidingScheduleConfig
 
 P2_PILOT_SCHEMA = "v3-p2-pilot-evidence-v4"
 P2_PILOT_PROTOCOL = "real-env-single-process-checkpoint-resume-v4"
-P2_SEED_DERIVATION = "sha256(root_seed,stream_name,worker_id,episode_id)-v1"
+P2_SEED_DERIVATION = FORMAL_SEED_DERIVATION_V1
 P2_VARIANTS = (
     "v3_role",
     "v3_admc",
@@ -94,25 +98,9 @@ def derive_pilot_stream_seed(
 ) -> int:
     """Derive a stable 32-bit seed using the frozen P1 stream contract."""
 
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in (
-        root_seed, worker_id, episode_id,
-    )):
-        raise TypeError("pilot seed coordinates must be integers")
-    if worker_id < 0 or episode_id < 0 or not stream_name:
-        raise ValueError("pilot seed coordinates must be non-negative and named")
-    envelope = json.dumps(
-        {
-            "contract": P2_SEED_DERIVATION,
-            "episode_id": episode_id,
-            "root_seed": root_seed,
-            "stream_name": stream_name,
-            "worker_id": worker_id,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return int.from_bytes(hashlib.sha256(envelope).digest()[:4], "big")
+    return derive_formal_stream_seed(
+        root_seed, stream_name, worker_id, episode_id
+    )
 
 
 def build_pilot_resolved_config(

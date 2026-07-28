@@ -9,7 +9,7 @@ import statistics
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
-P3_RUNTIME_SCHEMA = "v3-p3-runtime-decision-v2"
+P3_RUNTIME_SCHEMA = "v3-p3-runtime-decision-v3"
 P3_TOPOLOGIES = (
     "base_single_process",
     "base_async_4x4",
@@ -88,6 +88,12 @@ class P3RuntimeProtocol:
     full_hybrid_min_base_ratio: float = 0.70
     max_policy_lag: int = 128
     checkpoint_enabled: bool = True
+    deal_seed_derivation: str = (
+        "sha256(root_seed,stream_name,worker_id,episode_id)-v1"
+    )
+    episodes_per_learner_update: int = 4
+    full_hybrid_phase: str = "guided"
+    full_hybrid_phase_update: int = 10000
 
     def __post_init__(self) -> None:
         for name in (
@@ -135,6 +141,8 @@ class P3RuntimeProtocol:
             "batch_size",
             "repetitions",
             "max_policy_lag",
+            "episodes_per_learner_update",
+            "full_hybrid_phase_update",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -150,6 +158,12 @@ class P3RuntimeProtocol:
             raise ValueError("P3 full-hybrid threshold must be in (0, 1]")
         if self.checkpoint_enabled is not True:
             raise ValueError("P3 benchmark must be checkpoint-enabled")
+        if self.deal_seed_derivation != (
+            "sha256(root_seed,stream_name,worker_id,episode_id)-v1"
+        ):
+            raise ValueError("P3 deal seed derivation is unsupported")
+        if self.full_hybrid_phase != "guided":
+            raise ValueError("P3 full-hybrid benchmark phase must be guided")
 
     def identity(self) -> dict[str, object]:
         payload = asdict(self)
@@ -188,12 +202,14 @@ def validate_p3_records(
         "image_digest",
         "config_hash",
         "model_identity_hash",
+        "deal_seed_derivation",
         "measurement_seconds",
         "counters_before",
         "counters_after",
         "rates",
         "segments_seconds",
         "parameter_update_observed",
+        "training_phase",
         "checkpoint",
         "policy_lag_max",
         "actor_blocked_ratio",
@@ -251,6 +267,8 @@ def validate_p3_records(
             expected_kind
         ]:
             raise ValueError("P3 benchmark model identity drift")
+        if record["deal_seed_derivation"] != protocol.deal_seed_derivation:
+            raise ValueError("P3 benchmark deal seed derivation drift")
         elapsed = _number("measurement_seconds", record["measurement_seconds"])
         if elapsed < protocol.measurement_seconds:
             raise ValueError("P3 benchmark measurement window is too short")
@@ -278,16 +296,67 @@ def validate_p3_records(
                 raise ValueError(f"P3 rate {counter} is inconsistent")
         if not isinstance(record["parameter_update_observed"], bool):
             raise ValueError("P3 parameter update observation must be bool")
+        training_phase = record["training_phase"]
+        if not isinstance(training_phase, Mapping) or set(training_phase) != {
+            "before",
+            "after",
+            "learner_update_before",
+            "learner_update_after",
+        }:
+            raise ValueError("P3 training phase fields mismatch")
+        expected_phase = (
+            protocol.full_hybrid_phase
+            if expected_kind == "full_hybrid"
+            else "disabled"
+        )
+        if (
+            training_phase["before"] != expected_phase
+            or training_phase["after"] != expected_phase
+        ):
+            raise ValueError("P3 benchmark training phase drift")
+        for name in ("learner_update_before", "learner_update_after"):
+            value = training_phase[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"P3 training phase {name} is invalid")
+        if (
+            training_phase["learner_update_after"]
+            <= training_phase["learner_update_before"]
+        ):
+            raise ValueError("P3 training phase did not advance")
+        if (
+            training_phase["learner_update_after"]
+            - training_phase["learner_update_before"]
+            != after["optimizer_steps"] - before["optimizer_steps"]
+        ):
+            raise ValueError("P3 training phase/update counter drift")
+        if (
+            expected_kind == "full_hybrid"
+            and training_phase["learner_update_before"]
+            < protocol.full_hybrid_phase_update
+        ):
+            raise ValueError("P3 full-hybrid phase was not pre-advanced")
         checkpoint = record["checkpoint"]
         if not isinstance(checkpoint, Mapping) or set(checkpoint) != {
             "path",
             "sha256",
             "saved",
             "strict_reload",
+            "resumed_update",
+            "resume_quiesced",
         }:
             raise ValueError("P3 checkpoint fields mismatch")
-        if checkpoint["saved"] is not True or checkpoint["strict_reload"] is not True:
-            raise ValueError("P3 checkpoint save/strict reload was not demonstrated")
+        if any(
+            checkpoint[name] is not True
+            for name in (
+                "saved",
+                "strict_reload",
+                "resumed_update",
+                "resume_quiesced",
+            )
+        ):
+            raise ValueError(
+                "P3 checkpoint save/reload/resumed update was not demonstrated"
+            )
         if not isinstance(checkpoint["path"], str) or not checkpoint["path"]:
             raise ValueError("P3 checkpoint path is missing")
         _require_sha256("checkpoint.sha256", checkpoint["sha256"])
@@ -352,6 +421,8 @@ def summarize_p3_decision(
     runtime_stable = all(
         record["parameter_update_observed"] is True
         and record["checkpoint"]["strict_reload"] is True
+        and record["checkpoint"]["resumed_update"] is True
+        and record["checkpoint"]["resume_quiesced"] is True
         and record["policy_lag_max"] <= protocol.max_policy_lag
         for record in records
     )
