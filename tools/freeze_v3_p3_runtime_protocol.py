@@ -25,7 +25,7 @@ from douzero.v3_hybrid.runtime import (
 )
 from douzero.v3_hybrid.runtime_decision import P3RuntimeProtocol
 
-P3_RUNNER_VERSION = "v3-p3-matched-runtime-runner-v5"
+P3_RUNNER_VERSION = "v3-p3-matched-runtime-runner-v6"
 _SCALE_FIELDS = (
     "hidden_size",
     "history_encoder",

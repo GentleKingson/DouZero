@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+import benchmarks.run_v3_p3_runtime as p3_runtime
 from benchmarks.run_v3_p3_runtime import (
     CheckpointCadence,
     SegmentProfiler,
@@ -18,14 +19,17 @@ from benchmarks.run_v3_p3_runtime import (
     _fresh_full_state,
     _learner_updates_per_cycle,
     _learner_digest,
+    _load_full_runtime_checkpoint,
     _module_digest,
+    _new_measurement_runtime,
     _parser,
     _prime_full_hybrid_phase,
     _run_full,
     _run_full_until,
     _run_runtime_until,
-    _restart_runtime_for_measurement,
+    _save_full_runtime_checkpoint,
     _seed_for_repeat,
+    _shutdown_warmup_runtime,
     _strict_runtime_reload,
     _verify_hardware_identity,
 )
@@ -39,6 +43,7 @@ from douzero.v3_hybrid.pilot import (
 )
 from douzero.v3_hybrid.runtime import V3H7RuntimeConfig
 from douzero.v3_hybrid.runtime_decision import (
+    P3_FULL_CHECKPOINT_FORMAT,
     P3_MEASUREMENT_SEED_WINDOW,
     P3_RUNTIME_SCHEMA,
     P3_SEGMENTS,
@@ -310,10 +315,19 @@ def test_p3_protocol_freezes_threshold_before_measurement() -> None:
         protocol.identity()["measurement_seed_window"]
         == P3_MEASUREMENT_SEED_WINDOW
     )
+    assert (
+        protocol.identity()["full_checkpoint_format"]
+        == P3_FULL_CHECKPOINT_FORMAT
+    )
     with pytest.raises(ValueError, match="measurement seed window"):
         P3RuntimeProtocol(**{
             **changed,
             "measurement_seed_window": "cumulative-after-warmup",
+        })
+    with pytest.raises(ValueError, match="full checkpoint format"):
+        P3RuntimeProtocol(**{
+            **changed,
+            "full_checkpoint_format": "unknown",
         })
 
 
@@ -347,6 +361,44 @@ def test_p3_checkpoint_cadence_saves_every_crossed_boundary() -> None:
     assert len(saves) == 3
     with pytest.raises(ValueError, match="regressed"):
         cadence.observe(15)
+
+
+def test_p3_measurement_cadence_uses_global_warmup_offset() -> None:
+    saves: list[int] = []
+
+    class FakeTrainer:
+        policy_step = 0
+        _snapshot_step = 0
+
+        def __init__(self) -> None:
+            self.stats = SimpleNamespace(optimizer_steps=0)
+            self.global_updates = 4
+
+        def collect_episodes(self, episodes: int) -> None:
+            assert episodes == 6
+
+        def optimize(self, updates: int) -> None:
+            self.stats.optimizer_steps += updates
+            self.global_updates += updates
+
+    trainer = FakeTrainer()
+    cadence = CheckpointCadence(10, trainer.global_updates, lambda: saves.append(1))
+    with patch(
+        "benchmarks.run_v3_p3_runtime.time.monotonic",
+        side_effect=(0.0, 2.0),
+    ):
+        _run_runtime_until(
+            trainer,
+            deadline=1.0,
+            episodes=6,
+            episodes_per_learner_update=1,
+            checkpoint_cadence=cadence,
+            checkpoint_updates=lambda: trainer.global_updates,
+        )
+
+    assert trainer.stats.optimizer_steps == 6
+    assert trainer.global_updates == 10
+    assert saves == [1]
 
 
 def test_p3_runtime_cycles_keep_one_update_per_four_games() -> None:
@@ -388,7 +440,7 @@ def test_p3_runtime_cycles_keep_one_update_per_four_games() -> None:
     assert trainer.optimizations == [4]
 
 
-def test_p3_base_measurement_restarts_episode_and_stats_window() -> None:
+def test_p3_base_measurement_releases_warmup_before_new_runtime() -> None:
     order: list[str] = []
     learner = object()
     resolved = object()
@@ -420,12 +472,15 @@ def test_p3_base_measurement_restarts_episode_and_stats_window() -> None:
         def shutdown(self) -> None:
             order.append("shutdown-measurement")
 
+    warmup = WarmupTrainer()
+    _shutdown_warmup_runtime(warmup)
+    warmup = None
     with patch(
         "benchmarks.run_v3_p3_runtime._release_cuda_graph",
         side_effect=lambda: order.append("release"),
     ):
-        measured = _restart_runtime_for_measurement(
-            WarmupTrainer(),
+        p3_runtime._release_cuda_graph()
+        measured = _new_measurement_runtime(
             MeasurementTrainer,
             learner,
             resolved,
@@ -439,6 +494,49 @@ def test_p3_base_measurement_restarts_episode_and_stats_window() -> None:
         "release",
         "construct-measurement",
     ]
+
+
+def test_p3_full_checkpoint_restores_episode_cursor_fail_closed(
+    tmp_path: Path,
+) -> None:
+    protocol = _protocol()
+    path = tmp_path / "full.pt"
+
+    class FakeLearner:
+        def __init__(self) -> None:
+            self.loaded = None
+
+        def save_checkpoint(self, target: Path) -> None:
+            torch.save({"inner": torch.tensor([3])}, target)
+
+        def load_checkpoint(self, target: Path) -> None:
+            self.loaded = torch.load(
+                target, map_location="cpu", weights_only=True
+            )
+
+    _save_full_runtime_checkpoint(
+        FakeLearner(),
+        path,
+        protocol=protocol,
+        seed=101,
+        episode_number=17,
+    )
+    restored = FakeLearner()
+    assert _load_full_runtime_checkpoint(
+        restored,
+        path,
+        protocol=protocol,
+        seed=101,
+    ) == 17
+    assert torch.equal(restored.loaded["inner"], torch.tensor([3]))
+
+    with pytest.raises(RuntimeError, match="seed mismatch"):
+        _load_full_runtime_checkpoint(
+            FakeLearner(),
+            path,
+            protocol=protocol,
+            seed=202,
+        )
 
 
 def test_p3_runtime_reload_exercises_collection_update_and_quiescence() -> None:
@@ -681,7 +779,6 @@ def test_p3_full_hybrid_is_primed_to_guided_phase_consistently() -> None:
 def test_p3_full_releases_measured_cuda_graph_before_reload() -> None:
     order: list[str] = []
     measured = {
-        "_resume_episode_number": 9,
         "shutdown": 0.0,
     }
     with (

@@ -9,8 +9,9 @@ import statistics
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
-P3_RUNTIME_SCHEMA = "v3-p3-runtime-decision-v4"
+P3_RUNTIME_SCHEMA = "v3-p3-runtime-decision-v5"
 P3_MEASUREMENT_SEED_WINDOW = "fresh-runtime-episode-zero-v1"
+P3_FULL_CHECKPOINT_FORMAT = "douzero-v3-p3-full-runtime-checkpoint-v1"
 P3_TOPOLOGIES = (
     "base_single_process",
     "base_async_4x4",
@@ -96,6 +97,7 @@ class P3RuntimeProtocol:
     full_hybrid_phase: str = "guided"
     full_hybrid_phase_update: int = 10000
     measurement_seed_window: str = P3_MEASUREMENT_SEED_WINDOW
+    full_checkpoint_format: str = P3_FULL_CHECKPOINT_FORMAT
 
     def __post_init__(self) -> None:
         for name in (
@@ -168,6 +170,8 @@ class P3RuntimeProtocol:
             raise ValueError("P3 full-hybrid benchmark phase must be guided")
         if self.measurement_seed_window != P3_MEASUREMENT_SEED_WINDOW:
             raise ValueError("P3 measurement seed window is unsupported")
+        if self.full_checkpoint_format != P3_FULL_CHECKPOINT_FORMAT:
+            raise ValueError("P3 full checkpoint format is unsupported")
 
     def identity(self) -> dict[str, object]:
         payload = asdict(self)
@@ -457,6 +461,7 @@ def summarize_p3_decision(
 
 
 __all__ = [
+    "P3_FULL_CHECKPOINT_FORMAT",
     "P3_MEASUREMENT_SEED_WINDOW",
     "P3_RUNTIME_SCHEMA",
     "P3_SEGMENTS",

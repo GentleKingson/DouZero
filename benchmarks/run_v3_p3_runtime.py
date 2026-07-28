@@ -13,6 +13,7 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -39,6 +40,7 @@ from douzero.v3_hybrid.runtime import (
     V3SingleProcessTrainer,
 )
 from douzero.v3_hybrid.runtime_decision import (
+    P3_FULL_CHECKPOINT_FORMAT,
     P3_RUNTIME_SCHEMA,
     P3_SEGMENTS,
     P3RuntimeProtocol,
@@ -327,20 +329,37 @@ def _run_runtime_until(
     episodes: int,
     episodes_per_learner_update: int,
     checkpoint_cadence: CheckpointCadence,
+    *,
+    checkpoint_updates: Callable[[], int] | None = None,
 ) -> int:
     updates = _learner_updates_per_cycle(
         episodes, episodes_per_learner_update
     )
     max_lag = 0
+    update_counter = checkpoint_updates or (
+        lambda: int(trainer.stats.optimizer_steps)
+    )
     while time.monotonic() < deadline:
         trainer.collect_episodes(episodes)
         before_updates = trainer.stats.optimizer_steps
+        before_checkpoint_updates = update_counter()
         trainer.optimize(updates)
         if trainer.stats.optimizer_steps - before_updates != updates:
             raise RuntimeError("P3 runtime learner cadence did not advance exactly")
-        checkpoint_cadence.observe(trainer.stats.optimizer_steps)
+        after_checkpoint_updates = update_counter()
+        if after_checkpoint_updates - before_checkpoint_updates != updates:
+            raise RuntimeError("P3 global checkpoint cadence did not advance exactly")
+        checkpoint_cadence.observe(after_checkpoint_updates)
         max_lag = max(max_lag, trainer.policy_step - trainer._snapshot_step)
     return max_lag
+
+
+def _base_global_eligible_updates(trainer) -> int:
+    state = trainer.learner.base.base.base.schedule_state()
+    updates = state.learner_update
+    if isinstance(updates, bool) or not isinstance(updates, int) or updates < 0:
+        raise RuntimeError("P3 base learner global update counter is invalid")
+    return updates
 
 
 def _strict_runtime_reload(
@@ -389,20 +408,20 @@ def _strict_runtime_reload(
         restored.shutdown()
 
 
-def _restart_runtime_for_measurement(
-    trainer,
+def _shutdown_warmup_runtime(trainer) -> None:
+    """Quiesce and release a warmup runtime before replacement construction."""
+    try:
+        trainer.quiesce_cycle_boundary()
+    finally:
+        trainer.shutdown()
+
+
+def _new_measurement_runtime(
     trainer_type,
     learner,
     resolved,
     runtime_config,
 ):
-    """Keep warmed learner state while restarting episode/stat counters at zero."""
-
-    try:
-        trainer.quiesce_cycle_boundary()
-    finally:
-        trainer.shutdown()
-    _release_cuda_graph()
     measured = trainer_type(learner, resolved, runtime_config)
     if any(_counter_payload(measured.stats).values()):
         measured.shutdown()
@@ -452,7 +471,7 @@ def _run_base(
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     warmup_cadence = CheckpointCadence(
         protocol.checkpoint_cadence_updates,
-        trainer.stats.optimizer_steps,
+        _base_global_eligible_updates(trainer),
         lambda: trainer.save_training_checkpoint(
             str(checkpoint),
             long_running_state=checkpoint_state,
@@ -465,11 +484,12 @@ def _run_base(
             episodes,
             protocol.episodes_per_learner_update,
             warmup_cadence,
+            checkpoint_updates=lambda: _base_global_eligible_updates(trainer),
         )
-        warmup_trainer = trainer
+        _shutdown_warmup_runtime(trainer)
         trainer = None
-        trainer = _restart_runtime_for_measurement(
-            warmup_trainer,
+        _release_cuda_graph()
+        trainer = _new_measurement_runtime(
             trainer_type,
             learner,
             resolved,
@@ -477,7 +497,7 @@ def _run_base(
         )
         cadence = CheckpointCadence(
             protocol.checkpoint_cadence_updates,
-            trainer.stats.optimizer_steps,
+            _base_global_eligible_updates(trainer),
             lambda: trainer.save_training_checkpoint(
                 str(checkpoint),
                 long_running_state=checkpoint_state,
@@ -495,6 +515,7 @@ def _run_base(
             episodes,
             protocol.episodes_per_learner_update,
             cadence,
+            checkpoint_updates=lambda: _base_global_eligible_updates(trainer),
         )
         elapsed = time.monotonic() - started
         boundary = trainer.quiesce_cycle_boundary()
@@ -602,6 +623,101 @@ def _fresh_full_state(*, episode_number: int = 0) -> dict[str, int]:
         "skipped": 0,
         "skipped_incomplete": 0,
     }
+
+
+_P3_FULL_CHECKPOINT_KEYS = {
+    "format",
+    "artifact_access",
+    "protocol_hash",
+    "topology",
+    "seed",
+    "measurement_seed_window",
+    "episode_number",
+    "learner_checkpoint",
+}
+
+
+def _save_full_runtime_checkpoint(
+    learner,
+    path: Path,
+    *,
+    protocol: P3RuntimeProtocol,
+    seed: int,
+    episode_number: int,
+) -> None:
+    if (
+        isinstance(episode_number, bool)
+        or not isinstance(episode_number, int)
+        or episode_number < 0
+    ):
+        raise ValueError("P3 full checkpoint episode number is invalid")
+    with tempfile.TemporaryDirectory(prefix="douzero-p3-full-save-") as temporary:
+        learner_path = Path(temporary) / "learner.pt"
+        learner.save_checkpoint(learner_path)
+        learner_bundle = torch.load(
+            learner_path, map_location="cpu", weights_only=True
+        )
+    bundle = {
+        "format": P3_FULL_CHECKPOINT_FORMAT,
+        "artifact_access": "privileged_training_only",
+        "protocol_hash": protocol.stable_hash(),
+        "topology": "full_hybrid_single_process",
+        "seed": seed,
+        "measurement_seed_window": protocol.measurement_seed_window,
+        "episode_number": episode_number,
+        "learner_checkpoint": learner_bundle,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        torch.save(bundle, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _load_full_runtime_checkpoint(
+    learner,
+    path: Path,
+    *,
+    protocol: P3RuntimeProtocol,
+    seed: int,
+) -> int:
+    try:
+        bundle = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"unable to safely load P3 full runtime checkpoint: {exc}"
+        ) from exc
+    if not isinstance(bundle, Mapping) or set(bundle) != _P3_FULL_CHECKPOINT_KEYS:
+        raise RuntimeError("P3 full runtime checkpoint envelope mismatch")
+    expected = {
+        "format": P3_FULL_CHECKPOINT_FORMAT,
+        "artifact_access": "privileged_training_only",
+        "protocol_hash": protocol.stable_hash(),
+        "topology": "full_hybrid_single_process",
+        "seed": seed,
+        "measurement_seed_window": protocol.measurement_seed_window,
+    }
+    for name, value in expected.items():
+        if bundle[name] != value:
+            raise RuntimeError(f"P3 full runtime checkpoint {name} mismatch")
+    episode_number = bundle["episode_number"]
+    if (
+        isinstance(episode_number, bool)
+        or not isinstance(episode_number, int)
+        or episode_number < 0
+    ):
+        raise RuntimeError("P3 full runtime checkpoint episode number is invalid")
+    with tempfile.TemporaryDirectory(prefix="douzero-p3-full-load-") as temporary:
+        learner_path = Path(temporary) / "learner.pt"
+        torch.save(bundle["learner_checkpoint"], learner_path)
+        learner.load_checkpoint(learner_path)
+    return episode_number
 
 
 def _prime_full_hybrid_phase(learner, target_update: int):
@@ -721,10 +837,14 @@ def _strict_full_reload(
     checkpoint: Path,
     *,
     seed: int,
-    episode_number: int,
 ) -> dict[str, bool]:
     restored, _resolved = create_pilot_learner(formal)
-    restored.load_checkpoint(checkpoint)
+    episode_number = _load_full_runtime_checkpoint(
+        restored,
+        checkpoint,
+        protocol=protocol,
+        seed=seed,
+    )
     h3 = restored.base.base.base
     if h3.schedule_state().phase != protocol.full_hybrid_phase:
         raise RuntimeError("P3 restored full-hybrid phase drifted")
@@ -828,7 +948,13 @@ def _measure_full(protocol, formal, seed: int, checkpoint: Path):
     cadence = CheckpointCadence(
         protocol.checkpoint_cadence_updates,
         learner.eligible_updates,
-        lambda: learner.save_checkpoint(checkpoint),
+        lambda: _save_full_runtime_checkpoint(
+            learner,
+            checkpoint,
+            protocol=protocol,
+            seed=seed,
+            episode_number=state["games"],
+        ),
     )
     try:
         _run_full_until(
@@ -843,7 +969,13 @@ def _measure_full(protocol, formal, seed: int, checkpoint: Path):
         cadence = CheckpointCadence(
             protocol.checkpoint_cadence_updates,
             learner.eligible_updates,
-            lambda: learner.save_checkpoint(checkpoint),
+            lambda: _save_full_runtime_checkpoint(
+                learner,
+                checkpoint,
+                protocol=protocol,
+                seed=seed,
+                episode_number=state["games"],
+            ),
         )
         before = _full_counter(state)
         phase_before = h3.schedule_state()
@@ -869,7 +1001,13 @@ def _measure_full(protocol, formal, seed: int, checkpoint: Path):
         profiler.values["belief_logits"] = belief_logits[0]
         profiler.values["exact_dp"] = max(0.0, belief_total[0] - belief_logits[0])
         checkpoint_started = time.perf_counter()
-        learner.save_checkpoint(checkpoint)
+        _save_full_runtime_checkpoint(
+            learner,
+            checkpoint,
+            protocol=protocol,
+            seed=seed,
+            episode_number=state["games"],
+        )
         profiler.values["checkpoint"] = (
             cadence.seconds
             - cadence_seconds_before
@@ -902,7 +1040,6 @@ def _measure_full(protocol, formal, seed: int, checkpoint: Path):
             "shutdown": 0.0,
             "skipped": state["skipped"],
             "skipped_incomplete": state["skipped_incomplete"],
-            "_resume_episode_number": state["games"],
         }
     finally:
         stack.close()
@@ -915,7 +1052,6 @@ def _release_cuda_graph() -> None:
 
 def _run_full(protocol, formal, seed: int, checkpoint: Path):
     result = _measure_full(protocol, formal, seed, checkpoint)
-    resume_episode_number = result.pop("_resume_episode_number")
     cleanup_started = time.monotonic()
     _release_cuda_graph()
     result["shutdown"] = time.monotonic() - cleanup_started
@@ -925,7 +1061,6 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
             formal,
             checkpoint,
             seed=seed,
-            episode_number=resume_episode_number,
         )
     finally:
         _release_cuda_graph()
