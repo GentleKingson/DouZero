@@ -262,6 +262,24 @@ def unique_legal_actions(actions) -> list[list[int]]:
     return result
 
 
+def _step_forced_action_without_replay(
+    env,
+    infoset,
+    action_trace: list[tuple[str, tuple[int, ...]]],
+    *,
+    enabled: bool,
+):
+    """Apply an engine-forced action without policy inference or replay."""
+
+    if not isinstance(enabled, bool):
+        raise TypeError("forced-action collection mode must be boolean")
+    if not enabled or len(infoset.legal_actions) != 1:
+        return None
+    action = tuple(infoset.legal_actions[0])
+    action_trace.append((infoset.player_position, action))
+    return env.step(list(action))
+
+
 def _strategy_target(row: Transition) -> dict[str, float]:
     return {
         "min_turns_after": row.target_min_turns_after,
@@ -289,6 +307,7 @@ def collect_real_pilot_episode(
     worker_id: int,
     epsilon: float,
     segment_profiler=None,
+    skip_forced_actions: bool = False,
 ) -> PilotBatch:
     """Collect one real rules-engine episode and build aligned training sidecars."""
 
@@ -325,11 +344,24 @@ def collect_real_pilot_episode(
     deal_id = f"p2-deal-{episode_number}"
     decisions: list[PilotDecision] = []
     action_trace: list[tuple[str, tuple[int, ...]]] = []
+    environment_decisions = 0
     features = learner.config.learner.features
     collect_strategy_targets = _should_collect_strategy_targets(learner)
     strategy_config = learner.model.strategy_feature_config()
     while True:
         infoset = env.infoset
+        environment_decisions += 1
+        forced_step = _step_forced_action_without_replay(
+            env,
+            infoset,
+            action_trace,
+            enabled=skip_forced_actions,
+        )
+        if forced_step is not None:
+            _obs, _reward, done, info = forced_step
+            if done:
+                break
+            continue
         # The legacy move generator can emit rank-identical rows through
         # different decomposition paths. They are the same environment action,
         # but H3's offline-compatible action keys are intentionally unique.
@@ -497,7 +529,7 @@ def collect_real_pilot_episode(
             tuple(_strategy_target(item.v2_transition) for item in decisions)
             if collect_strategy_targets else None
         ),
-        decisions=len(decisions),
+        decisions=environment_decisions,
         winner_team=str(terminal["winner_team"]),
     )
 

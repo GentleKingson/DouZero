@@ -1,19 +1,25 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
 from benchmarks.run_v3_p3_runtime import (
     CheckpointCadence,
+    SegmentProfiler,
+    _aggregate_runtime_rss_bytes,
     _episodes_per_cycle,
     _learner_digest,
     _module_digest,
+    _run_full_until,
     _verify_hardware_identity,
 )
+from douzero.v3_hybrid.pilot import _step_forced_action_without_replay
 from douzero.v3_hybrid.runtime_decision import (
     P3_RUNTIME_SCHEMA,
     P3_SEGMENTS,
@@ -254,3 +260,166 @@ def test_p3_live_hardware_must_match_every_frozen_axis() -> None:
             return_value=drifted,
         ), pytest.raises(SystemExit, match=f"live {field}"):
             _verify_hardware_identity(protocol)
+
+
+def test_p3_async_rss_includes_every_live_actor_process(tmp_path: Path) -> None:
+    def write_status(pid: int, rss_kib: int) -> None:
+        directory = tmp_path / str(pid)
+        directory.mkdir()
+        (directory / "status").write_text(
+            f"Name:\ttest\nVmRSS:\t{rss_kib} kB\n", encoding="utf-8"
+        )
+
+    write_status(101, 100)
+    write_status(202, 20)
+    write_status(303, 30)
+    workers = [
+        SimpleNamespace(pid=202, is_alive=lambda: True),
+        SimpleNamespace(pid=303, is_alive=lambda: True),
+    ]
+    trainer = SimpleNamespace(_runtime_started=True, _workers=workers)
+
+    assert _aggregate_runtime_rss_bytes(
+        trainer, proc_root=tmp_path, parent_pid=101
+    ) == 150 * 1024
+
+    workers[1] = SimpleNamespace(pid=303, is_alive=lambda: False)
+    with pytest.raises(RuntimeError, match="not live"):
+        _aggregate_runtime_rss_bytes(
+            trainer, proc_root=tmp_path, parent_pid=101
+        )
+
+
+def test_p3_segment_timers_synchronize_before_and_after_cuda_work() -> None:
+    events: list[str] = []
+    times = iter((1.0, 3.5, 4.0, 7.0))
+    profiler = SegmentProfiler(
+        synchronize=lambda: events.append("sync"),
+        clock=lambda: next(times),
+    )
+
+    with profiler.measure("public_model_forward"):
+        events.append("body")
+    accumulator = [0.0]
+    result = profiler.time_call(
+        accumulator, lambda: events.append("call") or "result"
+    )
+
+    assert result == "result"
+    assert events == ["sync", "body", "sync", "sync", "call", "sync"]
+    assert profiler.values["public_model_forward"] == pytest.approx(2.5)
+    assert accumulator[0] == pytest.approx(3.0)
+
+
+def test_p3_full_collection_skips_forced_inference_and_replay() -> None:
+    calls: list[list[int]] = []
+    env = SimpleNamespace(
+        step=lambda action: (
+            calls.append(action) or (None, 0.0, False, {"step": 1})
+        )
+    )
+    infoset = SimpleNamespace(
+        player_position="landlord_down",
+        legal_actions=[[7]],
+    )
+    trace: list[tuple[str, tuple[int, ...]]] = []
+
+    result = _step_forced_action_without_replay(
+        env, infoset, trace, enabled=True
+    )
+
+    assert result == (None, 0.0, False, {"step": 1})
+    assert calls == [[7]]
+    assert trace == [("landlord_down", (7,))]
+    assert _step_forced_action_without_replay(
+        env,
+        SimpleNamespace(
+            player_position="landlord_down",
+            legal_actions=[[7], [8]],
+        ),
+        trace,
+        enabled=True,
+    ) is None
+    assert _step_forced_action_without_replay(
+        env, infoset, trace, enabled=False
+    ) is None
+
+
+def test_p3_full_runner_enables_matched_forced_action_semantics() -> None:
+    learner = SimpleNamespace(
+        config=SimpleNamespace(
+            learner=SimpleNamespace(
+                base=SimpleNamespace(
+                    base=SimpleNamespace(
+                        base=SimpleNamespace(
+                            public=SimpleNamespace(batch_size=32)
+                        )
+                    )
+                )
+            )
+        ),
+        samples_consumed=0,
+        eligible_updates=0,
+    )
+    batch = SimpleNamespace(
+        decisions=2,
+        transitions=("row",),
+        trajectories=None,
+    )
+    collector = Mock(return_value=batch)
+
+    def train(current, _batch) -> None:
+        current.samples_consumed += 1
+        current.eligible_updates += 1
+
+    state = {
+        "games": 0,
+        "decisions": 0,
+        "transitions": 0,
+        "samples": 0,
+        "steps": 0,
+        "skipped": 0,
+    }
+    cadence = CheckpointCadence(10, 0, lambda: None)
+    with (
+        patch(
+            "benchmarks.run_v3_p3_runtime.collect_real_pilot_episode",
+            collector,
+        ),
+        patch(
+            "benchmarks.run_v3_p3_runtime.train_pilot_batch",
+            side_effect=train,
+        ),
+        patch(
+            "benchmarks.run_v3_p3_runtime.time.monotonic",
+            side_effect=(0.0, 2.0),
+        ),
+    ):
+        _run_full_until(
+            learner,
+            seed=101,
+            deadline=1.0,
+            state=state,
+            profiler=SegmentProfiler(),
+            checkpoint_cadence=cadence,
+        )
+
+    assert collector.call_args.kwargs["skip_forced_actions"] is True
+    assert state == {
+        "games": 1,
+        "decisions": 2,
+        "transitions": 1,
+        "samples": 1,
+        "steps": 1,
+        "skipped": 0,
+    }
+
+
+def test_p3_evidence_checksums_resolve_from_repository_root() -> None:
+    root = Path(__file__).resolve().parents[1]
+    manifest = root / "artifacts" / "v3-p3" / "SHA256SUMS"
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        expected, relative = line.split(maxsplit=1)
+        path = root / relative
+        assert path.is_file(), relative
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == expected

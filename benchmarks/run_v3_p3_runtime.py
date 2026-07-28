@@ -8,8 +8,8 @@ import contextlib
 import hashlib
 import json
 import math
+import os
 import platform
-import resource
 import subprocess
 import sys
 import time
@@ -173,20 +173,29 @@ class CheckpointCadence:
 
 
 class SegmentProfiler:
-    """Low-overhead semantic wall timers; nested segments may overlap."""
+    """Synchronized semantic wall timers; nested segments may overlap."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        synchronize: Callable[[], None] | None = None,
+        clock: Callable[[], float] = time.perf_counter,
+    ) -> None:
         self.values = {name: 0.0 for name in P3_SEGMENTS}
+        self._synchronize = synchronize or (lambda: None)
+        self._clock = clock
 
     @contextlib.contextmanager
     def measure(self, name: str):
         if name not in self.values:
             raise KeyError(name)
-        started = time.perf_counter()
+        self._synchronize()
+        started = self._clock()
         try:
             yield
         finally:
-            self.values[name] += time.perf_counter() - started
+            self._synchronize()
+            self.values[name] += self._clock() - started
 
     def wrap(self, name: str, function):
         def measured(*args, **kwargs):
@@ -194,6 +203,15 @@ class SegmentProfiler:
                 return function(*args, **kwargs)
 
         return measured
+
+    def time_call(self, accumulator: list[float], function, *args, **kwargs):
+        self._synchronize()
+        started = self._clock()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            self._synchronize()
+            accumulator[0] += self._clock() - started
 
 
 def _episodes_per_cycle(topology: str, actors: int, games: int) -> int:
@@ -234,6 +252,45 @@ def _shared_memory_bytes(trainer) -> int:
                 seen.add(key)
                 total += storage.nbytes()
     return total
+
+
+def _process_rss_bytes(pid: int, proc_root: Path) -> int:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 1:
+        raise ValueError("P3 process PID must be a positive int")
+    status = (proc_root / str(pid) / "status").read_text(encoding="utf-8")
+    rows = [
+        line.split()
+        for line in status.splitlines()
+        if line.startswith("VmRSS:")
+    ]
+    if len(rows) != 1 or len(rows[0]) != 3 or rows[0][2] != "kB":
+        raise RuntimeError(f"P3 could not read VmRSS for process {pid}")
+    try:
+        rss_kib = int(rows[0][1])
+    except ValueError as error:
+        raise RuntimeError(f"P3 process {pid} VmRSS is invalid") from error
+    if rss_kib < 0:
+        raise RuntimeError(f"P3 process {pid} VmRSS is negative")
+    return rss_kib * 1024
+
+
+def _aggregate_runtime_rss_bytes(
+    trainer,
+    *,
+    proc_root: Path = Path("/proc"),
+    parent_pid: int | None = None,
+) -> int:
+    """Measure parent plus every live async actor before worker shutdown."""
+
+    pids = [os.getpid() if parent_pid is None else parent_pid]
+    if trainer is not None and getattr(trainer, "_runtime_started", False):
+        for worker in trainer._workers:
+            if worker.pid is None or not worker.is_alive():
+                raise RuntimeError("P3 async actor is not live during RSS measurement")
+            pids.append(int(worker.pid))
+    if len(set(pids)) != len(pids):
+        raise RuntimeError("P3 runtime RSS process identities are not unique")
+    return sum(_process_rss_bytes(pid, proc_root) for pid in pids)
 
 
 def _run_runtime_until(
@@ -347,7 +404,7 @@ def _run_base(
             + time.perf_counter()
             - checkpoint_started
         )
-        cpu_ram = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
+        cpu_ram = _aggregate_runtime_rss_bytes(trainer)
         vram = int(torch.cuda.max_memory_allocated())
         shutdown_started = time.monotonic()
         trainer.shutdown()
@@ -419,6 +476,7 @@ def _run_full_until(
                 worker_id=0,
                 epsilon=0.01,
                 segment_profiler=profiler,
+                skip_forced_actions=True,
             )
         state["games"] += 1
         state["decisions"] += batch.decisions
@@ -442,7 +500,9 @@ def _strict_full_reload(formal, checkpoint: Path) -> bool:
 
 def _run_full(protocol, formal, seed: int, checkpoint: Path):
     learner, _resolved = create_pilot_learner(formal)
-    profiler = SegmentProfiler()
+    profiler = SegmentProfiler(
+        synchronize=lambda: torch.cuda.synchronize(learner.device)
+    )
     h3 = learner.base.base.base
     belief_model = learner.base.base.belief_model
     patches = [
@@ -479,16 +539,14 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
         original_logits = belief_model._forward_logits
 
         def timed_forward(*args, **kwargs):
-            started = time.perf_counter()
-            result = original_forward(*args, **kwargs)
-            belief_total[0] += time.perf_counter() - started
-            return result
+            return profiler.time_call(
+                belief_total, original_forward, *args, **kwargs
+            )
 
         def timed_logits(*args, **kwargs):
-            started = time.perf_counter()
-            result = original_logits(*args, **kwargs)
-            belief_logits[0] += time.perf_counter() - started
-            return result
+            return profiler.time_call(
+                belief_logits, original_logits, *args, **kwargs
+            )
 
         patches.extend([
             patch.object(belief_model, "forward", timed_forward),
@@ -549,7 +607,7 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
             + time.perf_counter()
             - checkpoint_started
         )
-        cpu_ram = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
+        cpu_ram = _aggregate_runtime_rss_bytes(None)
         vram = int(torch.cuda.max_memory_allocated())
         strict_reload = _strict_full_reload(formal, checkpoint)
         return {
