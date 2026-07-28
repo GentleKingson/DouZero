@@ -28,6 +28,7 @@ from douzero.v3_hybrid.runtime_decision import (
     summarize_p3_decision,
     validate_p3_records,
 )
+from tools.summarize_v3_p3_runtime import write_repository_checksums
 
 
 def _sha(character: str) -> str:
@@ -415,11 +416,31 @@ def test_p3_full_runner_enables_matched_forced_action_semantics() -> None:
     }
 
 
-def test_p3_evidence_checksums_resolve_from_repository_root() -> None:
-    root = Path(__file__).resolve().parents[1]
-    manifest = root / "artifacts" / "v3-p3" / "SHA256SUMS"
+def test_p3_evidence_checksums_resolve_from_repository_root(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    evidence = root / "artifacts" / "v3-p3"
+    evidence.mkdir(parents=True)
+    paths = tuple(evidence / name for name in (
+        "protocol.json", "records.jsonl", "summary.json"
+    ))
+    for index, path in enumerate(paths):
+        path.write_text(f"payload-{index}\n", encoding="utf-8")
+    manifest = evidence / "SHA256SUMS"
+
+    write_repository_checksums(
+        manifest, paths, repository_root=root
+    )
+
     for line in manifest.read_text(encoding="utf-8").splitlines():
         expected, relative = line.split(maxsplit=1)
         path = root / relative
         assert path.is_file(), relative
         assert hashlib.sha256(path.read_bytes()).hexdigest() == expected
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="inside the repository"):
+        write_repository_checksums(
+            manifest, (outside,), repository_root=root
+        )
