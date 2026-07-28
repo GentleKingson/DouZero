@@ -28,6 +28,11 @@ from douzero.observation.schema import (
     history_token_width,
     state_width,
 )
+from douzero.training.seed_stream import (
+    FORMAL_SEED_DERIVATION_V1,
+    TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
+    derive_formal_stream_seed,
+)
 from douzero.training.v2_buffer import compact_model_input_shapes
 
 
@@ -930,6 +935,7 @@ def async_actor_main(
     replay_slots: SharedReplaySlots,
     *,
     environment_seed: int,
+    environment_seed_derivation: str = TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
     action_rng_seed: int,
     epsilon: float,
     max_steps: int,
@@ -956,7 +962,15 @@ def async_actor_main(
         if action_rng_seed == 0
         else random.Random(action_rng_seed + actor_id)
     )
-    if environment_seed:
+    if environment_seed_derivation not in {
+        TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
+        FORMAL_SEED_DERIVATION_V1,
+    }:
+        raise ValueError("unsupported async environment seed derivation")
+    if (
+        environment_seed
+        and environment_seed_derivation == TOPOLOGY_LOCAL_SEED_DERIVATION_V1
+    ):
         np.random.seed((environment_seed + actor_id) % (1 << 32))
     if games_per_actor < 1:
         raise ValueError("games_per_actor must be positive")
@@ -966,6 +980,13 @@ def async_actor_main(
 
     def start_game(task):
         episode_id = int(task)
+        if environment_seed_derivation == FORMAL_SEED_DERIVATION_V1:
+            np.random.seed(derive_formal_stream_seed(
+                environment_seed,
+                "environment",
+                0,
+                episode_id,
+            ))
         snapshot = int(policy_step.value)
         event_queue.put(("started", actor_id, episode_id, snapshot))
         env = Env("adp", ruleset=ruleset)

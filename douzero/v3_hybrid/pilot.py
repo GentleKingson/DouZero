@@ -7,13 +7,14 @@ that the existing H3-H6 learners require.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import copy
 import dataclasses
+from dataclasses import dataclass
 import hashlib
 import json
 import math
 import random
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
@@ -27,6 +28,10 @@ from douzero.env.rules import RuleSet
 from douzero.observation.encode_v2 import ObservationV2, get_obs_v2
 from douzero.observation.privileged import PrivilegedObservation
 from douzero.observation.schema import build_v2_schema
+from douzero.training.seed_stream import (
+    FORMAL_SEED_DERIVATION_V1,
+    derive_formal_stream_seed,
+)
 from douzero.training.v2_buffer import Episode, Transition
 
 from .adaptive_dmc import AdaptiveDMCConfig
@@ -66,7 +71,7 @@ from .training.oracle_schedule import OracleGuidingScheduleConfig
 
 P2_PILOT_SCHEMA = "v3-p2-pilot-evidence-v4"
 P2_PILOT_PROTOCOL = "real-env-single-process-checkpoint-resume-v4"
-P2_SEED_DERIVATION = "sha256(root_seed,stream_name,worker_id,episode_id)-v1"
+P2_SEED_DERIVATION = FORMAL_SEED_DERIVATION_V1
 P2_VARIANTS = (
     "v3_role",
     "v3_admc",
@@ -93,25 +98,9 @@ def derive_pilot_stream_seed(
 ) -> int:
     """Derive a stable 32-bit seed using the frozen P1 stream contract."""
 
-    if any(isinstance(value, bool) or not isinstance(value, int) for value in (
-        root_seed, worker_id, episode_id,
-    )):
-        raise TypeError("pilot seed coordinates must be integers")
-    if worker_id < 0 or episode_id < 0 or not stream_name:
-        raise ValueError("pilot seed coordinates must be non-negative and named")
-    envelope = json.dumps(
-        {
-            "contract": P2_SEED_DERIVATION,
-            "episode_id": episode_id,
-            "root_seed": root_seed,
-            "stream_name": stream_name,
-            "worker_id": worker_id,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return int.from_bytes(hashlib.sha256(envelope).digest()[:4], "big")
+    return derive_formal_stream_seed(
+        root_seed, stream_name, worker_id, episode_id
+    )
 
 
 def build_pilot_resolved_config(
@@ -244,6 +233,7 @@ class PilotBatch:
     strategy_targets: tuple[Mapping[str, float], ...] | None
     decisions: int
     winner_team: str
+    cooperation_skip_reason: str | None = None
 
 
 def unique_legal_actions(actions) -> list[list[int]]:
@@ -259,6 +249,24 @@ def unique_legal_actions(actions) -> list[list[int]]:
     if not result:
         raise ValueError("environment returned no legal action")
     return result
+
+
+def _step_forced_action_without_replay(
+    env,
+    infoset,
+    action_trace: list[tuple[str, tuple[int, ...]]],
+    *,
+    enabled: bool,
+):
+    """Apply an engine-forced action without policy inference or replay."""
+
+    if not isinstance(enabled, bool):
+        raise TypeError("forced-action collection mode must be boolean")
+    if not enabled or len(infoset.legal_actions) != 1:
+        return None
+    action = tuple(infoset.legal_actions[0])
+    action_trace.append((infoset.player_position, action))
+    return env.step(list(action))
 
 
 def _strategy_target(row: Transition) -> dict[str, float]:
@@ -287,6 +295,8 @@ def collect_real_pilot_episode(
     root_seed: int,
     worker_id: int,
     epsilon: float,
+    segment_profiler=None,
+    skip_forced_actions: bool = False,
 ) -> PilotBatch:
     """Collect one real rules-engine episode and build aligned training sidecars."""
 
@@ -323,11 +333,24 @@ def collect_real_pilot_episode(
     deal_id = f"p2-deal-{episode_number}"
     decisions: list[PilotDecision] = []
     action_trace: list[tuple[str, tuple[int, ...]]] = []
+    environment_decisions = 0
     features = learner.config.learner.features
     collect_strategy_targets = _should_collect_strategy_targets(learner)
     strategy_config = learner.model.strategy_feature_config()
     while True:
         infoset = env.infoset
+        environment_decisions += 1
+        forced_step = _step_forced_action_without_replay(
+            env,
+            infoset,
+            action_trace,
+            enabled=skip_forced_actions,
+        )
+        if forced_step is not None:
+            _obs, _reward, done, info = forced_step
+            if done:
+                break
+            continue
         # The legacy move generator can emit rank-identical rows through
         # different decomposition paths. They are the same environment action,
         # but H3's offline-compatible action keys are intentionally unique.
@@ -446,40 +469,55 @@ def collect_real_pilot_episode(
             for index, item in enumerate(decisions)
         )
     trajectories = None
+    cooperation_skip_reason = None
     if features.cooperation:
-        trajectory_rows = []
-        for role in ("landlord_up", "landlord_down"):
-            selected_rows = [
-                (index, item, row)
-                for index, (item, row) in enumerate(zip(decisions, rows))
-                if row.role == role
-            ]
-            if not selected_rows:
-                raise RuntimeError("real pilot episode omitted one farmer role")
-            trajectory_rows.append(V3H5FarmerTrajectory(
-                episode_id=episode_id,
-                deal_id=deal_id,
-                role=role,
-                policy_id="p2-current",
-                teammate_policy_id="p2-current",
-                decisions=tuple(
-                    V3H5FarmerDecision(
-                        trace_index=item.trace_index,
-                        transition=row,
-                        public_features=build_h5_public_features(
-                            item.observation, item.selected_action_index
-                        ),
-                        selected_action_is_pass=(
-                            len(item.observation.actions.legal_actions[
-                                item.selected_action_index
-                            ]) == 0
-                        ),
-                    )
-                    for _index, item, row in selected_rows
-                ),
-                team_return=float(selected_rows[0][1].v2_transition.target_score),
-            ))
-        trajectories = tuple(trajectory_rows)
+        profile_context = (
+            nullcontext()
+            if segment_profiler is None
+            else segment_profiler.measure("cooperation_trajectory_assembly")
+        )
+        with profile_context:
+            selected_by_role = {
+                role: [
+                    (index, item, row)
+                    for index, (item, row) in enumerate(zip(decisions, rows))
+                    if row.role == role
+                ]
+                for role in ("landlord_up", "landlord_down")
+            }
+            if any(not selected for selected in selected_by_role.values()):
+                if not skip_forced_actions:
+                    raise RuntimeError("real pilot episode omitted one farmer role")
+                cooperation_skip_reason = "missing_nonforced_farmer_role"
+            trajectory_rows = []
+            for role, selected_rows in selected_by_role.items():
+                if cooperation_skip_reason is not None:
+                    break
+                trajectory_rows.append(V3H5FarmerTrajectory(
+                    episode_id=episode_id,
+                    deal_id=deal_id,
+                    role=role,
+                    policy_id="p2-current",
+                    teammate_policy_id="p2-current",
+                    decisions=tuple(
+                        V3H5FarmerDecision(
+                            trace_index=item.trace_index,
+                            transition=row,
+                            public_features=build_h5_public_features(
+                                item.observation, item.selected_action_index
+                            ),
+                            selected_action_is_pass=(
+                                len(item.observation.actions.legal_actions[
+                                    item.selected_action_index
+                                ]) == 0
+                            ),
+                        )
+                        for _index, item, row in selected_rows
+                    ),
+                    team_return=float(selected_rows[0][1].v2_transition.target_score),
+                ))
+            if cooperation_skip_reason is None:
+                trajectories = tuple(trajectory_rows)
     return PilotBatch(
         transitions=rows,
         belief_samples=belief_samples,
@@ -489,15 +527,19 @@ def collect_real_pilot_episode(
             tuple(_strategy_target(item.v2_transition) for item in decisions)
             if collect_strategy_targets else None
         ),
-        decisions=len(decisions),
+        decisions=environment_decisions,
         winner_team=str(terminal["winner_team"]),
+        cooperation_skip_reason=cooperation_skip_reason,
     )
 
 
 def slice_pilot_batch(batch: PilotBatch, start: int, end: int) -> PilotBatch:
     """Slice a non-cooperation batch while preserving sidecar alignment."""
 
-    if batch.trajectories is not None:
+    if (
+        batch.trajectories is not None
+        or batch.cooperation_skip_reason is not None
+    ):
         raise ValueError("cooperation pilot batches must stay episode-atomic")
     return PilotBatch(
         transitions=batch.transitions[start:end],
@@ -513,10 +555,13 @@ def slice_pilot_batch(batch: PilotBatch, start: int, end: int) -> PilotBatch:
         ),
         decisions=end - start,
         winner_team=batch.winner_team,
+        cooperation_skip_reason=None,
     )
 
 
 def train_pilot_batch(learner: V3H6Learner, batch: PilotBatch):
+    if batch.cooperation_skip_reason is not None:
+        raise ValueError("incomplete cooperation pilot batches must be skipped")
     oracle_state = learner.base.base.base.schedule_state()
     strategy_targets = (
         batch.strategy_targets if oracle_state.public_training else None

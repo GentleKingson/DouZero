@@ -18,6 +18,11 @@ from typing import Mapping
 
 import torch
 
+from douzero.training.seed_stream import (
+    FORMAL_SEED_DERIVATION_V1,
+    TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
+    derive_formal_stream_seed,
+)
 from douzero.training.async_single_gpu import (
     AsyncRequestCoordinator,
     PendingRequestScheduler,
@@ -37,7 +42,7 @@ from .support_matrix import (
 )
 from .training.h6_learner import V3H6Learner
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-runtime-v2"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-runtime-v3"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v2"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -63,6 +68,7 @@ class V3H7RuntimeConfig:
     request_timeout_seconds: float = 30.0
     max_policy_lag: int = 128
     environment_seed: int = 1
+    environment_seed_derivation: str = TOPOLOGY_LOCAL_SEED_DERIVATION_V1
     action_seed: int = 2
     epsilon: float = 0.01
     max_steps_per_episode: int = 1000
@@ -88,6 +94,11 @@ class V3H7RuntimeConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"H7 runtime {name} must be a non-negative int")
+        if self.environment_seed_derivation not in {
+            TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
+            FORMAL_SEED_DERIVATION_V1,
+        }:
+            raise ValueError("unknown H7 environment seed derivation")
         for name in ("microbatch_delay_ms", "request_timeout_seconds"):
             value = getattr(self, name)
             if (
@@ -284,6 +295,9 @@ class V3AsyncSingleGPUTrainer:
                 ),
                 kwargs={
                     "environment_seed": cfg.environment_seed,
+                    "environment_seed_derivation": (
+                        cfg.environment_seed_derivation
+                    ),
                     "action_rng_seed": cfg.action_seed,
                     "epsilon": cfg.epsilon,
                     "max_steps": cfg.max_steps_per_episode,
@@ -726,9 +740,18 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
             self.stats.games_collected,
             self.stats.games_collected + target,
         ):
-            np.random.seed(
-                (self.config.environment_seed + episode_number) % (1 << 32)
+            environment_seed = (
+                derive_formal_stream_seed(
+                    self.config.environment_seed,
+                    "environment",
+                    0,
+                    episode_number,
+                )
+                if self.config.environment_seed_derivation
+                == FORMAL_SEED_DERIVATION_V1
+                else (self.config.environment_seed + episode_number) % (1 << 32)
             )
+            np.random.seed(environment_seed)
             env = Env("adp")
             env.reset()
             pending = []
