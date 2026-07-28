@@ -70,7 +70,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
         required=True,
     )
-    parser.add_argument("--repeat", type=int, choices=range(3), required=True)
+    parser.add_argument("--repeat", type=int, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
@@ -82,6 +82,19 @@ def _load_protocol(path: Path) -> P3RuntimeProtocol:
         raise ValueError("P3 runtime protocol schema mismatch")
     payload["seeds"] = tuple(payload["seeds"])
     return P3RuntimeProtocol(**payload)
+
+
+def _seed_for_repeat(protocol: P3RuntimeProtocol, repeat: int) -> int:
+    if (
+        isinstance(repeat, bool)
+        or not isinstance(repeat, int)
+        or repeat < 0
+        or repeat >= protocol.repetitions
+    ):
+        raise ValueError(
+            f"P3 repeat must be in [0, {protocol.repetitions})"
+        )
+    return protocol.seeds[repeat]
 
 
 def _module_digest(components: Mapping[str, torch.nn.Module]) -> str:
@@ -879,6 +892,10 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
 def main() -> None:
     args = _parser().parse_args()
     protocol = _load_protocol(args.protocol)
+    try:
+        seed = _seed_for_repeat(protocol, args.repeat)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if git_sha() != protocol.source_git_sha:
         raise SystemExit("P3 source SHA does not match the frozen protocol")
     source_tree = _attest_clean_source(protocol.source_git_sha)
@@ -909,7 +926,6 @@ def main() -> None:
     if resolved.model.stable_hash() != expected_model:
         raise SystemExit("P3 model identity does not match the frozen protocol")
 
-    seed = protocol.seeds[args.repeat]
     result = (
         _run_full(protocol, formal, seed, args.checkpoint)
         if full

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -17,10 +18,12 @@ from benchmarks.run_v3_p3_runtime import (
     _learner_updates_per_cycle,
     _learner_digest,
     _module_digest,
+    _parser,
     _prime_full_hybrid_phase,
     _run_full,
     _run_full_until,
     _run_runtime_until,
+    _seed_for_repeat,
     _strict_runtime_reload,
     _verify_hardware_identity,
 )
@@ -153,6 +156,37 @@ def _records(protocol: P3RuntimeProtocol) -> list[dict[str, object]]:
         for topology in P3_TOPOLOGIES
         for repeat in range(protocol.repetitions)
     ]
+
+
+def test_p3_repeat_selection_uses_the_loaded_protocol() -> None:
+    args = _parser().parse_args(
+        [
+            "--protocol",
+            "protocol.json",
+            "--base-config",
+            "base.json",
+            "--full-config",
+            "full.json",
+            "--topology",
+            "base_single_process",
+            "--repeat",
+            "3",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--output",
+            "record.json",
+        ]
+    )
+    assert args.repeat == 3
+    protocol = replace(
+        _protocol(),
+        seeds=(101, 202, 303, 404),
+        repetitions=4,
+    )
+    assert _seed_for_repeat(protocol, 3) == 404
+    for repeat in (-1, 4, True):
+        with pytest.raises(ValueError, match=r"repeat must be in \[0, 4\)"):
+            _seed_for_repeat(protocol, repeat)
 
 
 def test_p3_requires_complete_matched_matrix_and_raw_rate_consistency() -> None:
