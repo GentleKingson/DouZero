@@ -9,7 +9,8 @@ import statistics
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
-P3_RUNTIME_SCHEMA = "v3-p3-runtime-decision-v3"
+P3_RUNTIME_SCHEMA = "v3-p3-runtime-decision-v4"
+P3_MEASUREMENT_SEED_WINDOW = "fresh-runtime-episode-zero-v1"
 P3_TOPOLOGIES = (
     "base_single_process",
     "base_async_4x4",
@@ -94,6 +95,7 @@ class P3RuntimeProtocol:
     episodes_per_learner_update: int = 4
     full_hybrid_phase: str = "guided"
     full_hybrid_phase_update: int = 10000
+    measurement_seed_window: str = P3_MEASUREMENT_SEED_WINDOW
 
     def __post_init__(self) -> None:
         for name in (
@@ -164,6 +166,8 @@ class P3RuntimeProtocol:
             raise ValueError("P3 deal seed derivation is unsupported")
         if self.full_hybrid_phase != "guided":
             raise ValueError("P3 full-hybrid benchmark phase must be guided")
+        if self.measurement_seed_window != P3_MEASUREMENT_SEED_WINDOW:
+            raise ValueError("P3 measurement seed window is unsupported")
 
     def identity(self) -> dict[str, object]:
         payload = asdict(self)
@@ -203,6 +207,7 @@ def validate_p3_records(
         "config_hash",
         "model_identity_hash",
         "deal_seed_derivation",
+        "measurement_seed_window",
         "measurement_seconds",
         "counters_before",
         "counters_after",
@@ -269,6 +274,8 @@ def validate_p3_records(
             raise ValueError("P3 benchmark model identity drift")
         if record["deal_seed_derivation"] != protocol.deal_seed_derivation:
             raise ValueError("P3 benchmark deal seed derivation drift")
+        if record["measurement_seed_window"] != protocol.measurement_seed_window:
+            raise ValueError("P3 benchmark measurement seed window drift")
         elapsed = _number("measurement_seconds", record["measurement_seconds"])
         if elapsed < protocol.measurement_seconds:
             raise ValueError("P3 benchmark measurement window is too short")
@@ -279,6 +286,10 @@ def validate_p3_records(
             raise ValueError("P3 counters_before fields mismatch")
         if not isinstance(after, Mapping) or set(after) != set(_COUNTERS):
             raise ValueError("P3 counters_after fields mismatch")
+        if any(before[counter] != 0 for counter in _COUNTERS):
+            raise ValueError(
+                "P3 measurement counters must start from a fresh runtime"
+            )
         if not isinstance(rates, Mapping) or set(rates) != set(_RATES):
             raise ValueError("P3 rate fields mismatch")
         for counter in _COUNTERS:
@@ -446,6 +457,7 @@ def summarize_p3_decision(
 
 
 __all__ = [
+    "P3_MEASUREMENT_SEED_WINDOW",
     "P3_RUNTIME_SCHEMA",
     "P3_SEGMENTS",
     "P3_TOPOLOGIES",

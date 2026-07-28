@@ -389,6 +389,27 @@ def _strict_runtime_reload(
         restored.shutdown()
 
 
+def _restart_runtime_for_measurement(
+    trainer,
+    trainer_type,
+    learner,
+    resolved,
+    runtime_config,
+):
+    """Keep warmed learner state while restarting episode/stat counters at zero."""
+
+    try:
+        trainer.quiesce_cycle_boundary()
+    finally:
+        trainer.shutdown()
+    _release_cuda_graph()
+    measured = trainer_type(learner, resolved, runtime_config)
+    if any(_counter_payload(measured.stats).values()):
+        measured.shutdown()
+        raise RuntimeError("P3 measurement runtime did not start from zero")
+    return measured
+
+
 def _run_base(
     protocol: P3RuntimeProtocol,
     formal,
@@ -426,9 +447,10 @@ def _run_base(
         "p3_protocol_hash": protocol.stable_hash(),
         "topology": topology,
         "seed": seed,
+        "measurement_seed_window": protocol.measurement_seed_window,
     }
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    cadence = CheckpointCadence(
+    warmup_cadence = CheckpointCadence(
         protocol.checkpoint_cadence_updates,
         trainer.stats.optimizer_steps,
         lambda: trainer.save_training_checkpoint(
@@ -442,9 +464,25 @@ def _run_base(
             time.monotonic() + protocol.warmup_seconds,
             episodes,
             protocol.episodes_per_learner_update,
-            cadence,
+            warmup_cadence,
         )
-        trainer.quiesce_cycle_boundary()
+        warmup_trainer = trainer
+        trainer = None
+        trainer = _restart_runtime_for_measurement(
+            warmup_trainer,
+            trainer_type,
+            learner,
+            resolved,
+            runtime_config,
+        )
+        cadence = CheckpointCadence(
+            protocol.checkpoint_cadence_updates,
+            trainer.stats.optimizer_steps,
+            lambda: trainer.save_training_checkpoint(
+                str(checkpoint),
+                long_running_state=checkpoint_state,
+            ),
+        )
         torch.cuda.reset_peak_memory_stats(trainer.device)
         before = _counter_payload(trainer.stats)
         phase_before = trainer.learner.base.base.base.schedule_state()
@@ -545,6 +583,24 @@ def _full_counter(state: Mapping[str, int]) -> dict[str, int]:
         "transitions": state["transitions"],
         "learner_samples": state["samples"],
         "optimizer_steps": state["steps"],
+    }
+
+
+def _fresh_full_state(*, episode_number: int = 0) -> dict[str, int]:
+    if (
+        isinstance(episode_number, bool)
+        or not isinstance(episode_number, int)
+        or episode_number < 0
+    ):
+        raise ValueError("P3 full-hybrid episode number must be non-negative")
+    return {
+        "games": episode_number,
+        "decisions": 0,
+        "transitions": 0,
+        "samples": 0,
+        "steps": 0,
+        "skipped": 0,
+        "skipped_incomplete": 0,
     }
 
 
@@ -674,15 +730,7 @@ def _strict_full_reload(
         raise RuntimeError("P3 restored full-hybrid phase drifted")
     parameter_before = _learner_digest(restored)
     updates_before = restored.eligible_updates
-    state = {
-        "games": episode_number,
-        "decisions": 0,
-        "transitions": 0,
-        "samples": 0,
-        "steps": 0,
-        "skipped": 0,
-        "skipped_incomplete": 0,
-    }
+    state = _fresh_full_state(episode_number=episode_number)
     cadence = CheckpointCadence(
         max(protocol.checkpoint_cadence_updates, 1000000),
         restored.eligible_updates,
@@ -775,15 +823,7 @@ def _measure_full(protocol, formal, seed: int, checkpoint: Path):
     stack = contextlib.ExitStack()
     for item in patches:
         stack.enter_context(item)
-    state = {
-        "games": 0,
-        "decisions": 0,
-        "transitions": 0,
-        "samples": 0,
-        "steps": 0,
-        "skipped": 0,
-        "skipped_incomplete": 0,
-    }
+    state = _fresh_full_state()
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     cadence = CheckpointCadence(
         protocol.checkpoint_cadence_updates,
@@ -798,6 +838,12 @@ def _measure_full(protocol, formal, seed: int, checkpoint: Path):
             state=state,
             profiler=profiler,
             checkpoint_cadence=cadence,
+        )
+        state = _fresh_full_state()
+        cadence = CheckpointCadence(
+            protocol.checkpoint_cadence_updates,
+            learner.eligible_updates,
+            lambda: learner.save_checkpoint(checkpoint),
         )
         before = _full_counter(state)
         phase_before = h3.schedule_state()
@@ -952,6 +998,7 @@ def main() -> None:
         "config_hash": expected_config,
         "model_identity_hash": expected_model,
         "deal_seed_derivation": protocol.deal_seed_derivation,
+        "measurement_seed_window": protocol.measurement_seed_window,
         "measurement_seconds": elapsed,
         "counters_before": result["before"],
         "counters_after": result["after"],

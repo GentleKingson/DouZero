@@ -15,6 +15,7 @@ from benchmarks.run_v3_p3_runtime import (
     SegmentProfiler,
     _aggregate_runtime_rss_bytes,
     _episodes_per_cycle,
+    _fresh_full_state,
     _learner_updates_per_cycle,
     _learner_digest,
     _module_digest,
@@ -23,6 +24,7 @@ from benchmarks.run_v3_p3_runtime import (
     _run_full,
     _run_full_until,
     _run_runtime_until,
+    _restart_runtime_for_measurement,
     _seed_for_repeat,
     _strict_runtime_reload,
     _verify_hardware_identity,
@@ -37,6 +39,7 @@ from douzero.v3_hybrid.pilot import (
 )
 from douzero.v3_hybrid.runtime import V3H7RuntimeConfig
 from douzero.v3_hybrid.runtime_decision import (
+    P3_MEASUREMENT_SEED_WINDOW,
     P3_RUNTIME_SCHEMA,
     P3_SEGMENTS,
     P3_TOPOLOGIES,
@@ -108,6 +111,7 @@ def _record(
             "full_hybrid" if full else "base"
         ],
         "deal_seed_derivation": protocol.deal_seed_derivation,
+        "measurement_seed_window": protocol.measurement_seed_window,
         "measurement_seconds": elapsed,
         "counters_before": before,
         "counters_after": after,
@@ -259,6 +263,16 @@ def test_p3_requires_guided_phase_and_exercised_resume() -> None:
     with pytest.raises(ValueError, match="seed derivation drift"):
         validate_p3_records(records, protocol)
 
+    records = _records(protocol)
+    records[0]["measurement_seed_window"] = "cumulative-after-warmup"
+    with pytest.raises(ValueError, match="measurement seed window drift"):
+        validate_p3_records(records, protocol)
+
+    records = _records(protocol)
+    records[0]["counters_before"]["games"] = 1
+    with pytest.raises(ValueError, match="start from a fresh runtime"):
+        validate_p3_records(records, protocol)
+
 
 def test_p3_decision_uses_median_full_to_base_ratio() -> None:
     protocol = _protocol()
@@ -292,6 +306,15 @@ def test_p3_protocol_freezes_threshold_before_measurement() -> None:
         "full_hybrid_phase_update": 20000,
     })
     assert phase.stable_hash() != protocol.stable_hash()
+    assert (
+        protocol.identity()["measurement_seed_window"]
+        == P3_MEASUREMENT_SEED_WINDOW
+    )
+    with pytest.raises(ValueError, match="measurement seed window"):
+        P3RuntimeProtocol(**{
+            **changed,
+            "measurement_seed_window": "cumulative-after-warmup",
+        })
 
 
 def test_p3_full_learner_digest_tracks_training_only_modules() -> None:
@@ -363,6 +386,59 @@ def test_p3_runtime_cycles_keep_one_update_per_four_games() -> None:
         )
     assert trainer.collections == [16]
     assert trainer.optimizations == [4]
+
+
+def test_p3_base_measurement_restarts_episode_and_stats_window() -> None:
+    order: list[str] = []
+    learner = object()
+    resolved = object()
+    runtime_config = object()
+
+    class WarmupTrainer:
+        def quiesce_cycle_boundary(self) -> None:
+            order.append("quiesce")
+
+        def shutdown(self) -> None:
+            order.append("shutdown-warmup")
+
+    class MeasurementTrainer:
+        def __init__(self, actual_learner, actual_resolved, actual_config):
+            assert (actual_learner, actual_resolved, actual_config) == (
+                learner,
+                resolved,
+                runtime_config,
+            )
+            order.append("construct-measurement")
+            self.stats = SimpleNamespace(
+                games_collected=0,
+                decisions_collected=0,
+                transitions_collected=0,
+                learner_cardplay_samples=0,
+                optimizer_steps=0,
+            )
+
+        def shutdown(self) -> None:
+            order.append("shutdown-measurement")
+
+    with patch(
+        "benchmarks.run_v3_p3_runtime._release_cuda_graph",
+        side_effect=lambda: order.append("release"),
+    ):
+        measured = _restart_runtime_for_measurement(
+            WarmupTrainer(),
+            MeasurementTrainer,
+            learner,
+            resolved,
+            runtime_config,
+        )
+
+    assert isinstance(measured, MeasurementTrainer)
+    assert order == [
+        "quiesce",
+        "shutdown-warmup",
+        "release",
+        "construct-measurement",
+    ]
 
 
 def test_p3_runtime_reload_exercises_collection_update_and_quiescence() -> None:
@@ -450,6 +526,26 @@ def test_p3_matched_deal_seed_uses_one_formal_episode_stream() -> None:
     ).stable_hash()
     with pytest.raises(ValueError, match="seed derivation"):
         V3H7RuntimeConfig(environment_seed_derivation="unknown")
+    assert _protocol().measurement_seed_window == P3_MEASUREMENT_SEED_WINDOW
+    warmup_state = _fresh_full_state()
+    warmup_state.update({
+        "games": 99,
+        "decisions": 1000,
+        "transitions": 500,
+        "samples": 256,
+        "steps": 8,
+    })
+    assert _fresh_full_state() == {
+        "games": 0,
+        "decisions": 0,
+        "transitions": 0,
+        "samples": 0,
+        "steps": 0,
+        "skipped": 0,
+        "skipped_incomplete": 0,
+    }
+    with pytest.raises(ValueError, match="episode number"):
+        _fresh_full_state(episode_number=-1)
 
 
 def test_p3_live_hardware_must_match_every_frozen_axis() -> None:
@@ -722,6 +818,7 @@ def test_p3_full_runner_enables_matched_forced_action_semantics() -> None:
         )
 
     assert collector.call_args.kwargs["skip_forced_actions"] is True
+    assert collector.call_args.kwargs["episode_number"] == 0
     assert state == {
         "games": 1,
         "decisions": 2,
