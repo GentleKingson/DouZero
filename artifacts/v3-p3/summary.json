@@ -1,0 +1,17 @@
+{
+  "full_hybrid_to_base_single_ratio": 0.0061686391423206085,
+  "implement_h7_1": true,
+  "median_learner_samples_per_second": {
+    "base_async_4x4": 57.66482767972669,
+    "base_async_8x4": 62.75386851018534,
+    "base_single_process": 51.28223580559728,
+    "full_hybrid_single_process": 0.3163416070961228
+  },
+  "playing_strength": "NOT MEASURED",
+  "protocol_hash": "63afd2d9b982ac9e8c50dd2cc0eeecfae07872d6bb0f95f9ed0e7302ab4ae5ea",
+  "release_candidate": "NONE",
+  "release_status": "NOT READY",
+  "runtime_stable": false,
+  "schema": "v3-p3-runtime-decision-v1",
+  "threshold": 0.7
+}
