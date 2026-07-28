@@ -5,11 +5,15 @@
   "checkpoint_enabled": true,
   "cpu": "x86_64",
   "cuda": "13.2",
+  "deal_seed_derivation": "sha256(root_seed,stream_name,worker_id,episode_id)-v1",
   "driver": "595.71.05",
+  "episodes_per_learner_update": 4,
   "full_config_hash": "6f6733e78e48b8e58dc5cd348f897369a6b095572705e6d9984dc0f3be5f671f",
   "full_hybrid_min_base_ratio": 0.7,
+  "full_hybrid_phase": "guided",
+  "full_hybrid_phase_update": 10000,
   "gpu": "NVIDIA GeForce RTX 5070",
-  "image_digest": "sha256:2e6179b7077fafd9eec7d485d0fefe2b129452d6cf07df3fa1a866647ca4ab57",
+  "image_digest": "sha256:82baec25a5b85f24d6588c306c6b4a0c9c1edf5da04cbf8b989e424b2622f844",
   "max_policy_lag": 128,
   "measurement_seconds": 300.0,
   "model_identity_hashes": {
@@ -18,16 +22,16 @@
   },
   "pytorch": "2.12.1+cu132",
   "repetitions": 3,
-  "replay_protocol_hash": "9bf83b89e4d151c4df7cf4bf76844196680d983e3a9b7af055883b4d5d2ddb3d",
-  "schema": "v3-p3-runtime-decision-v2",
+  "replay_protocol_hash": "0a3c59e3d0dc6fb34d6c1aeb72710e6a0aa382881f5160717544d04c008a7029",
+  "schema": "v3-p3-runtime-decision-v3",
   "seeds": [
     101,
     202,
     303
   ],
   "shared_scale_hash": "377320fb1eed846e322086b092053ffdc7b865b5c810a58555adcabef918c26e",
-  "source_git_sha": "1848cc37541f5bc17b570728ae3741491b5a241b",
-  "source_tree": "7408dda59406dee7c63454923015b57d25c84eff",
-  "trainer_identity_hash": "e157ff8e5653d0c6998b765caa322835f173e6127e2b2fae6c6559a62ce795f0",
+  "source_git_sha": "22df6a299a7eddfe6f5562067ac00bd8fd861828",
+  "source_tree": "1b4168d76cffd8af3fb6367d0b58304ed9ff6c81",
+  "trainer_identity_hash": "21566aa6db15c150727f6180940b3a4e0b496fe946d92f6a4bfa03faa3ae0ba5",
   "warmup_seconds": 30.0
 }

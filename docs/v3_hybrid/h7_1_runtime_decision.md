@@ -11,12 +11,21 @@ This record freezes the P3 decision before the first matched measurement.
 - Measurement: 300 seconds per repetition.
 - Shared constraints: one committed source SHA and source tree, one Docker image
   digest, one RTX 5070, batch size 32, checkpoint cadence 1,000 eligible
-  updates, and the same public backbone scale.
+  updates, the same public backbone scale, and the P1 formal per-episode deal
+  seed derivation.
+- Learner cadence: one base learner update per four collected games in every
+  base topology. Async 4x4 and 8x4 therefore execute four and eight learner
+  updates respectively after each 16- and 32-game collection cycle.
+- Full-hybrid phase: counters are checkpoint-consistently pre-advanced to the
+  first `guided` update (10,000) before warmup. The timed workload therefore
+  includes the public student, Adaptive DMC, Oracle guidance, belief,
+  cooperation, strategy, and style paths rather than Oracle warmup alone.
 - Primary gate: the median full-hybrid single-process learner samples/s must be
   at least 70% of the median base V3+ADMC single-process value.
 - Stability gate: checkpoint save and strict reload must succeed, policy lag
   must stay at or below 128, shutdown must quiesce active/in-flight/pending
-  work, and metrics must remain finite.
+  work, the restored runtime must complete another collection and optimizer
+  update, and metrics must remain finite.
 
 The 70% threshold is frozen before measurement. It will not be adjusted after
 results are observed. If throughput is below the threshold, the formal matrix
@@ -32,59 +41,63 @@ window, never the sum of segment timers.
 ## Current status
 
 - Measurement: complete on committed executable source
-  `1848cc37541f5bc17b570728ae3741491b5a241b`.
+  `22df6a299a7eddfe6f5562067ac00bd8fd861828`.
 - H7.1 decision: required.
 - Release candidate: NONE.
 - Release status: NOT READY.
 - Playing strength: NOT MEASURED.
 
-This PR does not modify the runtime algorithm and does not perform playing
-strength evaluation.
+This PR does not implement an H7.1 runtime topology and does not perform
+playing-strength evaluation. It adds only the identity-bound formal deal-seed
+mode needed to compare existing runtime paths on the same deals.
 
 ## Matched results
 
 The matrix ran in Docker on one NVIDIA GeForce RTX 5070 with driver
 595.71.05, PyTorch 2.12.1+cu132, and CUDA 13.2. The immutable protocol hash is
-`998e467f497d1c9390701bf65e1ce1bfbcab70b7ee6261776b79382043403023`;
+`7ed28fb9e3df98b31207d93eaad4551ba787a2ba090f1d61dd2a7c03c195bf73`;
 the image digest is
-`sha256:2e6179b7077fafd9eec7d485d0fefe2b129452d6cf07df3fa1a866647ca4ab57`.
+`sha256:82baec25a5b85f24d6588c306c6b4a0c9c1edf5da04cbf8b989e424b2622f844`.
 Every run used a 30-second warmup, a checkpoint-enabled 300-second measured
 window, and seeds 101, 202, and 303.
 
 | Topology | Learner samples/s (three runs) | Median | Median optimizer steps/s | Median CPU RSS |
 | --- | --- | ---: | ---: | ---: |
-| Base single process | 51.588, 46.312, 50.283 | 50.283 | 1.571 | 5.01 GiB |
-| Base async 4x4 | 22.204, 28.380, 16.369 | 22.204 | 0.694 | 8.72 GiB |
-| Base async 8x4 | 19.395, 17.907, 18.240 | 18.240 | 0.570 | 10.88 GiB |
-| Full hybrid single process | 4.435, 4.384, 4.805 | 4.435 | 0.156 | 2.40 GiB |
+| Base single process | 55.140, 49.100, 45.823 | 49.100 | 1.534 | 4.97 GiB |
+| Base async 4x4 | 78.818, 47.766, 70.495 | 70.495 | 2.203 | 7.98 GiB |
+| Base async 8x4 | 69.498, 63.603, 75.420 | 69.498 | 2.172 | 10.22 GiB |
+| Full hybrid single process | 6.876, 13.608, 19.645 | 13.608 | 0.599 | 2.39 GiB |
 
 Async CPU RSS is the aggregate of the parent process and every live Actor
 worker sampled before shutdown, not just the parent. The full-hybrid/base-
-single median learner-throughput ratio is 0.08820, far below the frozen 0.70
+single median learner-throughput ratio is 0.27716, far below the frozen 0.70
 gate. All twelve checkpoints saved and strictly reloaded, all processes
-quiesced, and all runs observed an update across the complete learner
-parameter graph. The full-hybrid measured windows produced 47, 47, and 51
-optimizer updates. Their cumulative counters, including warmup, recorded 363,
-369, and 361 skipped oversized cooperation episodes because enabled
+quiesced, and every restored runtime completed another collection and
+optimizer update. All runs observed an update across the complete learner
+parameter graph. The full-hybrid measured windows produced 75, 180, and 279
+optimizer updates entirely in the guided phase. Their cumulative counters,
+including warmup, recorded 221, 101, and 25 skipped oversized cooperation
+episodes because enabled
 cooperation requires episode-atomic batches and the frozen batch size is 32.
-Seed 202 also produced one episode where a farmer had no non-forced decision;
+Seed 303 also produced one episode where a farmer had no non-forced decision;
 the runner explicitly counted and skipped that incomplete cooperation pair
 without adding forced-action inference or replay. The runtime stability checks
 pass, but the efficiency gate fails decisively.
 
 Diagnostic medians reinforce the end-to-end result: base single process
-reached 6.285 games/s and 356.6 decisions/s, while full hybrid reached 1.255
-games/s and 80.4 decisions/s. Full-hybrid collection occupied essentially the
-entire measurement window; median synchronized segment totals were 52.6
-seconds for nested public inference, 13.4 seconds for exact belief DP, 2.94
-seconds for cooperation trajectory assembly, 8.72 seconds for Oracle learner
-work, and 274.6 seconds for collate and episode preparation. SegmentProfiler
+reached 6.137 games/s and 391.8 decisions/s, while full hybrid reached 0.900
+games/s and 47.3 decisions/s. Full-hybrid collection occupied much of the
+measurement window; median synchronized segment totals were 26.9 seconds for
+nested public inference, 13.0 seconds for exact belief DP, 1.87 seconds for
+cooperation trajectory assembly, 34.0 seconds for Oracle/public learner work,
+5.75 seconds for strategy features, and 167.5 seconds for collate and episode
+preparation. SegmentProfiler
 synchronizes CUDA at every segment boundary. These semantic components may
 still be nested, so their timings are not summed to derive throughput.
 
 ## Decision
 
-P3 selects H7.1. The complete hybrid reaches only 8.82% of base
+P3 selects H7.1. The complete hybrid reaches only 27.72% of base
 single-process learner throughput under the frozen matched protocol, so it
 cannot finish the formal training matrix within the available GPU budget.
 Work proceeds as separate PRs from the then-current `main`, starting with

@@ -1,17 +1,17 @@
 {
-  "full_hybrid_to_base_single_ratio": 0.0882009426295939,
+  "full_hybrid_to_base_single_ratio": 0.27715698393350824,
   "implement_h7_1": true,
   "median_learner_samples_per_second": {
-    "base_async_4x4": 22.20351232455441,
-    "base_async_8x4": 18.239758234862204,
-    "base_single_process": 50.28327443899778,
-    "full_hybrid_single_process": 4.435032204022169
+    "base_async_4x4": 70.49525799615547,
+    "base_async_8x4": 69.49817345961232,
+    "base_single_process": 49.09965842565583,
+    "full_hybrid_single_process": 13.608313241420236
   },
   "playing_strength": "NOT MEASURED",
-  "protocol_hash": "998e467f497d1c9390701bf65e1ce1bfbcab70b7ee6261776b79382043403023",
+  "protocol_hash": "7ed28fb9e3df98b31207d93eaad4551ba787a2ba090f1d61dd2a7c03c195bf73",
   "release_candidate": "NONE",
   "release_status": "NOT READY",
   "runtime_stable": true,
-  "schema": "v3-p3-runtime-decision-v2",
+  "schema": "v3-p3-runtime-decision-v3",
   "threshold": 0.7
 }
