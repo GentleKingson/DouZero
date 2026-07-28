@@ -9,7 +9,7 @@ import statistics
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
-P3_RUNTIME_SCHEMA = "v3-p3-runtime-decision-v1"
+P3_RUNTIME_SCHEMA = "v3-p3-runtime-decision-v2"
 P3_TOPOLOGIES = (
     "base_single_process",
     "base_async_4x4",
@@ -206,6 +206,7 @@ def validate_p3_records(
         "pending",
         "shutdown_seconds",
         "skipped_long_cooperation_episodes",
+        "skipped_incomplete_cooperation_episodes",
     }
     seen: set[tuple[str, int]] = set()
     for record in records:
@@ -313,9 +314,13 @@ def validate_p3_records(
         for name in ("active_slots", "in_flight", "pending"):
             if record[name] != 0:
                 raise ValueError(f"P3 benchmark did not quiesce {name}")
-        skipped = record["skipped_long_cooperation_episodes"]
-        if type(skipped) is not int or skipped < 0:
-            raise ValueError("P3 skipped cooperation counter is invalid")
+        for name in (
+            "skipped_long_cooperation_episodes",
+            "skipped_incomplete_cooperation_episodes",
+        ):
+            skipped = record[name]
+            if type(skipped) is not int or skipped < 0:
+                raise ValueError(f"P3 {name} counter is invalid")
     expected_pairs = {
         (topology, repeat)
         for topology in P3_TOPOLOGIES

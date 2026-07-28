@@ -245,6 +245,7 @@ class PilotBatch:
     strategy_targets: tuple[Mapping[str, float], ...] | None
     decisions: int
     winner_team: str
+    cooperation_skip_reason: str | None = None
 
 
 def unique_legal_actions(actions) -> list[list[int]]:
@@ -480,6 +481,7 @@ def collect_real_pilot_episode(
             for index, item in enumerate(decisions)
         )
     trajectories = None
+    cooperation_skip_reason = None
     if features.cooperation:
         profile_context = (
             nullcontext()
@@ -487,15 +489,22 @@ def collect_real_pilot_episode(
             else segment_profiler.measure("cooperation_trajectory_assembly")
         )
         with profile_context:
-            trajectory_rows = []
-            for role in ("landlord_up", "landlord_down"):
-                selected_rows = [
+            selected_by_role = {
+                role: [
                     (index, item, row)
                     for index, (item, row) in enumerate(zip(decisions, rows))
                     if row.role == role
                 ]
-                if not selected_rows:
+                for role in ("landlord_up", "landlord_down")
+            }
+            if any(not selected for selected in selected_by_role.values()):
+                if not skip_forced_actions:
                     raise RuntimeError("real pilot episode omitted one farmer role")
+                cooperation_skip_reason = "missing_nonforced_farmer_role"
+            trajectory_rows = []
+            for role, selected_rows in selected_by_role.items():
+                if cooperation_skip_reason is not None:
+                    break
                 trajectory_rows.append(V3H5FarmerTrajectory(
                     episode_id=episode_id,
                     deal_id=deal_id,
@@ -519,7 +528,8 @@ def collect_real_pilot_episode(
                     ),
                     team_return=float(selected_rows[0][1].v2_transition.target_score),
                 ))
-            trajectories = tuple(trajectory_rows)
+            if cooperation_skip_reason is None:
+                trajectories = tuple(trajectory_rows)
     return PilotBatch(
         transitions=rows,
         belief_samples=belief_samples,
@@ -531,13 +541,17 @@ def collect_real_pilot_episode(
         ),
         decisions=environment_decisions,
         winner_team=str(terminal["winner_team"]),
+        cooperation_skip_reason=cooperation_skip_reason,
     )
 
 
 def slice_pilot_batch(batch: PilotBatch, start: int, end: int) -> PilotBatch:
     """Slice a non-cooperation batch while preserving sidecar alignment."""
 
-    if batch.trajectories is not None:
+    if (
+        batch.trajectories is not None
+        or batch.cooperation_skip_reason is not None
+    ):
         raise ValueError("cooperation pilot batches must stay episode-atomic")
     return PilotBatch(
         transitions=batch.transitions[start:end],
@@ -553,10 +567,13 @@ def slice_pilot_batch(batch: PilotBatch, start: int, end: int) -> PilotBatch:
         ),
         decisions=end - start,
         winner_team=batch.winner_team,
+        cooperation_skip_reason=None,
     )
 
 
 def train_pilot_batch(learner: V3H6Learner, batch: PilotBatch):
+    if batch.cooperation_skip_reason is not None:
+        raise ValueError("incomplete cooperation pilot batches must be skipped")
     oracle_state = learner.base.base.base.schedule_state()
     strategy_targets = (
         batch.strategy_targets if oracle_state.public_training else None

@@ -231,6 +231,7 @@ def test_oracle_warmup_does_not_feed_public_strategy_targets():
     batch = SimpleNamespace(
         transitions=("row",), trajectories=None, belief_samples=None,
         oracle_samples=("oracle",), strategy_targets=({"label": 1.0},),
+        cooperation_skip_reason=None,
     )
     assert train_pilot_batch(Learner(), batch) == "metrics"
     assert captured["oracle_samples"] == ("oracle",)

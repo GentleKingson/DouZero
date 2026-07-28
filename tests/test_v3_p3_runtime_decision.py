@@ -117,6 +117,7 @@ def _record(
         "pending": 0,
         "shutdown_seconds": 0.1,
         "skipped_long_cooperation_episodes": 0,
+        "skipped_incomplete_cooperation_episodes": 0,
     }
 
 
@@ -171,6 +172,13 @@ def test_p3_rejects_nonfinite_segments_progress_regression_and_live_slots() -> N
     records = _records(protocol)
     records[0]["pending"] = 1
     with pytest.raises(ValueError, match="quiesce pending"):
+        validate_p3_records(records, protocol)
+    records = _records(protocol)
+    records[0]["skipped_incomplete_cooperation_episodes"] = -1
+    with pytest.raises(
+        ValueError,
+        match="skipped_incomplete_cooperation_episodes counter",
+    ):
         validate_p3_records(records, protocol)
 
 
@@ -366,6 +374,7 @@ def test_p3_full_runner_enables_matched_forced_action_semantics() -> None:
         decisions=2,
         transitions=("row",),
         trajectories=None,
+        cooperation_skip_reason=None,
     )
     collector = Mock(return_value=batch)
 
@@ -380,6 +389,7 @@ def test_p3_full_runner_enables_matched_forced_action_semantics() -> None:
         "samples": 0,
         "steps": 0,
         "skipped": 0,
+        "skipped_incomplete": 0,
     }
     cadence = CheckpointCadence(10, 0, lambda: None)
     with (
@@ -413,6 +423,75 @@ def test_p3_full_runner_enables_matched_forced_action_semantics() -> None:
         "samples": 1,
         "steps": 1,
         "skipped": 0,
+        "skipped_incomplete": 0,
+    }
+
+
+def test_p3_full_runner_skips_incomplete_nonforced_farmer_pair() -> None:
+    learner = SimpleNamespace(
+        config=SimpleNamespace(
+            learner=SimpleNamespace(
+                base=SimpleNamespace(
+                    base=SimpleNamespace(
+                        base=SimpleNamespace(
+                            public=SimpleNamespace(batch_size=32)
+                        )
+                    )
+                )
+            )
+        ),
+        samples_consumed=0,
+        eligible_updates=0,
+    )
+    batch = SimpleNamespace(
+        decisions=3,
+        transitions=("landlord", "farmer"),
+        trajectories=None,
+        cooperation_skip_reason="missing_nonforced_farmer_role",
+    )
+    collector = Mock(return_value=batch)
+    trainer = Mock()
+    state = {
+        "games": 0,
+        "decisions": 0,
+        "transitions": 0,
+        "samples": 0,
+        "steps": 0,
+        "skipped": 0,
+        "skipped_incomplete": 0,
+    }
+    with (
+        patch(
+            "benchmarks.run_v3_p3_runtime.collect_real_pilot_episode",
+            collector,
+        ),
+        patch(
+            "benchmarks.run_v3_p3_runtime.train_pilot_batch",
+            trainer,
+        ),
+        patch(
+            "benchmarks.run_v3_p3_runtime.time.monotonic",
+            side_effect=(0.0, 2.0),
+        ),
+    ):
+        _run_full_until(
+            learner,
+            seed=101,
+            deadline=1.0,
+            state=state,
+            profiler=SegmentProfiler(),
+            checkpoint_cadence=CheckpointCadence(10, 0, lambda: None),
+        )
+
+    trainer.assert_not_called()
+    assert state == {
+        "games": 1,
+        "decisions": 3,
+        "transitions": 2,
+        "samples": 0,
+        "steps": 0,
+        "skipped": 0,
+        "skipped_incomplete": 1,
     }
 
 

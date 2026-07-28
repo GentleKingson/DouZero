@@ -441,6 +441,7 @@ def _run_base(
             "pending": int(boundary["pending_requests"]),
             "shutdown": shutdown_seconds,
             "skipped": 0,
+            "skipped_incomplete": 0,
         }
     finally:
         if trainer is not None:
@@ -481,6 +482,11 @@ def _run_full_until(
         state["games"] += 1
         state["decisions"] += batch.decisions
         state["transitions"] += len(batch.transitions)
+        if batch.cooperation_skip_reason is not None:
+            if batch.cooperation_skip_reason != "missing_nonforced_farmer_role":
+                raise RuntimeError("P3 encountered an unknown cooperation skip reason")
+            state["skipped_incomplete"] += 1
+            continue
         if batch.trajectories is not None and len(batch.transitions) > batch_size:
             state["skipped"] += 1
             continue
@@ -562,6 +568,7 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
         "samples": 0,
         "steps": 0,
         "skipped": 0,
+        "skipped_incomplete": 0,
     }
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     cadence = CheckpointCadence(
@@ -628,6 +635,7 @@ def _run_full(protocol, formal, seed: int, checkpoint: Path):
             "pending": 0,
             "shutdown": 0.0,
             "skipped": state["skipped"],
+            "skipped_incomplete": state["skipped_incomplete"],
         }
     finally:
         stack.close()
@@ -715,6 +723,9 @@ def main() -> None:
         "pending": result["pending"],
         "shutdown_seconds": result["shutdown"],
         "skipped_long_cooperation_episodes": result["skipped"],
+        "skipped_incomplete_cooperation_episodes": result[
+            "skipped_incomplete"
+        ],
     }
     json.dumps(record, allow_nan=False)
     if any(

@@ -25,7 +25,7 @@ from douzero.v3_hybrid.runtime import (
 )
 from douzero.v3_hybrid.runtime_decision import P3RuntimeProtocol
 
-P3_RUNNER_VERSION = "v3-p3-matched-runtime-runner-v2"
+P3_RUNNER_VERSION = "v3-p3-matched-runtime-runner-v3"
 _SCALE_FIELDS = (
     "hidden_size",
     "history_encoder",
@@ -114,7 +114,9 @@ def main() -> None:
         }),
         replay_protocol_hash=_hash({
             "runtime_replay": V3_H7_REPLAY_PROTOCOL,
-            "full_single_replay": "v3-p2-real-env-episode-atomic-v4",
+            "full_single_replay": (
+                "v3-p3-nonforced-actions-incomplete-pair-skip-v1"
+            ),
         }),
         gpu=args.gpu,
         driver=args.driver,
