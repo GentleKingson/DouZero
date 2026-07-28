@@ -7,13 +7,14 @@ that the existing H3-H6 learners require.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import copy
 import dataclasses
+from dataclasses import dataclass
 import hashlib
 import json
 import math
 import random
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
@@ -287,6 +288,7 @@ def collect_real_pilot_episode(
     root_seed: int,
     worker_id: int,
     epsilon: float,
+    segment_profiler=None,
 ) -> PilotBatch:
     """Collect one real rules-engine episode and build aligned training sidecars."""
 
@@ -447,39 +449,45 @@ def collect_real_pilot_episode(
         )
     trajectories = None
     if features.cooperation:
-        trajectory_rows = []
-        for role in ("landlord_up", "landlord_down"):
-            selected_rows = [
-                (index, item, row)
-                for index, (item, row) in enumerate(zip(decisions, rows))
-                if row.role == role
-            ]
-            if not selected_rows:
-                raise RuntimeError("real pilot episode omitted one farmer role")
-            trajectory_rows.append(V3H5FarmerTrajectory(
-                episode_id=episode_id,
-                deal_id=deal_id,
-                role=role,
-                policy_id="p2-current",
-                teammate_policy_id="p2-current",
-                decisions=tuple(
-                    V3H5FarmerDecision(
-                        trace_index=item.trace_index,
-                        transition=row,
-                        public_features=build_h5_public_features(
-                            item.observation, item.selected_action_index
-                        ),
-                        selected_action_is_pass=(
-                            len(item.observation.actions.legal_actions[
-                                item.selected_action_index
-                            ]) == 0
-                        ),
-                    )
-                    for _index, item, row in selected_rows
-                ),
-                team_return=float(selected_rows[0][1].v2_transition.target_score),
-            ))
-        trajectories = tuple(trajectory_rows)
+        profile_context = (
+            nullcontext()
+            if segment_profiler is None
+            else segment_profiler.measure("cooperation_trajectory_assembly")
+        )
+        with profile_context:
+            trajectory_rows = []
+            for role in ("landlord_up", "landlord_down"):
+                selected_rows = [
+                    (index, item, row)
+                    for index, (item, row) in enumerate(zip(decisions, rows))
+                    if row.role == role
+                ]
+                if not selected_rows:
+                    raise RuntimeError("real pilot episode omitted one farmer role")
+                trajectory_rows.append(V3H5FarmerTrajectory(
+                    episode_id=episode_id,
+                    deal_id=deal_id,
+                    role=role,
+                    policy_id="p2-current",
+                    teammate_policy_id="p2-current",
+                    decisions=tuple(
+                        V3H5FarmerDecision(
+                            trace_index=item.trace_index,
+                            transition=row,
+                            public_features=build_h5_public_features(
+                                item.observation, item.selected_action_index
+                            ),
+                            selected_action_is_pass=(
+                                len(item.observation.actions.legal_actions[
+                                    item.selected_action_index
+                                ]) == 0
+                            ),
+                        )
+                        for _index, item, row in selected_rows
+                    ),
+                    team_return=float(selected_rows[0][1].v2_transition.target_score),
+                ))
+            trajectories = tuple(trajectory_rows)
     return PilotBatch(
         transitions=rows,
         belief_samples=belief_samples,
