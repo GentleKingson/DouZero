@@ -67,7 +67,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1c-runtime-v10"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1c-runtime-v11"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v6"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -765,6 +765,25 @@ def _restore_h7_cooperation_alignment_counters(
     alignment.oversized_episodes = stats.cooperation_oversized_episodes
 
 
+def _h71c_needs_collection_retry(
+    *,
+    completed: int,
+    target: int,
+    received: int,
+    expected: int,
+    replay_size: int,
+) -> bool:
+    """Return whether a completed collection has no eligible farmer episode."""
+
+    values = (completed, target, received, expected, replay_size)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in values
+    ):
+        raise ValueError("H7.1c collection retry counters must be non-negative ints")
+    return completed >= target and received >= expected and replay_size == 0
+
+
 def validate_v3_h7_runtime_config(
     resolved_config: V3H6ResolvedConfig,
     runtime_config: V3H7RuntimeConfig,
@@ -1389,20 +1408,50 @@ class V3AsyncSingleGPUTrainer:
             raise ValueError("H7 episode target must be non-negative")
         if target == 0:
             return
+        initial_episode_id = self.stats.games_collected
+        requested_target = target
+        retry_limit = (
+            self.config.cooperation_episode_capacity
+            if self.cooperation_buffer is not None
+            else 0
+        )
         if not self._runtime_started:
             self._start_runtime()
         self._publish_snapshot()
         for episode_id in range(
-            self.stats.games_collected,
-            self.stats.games_collected + target,
+            initial_episode_id,
+            initial_episode_id + target,
         ):
             self._tasks.put(episode_id)
         completed = expected = received = 0
         deadline = time.monotonic() + self.config.request_timeout_seconds * max(1, target)
-        while completed < target or received < expected:
+        while True:
             self._coordinator._raise_if_failed()
             self._service_requests()
             received += self._drain_replay()
+            if completed >= target and received >= expected:
+                needs_retry = (
+                    self.cooperation_buffer is not None
+                    and _h71c_needs_collection_retry(
+                        completed=completed,
+                        target=target,
+                        received=received,
+                        expected=expected,
+                        replay_size=len(self.cooperation_buffer),
+                    )
+                )
+                if not needs_retry:
+                    break
+                retries = target - requested_target
+                if retries >= retry_limit:
+                    raise RuntimeError(
+                        "H7.1c collection exhausted its bounded eligible-episode "
+                        "retry budget"
+                    )
+                self._tasks.put(initial_episode_id + target)
+                target += 1
+                deadline += self.config.request_timeout_seconds
+                continue
             for process in self._workers:
                 if process.exitcode is not None:
                     raise RuntimeError(
@@ -2001,10 +2050,31 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
         if target < 0:
             raise ValueError("H7 episode target must be non-negative")
         self._publish_snapshot()
-        for episode_number in range(
-            self.stats.games_collected,
-            self.stats.games_collected + target,
-        ):
+        episode_number = self.stats.games_collected
+        completed = 0
+        retry_limit = (
+            self.config.cooperation_episode_capacity
+            if self.cooperation_buffer is not None
+            else 0
+        )
+        while True:
+            needs_retry = (
+                self.cooperation_buffer is not None
+                and _h71c_needs_collection_retry(
+                    completed=completed,
+                    target=target,
+                    received=completed,
+                    expected=completed,
+                    replay_size=len(self.cooperation_buffer),
+                )
+            )
+            if completed >= target and not needs_retry:
+                break
+            if needs_retry and completed - target >= retry_limit:
+                raise RuntimeError(
+                    "H7.1c collection exhausted its bounded eligible-episode "
+                    "retry budget"
+                )
             environment_seed = (
                 derive_formal_stream_seed(
                     self.config.environment_seed,
@@ -2208,6 +2278,8 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
             if team not in {"landlord", "farmer"}:
                 raise ValueError("H7 terminal winner_team is invalid")
             self.stats.episodes_per_team[team] += 1
+            completed += 1
+            episode_number += 1
 
     def quiesce_cycle_boundary(self) -> dict[str, object]:
         self._publish_snapshot()

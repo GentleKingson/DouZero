@@ -29,6 +29,7 @@ from douzero.v3_hybrid.runtime import (
     V3H71CCooperationAlignment,
     V3H7RuntimeConfig,
     V3H7RuntimeStats,
+    _h71c_needs_collection_retry,
     _remap_h7_cooperation_trajectories,
     _restore_h7_cooperation_alignment_counters,
     validate_v3_h7_runtime_config,
@@ -217,6 +218,22 @@ def test_resume_seeds_cumulative_alignment_skip_counters():
     )
     assert alignment.incomplete_episodes == 8
     assert alignment.oversized_episodes == 11
+
+
+def test_collection_retries_only_after_all_rows_arrive_without_eligible_episode():
+    assert _h71c_needs_collection_retry(
+        completed=4, target=4, received=120, expected=120, replay_size=0
+    )
+    assert not _h71c_needs_collection_retry(
+        completed=4, target=4, received=119, expected=120, replay_size=0
+    )
+    assert not _h71c_needs_collection_retry(
+        completed=4, target=4, received=120, expected=120, replay_size=1
+    )
+    with pytest.raises(ValueError, match="non-negative ints"):
+        _h71c_needs_collection_retry(
+            completed=-1, target=4, received=0, expected=0, replay_size=0
+        )
 
 
 def test_alignment_explicitly_skips_incomplete_and_oversized_episodes():
