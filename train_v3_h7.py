@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 
+from douzero.belief.model import BeliefConfig, BeliefModel
 from douzero.env.rules import RuleSet
 from douzero.observation.schema import build_v2_schema
 from douzero.training.long_running import (
@@ -17,12 +18,22 @@ from douzero.training.long_running import (
     LongRunningTrainer,
 )
 from douzero.v3_hybrid import V3HybridModel
+from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
 from douzero.v3_hybrid.integration_config import load_v3_hybrid_config
+from douzero.v3_hybrid.pilot import (
+    build_pilot_resolved_config,
+    create_pilot_learner,
+)
 from douzero.v3_hybrid.runtime import (
+    V3_H71A_REPLAY_PROTOCOL,
+    V3_H71A_REQUEST_PROTOCOL,
+    V3_H71A_SNAPSHOT_SEMANTICS,
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
+    resolve_v3_h7_seed_contract,
+    validate_v3_h7_formal_initialization,
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.support_matrix import (
@@ -48,6 +59,11 @@ def _parser() -> argparse.ArgumentParser:
     config = parser.add_mutually_exclusive_group(required=True)
     config.add_argument("--config", type=Path)
     config.add_argument(
+        "--formal-config",
+        type=Path,
+        help="Use a frozen P1 formal config, including H7.1a belief.",
+    )
+    config.add_argument(
         "--smoke-config",
         action="store_true",
         help="Use the explicit tiny CUDA test identity; never a strength run.",
@@ -56,10 +72,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--games-per-actor", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--replay-capacity", type=int, default=4096)
+    parser.add_argument("--belief-sidecar-capacity", type=int, default=4096)
     parser.add_argument("--target-microbatch", type=int, default=4)
     parser.add_argument("--max-policy-lag", type=int, default=128)
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--action-seed", type=int, default=2)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--action-seed", type=int)
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--episodes-per-cycle", type=int, default=4)
     parser.add_argument("--optimizer-steps-per-cycle", type=int, default=1)
@@ -79,12 +96,34 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _parser().parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("H7 async runtime requires CUDA")
+    formal = (
+        None
+        if args.formal_config is None
+        else load_formal_config(args.formal_config)
+    )
+    if formal is not None:
+        validate_v3_h7_formal_initialization(formal.initialization.kind)
     resolved = (
         build_v3_h7_smoke_config()
         if args.smoke_config
-        else load_v3_hybrid_config(args.config)
+        else (
+            load_v3_hybrid_config(args.config)
+            if formal is None
+            else build_pilot_resolved_config(formal)
+        )
+    )
+    belief_enabled = resolved.learner.features.belief
+    environment_seed, action_seed, seed_derivation = (
+        resolve_v3_h7_seed_contract(
+            formal_training_seeds=(
+                None if formal is None else formal.seeds.training
+            ),
+            formal_derivation=(
+                None if formal is None else formal.seeds.derivation
+            ),
+            requested_environment_seed=args.seed,
+            requested_action_seed=args.action_seed,
+        )
     )
     runtime_config = V3H7RuntimeConfig(
         topology=args.topology,
@@ -92,17 +131,49 @@ def main() -> None:
         games_per_actor=args.games_per_actor,
         batch_size=args.batch_size,
         replay_capacity=args.replay_capacity,
+        belief_sidecar_capacity=args.belief_sidecar_capacity,
         target_microbatch=args.target_microbatch,
         max_policy_lag=args.max_policy_lag,
-        environment_seed=args.seed,
-        action_seed=args.action_seed,
+        environment_seed=environment_seed,
+        environment_seed_derivation=seed_derivation,
+        action_seed=action_seed,
         epsilon=args.epsilon,
+        belief_runtime_enabled=belief_enabled,
+        request_protocol=(
+            V3_H71A_REQUEST_PROTOCOL
+            if belief_enabled
+            else V3H7RuntimeConfig.request_protocol
+        ),
+        replay_protocol=(
+            V3_H71A_REPLAY_PROTOCOL
+            if belief_enabled
+            else V3H7RuntimeConfig.replay_protocol
+        ),
+        snapshot_semantics=(
+            V3_H71A_SNAPSHOT_SEMANTICS
+            if belief_enabled
+            else V3H7RuntimeConfig.snapshot_semantics
+        ),
     )
     validate_v3_h7_runtime_config(resolved, runtime_config)
-    model = V3HybridModel(build_v2_schema(), resolved.model)
-    learner = V3H6Learner(
-        model, ruleset=RuleSet.legacy(), config=resolved
-    )
+    if not torch.cuda.is_available():
+        raise RuntimeError("H7 async runtime requires CUDA")
+    if formal is None:
+        model = V3HybridModel(build_v2_schema(), resolved.model)
+        belief_model = (
+            BeliefModel(BeliefConfig()) if belief_enabled else None
+        )
+        learner = V3H6Learner(
+            model,
+            ruleset=RuleSet.legacy(),
+            config=resolved,
+            belief_model=belief_model,
+        )
+    else:
+        learner, learner_resolved = create_pilot_learner(formal)
+        if learner_resolved != resolved:
+            raise RuntimeError("H7 formal config resolution is not stable")
+        model = learner.model
     trainer_type = (
         V3SingleProcessTrainer
         if args.topology == TOPOLOGY_SINGLE_PROCESS

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import platform
 import resource
+import subprocess
 import time
 from pathlib import Path
 
@@ -18,12 +22,27 @@ from douzero.v3_hybrid import V3HybridModel
 from douzero.v3_hybrid.benchmark import (
     H7_BENCHMARK_SCHEMA,
     V3H7BenchmarkProtocol,
+    h7_trainer_identity_hash,
 )
+from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
+from douzero.v3_hybrid.pilot import (
+    build_pilot_resolved_config,
+    create_pilot_learner,
+)
 from douzero.v3_hybrid.runtime import (
+    V3_H71A_REPLAY_PROTOCOL,
+    V3_H71A_REQUEST_PROTOCOL,
+    V3_H71A_SNAPSHOT_SEMANTICS,
+    V3_H7_CHECKPOINT_FORMAT,
+    V3_H7_REPLAY_PROTOCOL,
+    V3_H7_REQUEST_PROTOCOL,
+    V3_H7_RUNTIME_VERSION,
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
+    resolve_v3_h7_seed_contract,
+    validate_v3_h7_formal_initialization,
 )
 from douzero.v3_hybrid.support_matrix import (
     TOPOLOGY_ASYNC_SINGLE_GPU,
@@ -42,6 +61,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat", type=int, choices=range(3), required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--formal-config",
+        type=Path,
+        help="run the H7.1a belief topology for a committed formal config",
+    )
     return parser
 
 
@@ -58,17 +82,76 @@ def _load_protocol(path: Path) -> V3H7BenchmarkProtocol:
     return protocol
 
 
+def _hash(payload: object) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
+def _validate_live_identity(
+    protocol: V3H7BenchmarkProtocol, resolved, *, formal_config: bool
+) -> None:
+    image_digest = os.environ.get("DOUZERO_IMAGE_DIGEST")
+    if image_digest != protocol.image_digest:
+        raise ValueError("H7 benchmark live image digest mismatch")
+    query = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=driver_version",
+            "--format=csv,noheader",
+            "-i",
+            str(torch.cuda.current_device()),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    observed = {
+        "gpu": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "driver": query[0].strip() if len(query) == 1 else "",
+        "pytorch": str(torch.__version__),
+        "cuda": str(torch.version.cuda),
+        "cpu": platform.machine(),
+    }
+    for name, value in observed.items():
+        if value != getattr(protocol, name):
+            raise ValueError(f"H7 benchmark live {name} mismatch")
+    belief_enabled = resolved.learner.features.belief
+    request = (
+        V3_H71A_REQUEST_PROTOCOL if belief_enabled else V3_H7_REQUEST_PROTOCOL
+    )
+    replay = (
+        V3_H71A_REPLAY_PROTOCOL if belief_enabled else V3_H7_REPLAY_PROTOCOL
+    )
+    trainer_identity_hash = h7_trainer_identity_hash(
+        runtime_version=V3_H7_RUNTIME_VERSION,
+        checkpoint_format=V3_H7_CHECKPOINT_FORMAT,
+        request_protocol=request,
+        resolved_learner_hash=(
+            resolved.learner.stable_hash() if formal_config else None
+        ),
+    )
+    if protocol.trainer_identity_hash != trainer_identity_hash:
+        raise ValueError("H7 benchmark trainer identity mismatch")
+    if protocol.replay_protocol_hash != _hash({"replay": replay}):
+        raise ValueError("H7 benchmark replay identity mismatch")
+
+
 def _shared_memory_bytes(trainer) -> int:
     if not getattr(trainer, "_runtime_started", False):
         return 0
     seen: set[tuple[int, int]] = set()
     total = 0
-    for owner in (
+    owners = [
         trainer._coordinator,
         trainer._coordinator.slots,
         trainer._replay_slots,
         trainer._replay_slots.observations,
-    ):
+    ]
+    if trainer._coordinator.belief_inputs is not None:
+        owners.append(trainer._coordinator.belief_inputs)
+    for owner in owners:
         for value in vars(owner).values():
             if not isinstance(value, torch.Tensor):
                 continue
@@ -96,11 +179,32 @@ def main() -> None:
     args = _parser().parse_args()
     protocol = _load_protocol(args.protocol)
     seed = protocol.seeds[args.repeat]
-    resolved = build_v3_h7_smoke_config()
+    formal = (
+        None
+        if args.formal_config is None
+        else load_formal_config(args.formal_config)
+    )
+    if formal is not None:
+        validate_v3_h7_formal_initialization(formal.initialization.kind)
+    resolved = (
+        build_v3_h7_smoke_config()
+        if formal is None
+        else build_pilot_resolved_config(formal)
+    )
+    formal_config_hash = (
+        None
+        if formal is None
+        else str(formal.identity_dict()["config_sha256"])
+    )
+    if protocol.formal_config_hash != formal_config_hash:
+        raise ValueError("H7 benchmark formal config identity mismatch")
     if resolved.stable_hash() != protocol.config_hash:
         raise ValueError("H7 benchmark config hash mismatch")
     if resolved.model.stable_hash() != protocol.model_identity_hash:
         raise ValueError("H7 benchmark model hash mismatch")
+    _validate_live_identity(
+        protocol, resolved, formal_config=formal is not None
+    )
 
     if args.topology == "single_process":
         topology = TOPOLOGY_SINGLE_PROCESS
@@ -111,6 +215,19 @@ def main() -> None:
         actors = 4 if args.topology == "async_4x4" else 8
         games, episodes = 4, 4
         trainer_type = V3AsyncSingleGPUTrainer
+    belief_enabled = resolved.learner.features.belief
+    environment_seed, action_seed, seed_derivation = (
+        resolve_v3_h7_seed_contract(
+            formal_training_seeds=(
+                None if formal is None else formal.seeds.training
+            ),
+            formal_derivation=(
+                None if formal is None else formal.seeds.derivation
+            ),
+            requested_environment_seed=seed,
+            requested_action_seed=None,
+        )
+    )
     runtime_config = V3H7RuntimeConfig(
         topology=topology,
         num_actors=actors,
@@ -118,11 +235,35 @@ def main() -> None:
         batch_size=32,
         replay_capacity=4096,
         target_microbatch=4,
-        environment_seed=seed,
-        action_seed=seed + 1,
+        environment_seed=environment_seed,
+        environment_seed_derivation=seed_derivation,
+        action_seed=action_seed,
+        belief_runtime_enabled=belief_enabled,
+        request_protocol=(
+            V3_H71A_REQUEST_PROTOCOL
+            if belief_enabled
+            else V3H7RuntimeConfig.request_protocol
+        ),
+        replay_protocol=(
+            V3_H71A_REPLAY_PROTOCOL
+            if belief_enabled
+            else V3H7RuntimeConfig.replay_protocol
+        ),
+        snapshot_semantics=(
+            V3_H71A_SNAPSHOT_SEMANTICS
+            if belief_enabled
+            else V3H7RuntimeConfig.snapshot_semantics
+        ),
     )
-    model = V3HybridModel(build_v2_schema(), resolved.model)
-    learner = V3H6Learner(model, ruleset=RuleSet.legacy(), config=resolved)
+    if formal is None:
+        model = V3HybridModel(build_v2_schema(), resolved.model)
+        learner = V3H6Learner(
+            model, ruleset=RuleSet.legacy(), config=resolved
+        )
+    else:
+        learner, learner_resolved = create_pilot_learner(formal)
+        if learner_resolved != resolved:
+            raise RuntimeError("H7 benchmark formal resolution is not stable")
     trainer = trainer_type(learner, resolved, runtime_config)
     try:
         _run_until(
@@ -200,7 +341,9 @@ def main() -> None:
             "slot_read_seconds": float(boundary["slot_read_seconds"]),
             "collate_seconds": float(boundary["collate_seconds"]),
             "h2d_seconds": float(boundary["h2d_seconds"]),
-            "forward_seconds": float(boundary["forward_seconds"]),
+            "forward_seconds": float(
+                boundary["forward_seconds"] + boundary["belief_forward_seconds"]
+            ),
             "d2h_seconds": float(boundary["d2h_seconds"]),
             "publish_seconds": float(boundary["publish_seconds"]),
             "replay_drain_seconds": float(boundary["replay_drain_seconds"]),

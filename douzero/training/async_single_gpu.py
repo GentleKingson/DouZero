@@ -20,14 +20,18 @@ from enum import IntEnum
 import torch
 import numpy as np
 
+from douzero.belief.constraints import NUM_BELIEF_RANKS
+from douzero.belief.features import BELIEF_INPUT_DIM, BeliefInput
 from douzero.models_v2.batch import BatchedModelInputBundle, ModelInputBundle
 from douzero.models_v2.config import SUPPORTED_ROLES
+from douzero.observation.seats import ALL_ROLES
 from douzero.observation.schema import (
     action_width,
     context_width,
     history_token_width,
     state_width,
 )
+from douzero.style.features import STYLE_FEATURE_WIDTH
 from douzero.training.seed_stream import (
     FORMAL_SEED_DERIVATION_V1,
     TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
@@ -41,6 +45,12 @@ from douzero.training.v2_buffer import compact_model_input_shapes
 # deliberately uses two broad buckets so a small actor pool does not fragment
 # into singleton GPU launches.
 INFERENCE_ACTION_BUCKET_LIMITS: tuple[int, ...] = (64, 512)
+
+
+def _formal_action_seed(root_seed: int, actor_id: int, episode_id: int) -> int:
+    return derive_formal_stream_seed(
+        root_seed, "action", actor_id, episode_id
+    )
 
 
 def inference_action_count_bucket(action_count: int) -> int | str:
@@ -105,6 +115,21 @@ class RequestMetadata:
             self.policy_snapshot,
             inference_action_count_bucket(self.action_count),
         )
+
+
+@dataclass(frozen=True)
+class AsyncReplayKey:
+    """Stable actor-local transition identity shared by public and sidecar paths."""
+
+    actor_id: int
+    episode_id: int
+    trace_index: int
+
+    def __post_init__(self) -> None:
+        for name in ("actor_id", "episode_id", "trace_index"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"async replay key {name} must be non-negative")
 
 
 class SharedObservationSlots:
@@ -240,6 +265,100 @@ class SharedObservationSlots:
             action_mask=self.action_mask[slot_id, :count],
             acting_role=role,
             feature_schema_hash=feature_schema_hash,
+        )
+
+
+class SharedBeliefInputSlots:
+    """Public-only belief inputs transported beside existing inference slots."""
+
+    _TENSOR_FIELDS = (
+        "feature_vectors",
+        "unseen_counts",
+        "opponent_totals",
+        "roles",
+        "style_features",
+        "valid",
+    )
+
+    def __init__(self, num_slots: int) -> None:
+        if isinstance(num_slots, bool) or not isinstance(num_slots, int) or num_slots < 1:
+            raise ValueError("belief input slots require a positive slot count")
+        self.num_slots = num_slots
+        self._shared_owners = []
+        self._shared_specs = []
+
+        def shared(shape, dtype):
+            tensor, owner = _shared_tensor(shape, dtype)
+            self._shared_owners.append(owner)
+            self._shared_specs.append((tuple(shape), dtype))
+            return tensor
+
+        self.feature_vectors = shared(
+            (num_slots, BELIEF_INPUT_DIM), torch.float32
+        )
+        self.unseen_counts = shared(
+            (num_slots, NUM_BELIEF_RANKS), torch.int64
+        )
+        self.opponent_totals = shared((num_slots, 2), torch.int64)
+        self.roles = shared((num_slots, 3), torch.int64)
+        self.style_features = shared(
+            (num_slots, STYLE_FEATURE_WIDTH), torch.float32
+        )
+        self.valid = shared((num_slots,), torch.bool)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for name in self._TENSOR_FIELDS:
+            state.pop(name, None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        for name, owner, (shape, dtype) in zip(
+            self._TENSOR_FIELDS, self._shared_owners, self._shared_specs
+        ):
+            setattr(self, name, _restore_shared_tensor(owner, shape, dtype))
+
+    def clear(self, slot_id: int) -> None:
+        self.valid[slot_id] = False
+
+    def write(self, slot_id: int, belief_input: BeliefInput) -> None:
+        if not isinstance(belief_input, BeliefInput):
+            raise TypeError("async belief input slot requires BeliefInput")
+        self.feature_vectors[slot_id].copy_(
+            torch.from_numpy(belief_input.feature_vector.copy())
+        )
+        self.unseen_counts[slot_id].copy_(
+            torch.from_numpy(belief_input.unseen_counts.copy())
+        )
+        self.opponent_totals[slot_id, 0] = belief_input.opponent_a_total
+        self.opponent_totals[slot_id, 1] = belief_input.opponent_b_total
+        for index, role in enumerate((
+            belief_input.acting_role,
+            belief_input.opponent_a_role,
+            belief_input.opponent_b_role,
+        )):
+            try:
+                self.roles[slot_id, index] = ALL_ROLES.index(role)
+            except ValueError as exc:
+                raise ValueError("async belief input contains an unknown role") from exc
+        self.style_features[slot_id].copy_(
+            torch.from_numpy(belief_input.style_features.copy())
+        )
+        self.valid[slot_id] = True
+
+    def read(self, slot_id: int) -> BeliefInput:
+        if not bool(self.valid[slot_id]):
+            raise RuntimeError("async belief input slot was not written")
+        return BeliefInput(
+            feature_vector=self.feature_vectors[slot_id].numpy().copy(),
+            unseen_counts=self.unseen_counts[slot_id].numpy().copy(),
+            opponent_a_total=int(self.opponent_totals[slot_id, 0]),
+            opponent_b_total=int(self.opponent_totals[slot_id, 1]),
+            acting_role=ALL_ROLES[int(self.roles[slot_id, 0])],
+            opponent_a_role=ALL_ROLES[int(self.roles[slot_id, 1])],
+            opponent_b_role=ALL_ROLES[int(self.roles[slot_id, 2])],
+            style_features=self.style_features[slot_id].numpy().copy(),
         )
 
 
@@ -611,7 +730,7 @@ class SharedReplaySlots:
             self.free_queue.put(slot_id)
         return records
 
-    def read_ready_v3(
+    def read_ready_v3_aligned(
         self,
         *,
         feature_schema_hash: str,
@@ -670,9 +789,32 @@ class SharedReplaySlots:
                 expected_ruleset_identity=ruleset_identity,
                 adaptive_required=True,
             )
-            records.append(record)
+            records.append((
+                record,
+                AsyncReplayKey(
+                    actor_id=actor_id,
+                    episode_id=episode_id,
+                    trace_index=int(self.trace_indices[slot_id]),
+                ),
+            ))
             self.free_queue.put(slot_id)
         return records
+
+    def read_ready_v3(
+        self,
+        *,
+        feature_schema_hash: str,
+        target_transform: str,
+        ruleset_identity,
+    ):
+        return [
+            record
+            for record, _key in self.read_ready_v3_aligned(
+                feature_schema_hash=feature_schema_hash,
+                target_transform=target_transform,
+                ruleset_identity=ruleset_identity,
+            )
+        ]
 
     def close(self) -> None:
         self.free_queue.close()
@@ -690,14 +832,20 @@ class AsyncRequestCoordinator:
         max_actions: int = 256,
         output_width: int = 5,
         request_timeout_seconds: float = 30.0,
+        belief_inputs: bool = False,
     ) -> None:
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
+        if not isinstance(belief_inputs, bool):
+            raise TypeError("belief_inputs must be bool")
         self.context = mp.get_context("spawn")
         if self.context.get_start_method() != "spawn":
             raise RuntimeError("async V2 requires multiprocessing spawn")
         self.slots = SharedObservationSlots(
             schema, num_slots, max_actions, output_width=output_width
+        )
+        self.belief_inputs = (
+            SharedBeliefInputSlots(num_slots) if belief_inputs else None
         )
         self._shared_owners = []
         self._shared_specs = []
@@ -782,6 +930,8 @@ class AsyncRequestCoordinator:
         if int(self.states[slot_id]) != SlotState.FREE:
             raise RuntimeError("free queue returned a non-FREE slot")
         self.response_events[slot_id].clear()
+        if self.belief_inputs is not None:
+            self.belief_inputs.clear(slot_id)
         self.states[slot_id] = int(SlotState.WRITING)
         self.actor_ids[slot_id] = actor_id
         return slot_id
@@ -796,6 +946,16 @@ class AsyncRequestCoordinator:
         if count < 1 or not bool(self.slots.action_mask[slot_id, :count].any()):
             self.states[slot_id] = int(SlotState.FAILED)
             raise ValueError("request has zero legal actions")
+        if self.belief_inputs is not None:
+            try:
+                belief = self.belief_inputs.read(slot_id)
+            except Exception:
+                self.states[slot_id] = int(SlotState.FAILED)
+                raise
+            role = SUPPORTED_ROLES[int(self.slots.roles[slot_id])]
+            if belief.acting_role != role:
+                self.states[slot_id] = int(SlotState.FAILED)
+                raise ValueError("public policy and belief acting roles differ")
         self.request_ids[slot_id] = request_id
         self.policy_snapshots[slot_id] = policy_snapshot
         self.states[slot_id] = int(SlotState.READY)
@@ -883,6 +1043,8 @@ class AsyncRequestCoordinator:
         if int(self.states[slot_id]) != SlotState.DONE:
             raise RuntimeError("only a DONE slot may be released")
         self.states[slot_id] = int(SlotState.FREE)
+        if self.belief_inputs is not None:
+            self.belief_inputs.clear(slot_id)
         self.response_events[slot_id].clear()
         self._submitted_at.pop(slot_id, None)
         self.free_queue.put(slot_id)
@@ -946,11 +1108,13 @@ def async_actor_main(
     policy_step,
     games_per_actor: int,
     runtime_kind: str = "v2",
+    belief_sidecar_queue=None,
 ) -> None:
     """CPU-only interleaved-game actor. CUDA is never initialized here."""
     import random
 
     from douzero.env.env import Env
+    from douzero.belief.features import build_belief_input
     from douzero.models_v2.batch import observation_to_model_inputs
     from douzero.models_v2.output import ModelOutput
     from douzero.observation.encode_v2 import get_obs_v2
@@ -976,7 +1140,36 @@ def async_actor_main(
         raise ValueError("games_per_actor must be positive")
     if runtime_kind not in {"v2", "v3_hybrid"}:
         raise ValueError("runtime_kind must be v2 or v3_hybrid")
+    belief_async = coordinator.belief_inputs is not None
+    if belief_async != (belief_sidecar_queue is not None):
+        raise ValueError(
+            "async belief inference and training sidecar must be enabled together"
+        )
+    if belief_async and runtime_kind != "v3_hybrid":
+        raise ValueError("async belief is supported only by the V3 runtime")
+    if belief_async:
+        from douzero.observation.privileged import PrivilegedObservation
+        from douzero.v3_hybrid.training.h4_learner import (
+            build_v3_h4_belief_sidecar,
+        )
     request_id = actor_id << 48
+
+    def publish_belief_sidecar(key, sidecar) -> None:
+        deadline = time.monotonic() + coordinator.request_timeout_seconds
+        while True:
+            coordinator._raise_if_failed()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "async belief sidecar queue remained full past its deadline"
+                )
+            try:
+                belief_sidecar_queue.put(
+                    (key, sidecar), timeout=min(0.05, remaining)
+                )
+                return
+            except queue.Full:
+                continue
 
     def start_game(task):
         episode_id = int(task)
@@ -987,6 +1180,11 @@ def async_actor_main(
                 0,
                 episode_id,
             ))
+            action_rng = random.Random(
+                _formal_action_seed(action_rng_seed, actor_id, episode_id)
+            )
+        else:
+            action_rng = rng
         snapshot = int(policy_step.value)
         event_queue.put(("started", actor_id, episode_id, snapshot))
         env = Env("adp", ruleset=ruleset)
@@ -1003,6 +1201,7 @@ def async_actor_main(
             "pending": None,
             "started_at": time.monotonic(),
             "blocked_seconds": 0.0,
+            "action_rng": action_rng,
         }
 
     def finish_game(game) -> None:
@@ -1017,6 +1216,20 @@ def async_actor_main(
                 coordinator.abort_event,
                 coordinator.shutdown_event,
             )
+            if belief_async:
+                sidecar = getattr(transition, "belief_sidecar", None)
+                if sidecar is None:
+                    raise RuntimeError(
+                        "async belief transition is missing its training sidecar"
+                    )
+                publish_belief_sidecar(
+                    AsyncReplayKey(
+                        actor_id=actor_id,
+                        episode_id=game["episode_id"],
+                        trace_index=transition.trace_index,
+                    ),
+                    sidecar,
+                )
         team = episode.terminal_result.get("winner_team", "landlord")
         event_queue.put((
             "completed", actor_id, game["episode_id"], len(episode.transitions),
@@ -1027,7 +1240,14 @@ def async_actor_main(
         ))
 
     def apply_action(
-        game, action_index, obs, position, legal_actions, *, q_old=None
+        game,
+        action_index,
+        obs,
+        position,
+        legal_actions,
+        *,
+        q_old=None,
+        belief_sidecar=None,
     ) -> bool:
         episode = game["episode"]
         if obs is not None:
@@ -1046,6 +1266,12 @@ def async_actor_main(
                 transition.actor_q_old = float(q_old)
                 transition.actor_id = int(actor_id)
                 transition.episode_id = int(game["episode_id"])
+            if belief_async:
+                if belief_sidecar is None:
+                    raise ValueError(
+                        "async belief decision requires a training sidecar"
+                    )
+                transition.belief_sidecar = belief_sidecar
             episode.transitions.append(transition)
         action = legal_actions[action_index]
         episode.action_trace.append((position, tuple(sorted(action))))
@@ -1071,8 +1297,13 @@ def async_actor_main(
                 continue
 
             obs = get_obs_v2(infoset, ruleset=ruleset)
-            if runtime_kind == "v2" and epsilon > 0 and rng.random() < epsilon:
-                action_index = rng.randrange(len(legal_actions))
+            action_rng = game["action_rng"]
+            if (
+                runtime_kind == "v2"
+                and epsilon > 0
+                and action_rng.random() < epsilon
+            ):
+                action_index = action_rng.randrange(len(legal_actions))
                 if apply_action(
                     game, action_index, obs, position, legal_actions
                 ):
@@ -1082,6 +1313,17 @@ def async_actor_main(
             bundle = observation_to_model_inputs(obs)
             slot_id = coordinator.acquire(actor_id)
             coordinator.slots.write(slot_id, bundle)
+            belief_sidecar = None
+            if belief_async:
+                public_belief_input = build_belief_input(obs.public)
+                coordinator.belief_inputs.write(slot_id, public_belief_input)
+                privileged = PrivilegedObservation(
+                    all_handcards=dict(infoset.all_handcards),
+                    acting_role=position,
+                )
+                belief_sidecar = build_v3_h4_belief_sidecar(
+                    obs, privileged, public_inputs=bundle
+                )
             request_id += 1
             coordinator.submit(
                 slot_id,
@@ -1089,12 +1331,24 @@ def async_actor_main(
                 policy_snapshot=game["snapshot"],
             )
             game["pending"] = (
-                slot_id, request_id, obs, position, legal_actions
+                slot_id,
+                request_id,
+                obs,
+                position,
+                legal_actions,
+                belief_sidecar,
             )
             return False
 
     def resolve_request(game):
-        slot_id, pending_id, obs, position, legal_actions = game["pending"]
+        (
+            slot_id,
+            pending_id,
+            obs,
+            position,
+            legal_actions,
+            belief_sidecar,
+        ) = game["pending"]
         blocked_started = time.monotonic()
         coordinator.wait_done(slot_id, pending_id)
         game["blocked_seconds"] += time.monotonic() - blocked_started
@@ -1117,15 +1371,22 @@ def async_actor_main(
             q_values = packed[:, 5].masked_fill(~mask, float("-inf"))
             valid_indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
             action_index = (
-                int(rng.choice(valid_indices))
-                if epsilon > 0 and rng.random() < epsilon
+                int(game["action_rng"].choice(valid_indices))
+                if epsilon > 0 and game["action_rng"].random() < epsilon
                 else int(torch.argmax(q_values).item())
             )
             q_old = float(q_values[action_index].item())
         else:
             action_index = select_action(output, decision_config)
             q_old = None
-        return action_index, obs, position, legal_actions, q_old
+        return (
+            action_index,
+            obs,
+            position,
+            legal_actions,
+            q_old,
+            belief_sidecar,
+        )
 
     try:
         active = []
@@ -1163,9 +1424,23 @@ def async_actor_main(
             resolved = [
                 (game, *resolve_request(game)) for game in pending_games
             ]
-            for game, action_index, obs, position, legal_actions, q_old in resolved:
+            for (
+                game,
+                action_index,
+                obs,
+                position,
+                legal_actions,
+                q_old,
+                belief_sidecar,
+            ) in resolved:
                 if apply_action(
-                    game, action_index, obs, position, legal_actions, q_old=q_old
+                    game,
+                    action_index,
+                    obs,
+                    position,
+                    legal_actions,
+                    q_old=q_old,
+                    belief_sidecar=belief_sidecar,
                 ):
                     active.remove(game)
     except BaseException as exc:

@@ -17,13 +17,16 @@ from pathlib import Path
 from typing import Mapping
 
 import torch
+import numpy as np
 
+from douzero.belief.model import BeliefModel, belief_features_from_probs
 from douzero.training.seed_stream import (
     FORMAL_SEED_DERIVATION_V1,
     TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
     derive_formal_stream_seed,
 )
 from douzero.training.async_single_gpu import (
+    AsyncReplayKey,
     AsyncRequestCoordinator,
     PendingRequestScheduler,
     PinnedObservationBatchStager,
@@ -32,7 +35,9 @@ from douzero.training.async_single_gpu import (
 )
 
 from .adaptive_dmc import ADMC_DISABLED
+from .config import BELIEF_FEEDBACK_NONE
 from .integration_config import V3H6ResolvedConfig
+from .belief_policy import V3BeliefPolicy
 from .replay import V3ReplayTransition
 from .support_matrix import (
     RULESET_LEGACY,
@@ -41,11 +46,67 @@ from .support_matrix import (
     validate_capability_support,
 )
 from .training.h6_learner import V3H6Learner
+from .training.belief_config import BELIEF_MODE_AUXILIARY
+from .training.h4_learner import (
+    V3H4BeliefSample,
+    V3H4BeliefSidecar,
+    bind_v3_h4_belief_sidecar,
+    build_v3_h4_belief_sidecar,
+)
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-runtime-v3"
-V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v2"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1a-runtime-v7"
+V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v4"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
+V3_H71A_REQUEST_PROTOCOL = (
+    "v2-shared-slots-v3-dmc-q-public-belief-coupled-snapshot-v1"
+)
+V3_H71A_REPLAY_PROTOCOL = (
+    "v3-public-replay-plus-privileged-belief-sidecar-source-fingerprint-v2"
+)
+V3_H71A_SNAPSHOT_SEMANTICS = (
+    "game-boundary-quiescent-public-policy-plus-belief-copy-v1"
+)
+
+
+def resolve_v3_h7_seed_contract(
+    *,
+    formal_training_seeds: tuple[int, ...] | None,
+    formal_derivation: str | None,
+    requested_environment_seed: int | None,
+    requested_action_seed: int | None,
+) -> tuple[int, int, str]:
+    """Resolve topology seeds without bypassing a frozen formal contract."""
+
+    if formal_training_seeds is None:
+        return (
+            1 if requested_environment_seed is None else requested_environment_seed,
+            2 if requested_action_seed is None else requested_action_seed,
+            TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
+        )
+    if formal_derivation != FORMAL_SEED_DERIVATION_V1:
+        raise ValueError("H7 formal config seed derivation is unsupported")
+    if not formal_training_seeds:
+        raise ValueError("H7 formal config has no training seeds")
+    root_seed = (
+        formal_training_seeds[0]
+        if requested_environment_seed is None
+        else requested_environment_seed
+    )
+    if root_seed not in formal_training_seeds:
+        raise ValueError("H7 requested seed is not frozen by the formal config")
+    if requested_action_seed is not None:
+        raise ValueError("H7 formal action seed is derived and cannot be overridden")
+    return root_seed, root_seed, FORMAL_SEED_DERIVATION_V1
+
+
+def validate_v3_h7_formal_initialization(initialization_kind: str) -> None:
+    """Reject formal initialization modes that H7.1a cannot faithfully apply."""
+
+    if initialization_kind != "seeded_fresh":
+        raise NotImplementedError(
+            "H7.1a formal checkpoint initialization is not implemented"
+        )
 
 
 def _stable_hash(payload: Mapping[str, object]) -> str:
@@ -75,16 +136,20 @@ class V3H7RuntimeConfig:
     snapshot_semantics: str = "game-boundary-quiescent-copy-v1"
     request_protocol: str = V3_H7_REQUEST_PROTOCOL
     replay_protocol: str = V3_H7_REPLAY_PROTOCOL
+    belief_runtime_enabled: bool = False
+    belief_sidecar_capacity: int = 4096
 
     def __post_init__(self) -> None:
         if self.topology not in {
             TOPOLOGY_SINGLE_PROCESS, TOPOLOGY_ASYNC_SINGLE_GPU,
         }:
             raise ValueError("unknown H7 runtime topology")
+        if not isinstance(self.belief_runtime_enabled, bool):
+            raise TypeError("H7 belief_runtime_enabled must be bool")
         positive = (
             "num_actors", "games_per_actor", "batch_size", "replay_capacity",
             "max_actions", "target_microbatch", "max_policy_lag",
-            "max_steps_per_episode",
+            "max_steps_per_episode", "belief_sidecar_capacity",
         )
         for name in positive:
             value = getattr(self, name)
@@ -110,13 +175,33 @@ class V3H7RuntimeConfig:
                 raise ValueError(f"H7 runtime {name} must be positive and finite")
         if not math.isfinite(self.epsilon) or not 0.0 <= self.epsilon <= 1.0:
             raise ValueError("H7 runtime epsilon must be in [0, 1]")
-        if self.request_protocol != V3_H7_REQUEST_PROTOCOL:
-            raise ValueError("unknown H7 request protocol")
-        if self.replay_protocol != V3_H7_REPLAY_PROTOCOL:
-            raise ValueError("unknown H7 replay protocol")
+        expected_request = (
+            V3_H71A_REQUEST_PROTOCOL
+            if self.belief_runtime_enabled
+            else V3_H7_REQUEST_PROTOCOL
+        )
+        expected_replay = (
+            V3_H71A_REPLAY_PROTOCOL
+            if self.belief_runtime_enabled
+            else V3_H7_REPLAY_PROTOCOL
+        )
+        expected_snapshot = (
+            V3_H71A_SNAPSHOT_SEMANTICS
+            if self.belief_runtime_enabled
+            else "game-boundary-quiescent-copy-v1"
+        )
+        if self.request_protocol != expected_request:
+            raise ValueError("unknown H7 request protocol for selected capabilities")
+        if self.replay_protocol != expected_replay:
+            raise ValueError("unknown H7 replay protocol for selected capabilities")
+        if self.snapshot_semantics != expected_snapshot:
+            raise ValueError("unknown H7 snapshot semantics for selected capabilities")
 
     def identity(self) -> dict[str, object]:
-        return {"version": V3_H7_RUNTIME_VERSION, **asdict(self)}
+        payload = asdict(self)
+        if not self.belief_runtime_enabled:
+            payload["belief_sidecar_capacity"] = None
+        return {"version": V3_H7_RUNTIME_VERSION, **payload}
 
     def stable_hash(self) -> str:
         return _stable_hash(self.identity())
@@ -130,10 +215,99 @@ class V3H7RuntimeStats:
     decisions_collected: int = 0
     optimizer_steps: int = 0
     learner_cardplay_samples: int = 0
+    belief_labels_collected: int = 0
+    belief_optimizer_steps: int = 0
     amp_fallbacks: int = 0
     episodes_per_team: dict[str, int] = field(
         default_factory=lambda: {"landlord": 0, "farmer": 0}
     )
+
+
+class V3H71ABeliefAlignment:
+    """Bound public replay and privileged labels without co-serializing them."""
+
+    def __init__(self, capacity: int) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("H7.1a alignment capacity must be positive")
+        self.capacity = capacity
+        self.public_rows: dict[AsyncReplayKey, V3ReplayTransition] = {}
+        self.sidecars: dict[AsyncReplayKey, V3H4BeliefSidecar] = {}
+        self._completed = deque(maxlen=capacity)
+        self._completed_set: set[AsyncReplayKey] = set()
+
+    @property
+    def pending_count(self) -> int:
+        return len(self.public_rows) + len(self.sidecars)
+
+    def _check_new(self, key: AsyncReplayKey, store: Mapping) -> None:
+        if not isinstance(key, AsyncReplayKey):
+            raise TypeError("H7.1a alignment key has an invalid type")
+        if key in store or key in self._completed_set:
+            raise RuntimeError("duplicate H7.1a alignment key")
+
+    def add_public(
+        self, key: AsyncReplayKey, row: V3ReplayTransition
+    ) -> None:
+        self._check_new(key, self.public_rows)
+        if not isinstance(row, V3ReplayTransition):
+            raise TypeError("H7.1a public alignment row has an invalid type")
+        if len(self.public_rows) >= self.capacity:
+            raise RuntimeError("H7.1a belief alignment backlog exceeded capacity")
+        self.public_rows[key] = row
+
+    def add_sidecar(
+        self, key: AsyncReplayKey, sidecar: V3H4BeliefSidecar
+    ) -> None:
+        self._check_new(key, self.sidecars)
+        if not isinstance(sidecar, V3H4BeliefSidecar):
+            raise TypeError("H7.1a sidecar alignment row has an invalid type")
+        if len(self.sidecars) >= self.capacity:
+            raise RuntimeError("H7.1a belief alignment backlog exceeded capacity")
+        self.sidecars[key] = sidecar
+
+    def add_pair(
+        self,
+        key: AsyncReplayKey,
+        row: V3ReplayTransition,
+        sidecar: V3H4BeliefSidecar,
+    ) -> tuple[V3ReplayTransition, V3H4BeliefSample]:
+        self._check_new(key, self.public_rows)
+        self._check_new(key, self.sidecars)
+        if not isinstance(row, V3ReplayTransition):
+            raise TypeError("H7.1a public alignment row has an invalid type")
+        if not isinstance(sidecar, V3H4BeliefSidecar):
+            raise TypeError("H7.1a sidecar alignment row has an invalid type")
+        sample = bind_v3_h4_belief_sidecar(row.model_inputs, sidecar)
+        self._remember_completed(key)
+        return row, sample
+
+    def _remember_completed(self, key: AsyncReplayKey) -> None:
+        if len(self._completed) == self.capacity:
+            expired = self._completed.popleft()
+            self._completed_set.remove(expired)
+        self._completed.append(key)
+        self._completed_set.add(key)
+
+    def pop_ready(
+        self,
+    ) -> list[tuple[V3ReplayTransition, V3H4BeliefSample]]:
+        result = []
+        for key in tuple(self.public_rows):
+            sidecar = self.sidecars.get(key)
+            if sidecar is None:
+                continue
+            row = self.public_rows.pop(key)
+            self.sidecars.pop(key)
+            sample = bind_v3_h4_belief_sidecar(row.model_inputs, sidecar)
+            self._remember_completed(key)
+            result.append((row, sample))
+        return result
+
+    def assert_quiescent(self) -> None:
+        if self.pending_count:
+            raise RuntimeError(
+                "H7.1a cannot quiesce with unmatched belief sidecars"
+            )
 
 
 def validate_v3_h7_runtime_config(
@@ -153,12 +327,35 @@ def validate_v3_h7_runtime_config(
             "H7 async runtime currently supports legacy card-play rules only"
         )
     enabled = set(features.enabled_capabilities())
-    unsupported = enabled - {"role_model", "adaptive_dmc", "public_export"}
+    unsupported = enabled - {
+        "role_model", "adaptive_dmc", "belief", "public_export"
+    }
     if unsupported:
         raise NotImplementedError(
             "H7 async runtime rejects unsupported capabilities before worker "
             f"startup: {sorted(unsupported)}"
         )
+    belief_enabled = "belief" in enabled
+    if belief_enabled != runtime_config.belief_runtime_enabled:
+        raise ValueError(
+            "H7 runtime belief feature and belief runtime transport disagree"
+        )
+    if belief_enabled:
+        belief = resolved_config.learner.base.base.belief
+        if belief.mode != BELIEF_MODE_AUXILIARY:
+            raise NotImplementedError(
+                "H7.1a belief runtime currently supports auxiliary phase only"
+            )
+        if resolved_config.model.belief_feedback == BELIEF_FEEDBACK_NONE:
+            raise ValueError("H7.1a belief runtime requires public belief feedback")
+        if belief.shared_encoder_updates:
+            raise NotImplementedError(
+                "H7.1a async belief rejects shared encoder updates"
+            )
+        if runtime_config.belief_sidecar_capacity < runtime_config.batch_size:
+            raise ValueError(
+                "H7.1a belief sidecar capacity cannot be smaller than batch_size"
+            )
     for capability in enabled:
         validate_capability_support(
             capability,
@@ -169,11 +366,12 @@ def validate_v3_h7_runtime_config(
             deployment=topology.deployment,
             search=False,
         )
-    if not features.adaptive_dmc:
+    if not features.adaptive_dmc and not belief_enabled:
         raise ValueError("H7 async replay requires Adaptive DMC q_old provenance")
     if (
         resolved_config.learner.base.base.base.public.adaptive_dmc.mode
         == ADMC_DISABLED
+        and not belief_enabled
     ):
         raise ValueError("H7 async runtime cannot use disabled Adaptive DMC")
     learner_batch_size = resolved_config.learner.base.base.base.public.batch_size
@@ -184,7 +382,7 @@ def validate_v3_h7_runtime_config(
 
 
 class V3AsyncSingleGPUTrainer:
-    """Base V3+ADMC async trainer; later privileged capabilities fail closed."""
+    """V3 async trainer for base ADMC and the H7.1a belief capability."""
 
     def __init__(
         self,
@@ -213,23 +411,63 @@ class V3AsyncSingleGPUTrainer:
         self.buffer: deque[V3ReplayTransition] = deque(
             maxlen=runtime_config.replay_capacity
         )
+        self.belief_buffer: deque[V3H4BeliefSample] | None = (
+            deque(maxlen=runtime_config.replay_capacity)
+            if runtime_config.belief_runtime_enabled
+            else None
+        )
+        self._belief_alignment = (
+            V3H71ABeliefAlignment(runtime_config.belief_sidecar_capacity)
+            if runtime_config.belief_runtime_enabled
+            else None
+        )
         self._rng = random.Random(runtime_config.action_seed)
         self._runtime_started = False
-        self._snapshot_step = learner.policy_version
+        self._served_version_offset = 0
+        self._snapshot_step = self.policy_step
         self._reset_metrics()
         self.inference_model = copy.deepcopy(self.model).to(self.device).eval()
+        self.belief_model: BeliefModel | None = self.learner.base.base.belief_model
+        if runtime_config.belief_runtime_enabled and self.belief_model is None:
+            raise TypeError("H7.1a runtime requires the H4 BeliefModel")
+        if not runtime_config.belief_runtime_enabled and self.belief_model is not None:
+            raise ValueError("H7 base runtime rejects an unserved belief model")
+        self.inference_belief_model = (
+            None
+            if self.belief_model is None
+            else copy.deepcopy(self.belief_model).to(self.device).eval()
+        )
+        self.inference_policy = (
+            None
+            if self.inference_belief_model is None
+            else V3BeliefPolicy(
+                self.inference_model,
+                self.inference_belief_model,
+                ruleset=self.learner.ruleset,
+            ).eval()
+        )
         self.runtime_identity = {
             "runtime": runtime_config.identity(),
             "runtime_hash": runtime_config.stable_hash(),
             "training_hash": learner.compatibility_hash,
             "model_hash": self.model.config.stable_hash(),
+            "belief_model_hash": (
+                None
+                if self.belief_model is None
+                else self.belief_model.config.stable_hash()
+            ),
             "ruleset": learner.ruleset.identity(),
+            "belief_sidecar": (
+                "disabled"
+                if self.belief_model is None
+                else "separate-privileged-keyed-sidecar-never-public-replay-v1"
+            ),
         }
         self.runtime_hash = _stable_hash(self.runtime_identity)
 
     @property
     def policy_step(self) -> int:
-        return int(self.learner.policy_version)
+        return int(self.learner.policy_version) + self._served_version_offset
 
     @property
     def policy_version(self) -> str:
@@ -239,7 +477,8 @@ class V3AsyncSingleGPUTrainer:
         self._segments = {
             name: 0.0 for name in (
                 "claim_wait", "slot_read", "collate", "h2d", "forward",
-                "d2h", "publish", "replay_drain", "learner", "data_wait",
+                "belief_forward", "d2h", "publish", "replay_drain",
+                "learner", "data_wait",
             )
         }
         self._requests = 0
@@ -272,6 +511,7 @@ class V3AsyncSingleGPUTrainer:
             max_actions=cfg.max_actions,
             output_width=6,
             request_timeout_seconds=cfg.request_timeout_seconds,
+            belief_inputs=cfg.belief_runtime_enabled,
         )
         self._replay_slots = SharedReplaySlots(
             self.model.schema,
@@ -283,6 +523,11 @@ class V3AsyncSingleGPUTrainer:
             max_batch_size=slots,
             target_batch_size=cfg.target_microbatch,
             max_delay_seconds=cfg.microbatch_delay_ms / 1000.0,
+        )
+        self._belief_sidecar_queue = (
+            context.Queue(maxsize=cfg.belief_sidecar_capacity)
+            if cfg.belief_runtime_enabled
+            else None
         )
         self._stagers: dict[int, PinnedObservationBatchStager] = {}
         self._workers = []
@@ -308,6 +553,7 @@ class V3AsyncSingleGPUTrainer:
                     "policy_step": self._policy_step,
                     "games_per_actor": cfg.games_per_actor,
                     "runtime_kind": "v3_hybrid",
+                    "belief_sidecar_queue": self._belief_sidecar_queue,
                 },
                 name=f"douzero-v3-actor-{actor_id}",
             )
@@ -356,6 +602,39 @@ class V3AsyncSingleGPUTrainer:
         batch.to(self.device, non_blocking=True)
         torch.cuda.synchronize(self.device)
         self._segments["h2d"] += time.perf_counter() - started
+        belief_features = None
+        if self.inference_belief_model is not None:
+            public_belief_inputs = [
+                self._coordinator.belief_inputs.read(request.slot_id)
+                for request in group
+            ]
+            started = time.perf_counter()
+            with torch.inference_mode():
+                shared_context = None
+                if self.inference_belief_model.config.shared_context_dim:
+                    shared_context = (
+                        self.inference_model.encode_input_batch_context(batch)
+                    )
+                belief_output = self.inference_belief_model(
+                    public_belief_inputs,
+                    shared_context=shared_context,
+                )
+                belief_numpy = belief_features_from_probs(
+                    belief_output.constrained_probs,
+                    belief_output.opponent_a_total,
+                    np.stack([
+                        item.unseen_counts for item in public_belief_inputs
+                    ]),
+                )
+                belief_features = torch.from_numpy(belief_numpy).to(
+                    device=self.device,
+                    dtype=next(self.inference_model.parameters()).dtype,
+                    non_blocking=True,
+                )
+            torch.cuda.synchronize(self.device)
+            self._segments["belief_forward"] += (
+                time.perf_counter() - started
+            )
         started = time.perf_counter()
         with torch.inference_mode():
             output = self.inference_model.forward_batched(
@@ -368,6 +647,7 @@ class V3AsyncSingleGPUTrainer:
                 batch.action_features,
                 batch.action_mask,
                 batch.acting_role,
+                belief_features=belief_features,
             )
             packed = torch.stack((
                 output.win_logit.squeeze(-1),
@@ -403,20 +683,67 @@ class V3AsyncSingleGPUTrainer:
 
     def _drain_replay(self) -> int:
         started = time.perf_counter()
-        rows = self._replay_slots.read_ready_v3(
-            feature_schema_hash=self.model.schema.stable_hash(),
-            target_transform=self.model.config.dmc_target_transform,
-            ruleset_identity=self.learner.ruleset.identity(),
-        )
-        self.buffer.extend(rows)
+        if self.belief_buffer is None:
+            rows = self._replay_slots.read_ready_v3(
+                feature_schema_hash=self.model.schema.stable_hash(),
+                target_transform=self.model.config.dmc_target_transform,
+                ruleset_identity=self.learner.ruleset.identity(),
+            )
+            self.buffer.extend(rows)
+            completed = len(rows)
+        else:
+            aligned = self._replay_slots.read_ready_v3_aligned(
+                feature_schema_hash=self.model.schema.stable_hash(),
+                target_transform=self.model.config.dmc_target_transform,
+                ruleset_identity=self.learner.ruleset.identity(),
+            )
+            queued_sidecars = {}
+            while True:
+                try:
+                    message = self._belief_sidecar_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if (
+                    not isinstance(message, tuple)
+                    or len(message) != 2
+                    or not isinstance(message[0], AsyncReplayKey)
+                    or not isinstance(message[1], V3H4BeliefSidecar)
+                ):
+                    raise TypeError("H7.1a belief sidecar envelope mismatch")
+                key, sidecar = message
+                if key in queued_sidecars:
+                    raise RuntimeError("duplicate H7.1a sidecar queue key")
+                queued_sidecars[key] = sidecar
+            paired = []
+            for row, key in aligned:
+                sidecar = queued_sidecars.pop(key, None)
+                if sidecar is None:
+                    self._belief_alignment.add_public(key, row)
+                else:
+                    paired.append(
+                        self._belief_alignment.add_pair(key, row, sidecar)
+                    )
+            for key, sidecar in queued_sidecars.items():
+                self._belief_alignment.add_sidecar(key, sidecar)
+            paired.extend(self._belief_alignment.pop_ready())
+            completed = len(paired)
+            for row, sample in paired:
+                self.buffer.append(row)
+                self.belief_buffer.append(sample)
+                self.stats.belief_labels_collected += 1
         self._segments["replay_drain"] += time.perf_counter() - started
-        return len(rows)
+        return completed
 
     def _publish_snapshot(self) -> None:
         if self._runtime_started:
             self._coordinator.quiesce()
         self.inference_model.load_state_dict(self.model.state_dict(), strict=True)
         self.inference_model.eval()
+        if self.inference_belief_model is not None:
+            self.inference_belief_model.load_state_dict(
+                self.belief_model.state_dict(), strict=True
+            )
+            self.inference_belief_model.eval()
         torch.cuda.synchronize(self.device)
         if self._runtime_started:
             with self._policy_step.get_lock():
@@ -482,7 +809,19 @@ class V3AsyncSingleGPUTrainer:
             started = time.perf_counter()
             indices = self._rng.sample(range(len(self.buffer)), self.config.batch_size)
             rows = [self.buffer[index] for index in indices]
-            self.learner.train_batch(rows)
+            learner_rows = self._learner_rows(rows)
+            belief_samples = (
+                None
+                if self.belief_buffer is None
+                else [self.belief_buffer[index] for index in indices]
+            )
+            learner_policy_before = int(self.learner.policy_version)
+            metrics = self.learner.train_batch(
+                learner_rows, belief_samples=belief_samples
+            )
+            self._record_served_update(learner_policy_before, metrics)
+            if metrics.base.base.belief_updated:
+                self.stats.belief_optimizer_steps += 1
             self.stats.optimizer_steps += 1
             self.stats.learner_cardplay_samples += len(rows)
             self._segments["learner"] += time.perf_counter() - started
@@ -493,22 +832,64 @@ class V3AsyncSingleGPUTrainer:
             return None
         indices = self._rng.sample(range(len(self.buffer)), self.config.batch_size)
         rows = [self.buffer[index] for index in indices]
+        learner_rows = self._learner_rows(rows)
+        belief_samples = (
+            None
+            if self.belief_buffer is None
+            else [self.belief_buffer[index] for index in indices]
+        )
         started = time.perf_counter()
-        metrics = self.learner.train_batch(rows)
+        learner_policy_before = int(self.learner.policy_version)
+        metrics = self.learner.train_batch(
+            learner_rows, belief_samples=belief_samples
+        )
+        self._record_served_update(learner_policy_before, metrics)
+        if metrics.base.base.belief_updated:
+            self.stats.belief_optimizer_steps += 1
         self.stats.optimizer_steps += 1
         self.stats.learner_cardplay_samples += len(rows)
         self._segments["learner"] += time.perf_counter() - started
         return metrics
 
+    def _record_served_update(self, learner_policy_before: int, metrics) -> None:
+        """Version belief-only changes to the coupled served snapshot."""
+
+        learner_policy_after = int(self.learner.policy_version)
+        if learner_policy_after < learner_policy_before:
+            raise RuntimeError("H7 learner policy version moved backwards")
+        if (
+            metrics.base.base.belief_updated
+            and learner_policy_after == learner_policy_before
+        ):
+            self._served_version_offset += 1
+
+    def _learner_rows(
+        self, rows: list[V3ReplayTransition]
+    ) -> list[V3ReplayTransition]:
+        if self.resolved_config.learner.features.adaptive_dmc:
+            return rows
+        if self.belief_buffer is None:
+            raise RuntimeError(
+                "H7 ordinary DMC replay is supported only by H7.1a belief"
+            )
+        return [replace(row, adaptive_provenance=None) for row in rows]
+
     def _parameter_update_snapshot(self) -> tuple[torch.Tensor, ...]:
         return tuple(
-            parameter.detach().clone() for parameter in self.model.parameters()
+            parameter.detach().clone()
+            for parameter in self._served_parameters()
         )
+
+    def _served_parameters(self) -> tuple[torch.nn.Parameter, ...]:
+        parameters = tuple(self.model.parameters())
+        if self.belief_model is not None:
+            parameters += tuple(self.belief_model.parameters())
+        return parameters
 
     def _parameters_changed_since(
         self, snapshots: tuple[torch.Tensor, ...]
     ) -> bool:
-        parameters = tuple(self.model.parameters())
+        parameters = self._served_parameters()
         if len(snapshots) != len(parameters):
             raise ValueError("H7 parameter update snapshot shape changed")
         return any(
@@ -529,6 +910,8 @@ class V3AsyncSingleGPUTrainer:
         lag = self.policy_step - self._snapshot_step
         if lag > self.config.max_policy_lag:
             raise RuntimeError("H7 policy lag exceeded its configured bound")
+        if self._belief_alignment is not None:
+            self._belief_alignment.assert_quiescent()
         latencies = sorted(self._queue_latencies_ms)
 
         def percentile(fraction: float) -> float:
@@ -541,6 +924,11 @@ class V3AsyncSingleGPUTrainer:
             "in_flight_slots": counts["ready"] + counts["running"],
             "pending_requests": self._scheduler.pending_count if self._runtime_started else 0,
             "replay_occupancy": len(self.buffer),
+            "belief_replay_occupancy": (
+                0 if self.belief_buffer is None else len(self.belief_buffer)
+            ),
+            "belief_labels_collected": self.stats.belief_labels_collected,
+            "belief_optimizer_steps": self.stats.belief_optimizer_steps,
             "requests_per_microbatch": self._requests / max(1, self._microbatches),
             "actions_per_microbatch": self._actions / max(1, self._microbatches),
             "inference_queue_p50_ms": percentile(0.50),
@@ -562,8 +950,12 @@ class V3AsyncSingleGPUTrainer:
 
     def clear_replay(self) -> None:
         self.buffer.clear()
+        if self.belief_buffer is not None:
+            self.belief_buffer.clear()
 
     def save_training_checkpoint(self, path: str, *, long_running_state) -> None:
+        if self._belief_alignment is not None:
+            self._belief_alignment.assert_quiescent()
         with tempfile.TemporaryDirectory(prefix="douzero-h7-save-") as temporary:
             inner_path = Path(temporary) / "h6.pt"
             self.learner.save_checkpoint(inner_path)
@@ -577,6 +969,7 @@ class V3AsyncSingleGPUTrainer:
                 ),
                 "stats": asdict(self.stats),
                 "rng_state": self._rng.getstate(),
+                "served_version_offset": self._served_version_offset,
                 "snapshot_step": self._snapshot_step,
                 "long_running_state": dict(long_running_state),
             }
@@ -597,7 +990,8 @@ class V3AsyncSingleGPUTrainer:
         bundle = torch.load(path, map_location="cpu", weights_only=True)
         expected = {
             "format", "artifact_access", "runtime_identity", "runtime_hash",
-            "h6_checkpoint", "stats", "rng_state", "snapshot_step",
+            "h6_checkpoint", "stats", "rng_state", "served_version_offset",
+            "snapshot_step",
             "long_running_state",
         }
         if not isinstance(bundle, dict) or set(bundle) != expected:
@@ -615,6 +1009,7 @@ class V3AsyncSingleGPUTrainer:
             "games_collected", "episodes_completed", "transitions_collected",
             "decisions_collected", "optimizer_steps", "episodes_per_team",
             "amp_fallbacks", "learner_cardplay_samples",
+            "belief_labels_collected", "belief_optimizer_steps",
         }:
             raise ValueError("H7 checkpoint statistics fields mismatch")
         candidate_stats = V3H7RuntimeStats(**stats_payload)
@@ -622,6 +1017,7 @@ class V3AsyncSingleGPUTrainer:
             "games_collected", "episodes_completed", "transitions_collected",
             "decisions_collected", "optimizer_steps",
             "amp_fallbacks", "learner_cardplay_samples",
+            "belief_labels_collected", "belief_optimizer_steps",
         ):
             value = getattr(candidate_stats, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -635,11 +1031,30 @@ class V3AsyncSingleGPUTrainer:
             )
         ):
             raise ValueError("H7 checkpoint team statistics are invalid")
+        if not self.config.belief_runtime_enabled and (
+            candidate_stats.belief_labels_collected
+            or candidate_stats.belief_optimizer_steps
+        ):
+            raise ValueError("H7 base checkpoint contains belief progress")
+        if (
+            candidate_stats.belief_optimizer_steps
+            > candidate_stats.optimizer_steps
+            or candidate_stats.belief_labels_collected
+            > candidate_stats.transitions_collected
+        ):
+            raise ValueError("H7 checkpoint belief statistics are invalid")
         candidate_rng = random.Random()
         candidate_rng.setstate(bundle["rng_state"])
         snapshot_step = bundle["snapshot_step"]
         if isinstance(snapshot_step, bool) or not isinstance(snapshot_step, int):
             raise ValueError("H7 checkpoint snapshot step is invalid")
+        served_version_offset = bundle["served_version_offset"]
+        if (
+            isinstance(served_version_offset, bool)
+            or not isinstance(served_version_offset, int)
+            or served_version_offset < 0
+        ):
+            raise ValueError("H7 checkpoint served version offset is invalid")
         inner_counters = bundle["h6_checkpoint"].get("counters", {})
         inner_policy_step = inner_counters.get("policy_version")
         if (
@@ -648,12 +1063,14 @@ class V3AsyncSingleGPUTrainer:
             or inner_policy_step < 0
         ):
             raise ValueError("H7 nested learner policy version is invalid")
-        if snapshot_step < 0 or snapshot_step > inner_policy_step:
+        coupled_policy_step = inner_policy_step + served_version_offset
+        if snapshot_step < 0 or snapshot_step > coupled_policy_step:
             raise ValueError("H7 checkpoint snapshot is newer than learner")
-        if inner_policy_step - snapshot_step > self.config.max_policy_lag:
+        if coupled_policy_step - snapshot_step > self.config.max_policy_lag:
             raise ValueError("H7 checkpoint policy lag exceeds its bound")
         previous_stats = copy.deepcopy(self.stats)
         previous_rng = self._rng.getstate()
+        previous_offset = self._served_version_offset
         previous_snapshot = self._snapshot_step
         with tempfile.TemporaryDirectory(prefix="douzero-h7-load-") as temporary:
             inner_path = Path(temporary) / "h6.pt"
@@ -662,10 +1079,16 @@ class V3AsyncSingleGPUTrainer:
                 self.learner.load_checkpoint(inner_path)
                 self.stats = candidate_stats
                 self._rng.setstate(bundle["rng_state"])
+                self._served_version_offset = served_version_offset
                 self._snapshot_step = snapshot_step
+                if int(self.learner.policy_version) != inner_policy_step:
+                    raise ValueError(
+                        "H7 nested learner policy version failed to restore"
+                    )
             except Exception:
                 self.stats = previous_stats
                 self._rng.setstate(previous_rng)
+                self._served_version_offset = previous_offset
                 self._snapshot_step = previous_snapshot
                 raise
         return bundle["long_running_state"]
@@ -699,6 +1122,9 @@ class V3AsyncSingleGPUTrainer:
         finally:
             self._coordinator.shutdown()
             self._replay_slots.close()
+            if self._belief_sidecar_queue is not None:
+                self._belief_sidecar_queue.close()
+                self._belief_sidecar_queue.join_thread()
             self._tasks.close()
             self._events.close()
             self._runtime_started = False
@@ -726,6 +1152,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
 
         from douzero.env.env import Env
         from douzero.observation.encode_v2 import get_obs_v2
+        from douzero.observation.privileged import PrivilegedObservation
 
         from .replay import (
             AdaptiveSnapshotProvenance,
@@ -752,9 +1179,21 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                 else (self.config.environment_seed + episode_number) % (1 << 32)
             )
             np.random.seed(environment_seed)
+            action_rng = (
+                random.Random(derive_formal_stream_seed(
+                    self.config.action_seed,
+                    "action",
+                    0,
+                    episode_number,
+                ))
+                if self.config.environment_seed_derivation
+                == FORMAL_SEED_DERIVATION_V1
+                else self._rng
+            )
             env = Env("adp")
             env.reset()
             pending = []
+            pending_belief = []
             decisions = 0
             steps = 0
             while True:
@@ -767,7 +1206,13 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                     observation = get_obs_v2(env.infoset, ruleset=self.learner.ruleset)
                     started = time.perf_counter()
                     with torch.inference_mode():
-                        output = self.inference_model.forward_observation(observation)
+                        output = (
+                            self.inference_model.forward_observation(observation)
+                            if self.inference_policy is None
+                            else self.inference_policy.forward_observation(
+                                observation
+                            )
+                        )
                     torch.cuda.synchronize(self.device)
                     self._segments["forward"] += time.perf_counter() - started
                     mask = output.action_mask.bool()
@@ -776,9 +1221,9 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                     )
                     valid = torch.nonzero(mask, as_tuple=False).flatten().tolist()
                     action_index = (
-                        int(self._rng.choice(valid))
+                        int(action_rng.choice(valid))
                         if self.config.epsilon > 0.0
-                        and self._rng.random() < self.config.epsilon
+                        and action_rng.random() < self.config.epsilon
                         else int(torch.argmax(q_values).item())
                     )
                     captured = capture_plain_transition(
@@ -788,6 +1233,20 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                         deal_id=f"single-deal-{episode_number}",
                         target_transform=self.model.config.dmc_target_transform,
                     )
+                    if self.belief_buffer is not None:
+                        sidecar = build_v3_h4_belief_sidecar(
+                            observation,
+                            PrivilegedObservation(
+                                all_handcards=dict(env.infoset.all_handcards),
+                                acting_role=position,
+                            ),
+                            public_inputs=captured.model_inputs,
+                        )
+                        pending_belief.append(
+                            bind_v3_h4_belief_sidecar(
+                                captured.model_inputs, sidecar
+                            )
+                        )
                     pending.append(replace(
                         captured,
                         adaptive_provenance=AdaptiveSnapshotProvenance(
@@ -815,6 +1274,13 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                 for row in pending
             ]
             self.buffer.extend(rows)
+            if self.belief_buffer is not None:
+                if len(pending_belief) != len(rows):
+                    raise RuntimeError(
+                        "H7.1a single-process belief alignment mismatch"
+                    )
+                self.belief_buffer.extend(pending_belief)
+                self.stats.belief_labels_collected += len(pending_belief)
             self.stats.games_collected += 1
             self.stats.episodes_completed += 1
             self.stats.transitions_collected += len(rows)
@@ -833,13 +1299,18 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
 
 
 __all__ = [
+    "V3_H71A_REPLAY_PROTOCOL",
+    "V3_H71A_REQUEST_PROTOCOL",
+    "V3_H71A_SNAPSHOT_SEMANTICS",
     "V3_H7_CHECKPOINT_FORMAT",
     "V3_H7_REPLAY_PROTOCOL",
     "V3_H7_REQUEST_PROTOCOL",
     "V3_H7_RUNTIME_VERSION",
     "V3AsyncSingleGPUTrainer",
+    "V3H71ABeliefAlignment",
     "V3SingleProcessTrainer",
     "V3H7RuntimeConfig",
     "V3H7RuntimeStats",
     "validate_v3_h7_runtime_config",
+    "validate_v3_h7_formal_initialization",
 ]

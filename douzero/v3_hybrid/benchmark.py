@@ -8,7 +8,7 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
-H7_BENCHMARK_SCHEMA = "v3-hybrid-h7-benchmark-v1"
+H7_BENCHMARK_SCHEMA = "v3-hybrid-h7-benchmark-v2"
 H7_TOPOLOGIES = ("single_process", "async_4x4", "async_8x4")
 
 
@@ -17,6 +17,25 @@ def _hash(payload: Mapping[str, object]) -> str:
         payload, sort_keys=True, separators=(",", ":"), allow_nan=False
     )
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
+def h7_trainer_identity_hash(
+    *,
+    runtime_version: str,
+    checkpoint_format: str,
+    request_protocol: str,
+    resolved_learner_hash: str | None,
+) -> str:
+    """Build the trainer hash shared by protocol freeze and live validation."""
+
+    payload = {
+        "runtime": runtime_version,
+        "checkpoint": checkpoint_format,
+        "request": request_protocol,
+    }
+    if resolved_learner_hash is not None:
+        payload["resolved_learner"] = resolved_learner_hash
+    return _hash(payload)
 
 
 @dataclass(frozen=True)
@@ -32,6 +51,7 @@ class V3H7BenchmarkProtocol:
     pytorch: str
     cuda: str
     cpu: str
+    formal_config_hash: str | None
     warmup_seconds: float = 30.0
     measurement_seconds: float = 300.0
     checkpoint_enabled: bool = True
@@ -53,6 +73,14 @@ class V3H7BenchmarkProtocol:
             value = getattr(self, name)
             if len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value):
                 raise ValueError(f"H7 benchmark {name} must be SHA-256")
+        if self.formal_config_hash is not None:
+            value = self.formal_config_hash
+            if len(value) != 64 or any(
+                ch not in "0123456789abcdef" for ch in value
+            ):
+                raise ValueError(
+                    "H7 benchmark formal_config_hash must be SHA-256 or null"
+                )
         if not self.image_digest.startswith("sha256:") or len(self.image_digest) != 71:
             raise ValueError("H7 benchmark image digest must be sha256:<64 hex>")
         for name in ("warmup_seconds", "measurement_seconds"):
@@ -150,5 +178,6 @@ __all__ = [
     "H7_BENCHMARK_SCHEMA",
     "H7_TOPOLOGIES",
     "V3H7BenchmarkProtocol",
+    "h7_trainer_identity_hash",
     "validate_h7_benchmark_evidence",
 ]
