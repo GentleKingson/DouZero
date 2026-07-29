@@ -735,13 +735,14 @@ class V3AsyncSingleGPUTrainer:
             started = time.perf_counter()
             indices = self._rng.sample(range(len(self.buffer)), self.config.batch_size)
             rows = [self.buffer[index] for index in indices]
+            learner_rows = self._learner_rows(rows)
             belief_samples = (
                 None
                 if self.belief_buffer is None
                 else [self.belief_buffer[index] for index in indices]
             )
             metrics = self.learner.train_batch(
-                rows, belief_samples=belief_samples
+                learner_rows, belief_samples=belief_samples
             )
             if metrics.base.base.belief_updated:
                 self.stats.belief_optimizer_steps += 1
@@ -755,6 +756,7 @@ class V3AsyncSingleGPUTrainer:
             return None
         indices = self._rng.sample(range(len(self.buffer)), self.config.batch_size)
         rows = [self.buffer[index] for index in indices]
+        learner_rows = self._learner_rows(rows)
         belief_samples = (
             None
             if self.belief_buffer is None
@@ -762,7 +764,7 @@ class V3AsyncSingleGPUTrainer:
         )
         started = time.perf_counter()
         metrics = self.learner.train_batch(
-            rows, belief_samples=belief_samples
+            learner_rows, belief_samples=belief_samples
         )
         if metrics.base.base.belief_updated:
             self.stats.belief_optimizer_steps += 1
@@ -770,6 +772,17 @@ class V3AsyncSingleGPUTrainer:
         self.stats.learner_cardplay_samples += len(rows)
         self._segments["learner"] += time.perf_counter() - started
         return metrics
+
+    def _learner_rows(
+        self, rows: list[V3ReplayTransition]
+    ) -> list[V3ReplayTransition]:
+        if self.resolved_config.learner.features.adaptive_dmc:
+            return rows
+        if self.belief_buffer is None:
+            raise RuntimeError(
+                "H7 ordinary DMC replay is supported only by H7.1a belief"
+            )
+        return [replace(row, adaptive_provenance=None) for row in rows]
 
     def _parameter_update_snapshot(self) -> tuple[torch.Tensor, ...]:
         return tuple(
