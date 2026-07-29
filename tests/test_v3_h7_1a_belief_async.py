@@ -4,6 +4,7 @@ import sys
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -21,6 +22,7 @@ from douzero.training.async_single_gpu import (
     AsyncReplayKey,
     AsyncRequestCoordinator,
     SharedBeliefInputSlots,
+    _formal_action_seed,
 )
 from douzero.training.seed_stream import FORMAL_SEED_DERIVATION_V1
 from douzero.v3_hybrid.formal_config import load_formal_config
@@ -42,6 +44,7 @@ from douzero.v3_hybrid.runtime import (
     V3H7RuntimeConfig,
     validate_v3_h7_runtime_config,
     resolve_v3_h7_seed_contract,
+    validate_v3_h7_formal_initialization,
 )
 from douzero.v3_hybrid.support_matrix import (
     RULESET_LEGACY,
@@ -299,7 +302,7 @@ def test_formal_runtime_seeds_use_frozen_sha256_contract():
         requested_action_seed=None,
     )
     assert resolved[0] == 101
-    assert resolved[1] != 2
+    assert resolved[1] == 101
     assert resolved[2] == FORMAL_SEED_DERIVATION_V1
     with pytest.raises(ValueError, match="not frozen"):
         resolve_v3_h7_seed_contract(
@@ -315,6 +318,39 @@ def test_formal_runtime_seeds_use_frozen_sha256_contract():
             requested_environment_seed=101,
             requested_action_seed=102,
         )
+
+
+def test_formal_action_rng_is_stable_per_actor_and_episode():
+    seeds = {
+        _formal_action_seed(101, actor_id, episode_id)
+        for actor_id in range(2)
+        for episode_id in range(3)
+    }
+    assert len(seeds) == 6
+    assert _formal_action_seed(101, 1, 2) == _formal_action_seed(101, 1, 2)
+    assert _formal_action_seed(202, 1, 2) != _formal_action_seed(101, 1, 2)
+
+
+def test_formal_checkpoint_initialization_fails_closed():
+    validate_v3_h7_formal_initialization("seeded_fresh")
+    with pytest.raises(NotImplementedError, match="checkpoint initialization"):
+        validate_v3_h7_formal_initialization("checkpoint")
+
+
+def test_belief_only_update_advances_coupled_served_version():
+    runtime = object.__new__(V3AsyncSingleGPUTrainer)
+    runtime.learner = SimpleNamespace(policy_version=7)
+    runtime._served_version_offset = 0
+    metrics = SimpleNamespace(
+        base=SimpleNamespace(
+            base=SimpleNamespace(belief_updated=True)
+        )
+    )
+    runtime._record_served_update(7, metrics)
+    assert runtime.policy_step == 8
+    runtime.learner.policy_version = 8
+    runtime._record_served_update(7, metrics)
+    assert runtime.policy_step == 9
 
 
 def test_belief_async_standard_combination_is_not_advertised():
@@ -362,6 +398,44 @@ def test_protocol_freeze_rejects_unsupported_formal_config_before_write(
         ],
     )
     with pytest.raises((ValueError, NotImplementedError)):
+        freeze_h7.main()
+    assert not output.exists()
+
+
+def test_protocol_freeze_rejects_checkpoint_initialization_before_write(
+    monkeypatch, tmp_path
+):
+    formal = _belief_formal()
+    formal = replace(
+        formal,
+        initialization=replace(formal.initialization, kind="checkpoint"),
+    )
+    output = tmp_path / "protocol.json"
+    monkeypatch.setattr(freeze_h7, "load_formal_config", lambda _path: formal)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "freeze_v3_h7_protocol.py",
+            "--image-digest",
+            f"sha256:{'a' * 64}",
+            "--gpu",
+            "gpu",
+            "--driver",
+            "driver",
+            "--pytorch",
+            "pytorch",
+            "--cuda",
+            "cuda",
+            "--cpu",
+            "cpu",
+            "--formal-config",
+            "ignored.yaml",
+            "--output",
+            str(output),
+        ],
+    )
+    with pytest.raises(NotImplementedError, match="checkpoint initialization"):
         freeze_h7.main()
     assert not output.exists()
 
@@ -456,6 +530,7 @@ def test_h71a_cuda_coupled_snapshot_update_checkpoint_resume_and_shutdown(
         runtime.save_training_checkpoint(
             str(checkpoint), long_running_state={"cycle": 1}
         )
+        saved_policy_step = runtime.policy_step
     finally:
         runtime.shutdown()
 
@@ -465,6 +540,7 @@ def test_h71a_cuda_coupled_snapshot_update_checkpoint_resume_and_shutdown(
     )
     try:
         assert resumed.load_training_checkpoint(checkpoint) == {"cycle": 1}
+        assert resumed.policy_step == saved_policy_step
         assert resumed.stats.belief_optimizer_steps == 1
         assert resumed.learner.base.base.phase() == learner.base.base.phase()
         resumed.collect_episodes(1)

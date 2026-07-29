@@ -33,6 +33,7 @@ from douzero.v3_hybrid.runtime import (
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
     resolve_v3_h7_seed_contract,
+    validate_v3_h7_formal_initialization,
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.support_matrix import (
@@ -100,6 +101,8 @@ def main() -> None:
         if args.formal_config is None
         else load_formal_config(args.formal_config)
     )
+    if formal is not None:
+        validate_v3_h7_formal_initialization(formal.initialization.kind)
     resolved = (
         build_v3_h7_smoke_config()
         if args.smoke_config

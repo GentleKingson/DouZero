@@ -47,6 +47,12 @@ from douzero.training.v2_buffer import compact_model_input_shapes
 INFERENCE_ACTION_BUCKET_LIMITS: tuple[int, ...] = (64, 512)
 
 
+def _formal_action_seed(root_seed: int, actor_id: int, episode_id: int) -> int:
+    return derive_formal_stream_seed(
+        root_seed, "action", actor_id, episode_id
+    )
+
+
 def inference_action_count_bucket(action_count: int) -> int | str:
     """Return the coarse centralized-inference padding bucket."""
     if isinstance(action_count, bool) or not isinstance(action_count, int):
@@ -1174,6 +1180,11 @@ def async_actor_main(
                 0,
                 episode_id,
             ))
+            action_rng = random.Random(
+                _formal_action_seed(action_rng_seed, actor_id, episode_id)
+            )
+        else:
+            action_rng = rng
         snapshot = int(policy_step.value)
         event_queue.put(("started", actor_id, episode_id, snapshot))
         env = Env("adp", ruleset=ruleset)
@@ -1190,6 +1201,7 @@ def async_actor_main(
             "pending": None,
             "started_at": time.monotonic(),
             "blocked_seconds": 0.0,
+            "action_rng": action_rng,
         }
 
     def finish_game(game) -> None:
@@ -1285,8 +1297,13 @@ def async_actor_main(
                 continue
 
             obs = get_obs_v2(infoset, ruleset=ruleset)
-            if runtime_kind == "v2" and epsilon > 0 and rng.random() < epsilon:
-                action_index = rng.randrange(len(legal_actions))
+            action_rng = game["action_rng"]
+            if (
+                runtime_kind == "v2"
+                and epsilon > 0
+                and action_rng.random() < epsilon
+            ):
+                action_index = action_rng.randrange(len(legal_actions))
                 if apply_action(
                     game, action_index, obs, position, legal_actions
                 ):
@@ -1354,8 +1371,8 @@ def async_actor_main(
             q_values = packed[:, 5].masked_fill(~mask, float("-inf"))
             valid_indices = torch.nonzero(mask, as_tuple=False).flatten().tolist()
             action_index = (
-                int(rng.choice(valid_indices))
-                if epsilon > 0 and rng.random() < epsilon
+                int(game["action_rng"].choice(valid_indices))
+                if epsilon > 0 and game["action_rng"].random() < epsilon
                 else int(torch.argmax(q_values).item())
             )
             q_old = float(q_values[action_index].item())

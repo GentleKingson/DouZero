@@ -54,8 +54,8 @@ from .training.h4_learner import (
     build_v3_h4_belief_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1a-runtime-v6"
-V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v3"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1a-runtime-v7"
+V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v4"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
 V3_H71A_REQUEST_PROTOCOL = (
@@ -97,10 +97,16 @@ def resolve_v3_h7_seed_contract(
         raise ValueError("H7 requested seed is not frozen by the formal config")
     if requested_action_seed is not None:
         raise ValueError("H7 formal action seed is derived and cannot be overridden")
-    action_seed = derive_formal_stream_seed(
-        root_seed, "action_rng_root", 0, 0
-    )
-    return root_seed, action_seed, FORMAL_SEED_DERIVATION_V1
+    return root_seed, root_seed, FORMAL_SEED_DERIVATION_V1
+
+
+def validate_v3_h7_formal_initialization(initialization_kind: str) -> None:
+    """Reject formal initialization modes that H7.1a cannot faithfully apply."""
+
+    if initialization_kind != "seeded_fresh":
+        raise NotImplementedError(
+            "H7.1a formal checkpoint initialization is not implemented"
+        )
 
 
 def _stable_hash(payload: Mapping[str, object]) -> str:
@@ -417,7 +423,8 @@ class V3AsyncSingleGPUTrainer:
         )
         self._rng = random.Random(runtime_config.action_seed)
         self._runtime_started = False
-        self._snapshot_step = learner.policy_version
+        self._served_version_offset = 0
+        self._snapshot_step = self.policy_step
         self._reset_metrics()
         self.inference_model = copy.deepcopy(self.model).to(self.device).eval()
         self.belief_model: BeliefModel | None = self.learner.base.base.belief_model
@@ -460,7 +467,7 @@ class V3AsyncSingleGPUTrainer:
 
     @property
     def policy_step(self) -> int:
-        return int(self.learner.policy_version)
+        return int(self.learner.policy_version) + self._served_version_offset
 
     @property
     def policy_version(self) -> str:
@@ -808,9 +815,11 @@ class V3AsyncSingleGPUTrainer:
                 if self.belief_buffer is None
                 else [self.belief_buffer[index] for index in indices]
             )
+            learner_policy_before = int(self.learner.policy_version)
             metrics = self.learner.train_batch(
                 learner_rows, belief_samples=belief_samples
             )
+            self._record_served_update(learner_policy_before, metrics)
             if metrics.base.base.belief_updated:
                 self.stats.belief_optimizer_steps += 1
             self.stats.optimizer_steps += 1
@@ -830,15 +839,29 @@ class V3AsyncSingleGPUTrainer:
             else [self.belief_buffer[index] for index in indices]
         )
         started = time.perf_counter()
+        learner_policy_before = int(self.learner.policy_version)
         metrics = self.learner.train_batch(
             learner_rows, belief_samples=belief_samples
         )
+        self._record_served_update(learner_policy_before, metrics)
         if metrics.base.base.belief_updated:
             self.stats.belief_optimizer_steps += 1
         self.stats.optimizer_steps += 1
         self.stats.learner_cardplay_samples += len(rows)
         self._segments["learner"] += time.perf_counter() - started
         return metrics
+
+    def _record_served_update(self, learner_policy_before: int, metrics) -> None:
+        """Version belief-only changes to the coupled served snapshot."""
+
+        learner_policy_after = int(self.learner.policy_version)
+        if learner_policy_after < learner_policy_before:
+            raise RuntimeError("H7 learner policy version moved backwards")
+        if (
+            metrics.base.base.belief_updated
+            and learner_policy_after == learner_policy_before
+        ):
+            self._served_version_offset += 1
 
     def _learner_rows(
         self, rows: list[V3ReplayTransition]
@@ -946,6 +969,7 @@ class V3AsyncSingleGPUTrainer:
                 ),
                 "stats": asdict(self.stats),
                 "rng_state": self._rng.getstate(),
+                "served_version_offset": self._served_version_offset,
                 "snapshot_step": self._snapshot_step,
                 "long_running_state": dict(long_running_state),
             }
@@ -966,7 +990,8 @@ class V3AsyncSingleGPUTrainer:
         bundle = torch.load(path, map_location="cpu", weights_only=True)
         expected = {
             "format", "artifact_access", "runtime_identity", "runtime_hash",
-            "h6_checkpoint", "stats", "rng_state", "snapshot_step",
+            "h6_checkpoint", "stats", "rng_state", "served_version_offset",
+            "snapshot_step",
             "long_running_state",
         }
         if not isinstance(bundle, dict) or set(bundle) != expected:
@@ -1023,6 +1048,13 @@ class V3AsyncSingleGPUTrainer:
         snapshot_step = bundle["snapshot_step"]
         if isinstance(snapshot_step, bool) or not isinstance(snapshot_step, int):
             raise ValueError("H7 checkpoint snapshot step is invalid")
+        served_version_offset = bundle["served_version_offset"]
+        if (
+            isinstance(served_version_offset, bool)
+            or not isinstance(served_version_offset, int)
+            or served_version_offset < 0
+        ):
+            raise ValueError("H7 checkpoint served version offset is invalid")
         inner_counters = bundle["h6_checkpoint"].get("counters", {})
         inner_policy_step = inner_counters.get("policy_version")
         if (
@@ -1031,12 +1063,14 @@ class V3AsyncSingleGPUTrainer:
             or inner_policy_step < 0
         ):
             raise ValueError("H7 nested learner policy version is invalid")
-        if snapshot_step < 0 or snapshot_step > inner_policy_step:
+        coupled_policy_step = inner_policy_step + served_version_offset
+        if snapshot_step < 0 or snapshot_step > coupled_policy_step:
             raise ValueError("H7 checkpoint snapshot is newer than learner")
-        if inner_policy_step - snapshot_step > self.config.max_policy_lag:
+        if coupled_policy_step - snapshot_step > self.config.max_policy_lag:
             raise ValueError("H7 checkpoint policy lag exceeds its bound")
         previous_stats = copy.deepcopy(self.stats)
         previous_rng = self._rng.getstate()
+        previous_offset = self._served_version_offset
         previous_snapshot = self._snapshot_step
         with tempfile.TemporaryDirectory(prefix="douzero-h7-load-") as temporary:
             inner_path = Path(temporary) / "h6.pt"
@@ -1045,10 +1079,16 @@ class V3AsyncSingleGPUTrainer:
                 self.learner.load_checkpoint(inner_path)
                 self.stats = candidate_stats
                 self._rng.setstate(bundle["rng_state"])
+                self._served_version_offset = served_version_offset
                 self._snapshot_step = snapshot_step
+                if int(self.learner.policy_version) != inner_policy_step:
+                    raise ValueError(
+                        "H7 nested learner policy version failed to restore"
+                    )
             except Exception:
                 self.stats = previous_stats
                 self._rng.setstate(previous_rng)
+                self._served_version_offset = previous_offset
                 self._snapshot_step = previous_snapshot
                 raise
         return bundle["long_running_state"]
@@ -1139,6 +1179,17 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                 else (self.config.environment_seed + episode_number) % (1 << 32)
             )
             np.random.seed(environment_seed)
+            action_rng = (
+                random.Random(derive_formal_stream_seed(
+                    self.config.action_seed,
+                    "action",
+                    0,
+                    episode_number,
+                ))
+                if self.config.environment_seed_derivation
+                == FORMAL_SEED_DERIVATION_V1
+                else self._rng
+            )
             env = Env("adp")
             env.reset()
             pending = []
@@ -1170,9 +1221,9 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                     )
                     valid = torch.nonzero(mask, as_tuple=False).flatten().tolist()
                     action_index = (
-                        int(self._rng.choice(valid))
+                        int(action_rng.choice(valid))
                         if self.config.epsilon > 0.0
-                        and self._rng.random() < self.config.epsilon
+                        and action_rng.random() < self.config.epsilon
                         else int(torch.argmax(q_values).item())
                     )
                     captured = capture_plain_transition(
@@ -1261,4 +1312,5 @@ __all__ = [
     "V3H7RuntimeConfig",
     "V3H7RuntimeStats",
     "validate_v3_h7_runtime_config",
+    "validate_v3_h7_formal_initialization",
 ]
