@@ -724,6 +724,35 @@ class V3H71CCooperationAlignment:
             )
 
 
+def _remap_h7_cooperation_trajectories(
+    source_rows: Sequence[V3ReplayTransition],
+    learner_rows: Sequence[V3ReplayTransition],
+    trajectories: Sequence[V3H5FarmerTrajectory] | None,
+) -> tuple[V3H5FarmerTrajectory, ...] | None:
+    """Preserve episode metadata when replay rows are normalized for H2."""
+
+    if trajectories is None:
+        return None
+    if len(source_rows) != len(learner_rows):
+        raise ValueError("H7.1c learner row remap length mismatch")
+    replacements = {
+        id(source): learner
+        for source, learner in zip(source_rows, learner_rows)
+    }
+    remapped = []
+    for trajectory in trajectories:
+        decisions = []
+        for decision in trajectory.decisions:
+            replacement = replacements.get(id(decision.transition))
+            if replacement is None:
+                raise ValueError(
+                    "H7.1c trajectory row is absent from the learner batch"
+                )
+            decisions.append(replace(decision, transition=replacement))
+        remapped.append(replace(trajectory, decisions=tuple(decisions)))
+    return tuple(remapped)
+
+
 def validate_v3_h7_runtime_config(
     resolved_config: V3H6ResolvedConfig,
     runtime_config: V3H7RuntimeConfig,
@@ -1434,6 +1463,9 @@ class V3AsyncSingleGPUTrainer:
                 trajectories = None
             started = time.perf_counter()
             learner_rows = self._learner_rows(rows)
+            learner_trajectories = _remap_h7_cooperation_trajectories(
+                rows, learner_rows, trajectories
+            )
             belief_samples = (
                 None
                 if self.belief_buffer is None
@@ -1443,7 +1475,7 @@ class V3AsyncSingleGPUTrainer:
             learner_policy_before = int(self.learner.policy_version)
             metrics = self.learner.train_batch(
                 learner_rows,
-                trajectories=trajectories,
+                trajectories=learner_trajectories,
                 belief_samples=belief_samples,
                 oracle_samples=oracle_samples,
             )
@@ -1477,6 +1509,9 @@ class V3AsyncSingleGPUTrainer:
             rows = [self.buffer[index] for index in indices]
             trajectories = None
         learner_rows = self._learner_rows(rows)
+        learner_trajectories = _remap_h7_cooperation_trajectories(
+            rows, learner_rows, trajectories
+        )
         belief_samples = (
             None
             if self.belief_buffer is None
@@ -1487,7 +1522,7 @@ class V3AsyncSingleGPUTrainer:
         learner_policy_before = int(self.learner.policy_version)
         metrics = self.learner.train_batch(
             learner_rows,
-            trajectories=trajectories,
+            trajectories=learner_trajectories,
             belief_samples=belief_samples,
             oracle_samples=oracle_samples,
         )

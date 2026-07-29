@@ -28,6 +28,7 @@ from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H71CCooperationAlignment,
     V3H7RuntimeConfig,
+    _remap_h7_cooperation_trajectories,
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.training.cooperation import (
@@ -163,6 +164,36 @@ def test_alignment_builds_unequal_episode_atomic_farmer_pair():
     assert down.decision_indices == (4,)
     assert len(episodes[0].transitions) == 3
     alignment.assert_quiescent()
+
+
+def test_ordinary_dmc_row_normalization_preserves_trajectory_alignment():
+    alignment = V3H71CCooperationAlignment(
+        capacity=8, max_episode_transitions=8
+    )
+    for role, trace in zip(FARMER_ROLES, (0, 1)):
+        key, row, sidecar = _decision(role, trace)
+        alignment.add_pair(key, row, sidecar)
+    alignment.mark_episode_complete(
+        1, 2, {"landlord_up": 1, "landlord_down": 1}
+    )
+    episode = alignment.pop_ready_episodes()[0]
+    learner_rows = [
+        replace(row, adaptive_provenance=None)
+        for row in episode.transitions
+    ]
+    trajectories = _remap_h7_cooperation_trajectories(
+        episode.transitions, learner_rows, episode.trajectories
+    )
+    assert trajectories is not None
+    remapped_rows = [
+        row for trajectory in trajectories for row in trajectory.transitions
+    ]
+    assert all(
+        remapped is learner
+        for remapped, learner in zip(remapped_rows, learner_rows)
+    )
+    assert trajectories[0].decision_indices == (0,)
+    assert trajectories[1].decision_indices == (1,)
 
 
 def test_alignment_explicitly_skips_incomplete_and_oversized_episodes():
