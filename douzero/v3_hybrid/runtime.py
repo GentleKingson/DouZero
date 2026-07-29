@@ -363,12 +363,16 @@ class V3H71BOracleAlignment:
 
     def add_public(self, key: AsyncReplayKey, row: V3ReplayTransition) -> None:
         self._check_new(key, self.public_rows)
+        if not isinstance(row, V3ReplayTransition):
+            raise TypeError("H7.1b public alignment row has an invalid type")
         if len(self.public_rows) >= self.capacity:
             raise RuntimeError("H7.1b Oracle alignment backlog exceeded capacity")
         self.public_rows[key] = row
 
     def add_sidecar(self, key: AsyncReplayKey, sidecar: V3H3OracleSidecar) -> None:
         self._check_new(key, self.sidecars)
+        if not isinstance(sidecar, V3H3OracleSidecar):
+            raise TypeError("H7.1b sidecar alignment row has an invalid type")
         if len(self.sidecars) >= self.capacity:
             raise RuntimeError("H7.1b Oracle alignment backlog exceeded capacity")
         self.sidecars[key] = sidecar
@@ -859,7 +863,7 @@ class V3AsyncSingleGPUTrainer:
                     raise TypeError("H7 training sidecar envelope mismatch")
                 key, sidecar = message
                 if key in queued_sidecars:
-                    raise RuntimeError("duplicate H7.1a sidecar queue key")
+                    raise RuntimeError("duplicate H7 training sidecar queue key")
                 queued_sidecars[key] = sidecar
             paired = []
             for row, key in aligned:
@@ -966,11 +970,7 @@ class V3AsyncSingleGPUTrainer:
                 if self.belief_buffer is None
                 else [self.belief_buffer[index] for index in indices]
             )
-            oracle_samples = (
-                None
-                if self.oracle_buffer is None
-                else [self.oracle_buffer[index] for index in indices]
-            )
+            oracle_samples = self._oracle_samples_for_indices(indices)
             learner_policy_before = int(self.learner.policy_version)
             metrics = self.learner.train_batch(
                 learner_rows,
@@ -999,11 +999,7 @@ class V3AsyncSingleGPUTrainer:
             if self.belief_buffer is None
             else [self.belief_buffer[index] for index in indices]
         )
-        oracle_samples = (
-            None
-            if self.oracle_buffer is None
-            else [self.oracle_buffer[index] for index in indices]
-        )
+        oracle_samples = self._oracle_samples_for_indices(indices)
         started = time.perf_counter()
         learner_policy_before = int(self.learner.policy_version)
         metrics = self.learner.train_batch(
@@ -1044,6 +1040,16 @@ class V3AsyncSingleGPUTrainer:
                 "H7 ordinary DMC replay requires a sidecar-enabled runtime"
             )
         return [replace(row, adaptive_provenance=None) for row in rows]
+
+    def _oracle_samples_for_indices(self, indices: list[int]):
+        if self.oracle_buffer is None:
+            return None
+        h3 = self.learner.base.base.base
+        return (
+            [self.oracle_buffer[index] for index in indices]
+            if h3._privileged_needed(h3.schedule_state())
+            else None
+        )
 
     def _parameter_update_snapshot(self) -> tuple[torch.Tensor, ...]:
         return tuple(
