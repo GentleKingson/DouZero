@@ -61,6 +61,7 @@ from douzero.v3_hybrid.selective_search import (
 )
 from douzero.v3_hybrid.support_matrix import (
     RULESET_LEGACY,
+    RULESET_STANDARD,
     TOPOLOGY_ASYNC_SINGLE_GPU,
     validate_capability_support,
 )
@@ -126,7 +127,9 @@ def test_h7_benchmark_waits_for_a_full_single_process_replay_batch():
 
 
 def test_h7_support_matrix_enables_implemented_async_capabilities():
-    for capability in ("role_model", "adaptive_dmc", "oracle", "public_export"):
+    for capability in (
+        "role_model", "adaptive_dmc", "oracle", "cooperation", "public_export"
+    ):
         validate_capability_support(
             capability,
             topology=TOPOLOGY_ASYNC_SINGLE_GPU,
@@ -138,9 +141,19 @@ def test_h7_support_matrix_enables_implemented_async_capabilities():
         )
     with pytest.raises(ValueError, match="does not support async_single_gpu"):
         validate_capability_support(
-            "cooperation",
+            "strategy",
             topology=TOPOLOGY_ASYNC_SINGLE_GPU,
             ruleset=RULESET_LEGACY,
+            checkpoint_resume=True,
+            export=False,
+            deployment=False,
+            search=False,
+        )
+    with pytest.raises(ValueError, match="async_single_gpu.*standard"):
+        validate_capability_support(
+            "cooperation",
+            topology=TOPOLOGY_ASYNC_SINGLE_GPU,
+            ruleset=RULESET_STANDARD,
             checkpoint_resume=True,
             export=False,
             deployment=False,
@@ -404,6 +417,10 @@ def _benchmark_record(protocol, topology, repeat):
         "oracle_samples_per_second": 0.0,
         "oracle_optimizer_steps_per_second": 0.0,
         "oracle_parameter_vram_bytes": 0.0,
+        "cooperation_samples_per_second": 0.0,
+        "cooperation_episodes_per_second": 0.0,
+        "cooperation_optimizer_steps_per_second": 0.0,
+        "cooperation_parameter_vram_bytes": 0.0,
         "requests_per_microbatch": 2.0,
         "legal_actions_per_batch": 16.0,
         "queue_wait_seconds": 1.0,
@@ -452,6 +469,17 @@ def test_h7_benchmark_requires_three_matched_repeats_per_topology():
     ]
     with pytest.raises(ValueError, match="Oracle benchmark metric"):
         validate_h7_benchmark_evidence(oracle_records, oracle_protocol)
+
+    cooperation_protocol = replace(protocol, cooperation_enabled=True)
+    cooperation_records = [
+        _benchmark_record(cooperation_protocol, topology, repeat)
+        for topology in H7_TOPOLOGIES
+        for repeat in range(3)
+    ]
+    with pytest.raises(ValueError, match="cooperation benchmark metric"):
+        validate_h7_benchmark_evidence(
+            cooperation_records, cooperation_protocol
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA host")

@@ -58,9 +58,17 @@ from .training.h3_learner import (
     bind_v3_h3_oracle_sidecar,
     build_v3_h3_oracle_sidecar,
 )
+from .training.cooperation import (
+    FARMER_ROLES,
+    MIXER_PRIVILEGED,
+    V3H5AsyncDecisionSidecar,
+    V3H5FarmerTrajectory,
+    bind_v3_h5_async_decision,
+    build_v3_h5_async_decision_sidecar,
+)
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1b-runtime-v8"
-V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v5"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1c-runtime-v12"
+V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v6"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
 V3_H71A_REQUEST_PROTOCOL = (
@@ -75,6 +83,12 @@ V3_H71A_SNAPSHOT_SEMANTICS = (
 V3_H71B_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-oracle-sidecar-v1"
 V3_H71B_REPLAY_PROTOCOL = (
     "v3-public-replay-plus-privileged-oracle-sidecar-source-fingerprint-v2"
+)
+V3_H71C_REQUEST_PROTOCOL = (
+    "v2-shared-slots-v3-dmc-q-public-farmer-cooperation-sidecar-v1"
+)
+V3_H71C_REPLAY_PROTOCOL = (
+    "v3-public-replay-plus-episode-atomic-farmer-trajectories-v1"
 )
 V3_H71AB_REQUEST_PROTOCOL = (
     "v2-shared-slots-v3-dmc-q-belief-oracle-sidecars-v1"
@@ -155,21 +169,28 @@ class V3H7RuntimeConfig:
     belief_sidecar_capacity: int = 4096
     oracle_runtime_enabled: bool = False
     oracle_sidecar_capacity: int = 4096
+    cooperation_runtime_enabled: bool = False
+    cooperation_sidecar_capacity: int = 4096
+    cooperation_episode_capacity: int = 1024
 
     def __post_init__(self) -> None:
         if self.topology not in {
             TOPOLOGY_SINGLE_PROCESS, TOPOLOGY_ASYNC_SINGLE_GPU,
         }:
             raise ValueError("unknown H7 runtime topology")
-        if not isinstance(self.belief_runtime_enabled, bool):
-            raise TypeError("H7 belief_runtime_enabled must be bool")
-        if not isinstance(self.oracle_runtime_enabled, bool):
-            raise TypeError("H7 oracle_runtime_enabled must be bool")
+        for name in (
+            "belief_runtime_enabled",
+            "oracle_runtime_enabled",
+            "cooperation_runtime_enabled",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"H7 {name} must be bool")
         positive = (
             "num_actors", "games_per_actor", "batch_size", "replay_capacity",
             "max_actions", "target_microbatch", "max_policy_lag",
             "max_steps_per_episode", "belief_sidecar_capacity",
-            "oracle_sidecar_capacity",
+            "oracle_sidecar_capacity", "cooperation_sidecar_capacity",
+            "cooperation_episode_capacity",
         )
         for name in positive:
             value = getattr(self, name)
@@ -195,21 +216,27 @@ class V3H7RuntimeConfig:
                 raise ValueError(f"H7 runtime {name} must be positive and finite")
         if not math.isfinite(self.epsilon) or not 0.0 <= self.epsilon <= 1.0:
             raise ValueError("H7 runtime epsilon must be in [0, 1]")
-        capability_pair = (
-            self.belief_runtime_enabled, self.oracle_runtime_enabled
-        )
-        expected_request = {
-            (False, False): V3_H7_REQUEST_PROTOCOL,
-            (True, False): V3_H71A_REQUEST_PROTOCOL,
-            (False, True): V3_H71B_REQUEST_PROTOCOL,
-            (True, True): V3_H71AB_REQUEST_PROTOCOL,
-        }[capability_pair]
-        expected_replay = {
-            (False, False): V3_H7_REPLAY_PROTOCOL,
-            (True, False): V3_H71A_REPLAY_PROTOCOL,
-            (False, True): V3_H71B_REPLAY_PROTOCOL,
-            (True, True): V3_H71AB_REPLAY_PROTOCOL,
-        }[capability_pair]
+        enabled_sidecars = sum((
+            self.belief_runtime_enabled,
+            self.oracle_runtime_enabled,
+            self.cooperation_runtime_enabled,
+        ))
+        if enabled_sidecars > 1:
+            raise NotImplementedError(
+                "combined async H7.1 capability transports are not supported"
+            )
+        if self.belief_runtime_enabled:
+            expected_request = V3_H71A_REQUEST_PROTOCOL
+            expected_replay = V3_H71A_REPLAY_PROTOCOL
+        elif self.oracle_runtime_enabled:
+            expected_request = V3_H71B_REQUEST_PROTOCOL
+            expected_replay = V3_H71B_REPLAY_PROTOCOL
+        elif self.cooperation_runtime_enabled:
+            expected_request = V3_H71C_REQUEST_PROTOCOL
+            expected_replay = V3_H71C_REPLAY_PROTOCOL
+        else:
+            expected_request = V3_H7_REQUEST_PROTOCOL
+            expected_replay = V3_H7_REPLAY_PROTOCOL
         expected_snapshot = (
             V3_H71A_SNAPSHOT_SEMANTICS
             if self.belief_runtime_enabled
@@ -228,6 +255,9 @@ class V3H7RuntimeConfig:
             payload["belief_sidecar_capacity"] = None
         if not self.oracle_runtime_enabled:
             payload["oracle_sidecar_capacity"] = None
+        if not self.cooperation_runtime_enabled:
+            payload["cooperation_sidecar_capacity"] = None
+            payload["cooperation_episode_capacity"] = None
         return {"version": V3_H7_RUNTIME_VERSION, **payload}
 
     def stable_hash(self) -> str:
@@ -242,7 +272,12 @@ def _h7_alignment_capacity(config: V3H7RuntimeConfig, sidecar_capacity: int) -> 
         inference_slots * 2,
         min(config.batch_size * 2, 64),
     )
-    return max(sidecar_capacity, replay_slots)
+    episode_rows = (
+        inference_slots * config.max_steps_per_episode
+        if config.cooperation_runtime_enabled
+        else 0
+    )
+    return max(sidecar_capacity, replay_slots, episode_rows)
 
 
 def _drain_sidecar_queue(sidecar_queue) -> int:
@@ -285,6 +320,11 @@ class V3H7RuntimeStats:
     belief_optimizer_steps: int = 0
     oracle_labels_collected: int = 0
     oracle_optimizer_steps: int = 0
+    cooperation_labels_collected: int = 0
+    cooperation_episodes_collected: int = 0
+    cooperation_optimizer_steps: int = 0
+    cooperation_incomplete_episodes: int = 0
+    cooperation_oversized_episodes: int = 0
     amp_fallbacks: int = 0
     episodes_per_team: dict[str, int] = field(
         default_factory=lambda: {"landlord": 0, "farmer": 0}
@@ -447,6 +487,353 @@ class V3H71BOracleAlignment:
             raise RuntimeError("H7.1b cannot quiesce with unmatched Oracle sidecars")
 
 
+@dataclass(frozen=True)
+class V3H71CCooperationEpisode:
+    """One complete, episode-atomic farmer training unit."""
+
+    transitions: tuple[V3ReplayTransition, ...]
+    trajectories: tuple[V3H5FarmerTrajectory, V3H5FarmerTrajectory]
+
+    def __post_init__(self) -> None:
+        if not self.transitions:
+            raise ValueError("H7.1c cooperation episode cannot be empty")
+        if len(self.trajectories) != 2:
+            raise ValueError("H7.1c cooperation episode requires two farmers")
+        trajectory_rows = tuple(
+            row for trajectory in self.trajectories for row in trajectory.transitions
+        )
+        transition_ids = tuple(id(row) for row in self.transitions)
+        trajectory_ids = tuple(id(row) for row in trajectory_rows)
+        if (
+            len(set(transition_ids)) != len(transition_ids)
+            or len(set(trajectory_ids)) != len(trajectory_ids)
+            or not set(trajectory_ids).issubset(transition_ids)
+            or any(row.role not in FARMER_ROLES for row in trajectory_rows)
+        ):
+            raise ValueError("H7.1c episode rows and trajectories disagree")
+
+
+class V3H71CCooperationAlignment:
+    """Aggregate unequal farmer decisions into complete learner-side pairs."""
+
+    def __init__(self, capacity: int, max_episode_transitions: int) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("H7.1c alignment capacity must be positive")
+        if (
+            isinstance(max_episode_transitions, bool)
+            or not isinstance(max_episode_transitions, int)
+            or max_episode_transitions < 1
+        ):
+            raise ValueError("H7.1c episode limit must be positive")
+        self.capacity = capacity
+        self.max_episode_transitions = max_episode_transitions
+        self.public_rows: dict[AsyncReplayKey, V3ReplayTransition] = {}
+        self.sidecars: dict[AsyncReplayKey, V3H5AsyncDecisionSidecar] = {}
+        self._episode_decisions: dict[
+            tuple[int, int],
+            dict[str, list[tuple[object, V3H5AsyncDecisionSidecar]]],
+        ] = {}
+        self._episode_public_rows: dict[
+            tuple[int, int], list[tuple[int, V3ReplayTransition]]
+        ] = {}
+        self._expected: dict[tuple[int, int], dict[str, int]] = {}
+        self._expected_total: dict[tuple[int, int], int] = {}
+        self._ready: deque[V3H71CCooperationEpisode] = deque()
+        self._completed = deque(maxlen=capacity)
+        self._completed_set: set[AsyncReplayKey] = set()
+        self.incomplete_episodes = 0
+        self.oversized_episodes = 0
+
+    @property
+    def pending_count(self) -> int:
+        staged = sum(
+            len(items)
+            for roles in self._episode_decisions.values()
+            for items in roles.values()
+        )
+        return (
+            len(self.public_rows)
+            + len(self.sidecars)
+            + staged
+            + sum(len(rows) for rows in self._episode_public_rows.values())
+            + len(self._expected)
+        )
+
+    def _check_new(self, key: AsyncReplayKey, store: Mapping) -> None:
+        if not isinstance(key, AsyncReplayKey):
+            raise TypeError("H7.1c alignment key has an invalid type")
+        if key in store or key in self._completed_set:
+            raise RuntimeError("duplicate H7.1c alignment key")
+
+    def add_public(self, key: AsyncReplayKey, row: V3ReplayTransition) -> None:
+        self._check_new(key, self.public_rows)
+        if not isinstance(row, V3ReplayTransition) or row.role not in FARMER_ROLES:
+            raise TypeError("H7.1c public alignment row must be a farmer replay row")
+        if len(self.public_rows) >= self.capacity:
+            raise RuntimeError("H7.1c public alignment backlog exceeded capacity")
+        self.public_rows[key] = row
+
+    def add_sidecar(
+        self, key: AsyncReplayKey, sidecar: V3H5AsyncDecisionSidecar
+    ) -> None:
+        self._check_new(key, self.sidecars)
+        if not isinstance(sidecar, V3H5AsyncDecisionSidecar):
+            raise TypeError("H7.1c sidecar alignment row has an invalid type")
+        if len(self.sidecars) >= self.capacity:
+            raise RuntimeError("H7.1c sidecar alignment backlog exceeded capacity")
+        self.sidecars[key] = sidecar
+
+    def _remember_completed(self, key: AsyncReplayKey) -> None:
+        if len(self._completed) == self.capacity:
+            expired = self._completed.popleft()
+            self._completed_set.remove(expired)
+        self._completed.append(key)
+        self._completed_set.add(key)
+
+    def _stage(
+        self,
+        key: AsyncReplayKey,
+        row: V3ReplayTransition,
+        sidecar: V3H5AsyncDecisionSidecar,
+    ) -> None:
+        if key.trace_index != sidecar.trace_index:
+            raise ValueError("H7.1c key and sidecar trace index differ")
+        expected_episode = f"actor-{key.actor_id}-episode-{key.episode_id}"
+        expected_deal = f"async-deal-{key.episode_id}"
+        if row.episode_id != expected_episode or row.deal_id != expected_deal:
+            raise ValueError("H7.1c replay episode identity mismatch")
+        decision = bind_v3_h5_async_decision(row, sidecar)
+        identity = (key.actor_id, key.episode_id)
+        staged = sum(
+            len(items)
+            for episode_roles in self._episode_decisions.values()
+            for items in episode_roles.values()
+        )
+        if staged >= self.capacity:
+            raise RuntimeError(
+                "H7.1c episode assembly backlog exceeded capacity"
+            )
+        roles = self._episode_decisions.setdefault(
+            identity, {role: [] for role in FARMER_ROLES}
+        )
+        roles[row.role].append((decision, sidecar))
+        self._episode_public_rows.setdefault(identity, []).append(
+            (key.trace_index, row)
+        )
+        self._remember_completed(key)
+        self._finalize_ready(identity)
+
+    def add_landlord(
+        self, key: AsyncReplayKey, row: V3ReplayTransition
+    ) -> None:
+        if row.role != "landlord":
+            raise ValueError("H7.1c non-farmer episode row must be landlord")
+        self._check_new(key, self.public_rows)
+        identity = (key.actor_id, key.episode_id)
+        self._episode_public_rows.setdefault(identity, []).append(
+            (key.trace_index, row)
+        )
+        self._remember_completed(key)
+        self._finalize_ready(identity)
+
+    def add_pair(self, key, row, sidecar) -> int:
+        self._check_new(key, self.public_rows)
+        self._check_new(key, self.sidecars)
+        self._stage(key, row, sidecar)
+        return 1
+
+    def pop_ready_pairs(self) -> int:
+        completed = 0
+        for key in tuple(self.public_rows):
+            sidecar = self.sidecars.get(key)
+            if sidecar is None:
+                continue
+            row = self.public_rows.pop(key)
+            self.sidecars.pop(key)
+            self._stage(key, row, sidecar)
+            completed += 1
+        return completed
+
+    def mark_episode_complete(
+        self,
+        actor_id: int,
+        episode_id: int,
+        farmer_counts: Mapping[str, object],
+        total_count: int | None = None,
+    ) -> None:
+        identity = (actor_id, episode_id)
+        if identity in self._expected:
+            raise RuntimeError("duplicate H7.1c episode completion")
+        if not isinstance(farmer_counts, Mapping) or set(farmer_counts) != set(
+            FARMER_ROLES
+        ):
+            raise ValueError("H7.1c farmer count fields mismatch")
+        normalized = {}
+        for role in FARMER_ROLES:
+            value = farmer_counts[role]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("H7.1c farmer decision count is invalid")
+            normalized[role] = value
+        self._expected[identity] = normalized
+        if total_count is None:
+            total_count = sum(normalized.values())
+        if (
+            isinstance(total_count, bool)
+            or not isinstance(total_count, int)
+            or total_count < sum(normalized.values())
+        ):
+            raise ValueError("H7.1c episode total count is invalid")
+        self._expected_total[identity] = total_count
+        self._episode_decisions.setdefault(
+            identity, {role: [] for role in FARMER_ROLES}
+        )
+        self._finalize_ready(identity)
+
+    def _finalize_ready(self, identity: tuple[int, int]) -> None:
+        expected = self._expected.get(identity)
+        roles = self._episode_decisions.get(identity)
+        if expected is None or roles is None:
+            return
+        actual = {role: len(roles[role]) for role in FARMER_ROLES}
+        if any(actual[role] > expected[role] for role in FARMER_ROLES):
+            raise RuntimeError("H7.1c received excess farmer decisions")
+        if actual != expected:
+            return
+        public_rows = self._episode_public_rows.get(identity, [])
+        if len(public_rows) != self._expected_total[identity]:
+            return
+        self._expected.pop(identity)
+        self._expected_total.pop(identity)
+        self._episode_decisions.pop(identity)
+        self._episode_public_rows.pop(identity)
+        if any(actual[role] == 0 for role in FARMER_ROLES):
+            self.incomplete_episodes += 1
+            return
+        trajectories = []
+        for role in FARMER_ROLES:
+            entries = sorted(
+                roles[role], key=lambda item: item[0].trace_index
+            )
+            sidecars = [item[1] for item in entries]
+            policy_ids = {item.policy_id for item in sidecars}
+            teammate_ids = {item.teammate_policy_id for item in sidecars}
+            if len(policy_ids) != 1 or len(teammate_ids) != 1:
+                raise ValueError("H7.1c policy provenance changed within one game")
+            decisions = tuple(item[0] for item in entries)
+            first = decisions[0].transition
+            trajectories.append(V3H5FarmerTrajectory(
+                episode_id=first.episode_id,
+                deal_id=first.deal_id,
+                role=role,
+                policy_id=next(iter(policy_ids)),
+                teammate_policy_id=next(iter(teammate_ids)),
+                decisions=decisions,
+                team_return=first.mc_return,
+            ))
+        up, down = trajectories
+        if up.teammate_policy_id != down.policy_id:
+            raise ValueError("H7.1c landlord-up teammate provenance mismatch")
+        if down.teammate_policy_id != up.policy_id:
+            raise ValueError("H7.1c landlord-down teammate provenance mismatch")
+        transitions = tuple(row for _trace, row in sorted(public_rows))
+        if len(transitions) > self.max_episode_transitions:
+            self.oversized_episodes += 1
+            return
+        self._ready.append(V3H71CCooperationEpisode(
+            transitions=transitions,
+            trajectories=(up, down),
+        ))
+
+    def pop_ready_episodes(self) -> list[V3H71CCooperationEpisode]:
+        result = list(self._ready)
+        self._ready.clear()
+        return result
+
+    def discard_pending(self) -> int:
+        identities = {
+            *self._episode_decisions,
+            *self._expected,
+            *self._expected_total,
+            *self._episode_public_rows,
+            *((key.actor_id, key.episode_id) for key in self.public_rows),
+            *((key.actor_id, key.episode_id) for key in self.sidecars),
+        }
+        self.public_rows.clear()
+        self.sidecars.clear()
+        self._episode_decisions.clear()
+        self._episode_public_rows.clear()
+        self._expected.clear()
+        self._expected_total.clear()
+        self._ready.clear()
+        return len(identities)
+
+    def assert_quiescent(self) -> None:
+        if self.pending_count:
+            raise RuntimeError(
+                "H7.1c cannot quiesce with unmatched farmer trajectories"
+            )
+
+
+def _remap_h7_cooperation_trajectories(
+    source_rows: Sequence[V3ReplayTransition],
+    learner_rows: Sequence[V3ReplayTransition],
+    trajectories: Sequence[V3H5FarmerTrajectory] | None,
+) -> tuple[V3H5FarmerTrajectory, ...] | None:
+    """Preserve episode metadata when replay rows are normalized for H2."""
+
+    if trajectories is None:
+        return None
+    if len(source_rows) != len(learner_rows):
+        raise ValueError("H7.1c learner row remap length mismatch")
+    replacements = {
+        id(source): learner
+        for source, learner in zip(source_rows, learner_rows)
+    }
+    remapped = []
+    for trajectory in trajectories:
+        decisions = []
+        for decision in trajectory.decisions:
+            replacement = replacements.get(id(decision.transition))
+            if replacement is None:
+                raise ValueError(
+                    "H7.1c trajectory row is absent from the learner batch"
+                )
+            decisions.append(replace(decision, transition=replacement))
+        remapped.append(replace(trajectory, decisions=tuple(decisions)))
+    return tuple(remapped)
+
+
+def _restore_h7_cooperation_alignment_counters(
+    alignment: V3H71CCooperationAlignment | None,
+    stats: V3H7RuntimeStats,
+) -> None:
+    """Seed alignment-local counters from cumulative checkpoint progress."""
+
+    if alignment is None:
+        return
+    alignment.incomplete_episodes = stats.cooperation_incomplete_episodes
+    alignment.oversized_episodes = stats.cooperation_oversized_episodes
+
+
+def _h71c_needs_collection_retry(
+    *,
+    completed: int,
+    target: int,
+    received: int,
+    expected: int,
+    replay_size: int,
+) -> bool:
+    """Return whether a completed collection has no eligible farmer episode."""
+
+    values = (completed, target, received, expected, replay_size)
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in values
+    ):
+        raise ValueError("H7.1c collection retry counters must be non-negative ints")
+    return completed >= target and received >= expected and replay_size == 0
+
+
 def validate_v3_h7_runtime_config(
     resolved_config: V3H6ResolvedConfig,
     runtime_config: V3H7RuntimeConfig,
@@ -465,7 +852,8 @@ def validate_v3_h7_runtime_config(
         )
     enabled = set(features.enabled_capabilities())
     unsupported = enabled - {
-        "role_model", "adaptive_dmc", "belief", "oracle", "public_export"
+        "role_model", "adaptive_dmc", "belief", "oracle", "cooperation",
+        "public_export",
     }
     if unsupported:
         raise NotImplementedError(
@@ -474,9 +862,10 @@ def validate_v3_h7_runtime_config(
         )
     belief_enabled = "belief" in enabled
     oracle_enabled = "oracle" in enabled
-    if belief_enabled and oracle_enabled:
+    cooperation_enabled = "cooperation" in enabled
+    if sum((belief_enabled, oracle_enabled, cooperation_enabled)) > 1:
         raise NotImplementedError(
-            "H7.1b isolates Oracle async; combined belief+Oracle transport is deferred"
+            "H7.1 capability transports remain isolated until a later integration"
         )
     if belief_enabled != runtime_config.belief_runtime_enabled:
         raise ValueError(
@@ -509,6 +898,23 @@ def validate_v3_h7_runtime_config(
             )
         if not resolved_config.learner.base.base.base.schedule.enabled:
             raise ValueError("H7.1b Oracle runtime requires an enabled H3 schedule")
+    if cooperation_enabled != runtime_config.cooperation_runtime_enabled:
+        raise ValueError(
+            "H7 runtime cooperation feature and transport disagree"
+        )
+    if cooperation_enabled:
+        cooperation = resolved_config.learner.base.cooperation
+        if cooperation.mixer_mode == MIXER_PRIVILEGED:
+            raise NotImplementedError(
+                "H7.1c privileged mixer state transport is not implemented"
+            )
+        if (
+            runtime_config.cooperation_sidecar_capacity
+            < runtime_config.batch_size
+        ):
+            raise ValueError(
+                "H7.1c cooperation sidecar capacity cannot be smaller than batch_size"
+            )
     for capability in enabled:
         validate_capability_support(
             capability,
@@ -519,13 +925,19 @@ def validate_v3_h7_runtime_config(
             deployment=topology.deployment,
             search=False,
         )
-    if not features.adaptive_dmc and not belief_enabled and not oracle_enabled:
+    if (
+        not features.adaptive_dmc
+        and not belief_enabled
+        and not oracle_enabled
+        and not cooperation_enabled
+    ):
         raise ValueError("H7 async replay requires Adaptive DMC q_old provenance")
     if (
         resolved_config.learner.base.base.base.public.adaptive_dmc.mode
         == ADMC_DISABLED
         and not belief_enabled
         and not oracle_enabled
+        and not cooperation_enabled
     ):
         raise ValueError("H7 async runtime cannot use disabled Adaptive DMC")
     learner_batch_size = resolved_config.learner.base.base.base.public.batch_size
@@ -536,7 +948,7 @@ def validate_v3_h7_runtime_config(
 
 
 class V3AsyncSingleGPUTrainer:
-    """V3 async trainer for base ADMC and the H7.1a belief capability."""
+    """V3 async trainer for base ADMC and isolated H7.1 capability transports."""
 
     def __init__(
         self,
@@ -575,6 +987,11 @@ class V3AsyncSingleGPUTrainer:
             if runtime_config.oracle_runtime_enabled
             else None
         )
+        self.cooperation_buffer: deque[V3H71CCooperationEpisode] | None = (
+            deque(maxlen=runtime_config.cooperation_episode_capacity)
+            if runtime_config.cooperation_runtime_enabled
+            else None
+        )
         self._belief_alignment = (
             V3H71ABeliefAlignment(
                 _h7_alignment_capacity(
@@ -591,6 +1008,16 @@ class V3AsyncSingleGPUTrainer:
                 )
             )
             if runtime_config.oracle_runtime_enabled
+            else None
+        )
+        self._cooperation_alignment = (
+            V3H71CCooperationAlignment(
+                _h7_alignment_capacity(
+                    runtime_config, runtime_config.cooperation_sidecar_capacity
+                ),
+                runtime_config.batch_size,
+            )
+            if runtime_config.cooperation_runtime_enabled
             else None
         )
         self._rng = random.Random(runtime_config.action_seed)
@@ -638,6 +1065,14 @@ class V3AsyncSingleGPUTrainer:
                 "disabled"
                 if self.oracle_buffer is None
                 else "separate-privileged-keyed-sidecar-learner-only-v1"
+            ),
+            "cooperation_sidecar": (
+                "disabled"
+                if self.cooperation_buffer is None
+                else (
+                    "public-decision-sidecar-episode-atomic-learner-mixer-"
+                    "never-public-replay-v1"
+                )
             ),
         }
         self.runtime_hash = _stable_hash(self.runtime_identity)
@@ -711,6 +1146,11 @@ class V3AsyncSingleGPUTrainer:
             if cfg.oracle_runtime_enabled
             else None
         )
+        self._cooperation_sidecar_queue = (
+            context.Queue(maxsize=cfg.cooperation_sidecar_capacity)
+            if cfg.cooperation_runtime_enabled
+            else None
+        )
         self._stagers: dict[int, PinnedObservationBatchStager] = {}
         self._workers = []
         for actor_id in range(cfg.num_actors):
@@ -737,6 +1177,7 @@ class V3AsyncSingleGPUTrainer:
                     "runtime_kind": "v3_hybrid",
                     "belief_sidecar_queue": self._belief_sidecar_queue,
                     "oracle_sidecar_queue": self._oracle_sidecar_queue,
+                    "cooperation_sidecar_queue": self._cooperation_sidecar_queue,
                 },
                 name=f"douzero-v3-actor-{actor_id}",
             )
@@ -866,7 +1307,11 @@ class V3AsyncSingleGPUTrainer:
 
     def _drain_replay(self) -> int:
         started = time.perf_counter()
-        if self.belief_buffer is None and self.oracle_buffer is None:
+        if (
+            self.belief_buffer is None
+            and self.oracle_buffer is None
+            and self.cooperation_buffer is None
+        ):
             rows = self._replay_slots.read_ready_v3(
                 feature_schema_hash=self.model.schema.stable_hash(),
                 target_transform=self.model.config.dmc_target_transform,
@@ -874,6 +1319,61 @@ class V3AsyncSingleGPUTrainer:
             )
             self.buffer.extend(rows)
             completed = len(rows)
+        elif self.cooperation_buffer is not None:
+            aligned = self._replay_slots.read_ready_v3_aligned(
+                feature_schema_hash=self.model.schema.stable_hash(),
+                target_transform=self.model.config.dmc_target_transform,
+                ruleset_identity=self.learner.ruleset.identity(),
+            )
+            queued_sidecars = {}
+            while True:
+                try:
+                    message = self._cooperation_sidecar_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if (
+                    not isinstance(message, tuple)
+                    or len(message) != 2
+                    or not isinstance(message[0], AsyncReplayKey)
+                    or not isinstance(message[1], V3H5AsyncDecisionSidecar)
+                ):
+                    raise TypeError("H7.1c cooperation sidecar envelope mismatch")
+                key, sidecar = message
+                if key in queued_sidecars:
+                    raise RuntimeError(
+                        "duplicate H7.1c cooperation sidecar queue key"
+                    )
+                queued_sidecars[key] = sidecar
+            completed = 0
+            for row, key in aligned:
+                if row.role not in FARMER_ROLES:
+                    self._cooperation_alignment.add_landlord(key, row)
+                    completed += 1
+                    continue
+                sidecar = queued_sidecars.pop(key, None)
+                if sidecar is None:
+                    self._cooperation_alignment.add_public(key, row)
+                else:
+                    completed += self._cooperation_alignment.add_pair(
+                        key, row, sidecar
+                    )
+                    self.stats.cooperation_labels_collected += 1
+            for key, sidecar in queued_sidecars.items():
+                self._cooperation_alignment.add_sidecar(key, sidecar)
+            paired = self._cooperation_alignment.pop_ready_pairs()
+            completed += paired
+            self.stats.cooperation_labels_collected += paired
+            episodes = self._cooperation_alignment.pop_ready_episodes()
+            for episode in episodes:
+                self.cooperation_buffer.append(episode)
+                self.buffer.extend(episode.transitions)
+                self.stats.cooperation_episodes_collected += 1
+            self.stats.cooperation_incomplete_episodes = (
+                self._cooperation_alignment.incomplete_episodes
+            )
+            self.stats.cooperation_oversized_episodes = (
+                self._cooperation_alignment.oversized_episodes
+            )
         else:
             aligned = self._replay_slots.read_ready_v3_aligned(
                 feature_schema_hash=self.model.schema.stable_hash(),
@@ -958,20 +1458,50 @@ class V3AsyncSingleGPUTrainer:
             raise ValueError("H7 episode target must be non-negative")
         if target == 0:
             return
+        initial_episode_id = self.stats.games_collected
+        requested_target = target
+        retry_limit = (
+            self.config.cooperation_episode_capacity
+            if self.cooperation_buffer is not None
+            else 0
+        )
         if not self._runtime_started:
             self._start_runtime()
         self._publish_snapshot()
         for episode_id in range(
-            self.stats.games_collected,
-            self.stats.games_collected + target,
+            initial_episode_id,
+            initial_episode_id + target,
         ):
             self._tasks.put(episode_id)
         completed = expected = received = 0
         deadline = time.monotonic() + self.config.request_timeout_seconds * max(1, target)
-        while completed < target or received < expected:
+        while True:
             self._coordinator._raise_if_failed()
             self._service_requests()
             received += self._drain_replay()
+            if completed >= target and received >= expected:
+                needs_retry = (
+                    self.cooperation_buffer is not None
+                    and _h71c_needs_collection_retry(
+                        completed=completed,
+                        target=target,
+                        received=received,
+                        expected=expected,
+                        replay_size=len(self.cooperation_buffer),
+                    )
+                )
+                if not needs_retry:
+                    break
+                retries = target - requested_target
+                if retries >= retry_limit:
+                    raise RuntimeError(
+                        "H7.1c collection exhausted its bounded eligible-episode "
+                        "retry budget"
+                    )
+                self._tasks.put(initial_episode_id + target)
+                target += 1
+                deadline += self.config.request_timeout_seconds
+                continue
             for process in self._workers:
                 if process.exitcode is not None:
                     raise RuntimeError(
@@ -1001,17 +1531,55 @@ class V3AsyncSingleGPUTrainer:
                 if len(event) >= 9:
                     self._actor_blocked_seconds += float(event[7])
                     self._actor_wall_seconds += float(event[8])
+                if self._cooperation_alignment is not None:
+                    if len(event) != 10:
+                        raise ValueError(
+                            "H7.1c completion event lacks farmer decision counts"
+                        )
+                    self._cooperation_alignment.mark_episode_complete(
+                        int(event[1]),
+                        int(event[2]),
+                        event[9],
+                        total_count=count,
+                    )
+                    episodes = self._cooperation_alignment.pop_ready_episodes()
+                    for episode in episodes:
+                        self.cooperation_buffer.append(episode)
+                        self.buffer.extend(episode.transitions)
+                        self.stats.cooperation_episodes_collected += 1
+                    self.stats.cooperation_incomplete_episodes = (
+                        self._cooperation_alignment.incomplete_episodes
+                    )
+                    self.stats.cooperation_oversized_episodes = (
+                        self._cooperation_alignment.oversized_episodes
+                    )
 
     def optimize(self, num_steps: int) -> None:
         if num_steps < 0:
             raise ValueError("H7 optimizer steps must be non-negative")
         for _ in range(num_steps):
-            if len(self.buffer) < self.config.batch_size:
+            if self.cooperation_buffer is not None:
+                if not self.cooperation_buffer:
+                    raise ValueError(
+                        "H7.1c replay has no complete farmer episode"
+                    )
+                episode = self._rng.choice(tuple(self.cooperation_buffer))
+                rows = list(episode.transitions)
+                trajectories = episode.trajectories
+                indices = []
+            elif len(self.buffer) < self.config.batch_size:
                 raise ValueError("H7 replay has fewer rows than batch_size")
+            else:
+                indices = self._rng.sample(
+                    range(len(self.buffer)), self.config.batch_size
+                )
+                rows = [self.buffer[index] for index in indices]
+                trajectories = None
             started = time.perf_counter()
-            indices = self._rng.sample(range(len(self.buffer)), self.config.batch_size)
-            rows = [self.buffer[index] for index in indices]
             learner_rows = self._learner_rows(rows)
+            learner_trajectories = _remap_h7_cooperation_trajectories(
+                rows, learner_rows, trajectories
+            )
             belief_samples = (
                 None
                 if self.belief_buffer is None
@@ -1021,6 +1589,7 @@ class V3AsyncSingleGPUTrainer:
             learner_policy_before = int(self.learner.policy_version)
             metrics = self.learner.train_batch(
                 learner_rows,
+                trajectories=learner_trajectories,
                 belief_samples=belief_samples,
                 oracle_samples=oracle_samples,
             )
@@ -1030,17 +1599,33 @@ class V3AsyncSingleGPUTrainer:
             h3_metrics = metrics.base.base.base
             if h3_metrics is not None and h3_metrics.oracle_updated:
                 self.stats.oracle_optimizer_steps += 1
+            if metrics.base.cooperation_updated:
+                self.stats.cooperation_optimizer_steps += 1
             self.stats.optimizer_steps += 1
             self.stats.learner_cardplay_samples += len(rows)
             self._segments["learner"] += time.perf_counter() - started
 
     def step(self):
         """Run one learner update for the shared long-running controller."""
-        if len(self.buffer) < self.config.batch_size:
-            return None
-        indices = self._rng.sample(range(len(self.buffer)), self.config.batch_size)
-        rows = [self.buffer[index] for index in indices]
+        if self.cooperation_buffer is not None:
+            if not self.cooperation_buffer:
+                return None
+            episode = self._rng.choice(tuple(self.cooperation_buffer))
+            rows = list(episode.transitions)
+            trajectories = episode.trajectories
+            indices = []
+        else:
+            if len(self.buffer) < self.config.batch_size:
+                return None
+            indices = self._rng.sample(
+                range(len(self.buffer)), self.config.batch_size
+            )
+            rows = [self.buffer[index] for index in indices]
+            trajectories = None
         learner_rows = self._learner_rows(rows)
+        learner_trajectories = _remap_h7_cooperation_trajectories(
+            rows, learner_rows, trajectories
+        )
         belief_samples = (
             None
             if self.belief_buffer is None
@@ -1051,6 +1636,7 @@ class V3AsyncSingleGPUTrainer:
         learner_policy_before = int(self.learner.policy_version)
         metrics = self.learner.train_batch(
             learner_rows,
+            trajectories=learner_trajectories,
             belief_samples=belief_samples,
             oracle_samples=oracle_samples,
         )
@@ -1060,6 +1646,8 @@ class V3AsyncSingleGPUTrainer:
         h3_metrics = metrics.base.base.base
         if h3_metrics is not None and h3_metrics.oracle_updated:
             self.stats.oracle_optimizer_steps += 1
+        if metrics.base.cooperation_updated:
+            self.stats.cooperation_optimizer_steps += 1
         self.stats.optimizer_steps += 1
         self.stats.learner_cardplay_samples += len(rows)
         self._segments["learner"] += time.perf_counter() - started
@@ -1082,7 +1670,11 @@ class V3AsyncSingleGPUTrainer:
     ) -> list[V3ReplayTransition]:
         if self.resolved_config.learner.features.adaptive_dmc:
             return rows
-        if self.belief_buffer is None and self.oracle_buffer is None:
+        if (
+            self.belief_buffer is None
+            and self.oracle_buffer is None
+            and self.cooperation_buffer is None
+        ):
             raise RuntimeError(
                 "H7 ordinary DMC replay requires a sidecar-enabled runtime"
             )
@@ -1111,6 +1703,9 @@ class V3AsyncSingleGPUTrainer:
         oracle = self.learner.base.base.base.oracle
         if oracle is not None:
             parameters += tuple(oracle.parameters())
+        cooperation = self.learner.base.cooperation
+        if cooperation is not None:
+            parameters += tuple(cooperation.parameters())
         return parameters
 
     def _parameters_changed_since(
@@ -1141,6 +1736,8 @@ class V3AsyncSingleGPUTrainer:
             self._belief_alignment.assert_quiescent()
         if self._oracle_alignment is not None:
             self._oracle_alignment.assert_quiescent()
+        if self._cooperation_alignment is not None:
+            self._cooperation_alignment.assert_quiescent()
         latencies = sorted(self._queue_latencies_ms)
 
         def percentile(fraction: float) -> float:
@@ -1171,6 +1768,34 @@ class V3AsyncSingleGPUTrainer:
                     else self.learner.base.base.base.oracle.parameters()
                 )
             ),
+            "cooperation_replay_occupancy": (
+                0
+                if self.cooperation_buffer is None
+                else len(self.cooperation_buffer)
+            ),
+            "cooperation_labels_collected": (
+                self.stats.cooperation_labels_collected
+            ),
+            "cooperation_episodes_collected": (
+                self.stats.cooperation_episodes_collected
+            ),
+            "cooperation_optimizer_steps": (
+                self.stats.cooperation_optimizer_steps
+            ),
+            "cooperation_incomplete_episodes": (
+                self.stats.cooperation_incomplete_episodes
+            ),
+            "cooperation_oversized_episodes": (
+                self.stats.cooperation_oversized_episodes
+            ),
+            "cooperation_parameter_vram_bytes": sum(
+                parameter.numel() * parameter.element_size()
+                for parameter in (
+                    ()
+                    if self.learner.base.cooperation is None
+                    else self.learner.base.cooperation.parameters()
+                )
+            ),
             "requests_per_microbatch": self._requests / max(1, self._microbatches),
             "actions_per_microbatch": self._actions / max(1, self._microbatches),
             "inference_queue_p50_ms": percentile(0.50),
@@ -1196,12 +1821,16 @@ class V3AsyncSingleGPUTrainer:
             self.belief_buffer.clear()
         if self.oracle_buffer is not None:
             self.oracle_buffer.clear()
+        if self.cooperation_buffer is not None:
+            self.cooperation_buffer.clear()
 
     def save_training_checkpoint(self, path: str, *, long_running_state) -> None:
         if self._belief_alignment is not None:
             self._belief_alignment.assert_quiescent()
         if self._oracle_alignment is not None:
             self._oracle_alignment.assert_quiescent()
+        if self._cooperation_alignment is not None:
+            self._cooperation_alignment.assert_quiescent()
         with tempfile.TemporaryDirectory(prefix="douzero-h7-save-") as temporary:
             inner_path = Path(temporary) / "h6.pt"
             self.learner.save_checkpoint(inner_path)
@@ -1257,6 +1886,11 @@ class V3AsyncSingleGPUTrainer:
             "amp_fallbacks", "learner_cardplay_samples",
             "belief_labels_collected", "belief_optimizer_steps",
             "oracle_labels_collected", "oracle_optimizer_steps",
+            "cooperation_labels_collected",
+            "cooperation_episodes_collected",
+            "cooperation_optimizer_steps",
+            "cooperation_incomplete_episodes",
+            "cooperation_oversized_episodes",
         }:
             raise ValueError("H7 checkpoint statistics fields mismatch")
         candidate_stats = V3H7RuntimeStats(**stats_payload)
@@ -1266,6 +1900,11 @@ class V3AsyncSingleGPUTrainer:
             "amp_fallbacks", "learner_cardplay_samples",
             "belief_labels_collected", "belief_optimizer_steps",
             "oracle_labels_collected", "oracle_optimizer_steps",
+            "cooperation_labels_collected",
+            "cooperation_episodes_collected",
+            "cooperation_optimizer_steps",
+            "cooperation_incomplete_episodes",
+            "cooperation_oversized_episodes",
         ):
             value = getattr(candidate_stats, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1289,6 +1928,16 @@ class V3AsyncSingleGPUTrainer:
             or candidate_stats.oracle_optimizer_steps
         ):
             raise ValueError("H7 checkpoint contains unexpected Oracle progress")
+        if not self.config.cooperation_runtime_enabled and any((
+            candidate_stats.cooperation_labels_collected,
+            candidate_stats.cooperation_episodes_collected,
+            candidate_stats.cooperation_optimizer_steps,
+            candidate_stats.cooperation_incomplete_episodes,
+            candidate_stats.cooperation_oversized_episodes,
+        )):
+            raise ValueError(
+                "H7 checkpoint contains unexpected cooperation progress"
+            )
         if (
             candidate_stats.belief_optimizer_steps
             > candidate_stats.optimizer_steps
@@ -1303,6 +1952,21 @@ class V3AsyncSingleGPUTrainer:
             > candidate_stats.transitions_collected
         ):
             raise ValueError("H7 checkpoint Oracle statistics are invalid")
+        if (
+            candidate_stats.cooperation_optimizer_steps
+            > candidate_stats.optimizer_steps
+            or candidate_stats.cooperation_labels_collected
+            > candidate_stats.transitions_collected
+            or candidate_stats.cooperation_episodes_collected
+            > candidate_stats.episodes_completed
+            or (
+                candidate_stats.cooperation_episodes_collected
+                + candidate_stats.cooperation_incomplete_episodes
+                + candidate_stats.cooperation_oversized_episodes
+                > candidate_stats.episodes_completed
+            )
+        ):
+            raise ValueError("H7 checkpoint cooperation statistics are invalid")
         candidate_rng = random.Random()
         candidate_rng.setstate(bundle["rng_state"])
         snapshot_step = bundle["snapshot_step"]
@@ -1345,6 +2009,9 @@ class V3AsyncSingleGPUTrainer:
                     raise ValueError(
                         "H7 nested learner policy version failed to restore"
                     )
+                _restore_h7_cooperation_alignment_counters(
+                    self._cooperation_alignment, self.stats
+                )
             except Exception:
                 self.stats = previous_stats
                 self._rng.setstate(previous_rng)
@@ -1366,6 +2033,7 @@ class V3AsyncSingleGPUTrainer:
                 (
                     self._belief_sidecar_queue,
                     self._oracle_sidecar_queue,
+                    self._cooperation_sidecar_queue,
                 ),
                 5.0,
             )
@@ -1392,6 +2060,11 @@ class V3AsyncSingleGPUTrainer:
             if self._oracle_sidecar_queue is not None:
                 self._oracle_sidecar_queue.close()
                 self._oracle_sidecar_queue.join_thread()
+            if self._cooperation_sidecar_queue is not None:
+                self._cooperation_sidecar_queue.close()
+                self._cooperation_sidecar_queue.join_thread()
+            if self._cooperation_alignment is not None:
+                self._cooperation_alignment.discard_pending()
             self._tasks.close()
             self._events.close()
             self._runtime_started = False
@@ -1429,11 +2102,34 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
         target = int(num_episodes or 0)
         if target < 0:
             raise ValueError("H7 episode target must be non-negative")
+        if target == 0:
+            return
         self._publish_snapshot()
-        for episode_number in range(
-            self.stats.games_collected,
-            self.stats.games_collected + target,
-        ):
+        episode_number = self.stats.games_collected
+        completed = 0
+        retry_limit = (
+            self.config.cooperation_episode_capacity
+            if self.cooperation_buffer is not None
+            else 0
+        )
+        while True:
+            needs_retry = (
+                self.cooperation_buffer is not None
+                and _h71c_needs_collection_retry(
+                    completed=completed,
+                    target=target,
+                    received=completed,
+                    expected=completed,
+                    replay_size=len(self.cooperation_buffer),
+                )
+            )
+            if completed >= target and not needs_retry:
+                break
+            if needs_retry and completed - target >= retry_limit:
+                raise RuntimeError(
+                    "H7.1c collection exhausted its bounded eligible-episode "
+                    "retry budget"
+                )
             environment_seed = (
                 derive_formal_stream_seed(
                     self.config.environment_seed,
@@ -1462,6 +2158,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
             pending = []
             pending_belief = []
             pending_oracle = []
+            pending_cooperation = []
             decisions = 0
             steps = 0
             while True:
@@ -1525,6 +2222,20 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                             action_index=action_index,
                             public_inputs=captured.model_inputs,
                         ))
+                    if self.cooperation_buffer is not None and position in FARMER_ROLES:
+                        provenance = f"{self.policy_version}@{self._snapshot_step}"
+                        pending_cooperation.append((
+                            len(pending),
+                            build_v3_h5_async_decision_sidecar(
+                                observation,
+                                selected_action_index=action_index,
+                                trace_index=steps,
+                                public_inputs=captured.model_inputs,
+                                snapshot_policy_version=self._snapshot_step,
+                                policy_id=provenance,
+                                teammate_policy_id=provenance,
+                            ),
+                        ))
                     pending.append(replace(
                         captured,
                         adaptive_provenance=AdaptiveSnapshotProvenance(
@@ -1569,6 +2280,48 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                     for row, sidecar in zip(rows, pending_oracle)
                 )
                 self.stats.oracle_labels_collected += len(pending_oracle)
+            if self.cooperation_buffer is not None:
+                by_role = {role: [] for role in FARMER_ROLES}
+                for row_index, sidecar in pending_cooperation:
+                    decision = bind_v3_h5_async_decision(
+                        rows[row_index], sidecar
+                    )
+                    by_role[sidecar.role].append((decision, sidecar))
+                if any(not by_role[role] for role in FARMER_ROLES):
+                    self.stats.cooperation_incomplete_episodes += 1
+                else:
+                    trajectories = []
+                    for role in FARMER_ROLES:
+                        entries = sorted(
+                            by_role[role], key=lambda item: item[0].trace_index
+                        )
+                        first = entries[0][0].transition
+                        trajectories.append(V3H5FarmerTrajectory(
+                            episode_id=first.episode_id,
+                            deal_id=first.deal_id,
+                            role=role,
+                            policy_id=entries[0][1].policy_id,
+                            teammate_policy_id=(
+                                entries[0][1].teammate_policy_id
+                            ),
+                            decisions=tuple(item[0] for item in entries),
+                            team_return=first.mc_return,
+                        ))
+                    episode_rows = tuple(rows)
+                    if len(episode_rows) > self.config.batch_size:
+                        self.stats.cooperation_oversized_episodes += 1
+                    else:
+                        episode = V3H71CCooperationEpisode(
+                            transitions=episode_rows,
+                            trajectories=(
+                                trajectories[0], trajectories[1]
+                            ),
+                        )
+                        self.cooperation_buffer.append(episode)
+                        self.stats.cooperation_episodes_collected += 1
+                self.stats.cooperation_labels_collected += len(
+                    pending_cooperation
+                )
             self.stats.games_collected += 1
             self.stats.episodes_completed += 1
             self.stats.transitions_collected += len(rows)
@@ -1577,6 +2330,8 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
             if team not in {"landlord", "farmer"}:
                 raise ValueError("H7 terminal winner_team is invalid")
             self.stats.episodes_per_team[team] += 1
+            completed += 1
+            episode_number += 1
 
     def quiesce_cycle_boundary(self) -> dict[str, object]:
         self._publish_snapshot()
@@ -1590,12 +2345,19 @@ __all__ = [
     "V3_H71A_REPLAY_PROTOCOL",
     "V3_H71A_REQUEST_PROTOCOL",
     "V3_H71A_SNAPSHOT_SEMANTICS",
+    "V3_H71B_REPLAY_PROTOCOL",
+    "V3_H71B_REQUEST_PROTOCOL",
+    "V3_H71C_REPLAY_PROTOCOL",
+    "V3_H71C_REQUEST_PROTOCOL",
     "V3_H7_CHECKPOINT_FORMAT",
     "V3_H7_REPLAY_PROTOCOL",
     "V3_H7_REQUEST_PROTOCOL",
     "V3_H7_RUNTIME_VERSION",
     "V3AsyncSingleGPUTrainer",
     "V3H71ABeliefAlignment",
+    "V3H71BOracleAlignment",
+    "V3H71CCooperationAlignment",
+    "V3H71CCooperationEpisode",
     "V3SingleProcessTrainer",
     "V3H7RuntimeConfig",
     "V3H7RuntimeStats",

@@ -21,6 +21,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71A_SNAPSHOT_SEMANTICS,
     V3_H71B_REPLAY_PROTOCOL,
     V3_H71B_REQUEST_PROTOCOL,
+    V3_H71C_REPLAY_PROTOCOL,
+    V3_H71C_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -69,13 +71,18 @@ def main() -> None:
     )
     belief_enabled = resolved.learner.features.belief
     oracle_enabled = resolved.learner.features.oracle
+    cooperation_enabled = resolved.learner.features.cooperation
     request_protocol = (
         V3_H71A_REQUEST_PROTOCOL
         if belief_enabled
         else (
             V3_H71B_REQUEST_PROTOCOL
             if oracle_enabled
-            else V3_H7_REQUEST_PROTOCOL
+            else (
+                V3_H71C_REQUEST_PROTOCOL
+                if cooperation_enabled
+                else V3_H7_REQUEST_PROTOCOL
+            )
         )
     )
     replay_protocol = (
@@ -84,12 +91,17 @@ def main() -> None:
         else (
             V3_H71B_REPLAY_PROTOCOL
             if oracle_enabled
-            else V3_H7_REPLAY_PROTOCOL
+            else (
+                V3_H71C_REPLAY_PROTOCOL
+                if cooperation_enabled
+                else V3_H7_REPLAY_PROTOCOL
+            )
         )
     )
     runtime_config = V3H7RuntimeConfig(
         belief_runtime_enabled=belief_enabled,
         oracle_runtime_enabled=oracle_enabled,
+        cooperation_runtime_enabled=cooperation_enabled,
         request_protocol=request_protocol,
         replay_protocol=replay_protocol,
         snapshot_semantics=(
@@ -121,6 +133,7 @@ def main() -> None:
             else str(formal.identity_dict()["config_sha256"])
         ),
         oracle_enabled=oracle_enabled,
+        cooperation_enabled=cooperation_enabled,
         gpu=args.gpu,
         driver=args.driver,
         pytorch=args.pytorch,

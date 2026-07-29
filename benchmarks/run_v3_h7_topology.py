@@ -36,6 +36,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71A_SNAPSHOT_SEMANTICS,
     V3_H71B_REPLAY_PROTOCOL,
     V3_H71B_REQUEST_PROTOCOL,
+    V3_H71C_REPLAY_PROTOCOL,
+    V3_H71C_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -121,15 +123,22 @@ def _validate_live_identity(
             raise ValueError(f"H7 benchmark live {name} mismatch")
     belief_enabled = resolved.learner.features.belief
     oracle_enabled = resolved.learner.features.oracle
+    cooperation_enabled = resolved.learner.features.cooperation
     if protocol.oracle_enabled != oracle_enabled:
         raise ValueError("H7 benchmark Oracle capability identity mismatch")
+    if protocol.cooperation_enabled != cooperation_enabled:
+        raise ValueError("H7 benchmark cooperation capability identity mismatch")
     request = (
         V3_H71A_REQUEST_PROTOCOL
         if belief_enabled
         else (
             V3_H71B_REQUEST_PROTOCOL
             if oracle_enabled
-            else V3_H7_REQUEST_PROTOCOL
+            else (
+                V3_H71C_REQUEST_PROTOCOL
+                if cooperation_enabled
+                else V3_H7_REQUEST_PROTOCOL
+            )
         )
     )
     replay = (
@@ -138,7 +147,11 @@ def _validate_live_identity(
         else (
             V3_H71B_REPLAY_PROTOCOL
             if oracle_enabled
-            else V3_H7_REPLAY_PROTOCOL
+            else (
+                V3_H71C_REPLAY_PROTOCOL
+                if cooperation_enabled
+                else V3_H7_REPLAY_PROTOCOL
+            )
         )
     )
     trainer_identity_hash = h7_trainer_identity_hash(
@@ -234,6 +247,7 @@ def main() -> None:
         trainer_type = V3AsyncSingleGPUTrainer
     belief_enabled = resolved.learner.features.belief
     oracle_enabled = resolved.learner.features.oracle
+    cooperation_enabled = resolved.learner.features.cooperation
     environment_seed, action_seed, seed_derivation = (
         resolve_v3_h7_seed_contract(
             formal_training_seeds=(
@@ -258,13 +272,18 @@ def main() -> None:
         action_seed=action_seed,
         belief_runtime_enabled=belief_enabled,
         oracle_runtime_enabled=oracle_enabled,
+        cooperation_runtime_enabled=cooperation_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL
             if belief_enabled
             else (
                 V3_H71B_REQUEST_PROTOCOL
                 if oracle_enabled
-                else V3H7RuntimeConfig.request_protocol
+                else (
+                    V3_H71C_REQUEST_PROTOCOL
+                    if cooperation_enabled
+                    else V3H7RuntimeConfig.request_protocol
+                )
             )
         ),
         replay_protocol=(
@@ -273,7 +292,11 @@ def main() -> None:
             else (
                 V3_H71B_REPLAY_PROTOCOL
                 if oracle_enabled
-                else V3H7RuntimeConfig.replay_protocol
+                else (
+                    V3_H71C_REPLAY_PROTOCOL
+                    if cooperation_enabled
+                    else V3H7RuntimeConfig.replay_protocol
+                )
             )
         ),
         snapshot_semantics=(
@@ -307,6 +330,15 @@ def main() -> None:
             "steps": trainer.stats.optimizer_steps,
             "oracle_labels": trainer.stats.oracle_labels_collected,
             "oracle_steps": trainer.stats.oracle_optimizer_steps,
+            "cooperation_labels": (
+                trainer.stats.cooperation_labels_collected
+            ),
+            "cooperation_episodes": (
+                trainer.stats.cooperation_episodes_collected
+            ),
+            "cooperation_steps": (
+                trainer.stats.cooperation_optimizer_steps
+            ),
         }
         parameter_snapshot = trainer._parameter_update_snapshot()
         started = time.monotonic()
@@ -324,6 +356,15 @@ def main() -> None:
             "steps": trainer.stats.optimizer_steps,
             "oracle_labels": trainer.stats.oracle_labels_collected,
             "oracle_steps": trainer.stats.oracle_optimizer_steps,
+            "cooperation_labels": (
+                trainer.stats.cooperation_labels_collected
+            ),
+            "cooperation_episodes": (
+                trainer.stats.cooperation_episodes_collected
+            ),
+            "cooperation_steps": (
+                trainer.stats.cooperation_optimizer_steps
+            ),
         }
         shared_memory = _shared_memory_bytes(trainer)
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -374,6 +415,19 @@ def main() -> None:
             ) / elapsed,
             "oracle_parameter_vram_bytes": int(
                 boundary["oracle_parameter_vram_bytes"]
+            ),
+            "cooperation_samples_per_second": (
+                after["cooperation_labels"] - before["cooperation_labels"]
+            ) / elapsed,
+            "cooperation_episodes_per_second": (
+                after["cooperation_episodes"]
+                - before["cooperation_episodes"]
+            ) / elapsed,
+            "cooperation_optimizer_steps_per_second": (
+                after["cooperation_steps"] - before["cooperation_steps"]
+            ) / elapsed,
+            "cooperation_parameter_vram_bytes": int(
+                boundary["cooperation_parameter_vram_bytes"]
             ),
             "requests_per_microbatch": float(boundary["requests_per_microbatch"]),
             "legal_actions_per_batch": float(boundary["actions_per_microbatch"]),
