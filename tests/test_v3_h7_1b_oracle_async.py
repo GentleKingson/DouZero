@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import pickle
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -157,6 +158,45 @@ def test_oracle_alignment_is_bounded_duplicate_safe_and_quiescent():
     pending.add_sidecar(key, sidecar)
     with pytest.raises(RuntimeError, match="unmatched Oracle"):
         pending.assert_quiescent()
+
+
+def test_primary_h7_cli_selects_oracle_sidecar_protocols_before_cuda(
+    monkeypatch, tmp_path
+):
+    import train_v3_h7
+
+    captured = {}
+    original_validate = train_v3_h7.validate_v3_h7_runtime_config
+
+    def capture(resolved, runtime_config):
+        original_validate(resolved, runtime_config)
+        captured["runtime"] = runtime_config
+
+    monkeypatch.setattr(
+        train_v3_h7, "validate_v3_h7_runtime_config", capture
+    )
+    monkeypatch.setattr(train_v3_h7.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_v3_h7.py",
+            "--formal-config",
+            str(ROOT / "configs/v3_formal/v3_oracle_legacy.yaml"),
+            "--checkpoint-path",
+            str(tmp_path / "oracle"),
+            "--oracle-sidecar-capacity",
+            "17",
+        ],
+    )
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        train_v3_h7.main()
+
+    runtime = captured["runtime"]
+    assert runtime.oracle_runtime_enabled is True
+    assert runtime.oracle_sidecar_capacity == 17
+    assert runtime.request_protocol == V3_H71B_REQUEST_PROTOCOL
+    assert runtime.replay_protocol == V3_H71B_REPLAY_PROTOCOL
 
 
 def test_actor_source_never_constructs_or_forwards_privileged_oracle():
