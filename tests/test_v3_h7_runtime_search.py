@@ -125,8 +125,8 @@ def test_h7_benchmark_waits_for_a_full_single_process_replay_batch():
     assert lag == 0
 
 
-def test_h7_support_matrix_enables_only_base_async_capabilities():
-    for capability in ("role_model", "adaptive_dmc", "public_export"):
+def test_h7_support_matrix_enables_implemented_async_capabilities():
+    for capability in ("role_model", "adaptive_dmc", "oracle", "public_export"):
         validate_capability_support(
             capability,
             topology=TOPOLOGY_ASYNC_SINGLE_GPU,
@@ -138,7 +138,7 @@ def test_h7_support_matrix_enables_only_base_async_capabilities():
         )
     with pytest.raises(ValueError, match="does not support async_single_gpu"):
         validate_capability_support(
-            "oracle",
+            "cooperation",
             topology=TOPOLOGY_ASYNC_SINGLE_GPU,
             ruleset=RULESET_LEGACY,
             checkpoint_resume=True,
