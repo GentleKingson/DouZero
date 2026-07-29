@@ -50,7 +50,7 @@ def main() -> None:
     parser.add_argument(
         "--formal-config",
         type=Path,
-        help="freeze the H7.1a belief protocol for a committed formal config",
+        help="freeze an H7 sidecar protocol for a committed formal config",
     )
     parser.add_argument("--warmup-seconds", type=float, default=30.0)
     parser.add_argument("--measurement-seconds", type=float, default=300.0)

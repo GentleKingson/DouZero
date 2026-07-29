@@ -1048,19 +1048,22 @@ class V3AsyncSingleGPUTrainer:
     def _parameter_update_snapshot(self) -> tuple[torch.Tensor, ...]:
         return tuple(
             parameter.detach().clone()
-            for parameter in self._served_parameters()
+            for parameter in self._tracked_training_parameters()
         )
 
-    def _served_parameters(self) -> tuple[torch.nn.Parameter, ...]:
+    def _tracked_training_parameters(self) -> tuple[torch.nn.Parameter, ...]:
         parameters = tuple(self.model.parameters())
         if self.belief_model is not None:
             parameters += tuple(self.belief_model.parameters())
+        oracle = self.learner.base.base.base.oracle
+        if oracle is not None:
+            parameters += tuple(oracle.parameters())
         return parameters
 
     def _parameters_changed_since(
         self, snapshots: tuple[torch.Tensor, ...]
     ) -> bool:
-        parameters = self._served_parameters()
+        parameters = self._tracked_training_parameters()
         if len(snapshots) != len(parameters):
             raise ValueError("H7 parameter update snapshot shape changed")
         return any(
@@ -1107,6 +1110,14 @@ class V3AsyncSingleGPUTrainer:
             ),
             "oracle_labels_collected": self.stats.oracle_labels_collected,
             "oracle_optimizer_steps": self.stats.oracle_optimizer_steps,
+            "oracle_parameter_vram_bytes": sum(
+                parameter.numel() * parameter.element_size()
+                for parameter in (
+                    ()
+                    if self.learner.base.base.base.oracle is None
+                    else self.learner.base.base.base.oracle.parameters()
+                )
+            ),
             "requests_per_microbatch": self._requests / max(1, self._microbatches),
             "actions_per_microbatch": self._actions / max(1, self._microbatches),
             "inference_queue_p50_ms": percentile(0.50),
