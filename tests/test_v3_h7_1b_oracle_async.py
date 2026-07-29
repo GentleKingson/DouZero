@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import torch
 
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
@@ -15,7 +16,10 @@ from douzero.observation.privileged import PrivilegedObservation
 from douzero.training.async_single_gpu import AsyncReplayKey, async_actor_main
 from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.integration_replay import assert_public_replay_payload
-from douzero.v3_hybrid.pilot import build_pilot_resolved_config
+from douzero.v3_hybrid.pilot import (
+    build_pilot_resolved_config,
+    create_pilot_learner,
+)
 from douzero.v3_hybrid.replay import capture_plain_transition
 from douzero.v3_hybrid.runtime import (
     V3_H71B_REPLAY_PROTOCOL,
@@ -160,3 +164,73 @@ def test_actor_source_never_constructs_or_forwards_privileged_oracle():
     assert "V3PrivilegedOracle" not in source
     assert ".oracle(" not in source
     assert "build_v3_h3_oracle_sidecar" in source
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_h71b_cuda_oracle_update_checkpoint_resume_and_shutdown(tmp_path):
+    formal = load_formal_config(
+        ROOT / "configs/v3_formal/v3_oracle_legacy.yaml"
+    )
+    learner, resolved = create_pilot_learner(formal)
+    from douzero.v3_hybrid.runtime import V3AsyncSingleGPUTrainer
+
+    runtime = V3AsyncSingleGPUTrainer(learner, resolved, _runtime())
+    checkpoint = tmp_path / "oracle-async.pt"
+    try:
+        runtime.collect_episodes(1)
+        public_before = {
+            name: value.detach().clone()
+            for name, value in learner.model.state_dict().items()
+        }
+        oracle_before = {
+            name: value.detach().clone()
+            for name, value in learner.base.base.base.oracle.state_dict().items()
+        }
+        policy_before = runtime.policy_step
+        metrics = runtime.step()
+        assert metrics is not None
+        assert metrics.base.base.base.oracle_updated
+        assert not metrics.base.base.base.public_updated
+        assert runtime.policy_step == policy_before
+        assert runtime.stats.oracle_optimizer_steps == 1
+        assert runtime.stats.oracle_labels_collected == len(runtime.buffer)
+        assert all(
+            torch.equal(public_before[name], value)
+            for name, value in learner.model.state_dict().items()
+        )
+        assert any(
+            not torch.equal(oracle_before[name], value)
+            for name, value in learner.base.base.base.oracle.state_dict().items()
+        )
+        boundary = runtime.quiesce_cycle_boundary()
+        assert boundary["active_slots"] == 0
+        assert boundary["pending_requests"] == 0
+        assert boundary["oracle_parameter_vram_bytes"] > 0
+        runtime.save_training_checkpoint(
+            str(checkpoint), long_running_state={"cycle": 1}
+        )
+        schedule_before = learner.base.base.base.schedule_state().as_dict()
+    finally:
+        runtime.shutdown()
+
+    resumed_learner, resumed_resolved = create_pilot_learner(formal)
+    resumed = V3AsyncSingleGPUTrainer(
+        resumed_learner, resumed_resolved, _runtime()
+    )
+    try:
+        assert resumed.load_training_checkpoint(checkpoint) == {"cycle": 1}
+        assert (
+            resumed_learner.base.base.base.schedule_state().as_dict()
+            == schedule_before
+        )
+        assert resumed.stats.oracle_optimizer_steps == 1
+        resumed.collect_episodes(1)
+        assert resumed.step() is not None
+        assert resumed.stats.oracle_optimizer_steps == 2
+        boundary = resumed.quiesce_cycle_boundary()
+        assert boundary["active_slots"] == 0
+        assert boundary["in_flight_slots"] == 0
+        assert boundary["pending_requests"] == 0
+    finally:
+        resumed.shutdown()
+    assert not list(tmp_path.glob("*.tmp"))
