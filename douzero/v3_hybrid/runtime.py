@@ -865,11 +865,11 @@ class V3AsyncSingleGPUTrainer:
             for row, key in aligned:
                 sidecar = queued_sidecars.pop(key, None)
                 if sidecar is None:
-                        alignment.add_public(key, row)
-                    else:
-                        paired.append(
-                            alignment.add_pair(key, row, sidecar)
-                        )
+                    alignment.add_public(key, row)
+                else:
+                    paired.append(
+                        alignment.add_pair(key, row, sidecar)
+                    )
             for key, sidecar in queued_sidecars.items():
                 alignment.add_sidecar(key, sidecar)
             paired.extend(alignment.pop_ready())
