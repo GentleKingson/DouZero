@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1b-support-matrix-v4"
+V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1c-support-matrix-v5"
 
 TOPOLOGY_SINGLE_PROCESS = "single_process"
 TOPOLOGY_ASYNC_SINGLE_GPU = "async_single_gpu"
@@ -60,8 +60,8 @@ _ROWS = {
         "H7.1a serves coupled public belief snapshots; labels stay sidecar-only",
     ),
     "cooperation": CapabilitySupport(
-        True, False, False, True, True, True, True, True, False,
-        "H5 sidecar and mixer are training-only and excluded from public export",
+        True, True, False, True, True, True, True, True, False,
+        "H7.1c aggregates farmer trajectories learner-side; mixer stays training-only",
     ),
     "human_bc": CapabilitySupport(
         True, False, False, True, False, True, True, True, False,

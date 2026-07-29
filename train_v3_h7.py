@@ -31,6 +31,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71A_SNAPSHOT_SEMANTICS,
     V3_H71B_REPLAY_PROTOCOL,
     V3_H71B_REQUEST_PROTOCOL,
+    V3_H71C_REPLAY_PROTOCOL,
+    V3_H71C_REQUEST_PROTOCOL,
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
@@ -87,6 +89,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--replay-capacity", type=int, default=4096)
     parser.add_argument("--belief-sidecar-capacity", type=int, default=4096)
     parser.add_argument("--oracle-sidecar-capacity", type=int, default=4096)
+    parser.add_argument("--cooperation-sidecar-capacity", type=int, default=4096)
+    parser.add_argument("--cooperation-episode-capacity", type=int, default=1024)
     parser.add_argument("--target-microbatch", type=int, default=4)
     parser.add_argument("--max-policy-lag", type=int, default=128)
     parser.add_argument("--seed", type=int)
@@ -128,6 +132,7 @@ def main() -> None:
     )
     belief_enabled = resolved.learner.features.belief
     oracle_enabled = resolved.learner.features.oracle
+    cooperation_enabled = resolved.learner.features.cooperation
     environment_seed, action_seed, seed_derivation = (
         resolve_v3_h7_seed_contract(
             formal_training_seeds=(
@@ -148,6 +153,8 @@ def main() -> None:
         replay_capacity=args.replay_capacity,
         belief_sidecar_capacity=args.belief_sidecar_capacity,
         oracle_sidecar_capacity=args.oracle_sidecar_capacity,
+        cooperation_sidecar_capacity=args.cooperation_sidecar_capacity,
+        cooperation_episode_capacity=args.cooperation_episode_capacity,
         target_microbatch=args.target_microbatch,
         max_policy_lag=args.max_policy_lag,
         environment_seed=environment_seed,
@@ -156,13 +163,18 @@ def main() -> None:
         epsilon=args.epsilon,
         belief_runtime_enabled=belief_enabled,
         oracle_runtime_enabled=oracle_enabled,
+        cooperation_runtime_enabled=cooperation_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL
             if belief_enabled
             else (
                 V3_H71B_REQUEST_PROTOCOL
                 if oracle_enabled
-                else V3H7RuntimeConfig.request_protocol
+                else (
+                    V3_H71C_REQUEST_PROTOCOL
+                    if cooperation_enabled
+                    else V3H7RuntimeConfig.request_protocol
+                )
             )
         ),
         replay_protocol=(
@@ -171,7 +183,11 @@ def main() -> None:
             else (
                 V3_H71B_REPLAY_PROTOCOL
                 if oracle_enabled
-                else V3H7RuntimeConfig.replay_protocol
+                else (
+                    V3_H71C_REPLAY_PROTOCOL
+                    if cooperation_enabled
+                    else V3H7RuntimeConfig.replay_protocol
+                )
             )
         ),
         snapshot_semantics=(

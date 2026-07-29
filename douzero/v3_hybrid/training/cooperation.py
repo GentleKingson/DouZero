@@ -13,6 +13,7 @@ import torch
 from torch import nn
 
 from douzero.belief.model import BELIEF_FEATURE_DIM
+from douzero.models_v2.batch import ModelInputBundle
 from douzero.observation.encode_v2 import ObservationV2
 from douzero.strategy.features import (
     STRATEGY_FEATURE_LAYOUT_HASH,
@@ -40,6 +41,7 @@ H5_PUBLIC_FEATURE_NAMES = (
     "belief_entropy",
 )
 H5_PUBLIC_FEATURE_DIM = len(H5_PUBLIC_FEATURE_NAMES)
+H5_ASYNC_SIDECAR_VERSION = "public-decision-sidecar-source-bound-v1"
 
 MIXER_DISABLED = "disabled"
 MIXER_PUBLIC = "public"
@@ -260,6 +262,131 @@ def build_h5_public_features(
     return result
 
 
+def _update_tensor_identity(
+    digest, name: str, value: torch.Tensor
+) -> None:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"H5 public source {name} must be a tensor")
+    array = value.detach().cpu().contiguous().numpy()
+    metadata = json.dumps(
+        {"name": name, "dtype": str(array.dtype), "shape": list(array.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    digest.update(metadata.encode("ascii"))
+    digest.update(array.tobytes(order="C"))
+
+
+def h5_public_source_identity(public_inputs: ModelInputBundle) -> str:
+    """Fingerprint the exact public model inputs used for one actor decision."""
+
+    if not isinstance(public_inputs, ModelInputBundle):
+        raise TypeError("H5 public source identity requires ModelInputBundle")
+    digest = hashlib.sha256(b"v3-h5-public-decision-source-binding-v1")
+    for index, value in enumerate(public_inputs.state_card_vectors):
+        _update_tensor_identity(digest, f"state_card_vectors.{index}", value)
+    _update_tensor_identity(
+        digest, "state_context_flat", public_inputs.state_context_flat
+    )
+    for index, value in enumerate(public_inputs.context_card_vectors):
+        _update_tensor_identity(digest, f"context_card_vectors.{index}", value)
+    for name in (
+        "context_flat",
+        "history_tokens",
+        "history_key_padding_mask",
+        "action_features",
+        "action_mask",
+    ):
+        _update_tensor_identity(digest, name, getattr(public_inputs, name))
+    for name in ("strategy_features", "style_features"):
+        value = getattr(public_inputs, name)
+        if value is None:
+            digest.update(f"{name}=none".encode("ascii"))
+        else:
+            _update_tensor_identity(digest, name, value)
+    digest.update(public_inputs.acting_role.encode("ascii"))
+    digest.update(public_inputs.feature_schema_hash.encode("ascii"))
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class V3H5AsyncDecisionSidecar:
+    """Public-only H5 decision metadata transported outside public replay."""
+
+    version: str
+    role: str
+    trace_index: int
+    selected_action_index: int
+    selected_action_is_pass: bool
+    public_features: torch.Tensor
+    source_state_identity: str
+    policy_id: str
+    teammate_policy_id: str
+
+    def __post_init__(self) -> None:
+        if self.version != H5_ASYNC_SIDECAR_VERSION:
+            raise ValueError("H5 async sidecar version mismatch")
+        if self.role not in FARMER_ROLES:
+            raise ValueError("H5 async decision sidecars are farmer-only")
+        for name in ("trace_index", "selected_action_index"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"H5 async sidecar {name} must be non-negative")
+        if not isinstance(self.selected_action_is_pass, bool):
+            raise TypeError("H5 async sidecar pass flag must be bool")
+        if (
+            not isinstance(self.public_features, torch.Tensor)
+            or self.public_features.shape != (H5_PUBLIC_FEATURE_DIM,)
+            or self.public_features.device.type != "cpu"
+            or self.public_features.dtype != torch.float32
+            or not bool(torch.isfinite(self.public_features).all())
+        ):
+            raise ValueError("H5 async public features must be a finite CPU row")
+        if (
+            not isinstance(self.source_state_identity, str)
+            or len(self.source_state_identity) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.source_state_identity
+            )
+        ):
+            raise ValueError("H5 async source identity must be SHA-256")
+        for name in ("policy_id", "teammate_policy_id"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"H5 async sidecar {name} must be non-empty")
+
+
+def build_v3_h5_async_decision_sidecar(
+    observation: ObservationV2,
+    *,
+    selected_action_index: int,
+    trace_index: int,
+    public_inputs: ModelInputBundle,
+    policy_id: str,
+    teammate_policy_id: str,
+) -> V3H5AsyncDecisionSidecar:
+    """Capture public cooperation features from the exact served decision."""
+
+    if observation.public.acting_role not in FARMER_ROLES:
+        raise ValueError("H5 async sidecars are farmer-only")
+    if public_inputs.acting_role != observation.public.acting_role:
+        raise ValueError("H5 async observation and public inputs disagree")
+    features = build_h5_public_features(observation, selected_action_index)
+    action = observation.actions.legal_actions[selected_action_index]
+    return V3H5AsyncDecisionSidecar(
+        version=H5_ASYNC_SIDECAR_VERSION,
+        role=observation.public.acting_role,
+        trace_index=trace_index,
+        selected_action_index=selected_action_index,
+        selected_action_is_pass=len(action) == 0,
+        public_features=features.detach().cpu().clone(),
+        source_state_identity=h5_public_source_identity(public_inputs),
+        policy_id=policy_id,
+        teammate_policy_id=teammate_policy_id,
+    )
+
+
 @dataclass(frozen=True)
 class V3H5FarmerDecision:
     """One trace-indexed replay row with its inseparable public side channel."""
@@ -287,6 +414,33 @@ class V3H5FarmerDecision:
             raise ValueError("H5 decision public features must be a finite CPU row")
         if not isinstance(self.selected_action_is_pass, bool):
             raise TypeError("H5 decision pass flag must be bool")
+
+
+def bind_v3_h5_async_decision(
+    transition: V3ReplayTransition,
+    sidecar: V3H5AsyncDecisionSidecar,
+) -> V3H5FarmerDecision:
+    """Bind one public replay row to its independently transported H5 data."""
+
+    if not isinstance(transition, V3ReplayTransition):
+        raise TypeError("H5 async binding requires V3ReplayTransition")
+    if not isinstance(sidecar, V3H5AsyncDecisionSidecar):
+        raise TypeError("H5 async binding requires V3H5AsyncDecisionSidecar")
+    if transition.role != sidecar.role:
+        raise ValueError("H5 async sidecar role mismatch")
+    if transition.selected_action_index != sidecar.selected_action_index:
+        raise ValueError("H5 async sidecar selected action mismatch")
+    if (
+        h5_public_source_identity(transition.model_inputs)
+        != sidecar.source_state_identity
+    ):
+        raise ValueError("H5 async sidecar source-state identity mismatch")
+    return V3H5FarmerDecision(
+        trace_index=sidecar.trace_index,
+        transition=transition,
+        public_features=sidecar.public_features.detach().cpu().clone(),
+        selected_action_is_pass=sidecar.selected_action_is_pass,
+    )
 
 
 @dataclass(frozen=True)
@@ -561,6 +715,7 @@ __all__ = [
     "FARMER_ROLES",
     "FARMER_ROLE_TO_INDEX",
     "H5_ALIGNMENT_VERSION",
+    "H5_ASYNC_SIDECAR_VERSION",
     "H5_MIXER_SEMANTICS_VERSION",
     "H5_PADDING_SEMANTICS",
     "H5_PUBLIC_FEATURE_DIM",
@@ -573,9 +728,13 @@ __all__ = [
     "FarmerCooperationOutput",
     "MonotonicSequentialMixer",
     "V3H5CooperationConfig",
+    "V3H5AsyncDecisionSidecar",
     "V3H5FarmerDecision",
     "V3H5FarmerTrajectory",
+    "bind_v3_h5_async_decision",
     "build_h5_public_features",
+    "build_v3_h5_async_decision_sidecar",
+    "h5_public_source_identity",
     "teammate_belief_summary",
     "validate_farmer_pairs",
 ]

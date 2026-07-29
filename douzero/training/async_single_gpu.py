@@ -1110,6 +1110,7 @@ def async_actor_main(
     runtime_kind: str = "v2",
     belief_sidecar_queue=None,
     oracle_sidecar_queue=None,
+    cooperation_sidecar_queue=None,
 ) -> None:
     """CPU-only interleaved-game actor. CUDA is never initialized here."""
     import random
@@ -1143,6 +1144,7 @@ def async_actor_main(
         raise ValueError("runtime_kind must be v2 or v3_hybrid")
     belief_async = coordinator.belief_inputs is not None
     oracle_async = oracle_sidecar_queue is not None
+    cooperation_async = cooperation_sidecar_queue is not None
     if belief_async != (belief_sidecar_queue is not None):
         raise ValueError(
             "async belief inference and training sidecar must be enabled together"
@@ -1151,9 +1153,11 @@ def async_actor_main(
         raise ValueError("async belief is supported only by the V3 runtime")
     if oracle_async and runtime_kind != "v3_hybrid":
         raise ValueError("async Oracle is supported only by the V3 runtime")
-    if belief_async and oracle_async:
+    if cooperation_async and runtime_kind != "v3_hybrid":
+        raise ValueError("async cooperation is supported only by the V3 runtime")
+    if sum((belief_async, oracle_async, cooperation_async)) > 1:
         raise NotImplementedError(
-            "combined async belief and Oracle sidecars are not supported"
+            "combined async H7.1 sidecar capabilities are not supported"
         )
     if belief_async or oracle_async:
         from douzero.observation.privileged import PrivilegedObservation
@@ -1164,6 +1168,11 @@ def async_actor_main(
     if oracle_async:
         from douzero.v3_hybrid.training.h3_learner import (
             build_v3_h3_oracle_sidecar,
+        )
+    if cooperation_async:
+        from douzero.v3_hybrid.training.cooperation import (
+            FARMER_ROLES,
+            build_v3_h5_async_decision_sidecar,
         )
     request_id = actor_id << 48
 
@@ -1195,6 +1204,23 @@ def async_actor_main(
                 )
             try:
                 oracle_sidecar_queue.put(
+                    (key, sidecar), timeout=min(0.05, remaining)
+                )
+                return
+            except queue.Full:
+                continue
+
+    def publish_cooperation_sidecar(key, sidecar) -> None:
+        deadline = time.monotonic() + coordinator.request_timeout_seconds
+        while True:
+            coordinator._raise_if_failed()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "async cooperation sidecar queue remained full past its deadline"
+                )
+            try:
+                cooperation_sidecar_queue.put(
                     (key, sidecar), timeout=min(0.05, remaining)
                 )
                 return
@@ -1274,13 +1300,34 @@ def async_actor_main(
                     ),
                     sidecar,
                 )
+            if cooperation_async and transition.position in FARMER_ROLES:
+                sidecar = getattr(transition, "cooperation_sidecar", None)
+                if sidecar is None:
+                    raise RuntimeError(
+                        "async farmer transition is missing its cooperation sidecar"
+                    )
+                publish_cooperation_sidecar(
+                    AsyncReplayKey(
+                        actor_id=actor_id,
+                        episode_id=game["episode_id"],
+                        trace_index=transition.trace_index,
+                    ),
+                    sidecar,
+                )
         team = episode.terminal_result.get("winner_team", "landlord")
+        farmer_counts = {
+            role: sum(
+                transition.position == role for transition in episode.transitions
+            )
+            for role in ("landlord_up", "landlord_down")
+        }
         event_queue.put((
             "completed", actor_id, game["episode_id"], len(episode.transitions),
             0 if team == "landlord" else 1, game["snapshot"],
             len(episode.action_trace),
             float(game["blocked_seconds"]),
             float(time.monotonic() - game["started_at"]),
+            farmer_counts,
         ))
 
     def apply_action(
@@ -1326,6 +1373,18 @@ def async_actor_main(
                     privileged,
                     action_index=action_index,
                     public_inputs=observation_to_model_inputs(obs),
+                )
+            if cooperation_async and position in FARMER_ROLES:
+                provenance = f"{policy_version}@{game['snapshot']}"
+                transition.cooperation_sidecar = (
+                    build_v3_h5_async_decision_sidecar(
+                        obs,
+                        selected_action_index=action_index,
+                        trace_index=transition.trace_index,
+                        public_inputs=observation_to_model_inputs(obs),
+                        policy_id=provenance,
+                        teammate_policy_id=provenance,
+                    )
                 )
             episode.transitions.append(transition)
         action = legal_actions[action_index]
