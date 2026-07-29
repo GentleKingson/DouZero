@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import benchmarks.freeze_v3_h7_protocol as freeze_h7
 from douzero.belief.features import build_belief_input
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
@@ -264,6 +266,42 @@ def test_formal_trainer_identity_always_binds_resolved_learner():
     assert formal == h7_trainer_identity_hash(
         **common, resolved_learner_hash="a" * 64
     )
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    ("v3_belief_standard.yaml", "v3_full_hybrid_legacy.yaml"),
+)
+def test_protocol_freeze_rejects_unsupported_formal_config_before_write(
+    config_name, monkeypatch, tmp_path
+):
+    output = tmp_path / "protocol.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "freeze_v3_h7_protocol.py",
+            "--image-digest",
+            f"sha256:{'a' * 64}",
+            "--gpu",
+            "gpu",
+            "--driver",
+            "driver",
+            "--pytorch",
+            "pytorch",
+            "--cuda",
+            "cuda",
+            "--cpu",
+            "cpu",
+            "--formal-config",
+            str(ROOT / "configs/v3_formal" / config_name),
+            "--output",
+            str(output),
+        ],
+    )
+    with pytest.raises((ValueError, NotImplementedError)):
+        freeze_h7.main()
+    assert not output.exists()
 
 
 def test_public_belief_request_is_invariant_to_hidden_hand_swap():

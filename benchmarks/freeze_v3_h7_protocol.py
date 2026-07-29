@@ -18,10 +18,13 @@ from douzero.v3_hybrid.pilot import build_pilot_resolved_config
 from douzero.v3_hybrid.runtime import (
     V3_H71A_REPLAY_PROTOCOL,
     V3_H71A_REQUEST_PROTOCOL,
+    V3_H71A_SNAPSHOT_SEMANTICS,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
     V3_H7_RUNTIME_VERSION,
+    V3H7RuntimeConfig,
+    validate_v3_h7_runtime_config,
 )
 
 
@@ -61,6 +64,17 @@ def main() -> None:
     replay_protocol = (
         V3_H71A_REPLAY_PROTOCOL if belief_enabled else V3_H7_REPLAY_PROTOCOL
     )
+    runtime_config = V3H7RuntimeConfig(
+        belief_runtime_enabled=belief_enabled,
+        request_protocol=request_protocol,
+        replay_protocol=replay_protocol,
+        snapshot_semantics=(
+            V3_H71A_SNAPSHOT_SEMANTICS
+            if belief_enabled
+            else V3H7RuntimeConfig.snapshot_semantics
+        ),
+    )
+    validate_v3_h7_runtime_config(resolved, runtime_config)
     protocol = V3H7BenchmarkProtocol(
         source_git_sha=git_sha(),
         image_digest=args.image_digest,
