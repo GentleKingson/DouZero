@@ -56,6 +56,17 @@ def _resolve_checkpoint(path: str) -> Path:
     return source
 
 
+def _oracle_update_limit(learner, oracle_enabled: bool) -> int:
+    if not oracle_enabled:
+        return 0
+    schedule = learner.base.base.base.config.schedule
+    return (
+        schedule.warmup_updates
+        + schedule.guided_updates
+        + schedule.finetune_updates
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     config = parser.add_mutually_exclusive_group(required=True)
@@ -209,6 +220,9 @@ def main() -> None:
     long_config = LongRunningConfig(
         episodes_per_cycle=args.episodes_per_cycle,
         optimizer_steps_per_cycle=args.optimizer_steps_per_cycle,
+        max_total_optimizer_steps=_oracle_update_limit(
+            learner, oracle_enabled
+        ),
         max_cycles=args.max_cycles,
         max_wall_time_minutes=args.max_wall_time_minutes,
         checkpoint_every_cycles=args.checkpoint_every_cycles,

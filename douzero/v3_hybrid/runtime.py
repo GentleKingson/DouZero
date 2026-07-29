@@ -245,6 +245,34 @@ def _h7_alignment_capacity(config: V3H7RuntimeConfig, sidecar_capacity: int) -> 
     return max(sidecar_capacity, replay_slots)
 
 
+def _drain_sidecar_queue(sidecar_queue) -> int:
+    if sidecar_queue is None:
+        return 0
+    drained = 0
+    while True:
+        try:
+            sidecar_queue.get_nowait()
+        except queue.Empty:
+            return drained
+        drained += 1
+
+
+def _stop_actor_processes(processes, sidecar_queues, timeout_seconds: float) -> list[str]:
+    deadline = time.monotonic() + timeout_seconds
+    alive = list(processes)
+    while alive and time.monotonic() < deadline:
+        for sidecar_queue in sidecar_queues:
+            _drain_sidecar_queue(sidecar_queue)
+        for process in alive:
+            process.join(min(0.05, max(0.0, deadline - time.monotonic())))
+        alive = [process for process in alive if process.is_alive()]
+    for process in alive:
+        process.terminate()
+    for process in alive:
+        process.join(1.0)
+    return [process.name for process in alive if process.is_alive()]
+
+
 @dataclass
 class V3H7RuntimeStats:
     games_collected: int = 0
@@ -1333,10 +1361,14 @@ class V3AsyncSingleGPUTrainer:
             self._coordinator.request_shutdown()
             for _ in self._workers:
                 self._tasks.put(None)
-            deadline = time.monotonic() + 5.0
-            for process in self._workers:
-                process.join(max(0.0, deadline - time.monotonic()))
-            alive = [process.name for process in self._workers if process.is_alive()]
+            alive = _stop_actor_processes(
+                self._workers,
+                (
+                    self._belief_sidecar_queue,
+                    self._oracle_sidecar_queue,
+                ),
+                5.0,
+            )
             if alive:
                 error = RuntimeError(f"H7 actor shutdown timed out: {alive}")
             from douzero.training.async_single_gpu import SlotState

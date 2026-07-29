@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import pickle
+import queue
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -27,7 +28,9 @@ from douzero.v3_hybrid.runtime import (
     V3_H71B_REQUEST_PROTOCOL,
     V3H71BOracleAlignment,
     V3H7RuntimeConfig,
+    _drain_sidecar_queue,
     _h7_alignment_capacity,
+    _stop_actor_processes,
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.training.h3_learner import (
@@ -203,6 +206,49 @@ def test_primary_h7_cli_selects_oracle_sidecar_protocols_before_cuda(
     assert runtime.oracle_sidecar_capacity == 37
     assert runtime.request_protocol == V3_H71B_REQUEST_PROTOCOL
     assert runtime.replay_protocol == V3_H71B_REPLAY_PROTOCOL
+
+
+def test_primary_h7_cli_caps_oracle_run_at_schedule_completion():
+    import train_v3_h7
+
+    formal = load_formal_config(
+        ROOT / "configs/v3_formal/v3_oracle_legacy.yaml"
+    )
+    learner, _resolved = create_pilot_learner(formal)
+    assert train_v3_h7._oracle_update_limit(learner, True) == 80_000
+    assert train_v3_h7._oracle_update_limit(learner, False) == 0
+
+
+def test_shutdown_drains_sidecars_and_terminates_stuck_actor():
+    class FakeQueue:
+        def __init__(self):
+            self.items = [object(), object()]
+
+        def get_nowait(self):
+            if not self.items:
+                raise queue.Empty
+            return self.items.pop()
+
+    class FakeProcess:
+        name = "stuck"
+
+        def __init__(self):
+            self.terminated = False
+
+        def join(self, _timeout):
+            return None
+
+        def is_alive(self):
+            return not self.terminated
+
+        def terminate(self):
+            self.terminated = True
+
+    sidecars = FakeQueue()
+    process = FakeProcess()
+    assert _drain_sidecar_queue(sidecars) == 2
+    assert _stop_actor_processes([process], [sidecars], 0.0) == []
+    assert process.terminated is True
 
 
 def test_actor_source_never_constructs_or_forwards_privileged_oracle():
