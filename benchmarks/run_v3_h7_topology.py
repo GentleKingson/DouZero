@@ -34,6 +34,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71A_REPLAY_PROTOCOL,
     V3_H71A_REQUEST_PROTOCOL,
     V3_H71A_SNAPSHOT_SEMANTICS,
+    V3_H71B_REPLAY_PROTOCOL,
+    V3_H71B_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -118,6 +120,7 @@ def _validate_live_identity(
         if value != getattr(protocol, name):
             raise ValueError(f"H7 benchmark live {name} mismatch")
     belief_enabled = resolved.learner.features.belief
+    oracle_enabled = resolved.learner.features.oracle
     request = (
         V3_H71A_REQUEST_PROTOCOL if belief_enabled else V3_H7_REQUEST_PROTOCOL
     )
@@ -239,15 +242,24 @@ def main() -> None:
         environment_seed_derivation=seed_derivation,
         action_seed=action_seed,
         belief_runtime_enabled=belief_enabled,
+        oracle_runtime_enabled=oracle_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL
             if belief_enabled
-            else V3H7RuntimeConfig.request_protocol
+            else (
+                V3_H71B_REQUEST_PROTOCOL
+                if oracle_enabled
+                else V3H7RuntimeConfig.request_protocol
+            )
         ),
         replay_protocol=(
             V3_H71A_REPLAY_PROTOCOL
             if belief_enabled
-            else V3H7RuntimeConfig.replay_protocol
+            else (
+                V3_H71B_REPLAY_PROTOCOL
+                if oracle_enabled
+                else V3H7RuntimeConfig.replay_protocol
+            )
         ),
         snapshot_semantics=(
             V3_H71A_SNAPSHOT_SEMANTICS

@@ -1109,6 +1109,7 @@ def async_actor_main(
     games_per_actor: int,
     runtime_kind: str = "v2",
     belief_sidecar_queue=None,
+    oracle_sidecar_queue=None,
 ) -> None:
     """CPU-only interleaved-game actor. CUDA is never initialized here."""
     import random
@@ -1141,16 +1142,28 @@ def async_actor_main(
     if runtime_kind not in {"v2", "v3_hybrid"}:
         raise ValueError("runtime_kind must be v2 or v3_hybrid")
     belief_async = coordinator.belief_inputs is not None
+    oracle_async = oracle_sidecar_queue is not None
     if belief_async != (belief_sidecar_queue is not None):
         raise ValueError(
             "async belief inference and training sidecar must be enabled together"
         )
     if belief_async and runtime_kind != "v3_hybrid":
         raise ValueError("async belief is supported only by the V3 runtime")
-    if belief_async:
+    if oracle_async and runtime_kind != "v3_hybrid":
+        raise ValueError("async Oracle is supported only by the V3 runtime")
+    if belief_async and oracle_async:
+        raise NotImplementedError(
+            "combined async belief and Oracle sidecars are not supported"
+        )
+    if belief_async or oracle_async:
         from douzero.observation.privileged import PrivilegedObservation
+    if belief_async:
         from douzero.v3_hybrid.training.h4_learner import (
             build_v3_h4_belief_sidecar,
+        )
+    if oracle_async:
+        from douzero.v3_hybrid.training.h3_learner import (
+            build_v3_h3_oracle_sidecar,
         )
     request_id = actor_id << 48
 
@@ -1165,6 +1178,23 @@ def async_actor_main(
                 )
             try:
                 belief_sidecar_queue.put(
+                    (key, sidecar), timeout=min(0.05, remaining)
+                )
+                return
+            except queue.Full:
+                continue
+
+    def publish_oracle_sidecar(key, sidecar) -> None:
+        deadline = time.monotonic() + coordinator.request_timeout_seconds
+        while True:
+            coordinator._raise_if_failed()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "async Oracle sidecar queue remained full past its deadline"
+                )
+            try:
+                oracle_sidecar_queue.put(
                     (key, sidecar), timeout=min(0.05, remaining)
                 )
                 return
@@ -1230,6 +1260,20 @@ def async_actor_main(
                     ),
                     sidecar,
                 )
+            if oracle_async:
+                sidecar = getattr(transition, "oracle_sidecar", None)
+                if sidecar is None:
+                    raise RuntimeError(
+                        "async Oracle transition is missing its training sidecar"
+                    )
+                publish_oracle_sidecar(
+                    AsyncReplayKey(
+                        actor_id=actor_id,
+                        episode_id=game["episode_id"],
+                        trace_index=transition.trace_index,
+                    ),
+                    sidecar,
+                )
         team = episode.terminal_result.get("winner_team", "landlord")
         event_queue.put((
             "completed", actor_id, game["episode_id"], len(episode.transitions),
@@ -1272,6 +1316,17 @@ def async_actor_main(
                         "async belief decision requires a training sidecar"
                     )
                 transition.belief_sidecar = belief_sidecar
+            if oracle_async:
+                privileged = PrivilegedObservation(
+                    all_handcards=dict(game["env"].infoset.all_handcards),
+                    acting_role=position,
+                )
+                transition.oracle_sidecar = build_v3_h3_oracle_sidecar(
+                    obs,
+                    privileged,
+                    action_index=action_index,
+                    public_inputs=observation_to_model_inputs(obs),
+                )
             episode.transitions.append(transition)
         action = legal_actions[action_index]
         episode.action_trace.append((position, tuple(sorted(action))))

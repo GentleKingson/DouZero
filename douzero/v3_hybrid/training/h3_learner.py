@@ -22,6 +22,8 @@ from douzero._version import git_sha
 from douzero.checkpoint.io import CheckpointCompatibilityError
 from douzero.env.rules import RuleSet
 from douzero.models_v2.batch import ModelInputBundle, model_input_bundles_to_batch
+from douzero.observation.encode_v2 import ObservationV2
+from douzero.observation.privileged import PrivilegedObservation
 
 from ..adaptive_dmc import ADMC_DISABLED, adaptive_dmc_loss, transform_dmc_target
 from ..config import BELIEF_FEEDBACK_NONE
@@ -78,6 +80,139 @@ def _canonical_hash(payload: Mapping[str, object]) -> str:
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
     )
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
+def _update_tensor_identity(
+    digest: "hashlib._Hash", name: str, value: torch.Tensor
+) -> None:
+    array = value.detach().cpu().contiguous().numpy()
+    metadata = json.dumps(
+        {"name": name, "dtype": str(array.dtype), "shape": list(array.shape)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    digest.update(metadata.encode("ascii"))
+    digest.update(array.tobytes(order="C"))
+
+
+def _h3_public_source_identity(public_inputs: ModelInputBundle) -> str:
+    digest = hashlib.sha256(b"v3-h3-oracle-public-source-binding-v1")
+    for index, value in enumerate(public_inputs.state_card_vectors):
+        _update_tensor_identity(digest, f"state_card_vectors.{index}", value)
+    _update_tensor_identity(
+        digest, "state_context_flat", public_inputs.state_context_flat
+    )
+    for index, value in enumerate(public_inputs.context_card_vectors):
+        _update_tensor_identity(digest, f"context_card_vectors.{index}", value)
+    for name in (
+        "context_flat",
+        "history_tokens",
+        "history_key_padding_mask",
+        "action_features",
+        "action_mask",
+    ):
+        _update_tensor_identity(digest, name, getattr(public_inputs, name))
+    for name in ("strategy_features", "style_features"):
+        value = getattr(public_inputs, name)
+        if value is None:
+            digest.update(f"{name}=none".encode("ascii"))
+        else:
+            _update_tensor_identity(digest, name, value)
+    digest.update(public_inputs.acting_role.encode("ascii"))
+    digest.update(public_inputs.feature_schema_hash.encode("ascii"))
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class V3H3OracleSidecar:
+    """Privileged decision data transported separately from public replay."""
+
+    privileged_observation: PrivilegedObservation
+    action_keys: tuple[tuple[int, ...], ...]
+    action_index: int
+    source_state_identity: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.privileged_observation, PrivilegedObservation):
+            raise TypeError("H3 Oracle sidecar requires PrivilegedObservation")
+        if not self.action_keys or len(set(self.action_keys)) != len(self.action_keys):
+            raise ValueError("H3 Oracle sidecar action keys must be non-empty and unique")
+        if any(key != tuple(sorted(key)) for key in self.action_keys):
+            raise ValueError("H3 Oracle sidecar action keys must be canonical")
+        if (
+            isinstance(self.action_index, bool)
+            or not isinstance(self.action_index, int)
+            or not 0 <= self.action_index < len(self.action_keys)
+        ):
+            raise ValueError("H3 Oracle sidecar action index is invalid")
+        if (
+            not isinstance(self.source_state_identity, str)
+            or len(self.source_state_identity) != 64
+            or any(c not in "0123456789abcdef" for c in self.source_state_identity)
+        ):
+            raise ValueError("H3 Oracle sidecar source identity must be a SHA-256")
+
+
+def build_v3_h3_oracle_sidecar(
+    observation: ObservationV2,
+    privileged: PrivilegedObservation,
+    *,
+    action_index: int,
+    public_inputs: ModelInputBundle,
+) -> V3H3OracleSidecar:
+    """Capture Oracle labels on the actor without constructing an Oracle model."""
+
+    from douzero.distillation.teacher_model import canonical_action_keys
+
+    if not isinstance(observation, ObservationV2):
+        raise TypeError("H3 Oracle sidecar requires ObservationV2")
+    if not isinstance(public_inputs, ModelInputBundle):
+        raise TypeError("H3 Oracle sidecar requires public model inputs")
+    if privileged.acting_role != observation.public.acting_role:
+        raise ValueError("H3 Oracle public and privileged roles differ")
+    if public_inputs.acting_role != observation.public.acting_role:
+        raise ValueError("H3 Oracle observation and public input roles differ")
+    keys = canonical_action_keys(observation.actions.legal_actions)
+    if len(keys) != public_inputs.action_features.shape[0]:
+        raise ValueError("H3 Oracle action layout differs from public inputs")
+    return V3H3OracleSidecar(
+        privileged_observation=privileged,
+        action_keys=keys,
+        action_index=action_index,
+        source_state_identity=_h3_public_source_identity(public_inputs),
+    )
+
+
+def bind_v3_h3_oracle_sidecar(
+    transition: V3ReplayTransition,
+    sidecar: V3H3OracleSidecar,
+) -> "OfflineDistillationSample":
+    """Bind a terminal public row to its independently transported sidecar."""
+
+    from douzero.distillation.dataset import OfflineDistillationSample
+
+    if not isinstance(transition, V3ReplayTransition):
+        raise TypeError("H3 Oracle binding requires V3ReplayTransition")
+    if not isinstance(sidecar, V3H3OracleSidecar):
+        raise TypeError("H3 Oracle binding requires V3H3OracleSidecar")
+    if _h3_public_source_identity(
+        transition.model_inputs
+    ) != sidecar.source_state_identity:
+        raise ValueError("H3 Oracle sidecar source-state identity mismatch")
+    if transition.selected_action_index != sidecar.action_index:
+        raise ValueError("H3 Oracle sidecar selected action mismatch")
+    if sidecar.privileged_observation.acting_role != transition.role:
+        raise ValueError("H3 Oracle sidecar role mismatch")
+    return OfflineDistillationSample(
+        public_inputs=transition.model_inputs,
+        privileged_observation=sidecar.privileged_observation,
+        action_keys=sidecar.action_keys,
+        action_index=sidecar.action_index,
+        target_win=1.0 if transition.mc_return > 0.0 else 0.0,
+        target_score=transition.mc_return,
+        sample_id=f"{transition.episode_id}:{transition.deal_id}",
+    )
 
 
 def _nonnegative(name: str, value: float) -> None:

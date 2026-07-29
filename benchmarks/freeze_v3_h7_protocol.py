@@ -19,6 +19,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71A_REPLAY_PROTOCOL,
     V3_H71A_REQUEST_PROTOCOL,
     V3_H71A_SNAPSHOT_SEMANTICS,
+    V3_H71B_REPLAY_PROTOCOL,
+    V3_H71B_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -66,14 +68,28 @@ def main() -> None:
         else build_pilot_resolved_config(formal)
     )
     belief_enabled = resolved.learner.features.belief
+    oracle_enabled = resolved.learner.features.oracle
     request_protocol = (
-        V3_H71A_REQUEST_PROTOCOL if belief_enabled else V3_H7_REQUEST_PROTOCOL
+        V3_H71A_REQUEST_PROTOCOL
+        if belief_enabled
+        else (
+            V3_H71B_REQUEST_PROTOCOL
+            if oracle_enabled
+            else V3_H7_REQUEST_PROTOCOL
+        )
     )
     replay_protocol = (
-        V3_H71A_REPLAY_PROTOCOL if belief_enabled else V3_H7_REPLAY_PROTOCOL
+        V3_H71A_REPLAY_PROTOCOL
+        if belief_enabled
+        else (
+            V3_H71B_REPLAY_PROTOCOL
+            if oracle_enabled
+            else V3_H7_REPLAY_PROTOCOL
+        )
     )
     runtime_config = V3H7RuntimeConfig(
         belief_runtime_enabled=belief_enabled,
+        oracle_runtime_enabled=oracle_enabled,
         request_protocol=request_protocol,
         replay_protocol=replay_protocol,
         snapshot_semantics=(
