@@ -186,7 +186,7 @@ def test_primary_h7_cli_selects_oracle_sidecar_protocols_before_cuda(
             "--checkpoint-path",
             str(tmp_path / "oracle"),
             "--oracle-sidecar-capacity",
-            "17",
+            "37",
         ],
     )
     with pytest.raises(RuntimeError, match="requires CUDA"):
@@ -194,7 +194,7 @@ def test_primary_h7_cli_selects_oracle_sidecar_protocols_before_cuda(
 
     runtime = captured["runtime"]
     assert runtime.oracle_runtime_enabled is True
-    assert runtime.oracle_sidecar_capacity == 17
+    assert runtime.oracle_sidecar_capacity == 37
     assert runtime.request_protocol == V3_H71B_REQUEST_PROTOCOL
     assert runtime.replay_protocol == V3_H71B_REPLAY_PROTOCOL
 
