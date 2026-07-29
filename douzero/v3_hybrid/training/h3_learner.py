@@ -44,7 +44,6 @@ from .oracle_schedule import (
 if TYPE_CHECKING:
     from douzero.distillation.dataset import OfflineDistillationSample
     from douzero.observation.privileged import PrivilegedObservation
-    from douzero.observation.seats import ALL_ROLES
 
 V3_H3_TRAINER_CHECKPOINT_FORMAT = "v3-hybrid-h3-oracle-trainer-v1"
 V3_H3_TRAINING_CONTRACT = "online-privileged-oracle-annealed-public-v1"
@@ -205,6 +204,7 @@ def build_v3_h3_oracle_sidecar(
     """Capture Oracle labels on the actor without constructing an Oracle model."""
 
     from douzero.observation.privileged import PrivilegedObservation
+    from douzero.observation.seats import ALL_ROLES
 
     if not isinstance(observation, ObservationV2):
         raise TypeError("H3 Oracle sidecar requires ObservationV2")
