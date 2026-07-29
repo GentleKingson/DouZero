@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import platform
 import resource
+import subprocess
 import time
 from pathlib import Path
 
@@ -29,6 +33,10 @@ from douzero.v3_hybrid.runtime import (
     V3_H71A_REPLAY_PROTOCOL,
     V3_H71A_REQUEST_PROTOCOL,
     V3_H71A_SNAPSHOT_SEMANTICS,
+    V3_H7_CHECKPOINT_FORMAT,
+    V3_H7_REPLAY_PROTOCOL,
+    V3_H7_REQUEST_PROTOCOL,
+    V3_H7_RUNTIME_VERSION,
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
@@ -69,6 +77,61 @@ def _load_protocol(path: Path) -> V3H7BenchmarkProtocol:
     if git_sha() != protocol.source_git_sha:
         raise ValueError("H7 benchmark source SHA does not match the frozen protocol")
     return protocol
+
+
+def _hash(payload: object) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return hashlib.sha256(encoded.encode("ascii")).hexdigest()
+
+
+def _validate_live_identity(
+    protocol: V3H7BenchmarkProtocol, resolved
+) -> None:
+    image_digest = os.environ.get("DOUZERO_IMAGE_DIGEST")
+    if image_digest != protocol.image_digest:
+        raise ValueError("H7 benchmark live image digest mismatch")
+    query = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=driver_version",
+            "--format=csv,noheader",
+            "-i",
+            str(torch.cuda.current_device()),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    observed = {
+        "gpu": torch.cuda.get_device_name(torch.cuda.current_device()),
+        "driver": query[0].strip() if len(query) == 1 else "",
+        "pytorch": str(torch.__version__),
+        "cuda": str(torch.version.cuda),
+        "cpu": platform.machine(),
+    }
+    for name, value in observed.items():
+        if value != getattr(protocol, name):
+            raise ValueError(f"H7 benchmark live {name} mismatch")
+    belief_enabled = resolved.learner.features.belief
+    request = (
+        V3_H71A_REQUEST_PROTOCOL if belief_enabled else V3_H7_REQUEST_PROTOCOL
+    )
+    replay = (
+        V3_H71A_REPLAY_PROTOCOL if belief_enabled else V3_H7_REPLAY_PROTOCOL
+    )
+    trainer_identity = {
+        "runtime": V3_H7_RUNTIME_VERSION,
+        "checkpoint": V3_H7_CHECKPOINT_FORMAT,
+        "request": request,
+    }
+    if belief_enabled:
+        trainer_identity["resolved_learner"] = resolved.learner.stable_hash()
+    if protocol.trainer_identity_hash != _hash(trainer_identity):
+        raise ValueError("H7 benchmark trainer identity mismatch")
+    if protocol.replay_protocol_hash != _hash({"replay": replay}):
+        raise ValueError("H7 benchmark replay identity mismatch")
 
 
 def _shared_memory_bytes(trainer) -> int:
@@ -126,6 +189,7 @@ def main() -> None:
         raise ValueError("H7 benchmark config hash mismatch")
     if resolved.model.stable_hash() != protocol.model_identity_hash:
         raise ValueError("H7 benchmark model hash mismatch")
+    _validate_live_identity(protocol, resolved)
 
     if args.topology == "single_process":
         topology = TOPOLOGY_SINGLE_PROCESS

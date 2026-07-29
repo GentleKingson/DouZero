@@ -168,6 +168,21 @@ def test_sidecar_alignment_is_bounded_duplicate_safe_and_not_public_replay():
     assert "belief" not in repr(public_payload).lower()
 
 
+def test_sidecar_alignment_rejects_backlog_and_unmatched_quiesce():
+    _env, observation, privileged = _observation_and_privileged()
+    sidecar = build_v3_h4_belief_sidecar(observation, privileged)
+    alignment = V3H71ABeliefAlignment(1)
+    alignment.add_sidecar(
+        AsyncReplayKey(actor_id=0, episode_id=0, trace_index=0), sidecar
+    )
+    with pytest.raises(RuntimeError, match="unmatched belief sidecars"):
+        alignment.assert_quiescent()
+    with pytest.raises(RuntimeError, match="exceeded capacity"):
+        alignment.add_sidecar(
+            AsyncReplayKey(actor_id=0, episode_id=0, trace_index=1), sidecar
+        )
+
+
 def test_sidecar_source_binding_rejects_different_public_state():
     env, observation, privileged = _observation_and_privileged()
     sidecar = build_v3_h4_belief_sidecar(observation, privileged)
