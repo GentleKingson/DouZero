@@ -67,7 +67,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1c-runtime-v9"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1c-runtime-v10"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v6"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -751,6 +751,18 @@ def _remap_h7_cooperation_trajectories(
             decisions.append(replace(decision, transition=replacement))
         remapped.append(replace(trajectory, decisions=tuple(decisions)))
     return tuple(remapped)
+
+
+def _restore_h7_cooperation_alignment_counters(
+    alignment: V3H71CCooperationAlignment | None,
+    stats: V3H7RuntimeStats,
+) -> None:
+    """Seed alignment-local counters from cumulative checkpoint progress."""
+
+    if alignment is None:
+        return
+    alignment.incomplete_episodes = stats.cooperation_incomplete_episodes
+    alignment.oversized_episodes = stats.cooperation_oversized_episodes
 
 
 def validate_v3_h7_runtime_config(
@@ -1895,6 +1907,9 @@ class V3AsyncSingleGPUTrainer:
                     raise ValueError(
                         "H7 nested learner policy version failed to restore"
                     )
+                _restore_h7_cooperation_alignment_counters(
+                    self._cooperation_alignment, self.stats
+                )
             except Exception:
                 self.stats = previous_stats
                 self._rng.setstate(previous_rng)

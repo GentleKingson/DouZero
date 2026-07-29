@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1c-support-matrix-v5"
+V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1c-support-matrix-v6"
 
 TOPOLOGY_SINGLE_PROCESS = "single_process"
 TOPOLOGY_ASYNC_SINGLE_GPU = "async_single_gpu"
@@ -103,6 +103,7 @@ V3_H6_UNSUPPORTED_COMBINATIONS = (
     ("adaptive_dmc", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("belief", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("oracle", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
+    ("cooperation", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("public_export", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
 )
 

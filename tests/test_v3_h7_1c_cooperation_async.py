@@ -28,7 +28,9 @@ from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H71CCooperationAlignment,
     V3H7RuntimeConfig,
+    V3H7RuntimeStats,
     _remap_h7_cooperation_trajectories,
+    _restore_h7_cooperation_alignment_counters,
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.training.cooperation import (
@@ -194,6 +196,27 @@ def test_ordinary_dmc_row_normalization_preserves_trajectory_alignment():
     )
     assert trajectories[0].decision_indices == (0,)
     assert trajectories[1].decision_indices == (1,)
+
+
+def test_resume_seeds_cumulative_alignment_skip_counters():
+    alignment = V3H71CCooperationAlignment(
+        capacity=8, max_episode_transitions=8
+    )
+    stats = V3H7RuntimeStats(
+        cooperation_incomplete_episodes=7,
+        cooperation_oversized_episodes=11,
+    )
+    _restore_h7_cooperation_alignment_counters(alignment, stats)
+    assert alignment.incomplete_episodes == 7
+    assert alignment.oversized_episodes == 11
+
+    key, row, sidecar = _decision("landlord_up", 0)
+    alignment.add_pair(key, row, sidecar)
+    alignment.mark_episode_complete(
+        1, 2, {"landlord_up": 1, "landlord_down": 0}
+    )
+    assert alignment.incomplete_episodes == 8
+    assert alignment.oversized_episodes == 11
 
 
 def test_alignment_explicitly_skips_incomplete_and_oversized_episodes():

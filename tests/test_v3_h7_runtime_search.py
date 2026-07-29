@@ -61,6 +61,7 @@ from douzero.v3_hybrid.selective_search import (
 )
 from douzero.v3_hybrid.support_matrix import (
     RULESET_LEGACY,
+    RULESET_STANDARD,
     TOPOLOGY_ASYNC_SINGLE_GPU,
     validate_capability_support,
 )
@@ -143,6 +144,16 @@ def test_h7_support_matrix_enables_implemented_async_capabilities():
             "strategy",
             topology=TOPOLOGY_ASYNC_SINGLE_GPU,
             ruleset=RULESET_LEGACY,
+            checkpoint_resume=True,
+            export=False,
+            deployment=False,
+            search=False,
+        )
+    with pytest.raises(ValueError, match="async_single_gpu.*standard"):
+        validate_capability_support(
+            "cooperation",
+            topology=TOPOLOGY_ASYNC_SINGLE_GPU,
+            ruleset=RULESET_STANDARD,
             checkpoint_resume=True,
             export=False,
             deployment=False,
