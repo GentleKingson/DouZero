@@ -251,6 +251,72 @@ class V3H4BeliefSample:
                 raise ValueError("H4 public and label unseen pools differ")
 
 
+@dataclass(frozen=True)
+class V3H4BeliefSidecar:
+    """Training-only belief target kept separate from public replay tensors."""
+
+    belief_input: BeliefInput
+    label: BeliefLabel
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.belief_input, BeliefInput):
+            raise TypeError("H4 belief sidecar requires a public BeliefInput")
+        if not isinstance(self.label, BeliefLabel):
+            raise TypeError("H4 belief sidecar requires a privileged BeliefLabel")
+        if self.label.opponent_a_role != self.belief_input.opponent_a_role:
+            raise ValueError("H4 belief sidecar opponent roles differ")
+        if self.label.opponent_a_total != self.belief_input.opponent_a_total:
+            raise ValueError("H4 belief sidecar opponent totals differ")
+        if not np.array_equal(
+            self.label.unseen_counts, self.belief_input.unseen_counts
+        ):
+            raise ValueError("H4 belief sidecar unseen pools differ")
+
+
+def build_v3_h4_belief_sidecar(
+    observation: ObservationV2,
+    privileged: PrivilegedObservation,
+) -> V3H4BeliefSidecar:
+    """Build the small privileged sidecar without duplicating public tensors."""
+
+    if not isinstance(observation, ObservationV2):
+        raise TypeError("H4 sidecar requires ObservationV2")
+    if not isinstance(privileged, PrivilegedObservation):
+        raise TypeError("H4 sidecar requires PrivilegedObservation")
+    if privileged.acting_role != observation.public.acting_role:
+        raise ValueError("H4 public and privileged acting roles differ")
+    public = observation.public
+    belief_input = build_belief_input(public)
+    label = build_belief_label(
+        acting_role=public.acting_role,
+        all_handcards=privileged.all_handcards,
+        unseen_counts=belief_input.unseen_counts,
+        num_cards_left=public.num_cards_left,
+        bottom_unplayed=public.bottom_cards.unplayed,
+    )
+    return V3H4BeliefSidecar(belief_input=belief_input, label=label)
+
+
+def bind_v3_h4_belief_sidecar(
+    public_inputs: ModelInputBundle,
+    sidecar: V3H4BeliefSidecar,
+) -> V3H4BeliefSample:
+    """Bind a training-only target to its independently transported public row."""
+
+    if not isinstance(public_inputs, ModelInputBundle):
+        raise TypeError("H4 sidecar binding requires public model inputs")
+    if not isinstance(sidecar, V3H4BeliefSidecar):
+        raise TypeError("H4 sidecar binding requires V3H4BeliefSidecar")
+    return V3H4BeliefSample(
+        public_inputs=public_inputs,
+        belief_input=sidecar.belief_input,
+        source_state_identity=_h4_source_state_identity(
+            public_inputs, sidecar.belief_input
+        ),
+        label=sidecar.label,
+    )
+
+
 def build_v3_h4_belief_sample(
     observation: ObservationV2,
     privileged: PrivilegedObservation | None = None,
@@ -262,29 +328,22 @@ def build_v3_h4_belief_sample(
 
     if not isinstance(observation, ObservationV2):
         raise TypeError("H4 sample requires ObservationV2")
-    binput = build_belief_input(observation.public)
-    label = None
-    if privileged is not None:
-        if not isinstance(privileged, PrivilegedObservation):
-            raise TypeError("H4 privileged input must be PrivilegedObservation")
-        if privileged.acting_role != observation.public.acting_role:
-            raise ValueError("H4 public and privileged acting roles differ")
-        public = observation.public
-        label = build_belief_label(
-            acting_role=public.acting_role,
-            all_handcards=privileged.all_handcards,
-            unseen_counts=binput.unseen_counts,
-            num_cards_left=public.num_cards_left,
-            bottom_unplayed=public.bottom_cards.unplayed,
-        )
     public_inputs = observation_to_model_inputs(
         observation, strategy_config, style_enabled=style_enabled
     )
-    return V3H4BeliefSample(
-        public_inputs=public_inputs,
-        belief_input=binput,
-        source_state_identity=_h4_source_state_identity(public_inputs, binput),
-        label=label,
+    if privileged is None:
+        belief_input = build_belief_input(observation.public)
+        return V3H4BeliefSample(
+            public_inputs=public_inputs,
+            belief_input=belief_input,
+            source_state_identity=_h4_source_state_identity(
+                public_inputs, belief_input
+            ),
+            label=None,
+        )
+    return bind_v3_h4_belief_sidecar(
+        public_inputs,
+        build_v3_h4_belief_sidecar(observation, privileged),
     )
 
 
@@ -1051,9 +1110,12 @@ __all__ = [
     "V3_H4_TRAINER_CHECKPOINT_FORMAT",
     "V3_H4_TRAINING_CONTRACT",
     "V3H4BeliefSample",
+    "V3H4BeliefSidecar",
     "V3H4Learner",
     "V3H4LearnerConfig",
     "V3H4StepMetrics",
+    "bind_v3_h4_belief_sidecar",
     "build_v3_h4_belief_sample",
+    "build_v3_h4_belief_sidecar",
     "h4_training_identity",
 ]
