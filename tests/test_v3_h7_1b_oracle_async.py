@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import pickle
 from dataclasses import replace
 from pathlib import Path
 
@@ -96,11 +97,17 @@ def test_oracle_sidecar_binds_terminal_target_and_stays_out_of_public_replay():
     assert sample.target_score == 1.0
     assert sample.target_win == 1.0
     assert sample.action_index == row.selected_action_index
-    assert sample.privileged_observation is sidecar.privileged_observation
+    assert (
+        sample.privileged_observation.all_handcards
+        == sidecar.privileged_observation().all_handcards
+    )
     payload = row.state_dict()
     assert_public_replay_payload(payload)
     assert "all_handcards" not in repr(payload)
     assert "privileged" not in repr(payload).lower()
+    restored = pickle.loads(pickle.dumps(sidecar))
+    assert restored == sidecar
+    assert bind_v3_h3_oracle_sidecar(row, restored).target_score == 1.0
 
 
 def test_oracle_action_alignment_stably_disambiguates_duplicate_rule_rows():
