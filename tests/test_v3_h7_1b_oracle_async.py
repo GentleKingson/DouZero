@@ -24,6 +24,7 @@ from douzero.v3_hybrid.runtime import (
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.training.h3_learner import (
+    _h3_oracle_action_keys,
     bind_v3_h3_oracle_sidecar,
     build_v3_h3_oracle_sidecar,
 )
@@ -100,6 +101,13 @@ def test_oracle_sidecar_binds_terminal_target_and_stays_out_of_public_replay():
     assert_public_replay_payload(payload)
     assert "all_handcards" not in repr(payload)
     assert "privileged" not in repr(payload).lower()
+
+
+def test_oracle_action_alignment_stably_disambiguates_duplicate_rule_rows():
+    keys = _h3_oracle_action_keys(([3, 3], [3, 3], [4], [3, 3]))
+    assert keys == ((-1, 3, 3), (-2, 3, 3), (4,), (-3, 3, 3))
+    assert len(set(keys)) == len(keys)
+    assert all(key == tuple(sorted(key)) for key in keys)
 
 
 def test_oracle_sidecar_rejects_source_and_action_mismatch():

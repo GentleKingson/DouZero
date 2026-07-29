@@ -124,6 +124,25 @@ def _h3_public_source_identity(public_inputs: ModelInputBundle) -> str:
     return digest.hexdigest()
 
 
+def _h3_oracle_action_keys(
+    actions: Sequence[Sequence[int]],
+) -> tuple[tuple[int, ...], ...]:
+    from douzero.distillation.teacher_model import canonical_action_key
+
+    base_keys = tuple(canonical_action_key(action) for action in actions)
+    totals = {key: base_keys.count(key) for key in set(base_keys)}
+    occurrences: dict[tuple[int, ...], int] = {}
+    keys = []
+    for key in base_keys:
+        occurrence = occurrences.get(key, 0)
+        occurrences[key] = occurrence + 1
+        # Some legacy rule states expose duplicate but semantically equivalent
+        # rows. A negative occurrence discriminator is sorted, stable, and used
+        # only for exact row alignment; it never enters action features/rules.
+        keys.append((-(occurrence + 1), *key) if totals[key] > 1 else key)
+    return tuple(keys)
+
+
 @dataclass(frozen=True)
 class V3H3OracleSidecar:
     """Privileged decision data transported separately from public replay."""
@@ -165,7 +184,6 @@ def build_v3_h3_oracle_sidecar(
 ) -> V3H3OracleSidecar:
     """Capture Oracle labels on the actor without constructing an Oracle model."""
 
-    from douzero.distillation.teacher_model import canonical_action_keys
     from douzero.observation.privileged import PrivilegedObservation
 
     if not isinstance(observation, ObservationV2):
@@ -176,7 +194,7 @@ def build_v3_h3_oracle_sidecar(
         raise ValueError("H3 Oracle public and privileged roles differ")
     if public_inputs.acting_role != observation.public.acting_role:
         raise ValueError("H3 Oracle observation and public input roles differ")
-    keys = canonical_action_keys(observation.actions.legal_actions)
+    keys = _h3_oracle_action_keys(observation.actions.legal_actions)
     if len(keys) != public_inputs.action_features.shape[0]:
         raise ValueError("H3 Oracle action layout differs from public inputs")
     return V3H3OracleSidecar(

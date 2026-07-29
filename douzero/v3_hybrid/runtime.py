@@ -74,7 +74,7 @@ V3_H71A_SNAPSHOT_SEMANTICS = (
 )
 V3_H71B_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-oracle-sidecar-v1"
 V3_H71B_REPLAY_PROTOCOL = (
-    "v3-public-replay-plus-privileged-oracle-sidecar-source-fingerprint-v1"
+    "v3-public-replay-plus-privileged-oracle-sidecar-source-fingerprint-v2"
 )
 V3_H71AB_REQUEST_PROTOCOL = (
     "v2-shared-slots-v3-dmc-q-belief-oracle-sidecars-v1"
