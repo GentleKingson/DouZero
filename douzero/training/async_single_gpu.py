@@ -1305,7 +1305,7 @@ def async_actor_main(
                     acting_role=position,
                 )
                 belief_sidecar = build_v3_h4_belief_sidecar(
-                    obs, privileged
+                    obs, privileged, public_inputs=bundle
                 )
             request_id += 1
             coordinator.submit(

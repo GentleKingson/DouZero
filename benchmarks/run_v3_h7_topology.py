@@ -22,6 +22,7 @@ from douzero.v3_hybrid import V3HybridModel
 from douzero.v3_hybrid.benchmark import (
     H7_BENCHMARK_SCHEMA,
     V3H7BenchmarkProtocol,
+    h7_trainer_identity_hash,
 )
 from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
@@ -87,7 +88,7 @@ def _hash(payload: object) -> str:
 
 
 def _validate_live_identity(
-    protocol: V3H7BenchmarkProtocol, resolved
+    protocol: V3H7BenchmarkProtocol, resolved, *, formal_config: bool
 ) -> None:
     image_digest = os.environ.get("DOUZERO_IMAGE_DIGEST")
     if image_digest != protocol.image_digest:
@@ -121,14 +122,15 @@ def _validate_live_identity(
     replay = (
         V3_H71A_REPLAY_PROTOCOL if belief_enabled else V3_H7_REPLAY_PROTOCOL
     )
-    trainer_identity = {
-        "runtime": V3_H7_RUNTIME_VERSION,
-        "checkpoint": V3_H7_CHECKPOINT_FORMAT,
-        "request": request,
-    }
-    if belief_enabled:
-        trainer_identity["resolved_learner"] = resolved.learner.stable_hash()
-    if protocol.trainer_identity_hash != _hash(trainer_identity):
+    trainer_identity_hash = h7_trainer_identity_hash(
+        runtime_version=V3_H7_RUNTIME_VERSION,
+        checkpoint_format=V3_H7_CHECKPOINT_FORMAT,
+        request_protocol=request,
+        resolved_learner_hash=(
+            resolved.learner.stable_hash() if formal_config else None
+        ),
+    )
+    if protocol.trainer_identity_hash != trainer_identity_hash:
         raise ValueError("H7 benchmark trainer identity mismatch")
     if protocol.replay_protocol_hash != _hash({"replay": replay}):
         raise ValueError("H7 benchmark replay identity mismatch")
@@ -189,7 +191,9 @@ def main() -> None:
         raise ValueError("H7 benchmark config hash mismatch")
     if resolved.model.stable_hash() != protocol.model_identity_hash:
         raise ValueError("H7 benchmark model hash mismatch")
-    _validate_live_identity(protocol, resolved)
+    _validate_live_identity(
+        protocol, resolved, formal_config=formal is not None
+    )
 
     if args.topology == "single_process":
         topology = TOPOLOGY_SINGLE_PROCESS

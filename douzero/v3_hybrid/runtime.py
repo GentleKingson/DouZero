@@ -54,7 +54,7 @@ from .training.h4_learner import (
     build_v3_h4_belief_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1a-runtime-v4"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1a-runtime-v5"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v3"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -62,7 +62,7 @@ V3_H71A_REQUEST_PROTOCOL = (
     "v2-shared-slots-v3-dmc-q-public-belief-coupled-snapshot-v1"
 )
 V3_H71A_REPLAY_PROTOCOL = (
-    "v3-public-replay-plus-privileged-belief-sidecar-alignment-v1"
+    "v3-public-replay-plus-privileged-belief-sidecar-source-fingerprint-v2"
 )
 V3_H71A_SNAPSHOT_SEMANTICS = (
     "game-boundary-quiescent-public-policy-plus-belief-copy-v1"
@@ -211,8 +211,9 @@ class V3H71ABeliefAlignment:
         self._check_new(key, self.public_rows)
         if not isinstance(row, V3ReplayTransition):
             raise TypeError("H7.1a public alignment row has an invalid type")
+        if len(self.public_rows) >= self.capacity:
+            raise RuntimeError("H7.1a belief alignment backlog exceeded capacity")
         self.public_rows[key] = row
-        self._check_capacity()
 
     def add_sidecar(
         self, key: AsyncReplayKey, sidecar: V3H4BeliefSidecar
@@ -220,12 +221,29 @@ class V3H71ABeliefAlignment:
         self._check_new(key, self.sidecars)
         if not isinstance(sidecar, V3H4BeliefSidecar):
             raise TypeError("H7.1a sidecar alignment row has an invalid type")
-        self.sidecars[key] = sidecar
-        self._check_capacity()
-
-    def _check_capacity(self) -> None:
-        if len(self.public_rows) > self.capacity or len(self.sidecars) > self.capacity:
+        if len(self.sidecars) >= self.capacity:
             raise RuntimeError("H7.1a belief alignment backlog exceeded capacity")
+        self.sidecars[key] = sidecar
+
+    def add_pair(
+        self,
+        key: AsyncReplayKey,
+        row: V3ReplayTransition,
+        sidecar: V3H4BeliefSidecar,
+    ) -> None:
+        self._check_new(key, self.public_rows)
+        self._check_new(key, self.sidecars)
+        if not isinstance(row, V3ReplayTransition):
+            raise TypeError("H7.1a public alignment row has an invalid type")
+        if not isinstance(sidecar, V3H4BeliefSidecar):
+            raise TypeError("H7.1a sidecar alignment row has an invalid type")
+        if (
+            len(self.public_rows) >= self.capacity
+            or len(self.sidecars) >= self.capacity
+        ):
+            raise RuntimeError("H7.1a belief alignment backlog exceeded capacity")
+        self.public_rows[key] = row
+        self.sidecars[key] = sidecar
 
     def pop_ready(
         self,
@@ -291,6 +309,10 @@ def validate_v3_h7_runtime_config(
             )
         if resolved_config.model.belief_feedback == BELIEF_FEEDBACK_NONE:
             raise ValueError("H7.1a belief runtime requires public belief feedback")
+        if belief.shared_encoder_updates:
+            raise NotImplementedError(
+                "H7.1a async belief rejects shared encoder updates"
+            )
         if runtime_config.belief_sidecar_capacity < runtime_config.batch_size:
             raise ValueError(
                 "H7.1a belief sidecar capacity cannot be smaller than batch_size"
@@ -635,8 +657,7 @@ class V3AsyncSingleGPUTrainer:
                 target_transform=self.model.config.dmc_target_transform,
                 ruleset_identity=self.learner.ruleset.identity(),
             )
-            for row, key in aligned:
-                self._belief_alignment.add_public(key, row)
+            queued_sidecars = {}
             while True:
                 try:
                     message = self._belief_sidecar_queue.get_nowait()
@@ -650,8 +671,20 @@ class V3AsyncSingleGPUTrainer:
                 ):
                     raise TypeError("H7.1a belief sidecar envelope mismatch")
                 key, sidecar = message
+                if key in queued_sidecars:
+                    raise RuntimeError("duplicate H7.1a sidecar queue key")
+                queued_sidecars[key] = sidecar
+            paired = []
+            for row, key in aligned:
+                sidecar = queued_sidecars.pop(key, None)
+                if sidecar is None:
+                    self._belief_alignment.add_public(key, row)
+                else:
+                    self._belief_alignment.add_pair(key, row, sidecar)
+                    paired.extend(self._belief_alignment.pop_ready())
+            for key, sidecar in queued_sidecars.items():
                 self._belief_alignment.add_sidecar(key, sidecar)
-            paired = self._belief_alignment.pop_ready()
+            paired.extend(self._belief_alignment.pop_ready())
             completed = len(paired)
             for row, sample in paired:
                 self.buffer.append(row)
@@ -1122,6 +1155,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                                 all_handcards=dict(env.infoset.all_handcards),
                                 acting_role=position,
                             ),
+                            public_inputs=captured.model_inputs,
                         )
                         pending_belief.append(
                             bind_v3_h4_belief_sidecar(

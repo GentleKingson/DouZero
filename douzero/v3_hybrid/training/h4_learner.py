@@ -257,6 +257,7 @@ class V3H4BeliefSidecar:
 
     belief_input: BeliefInput
     label: BeliefLabel
+    source_state_identity: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.belief_input, BeliefInput):
@@ -271,11 +272,26 @@ class V3H4BeliefSidecar:
             self.label.unseen_counts, self.belief_input.unseen_counts
         ):
             raise ValueError("H4 belief sidecar unseen pools differ")
+        if (
+            not isinstance(self.source_state_identity, str)
+            or len(self.source_state_identity) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.source_state_identity
+            )
+        ):
+            raise ValueError(
+                "H4 belief sidecar source-state identity must be a full SHA-256"
+            )
 
 
 def build_v3_h4_belief_sidecar(
     observation: ObservationV2,
     privileged: PrivilegedObservation,
+    *,
+    public_inputs: ModelInputBundle | None = None,
+    strategy_config=None,
+    style_enabled: bool = False,
 ) -> V3H4BeliefSidecar:
     """Build the small privileged sidecar without duplicating public tensors."""
 
@@ -285,6 +301,12 @@ def build_v3_h4_belief_sidecar(
         raise TypeError("H4 sidecar requires PrivilegedObservation")
     if privileged.acting_role != observation.public.acting_role:
         raise ValueError("H4 public and privileged acting roles differ")
+    if public_inputs is None:
+        public_inputs = observation_to_model_inputs(
+            observation, strategy_config, style_enabled=style_enabled
+        )
+    elif not isinstance(public_inputs, ModelInputBundle):
+        raise TypeError("H4 sidecar public_inputs must be a ModelInputBundle")
     public = observation.public
     belief_input = build_belief_input(public)
     label = build_belief_label(
@@ -294,7 +316,13 @@ def build_v3_h4_belief_sidecar(
         num_cards_left=public.num_cards_left,
         bottom_unplayed=public.bottom_cards.unplayed,
     )
-    return V3H4BeliefSidecar(belief_input=belief_input, label=label)
+    return V3H4BeliefSidecar(
+        belief_input=belief_input,
+        label=label,
+        source_state_identity=_h4_source_state_identity(
+            public_inputs, belief_input
+        ),
+    )
 
 
 def bind_v3_h4_belief_sidecar(
@@ -307,12 +335,15 @@ def bind_v3_h4_belief_sidecar(
         raise TypeError("H4 sidecar binding requires public model inputs")
     if not isinstance(sidecar, V3H4BeliefSidecar):
         raise TypeError("H4 sidecar binding requires V3H4BeliefSidecar")
+    source_state_identity = _h4_source_state_identity(
+        public_inputs, sidecar.belief_input
+    )
+    if source_state_identity != sidecar.source_state_identity:
+        raise ValueError("H4 belief sidecar source-state identity mismatch")
     return V3H4BeliefSample(
         public_inputs=public_inputs,
         belief_input=sidecar.belief_input,
-        source_state_identity=_h4_source_state_identity(
-            public_inputs, sidecar.belief_input
-        ),
+        source_state_identity=source_state_identity,
         label=sidecar.label,
     )
 
@@ -343,7 +374,11 @@ def build_v3_h4_belief_sample(
         )
     return bind_v3_h4_belief_sidecar(
         public_inputs,
-        build_v3_h4_belief_sidecar(observation, privileged),
+        build_v3_h4_belief_sidecar(
+            observation,
+            privileged,
+            public_inputs=public_inputs,
+        ),
     )
 
 

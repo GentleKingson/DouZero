@@ -15,7 +15,8 @@ The actor builds the hidden-hand `BeliefLabel` only after the public request is
 formed. That label travels through a separate bounded training-only queue,
 keyed by `(actor_id, episode_id, trace_index)`. The public replay row continues
 to use `V3ReplayTransition` and cannot serialize the label. The learner binds
-the two paths with a public-state fingerprint and rejects duplicates,
+the two paths with an actor-created public-state fingerprint and rejects
+duplicates,
 mismatches, overflow, or an unmatched quiescent boundary.
 
 `q_old` is the selected-action value returned by the coupled public snapshot

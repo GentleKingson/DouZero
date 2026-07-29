@@ -20,6 +20,7 @@ from douzero.training.async_single_gpu import (
     SharedBeliefInputSlots,
 )
 from douzero.v3_hybrid.formal_config import load_formal_config
+from douzero.v3_hybrid.benchmark import h7_trainer_identity_hash
 from douzero.v3_hybrid.integration_replay import assert_public_replay_payload
 from douzero.v3_hybrid.pilot import (
     build_pilot_resolved_config,
@@ -30,6 +31,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71A_REPLAY_PROTOCOL,
     V3_H71A_REQUEST_PROTOCOL,
     V3_H71A_SNAPSHOT_SEMANTICS,
+    V3_H7_CHECKPOINT_FORMAT,
+    V3_H7_RUNTIME_VERSION,
     V3AsyncSingleGPUTrainer,
     V3H71ABeliefAlignment,
     V3H7RuntimeConfig,
@@ -119,6 +122,22 @@ def test_h71a_support_and_runtime_transport_fail_closed_before_cuda():
         validate_v3_h7_runtime_config(
             resolved, replace(config, belief_sidecar_capacity=1)
         )
+    belief = resolved.learner.base.base.belief
+    shared = replace(
+        resolved,
+        learner=replace(
+            resolved.learner,
+            base=replace(
+                resolved.learner.base,
+                base=replace(
+                    resolved.learner.base.base,
+                    belief=replace(belief, shared_encoder_updates=True),
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="shared encoder"):
+        validate_v3_h7_runtime_config(shared, config)
 
 
 def test_public_belief_slots_roundtrip_and_submit_requires_matching_input():
@@ -168,6 +187,26 @@ def test_sidecar_alignment_is_bounded_duplicate_safe_and_not_public_replay():
     assert "belief" not in repr(public_payload).lower()
 
 
+def test_ready_sidecar_pairs_are_aligned_atomically_at_capacity():
+    _env, observation, privileged = _observation_and_privileged()
+    bundle = observation_to_model_inputs(observation)
+    sidecar = build_v3_h4_belief_sidecar(
+        observation, privileged, public_inputs=bundle
+    )
+    row = _public_row(observation)
+    alignment = V3H71ABeliefAlignment(1)
+    for trace_index in range(2):
+        alignment.add_pair(
+            AsyncReplayKey(
+                actor_id=0, episode_id=0, trace_index=trace_index
+            ),
+            row,
+            sidecar,
+        )
+        assert len(alignment.pop_ready()) == 1
+    alignment.assert_quiescent()
+
+
 def test_sidecar_alignment_rejects_backlog_and_unmatched_quiesce():
     _env, observation, privileged = _observation_and_privileged()
     sidecar = build_v3_h4_belief_sidecar(observation, privileged)
@@ -192,6 +231,39 @@ def test_sidecar_source_binding_rejects_different_public_state():
         bind_v3_h4_belief_sidecar(
             observation_to_model_inputs(later), sidecar
         )
+
+
+def test_sidecar_source_identity_rejects_same_metadata_different_tensor():
+    _env, observation, privileged = _observation_and_privileged()
+    original = observation_to_model_inputs(observation)
+    sidecar = build_v3_h4_belief_sidecar(
+        observation, privileged, public_inputs=original
+    )
+    changed_flat = original.state_context_flat.clone()
+    changed_flat[0] += 1.0
+    changed = replace(original, state_context_flat=changed_flat)
+    assert changed.acting_role == original.acting_role
+    assert changed.feature_schema_hash == original.feature_schema_hash
+    with pytest.raises(ValueError, match="source-state identity"):
+        bind_v3_h4_belief_sidecar(changed, sidecar)
+
+
+def test_formal_trainer_identity_always_binds_resolved_learner():
+    common = {
+        "runtime_version": V3_H7_RUNTIME_VERSION,
+        "checkpoint_format": V3_H7_CHECKPOINT_FORMAT,
+        "request_protocol": V3_H71A_REQUEST_PROTOCOL,
+    }
+    informal = h7_trainer_identity_hash(
+        **common, resolved_learner_hash=None
+    )
+    formal = h7_trainer_identity_hash(
+        **common, resolved_learner_hash="a" * 64
+    )
+    assert informal != formal
+    assert formal == h7_trainer_identity_hash(
+        **common, resolved_learner_hash="a" * 64
+    )
 
 
 def test_public_belief_request_is_invariant_to_hidden_hand_swap():

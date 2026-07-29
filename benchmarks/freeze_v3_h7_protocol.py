@@ -8,7 +8,10 @@ import json
 from pathlib import Path
 
 from douzero._version import git_sha
-from douzero.v3_hybrid.benchmark import V3H7BenchmarkProtocol
+from douzero.v3_hybrid.benchmark import (
+    V3H7BenchmarkProtocol,
+    h7_trainer_identity_hash,
+)
 from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
 from douzero.v3_hybrid.pilot import build_pilot_resolved_config
@@ -58,19 +61,21 @@ def main() -> None:
     replay_protocol = (
         V3_H71A_REPLAY_PROTOCOL if belief_enabled else V3_H7_REPLAY_PROTOCOL
     )
-    trainer_identity = {
-        "runtime": V3_H7_RUNTIME_VERSION,
-        "checkpoint": V3_H7_CHECKPOINT_FORMAT,
-        "request": request_protocol,
-    }
-    if args.formal_config is not None:
-        trainer_identity["resolved_learner"] = resolved.learner.stable_hash()
     protocol = V3H7BenchmarkProtocol(
         source_git_sha=git_sha(),
         image_digest=args.image_digest,
         config_hash=resolved.stable_hash(),
         model_identity_hash=resolved.model.stable_hash(),
-        trainer_identity_hash=_hash(trainer_identity),
+        trainer_identity_hash=h7_trainer_identity_hash(
+            runtime_version=V3_H7_RUNTIME_VERSION,
+            checkpoint_format=V3_H7_CHECKPOINT_FORMAT,
+            request_protocol=request_protocol,
+            resolved_learner_hash=(
+                resolved.learner.stable_hash()
+                if args.formal_config is not None
+                else None
+            ),
+        ),
         replay_protocol_hash=_hash({"replay": replay_protocol}),
         gpu=args.gpu,
         driver=args.driver,

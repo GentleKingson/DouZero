@@ -19,6 +19,25 @@ def _hash(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
 
+def h7_trainer_identity_hash(
+    *,
+    runtime_version: str,
+    checkpoint_format: str,
+    request_protocol: str,
+    resolved_learner_hash: str | None,
+) -> str:
+    """Build the trainer hash shared by protocol freeze and live validation."""
+
+    payload = {
+        "runtime": runtime_version,
+        "checkpoint": checkpoint_format,
+        "request": request_protocol,
+    }
+    if resolved_learner_hash is not None:
+        payload["resolved_learner"] = resolved_learner_hash
+    return _hash(payload)
+
+
 @dataclass(frozen=True)
 class V3H7BenchmarkProtocol:
     source_git_sha: str
@@ -150,5 +169,6 @@ __all__ = [
     "H7_BENCHMARK_SCHEMA",
     "H7_TOPOLOGIES",
     "V3H7BenchmarkProtocol",
+    "h7_trainer_identity_hash",
     "validate_h7_benchmark_evidence",
 ]
