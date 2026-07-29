@@ -8,7 +8,7 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
-H7_BENCHMARK_SCHEMA = "v3-hybrid-h7-benchmark-v2"
+H7_BENCHMARK_SCHEMA = "v3-hybrid-h7-benchmark-v3"
 H7_TOPOLOGIES = ("single_process", "async_4x4", "async_8x4")
 
 
@@ -104,6 +104,8 @@ class V3H7BenchmarkProtocol:
 _METRICS = (
     "games_per_second", "decisions_per_second", "transitions_per_second",
     "learner_samples_per_second", "optimizer_steps_per_second",
+    "oracle_samples_per_second", "oracle_optimizer_steps_per_second",
+    "oracle_parameter_vram_bytes",
     "requests_per_microbatch", "legal_actions_per_batch",
     "queue_wait_seconds", "slot_read_seconds", "collate_seconds",
     "h2d_seconds", "forward_seconds", "d2h_seconds", "publish_seconds",
