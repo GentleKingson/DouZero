@@ -23,7 +23,6 @@ from douzero.checkpoint.io import CheckpointCompatibilityError
 from douzero.env.rules import RuleSet
 from douzero.models_v2.batch import ModelInputBundle, model_input_bundles_to_batch
 from douzero.observation.encode_v2 import ObservationV2
-from douzero.observation.privileged import PrivilegedObservation
 
 from ..adaptive_dmc import ADMC_DISABLED, adaptive_dmc_loss, transform_dmc_target
 from ..config import BELIEF_FEEDBACK_NONE
@@ -44,6 +43,7 @@ from .oracle_schedule import (
 
 if TYPE_CHECKING:
     from douzero.distillation.dataset import OfflineDistillationSample
+    from douzero.observation.privileged import PrivilegedObservation
 
 V3_H3_TRAINER_CHECKPOINT_FORMAT = "v3-hybrid-h3-oracle-trainer-v1"
 V3_H3_TRAINING_CONTRACT = "online-privileged-oracle-annealed-public-v1"
@@ -134,6 +134,8 @@ class V3H3OracleSidecar:
     source_state_identity: str
 
     def __post_init__(self) -> None:
+        from douzero.observation.privileged import PrivilegedObservation
+
         if not isinstance(self.privileged_observation, PrivilegedObservation):
             raise TypeError("H3 Oracle sidecar requires PrivilegedObservation")
         if not self.action_keys or len(set(self.action_keys)) != len(self.action_keys):
@@ -164,6 +166,7 @@ def build_v3_h3_oracle_sidecar(
     """Capture Oracle labels on the actor without constructing an Oracle model."""
 
     from douzero.distillation.teacher_model import canonical_action_keys
+    from douzero.observation.privileged import PrivilegedObservation
 
     if not isinstance(observation, ObservationV2):
         raise TypeError("H3 Oracle sidecar requires ObservationV2")

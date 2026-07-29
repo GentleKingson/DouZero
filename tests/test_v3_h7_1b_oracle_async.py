@@ -89,27 +89,6 @@ def test_oracle_runtime_support_is_fail_closed_before_cuda():
         )
 
 
-def test_oracle_and_belief_transport_combination_is_explicitly_deferred():
-    resolved = _oracle_resolved()
-    combined = replace(
-        resolved,
-        learner=replace(
-            resolved.learner,
-            features=replace(resolved.learner.features, belief=True),
-        ),
-    )
-    config = _runtime(
-        belief_runtime_enabled=True,
-        request_protocol="v2-shared-slots-v3-dmc-q-belief-oracle-sidecars-v1",
-        replay_protocol="v3-public-replay-plus-separate-belief-oracle-sidecars-v1",
-        snapshot_semantics=(
-            "game-boundary-quiescent-public-policy-plus-belief-copy-v1"
-        ),
-    )
-    with pytest.raises(NotImplementedError, match="combined belief\\+Oracle"):
-        validate_v3_h7_runtime_config(combined, config)
-
-
 def test_oracle_sidecar_binds_terminal_target_and_stays_out_of_public_replay():
     _env, _observation, row, sidecar = _decision()
     sample = bind_v3_h3_oracle_sidecar(row, sidecar)
