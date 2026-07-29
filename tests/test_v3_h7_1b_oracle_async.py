@@ -6,6 +6,7 @@ import queue
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -37,6 +38,9 @@ from douzero.v3_hybrid.training.h3_learner import (
     _h3_oracle_action_keys,
     bind_v3_h3_oracle_sidecar,
     build_v3_h3_oracle_sidecar,
+)
+from douzero.v3_hybrid.training.oracle_schedule import (
+    OracleGuidingScheduleConfig,
 )
 
 
@@ -211,10 +215,21 @@ def test_primary_h7_cli_selects_oracle_sidecar_protocols_before_cuda(
 def test_primary_h7_cli_caps_oracle_run_at_schedule_completion():
     import train_v3_h7
 
-    formal = load_formal_config(
-        ROOT / "configs/v3_formal/v3_oracle_legacy.yaml"
+    schedule = OracleGuidingScheduleConfig(
+        enabled=True,
+        warmup_updates=10_000,
+        guided_updates=50_000,
+        finetune_updates=20_000,
     )
-    learner, _resolved = create_pilot_learner(formal)
+    learner = SimpleNamespace(
+        base=SimpleNamespace(
+            base=SimpleNamespace(
+                base=SimpleNamespace(
+                    config=SimpleNamespace(schedule=schedule)
+                )
+            )
+        )
+    )
     assert train_v3_h7._oracle_update_limit(learner, True) == 80_000
     assert train_v3_h7._oracle_update_limit(learner, False) == 0
 
