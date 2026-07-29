@@ -8,7 +8,7 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
-H7_BENCHMARK_SCHEMA = "v3-hybrid-h7-benchmark-v2"
+H7_BENCHMARK_SCHEMA = "v3-hybrid-h7-benchmark-v4"
 H7_TOPOLOGIES = ("single_process", "async_4x4", "async_8x4")
 
 
@@ -52,6 +52,7 @@ class V3H7BenchmarkProtocol:
     cuda: str
     cpu: str
     formal_config_hash: str | None
+    oracle_enabled: bool
     warmup_seconds: float = 30.0
     measurement_seconds: float = 300.0
     checkpoint_enabled: bool = True
@@ -81,6 +82,8 @@ class V3H7BenchmarkProtocol:
                 raise ValueError(
                     "H7 benchmark formal_config_hash must be SHA-256 or null"
                 )
+        if not isinstance(self.oracle_enabled, bool):
+            raise TypeError("H7 benchmark oracle_enabled must be bool")
         if not self.image_digest.startswith("sha256:") or len(self.image_digest) != 71:
             raise ValueError("H7 benchmark image digest must be sha256:<64 hex>")
         for name in ("warmup_seconds", "measurement_seconds"):
@@ -104,6 +107,8 @@ class V3H7BenchmarkProtocol:
 _METRICS = (
     "games_per_second", "decisions_per_second", "transitions_per_second",
     "learner_samples_per_second", "optimizer_steps_per_second",
+    "oracle_samples_per_second", "oracle_optimizer_steps_per_second",
+    "oracle_parameter_vram_bytes",
     "requests_per_microbatch", "legal_actions_per_batch",
     "queue_wait_seconds", "slot_read_seconds", "collate_seconds",
     "h2d_seconds", "forward_seconds", "d2h_seconds", "publish_seconds",
@@ -165,6 +170,16 @@ def validate_h7_benchmark_evidence(
         for name in ("active_slots", "in_flight", "pending"):
             if record[name] != 0:
                 raise ValueError(f"H7 benchmark did not quiesce {name}")
+        if protocol.oracle_enabled:
+            for name in (
+                "oracle_samples_per_second",
+                "oracle_optimizer_steps_per_second",
+                "oracle_parameter_vram_bytes",
+            ):
+                if record[name] <= 0.0:
+                    raise ValueError(
+                        f"H7 Oracle benchmark metric {name} must be positive"
+                    )
         for name in ("actor_blocked_ratio", "learner_data_wait_ratio"):
             if record[name] > 1.0:
                 raise ValueError(f"H7 benchmark ratio {name} exceeds one")

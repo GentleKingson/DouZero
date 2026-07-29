@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1a-support-matrix-v3"
+V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1b-support-matrix-v4"
 
 TOPOLOGY_SINGLE_PROCESS = "single_process"
 TOPOLOGY_ASYNC_SINGLE_GPU = "async_single_gpu"
@@ -52,8 +52,8 @@ _ROWS = {
         "H7 async replay binds q_old to the immutable served snapshot",
     ),
     "oracle": CapabilitySupport(
-        True, False, False, True, True, True, True, True, False,
-        "H3 training-only Oracle; export/deployment use the public student only",
+        True, True, False, True, True, True, True, True, False,
+        "H7.1b runs Oracle only in the learner; actors and export use the student",
     ),
     "belief": CapabilitySupport(
         True, True, False, True, True, True, True, True, False,
@@ -102,6 +102,7 @@ V3_H6_UNSUPPORTED_COMBINATIONS = (
     ("role_model", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("adaptive_dmc", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("belief", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
+    ("oracle", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("public_export", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
 )
 

@@ -29,6 +29,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71A_REPLAY_PROTOCOL,
     V3_H71A_REQUEST_PROTOCOL,
     V3_H71A_SNAPSHOT_SEMANTICS,
+    V3_H71B_REPLAY_PROTOCOL,
+    V3_H71B_REQUEST_PROTOCOL,
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
@@ -54,6 +56,17 @@ def _resolve_checkpoint(path: str) -> Path:
     return source
 
 
+def _oracle_update_limit(learner, oracle_enabled: bool) -> int:
+    if not oracle_enabled:
+        return 0
+    schedule = learner.base.base.base.config.schedule
+    return (
+        schedule.warmup_updates
+        + schedule.guided_updates
+        + schedule.finetune_updates
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     config = parser.add_mutually_exclusive_group(required=True)
@@ -61,7 +74,7 @@ def _parser() -> argparse.ArgumentParser:
     config.add_argument(
         "--formal-config",
         type=Path,
-        help="Use a frozen P1 formal config, including H7.1a belief.",
+        help="Use a frozen P1 formal config, including H7.1 sidecars.",
     )
     config.add_argument(
         "--smoke-config",
@@ -73,6 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--replay-capacity", type=int, default=4096)
     parser.add_argument("--belief-sidecar-capacity", type=int, default=4096)
+    parser.add_argument("--oracle-sidecar-capacity", type=int, default=4096)
     parser.add_argument("--target-microbatch", type=int, default=4)
     parser.add_argument("--max-policy-lag", type=int, default=128)
     parser.add_argument("--seed", type=int)
@@ -113,6 +127,7 @@ def main() -> None:
         )
     )
     belief_enabled = resolved.learner.features.belief
+    oracle_enabled = resolved.learner.features.oracle
     environment_seed, action_seed, seed_derivation = (
         resolve_v3_h7_seed_contract(
             formal_training_seeds=(
@@ -132,6 +147,7 @@ def main() -> None:
         batch_size=args.batch_size,
         replay_capacity=args.replay_capacity,
         belief_sidecar_capacity=args.belief_sidecar_capacity,
+        oracle_sidecar_capacity=args.oracle_sidecar_capacity,
         target_microbatch=args.target_microbatch,
         max_policy_lag=args.max_policy_lag,
         environment_seed=environment_seed,
@@ -139,15 +155,24 @@ def main() -> None:
         action_seed=action_seed,
         epsilon=args.epsilon,
         belief_runtime_enabled=belief_enabled,
+        oracle_runtime_enabled=oracle_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL
             if belief_enabled
-            else V3H7RuntimeConfig.request_protocol
+            else (
+                V3_H71B_REQUEST_PROTOCOL
+                if oracle_enabled
+                else V3H7RuntimeConfig.request_protocol
+            )
         ),
         replay_protocol=(
             V3_H71A_REPLAY_PROTOCOL
             if belief_enabled
-            else V3H7RuntimeConfig.replay_protocol
+            else (
+                V3_H71B_REPLAY_PROTOCOL
+                if oracle_enabled
+                else V3H7RuntimeConfig.replay_protocol
+            )
         ),
         snapshot_semantics=(
             V3_H71A_SNAPSHOT_SEMANTICS
@@ -195,6 +220,9 @@ def main() -> None:
     long_config = LongRunningConfig(
         episodes_per_cycle=args.episodes_per_cycle,
         optimizer_steps_per_cycle=args.optimizer_steps_per_cycle,
+        max_total_optimizer_steps=_oracle_update_limit(
+            learner, oracle_enabled
+        ),
         max_cycles=args.max_cycles,
         max_wall_time_minutes=args.max_wall_time_minutes,
         checkpoint_every_cycles=args.checkpoint_every_cycles,

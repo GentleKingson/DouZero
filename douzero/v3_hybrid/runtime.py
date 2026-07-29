@@ -53,9 +53,14 @@ from .training.h4_learner import (
     bind_v3_h4_belief_sidecar,
     build_v3_h4_belief_sidecar,
 )
+from .training.h3_learner import (
+    V3H3OracleSidecar,
+    bind_v3_h3_oracle_sidecar,
+    build_v3_h3_oracle_sidecar,
+)
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1a-runtime-v7"
-V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v4"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1b-runtime-v8"
+V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v5"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
 V3_H71A_REQUEST_PROTOCOL = (
@@ -66,6 +71,16 @@ V3_H71A_REPLAY_PROTOCOL = (
 )
 V3_H71A_SNAPSHOT_SEMANTICS = (
     "game-boundary-quiescent-public-policy-plus-belief-copy-v1"
+)
+V3_H71B_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-oracle-sidecar-v1"
+V3_H71B_REPLAY_PROTOCOL = (
+    "v3-public-replay-plus-privileged-oracle-sidecar-source-fingerprint-v2"
+)
+V3_H71AB_REQUEST_PROTOCOL = (
+    "v2-shared-slots-v3-dmc-q-belief-oracle-sidecars-v1"
+)
+V3_H71AB_REPLAY_PROTOCOL = (
+    "v3-public-replay-plus-separate-belief-oracle-sidecars-v1"
 )
 
 
@@ -138,6 +153,8 @@ class V3H7RuntimeConfig:
     replay_protocol: str = V3_H7_REPLAY_PROTOCOL
     belief_runtime_enabled: bool = False
     belief_sidecar_capacity: int = 4096
+    oracle_runtime_enabled: bool = False
+    oracle_sidecar_capacity: int = 4096
 
     def __post_init__(self) -> None:
         if self.topology not in {
@@ -146,10 +163,13 @@ class V3H7RuntimeConfig:
             raise ValueError("unknown H7 runtime topology")
         if not isinstance(self.belief_runtime_enabled, bool):
             raise TypeError("H7 belief_runtime_enabled must be bool")
+        if not isinstance(self.oracle_runtime_enabled, bool):
+            raise TypeError("H7 oracle_runtime_enabled must be bool")
         positive = (
             "num_actors", "games_per_actor", "batch_size", "replay_capacity",
             "max_actions", "target_microbatch", "max_policy_lag",
             "max_steps_per_episode", "belief_sidecar_capacity",
+            "oracle_sidecar_capacity",
         )
         for name in positive:
             value = getattr(self, name)
@@ -175,16 +195,21 @@ class V3H7RuntimeConfig:
                 raise ValueError(f"H7 runtime {name} must be positive and finite")
         if not math.isfinite(self.epsilon) or not 0.0 <= self.epsilon <= 1.0:
             raise ValueError("H7 runtime epsilon must be in [0, 1]")
-        expected_request = (
-            V3_H71A_REQUEST_PROTOCOL
-            if self.belief_runtime_enabled
-            else V3_H7_REQUEST_PROTOCOL
+        capability_pair = (
+            self.belief_runtime_enabled, self.oracle_runtime_enabled
         )
-        expected_replay = (
-            V3_H71A_REPLAY_PROTOCOL
-            if self.belief_runtime_enabled
-            else V3_H7_REPLAY_PROTOCOL
-        )
+        expected_request = {
+            (False, False): V3_H7_REQUEST_PROTOCOL,
+            (True, False): V3_H71A_REQUEST_PROTOCOL,
+            (False, True): V3_H71B_REQUEST_PROTOCOL,
+            (True, True): V3_H71AB_REQUEST_PROTOCOL,
+        }[capability_pair]
+        expected_replay = {
+            (False, False): V3_H7_REPLAY_PROTOCOL,
+            (True, False): V3_H71A_REPLAY_PROTOCOL,
+            (False, True): V3_H71B_REPLAY_PROTOCOL,
+            (True, True): V3_H71AB_REPLAY_PROTOCOL,
+        }[capability_pair]
         expected_snapshot = (
             V3_H71A_SNAPSHOT_SEMANTICS
             if self.belief_runtime_enabled
@@ -201,10 +226,51 @@ class V3H7RuntimeConfig:
         payload = asdict(self)
         if not self.belief_runtime_enabled:
             payload["belief_sidecar_capacity"] = None
+        if not self.oracle_runtime_enabled:
+            payload["oracle_sidecar_capacity"] = None
         return {"version": V3_H7_RUNTIME_VERSION, **payload}
 
     def stable_hash(self) -> str:
         return _stable_hash(self.identity())
+
+
+def _h7_alignment_capacity(config: V3H7RuntimeConfig, sidecar_capacity: int) -> int:
+    """Cover both the bounded sidecar queue and every ready replay slot."""
+
+    inference_slots = max(2, config.num_actors * config.games_per_actor)
+    replay_slots = max(
+        inference_slots * 2,
+        min(config.batch_size * 2, 64),
+    )
+    return max(sidecar_capacity, replay_slots)
+
+
+def _drain_sidecar_queue(sidecar_queue) -> int:
+    if sidecar_queue is None:
+        return 0
+    drained = 0
+    while True:
+        try:
+            sidecar_queue.get_nowait()
+        except queue.Empty:
+            return drained
+        drained += 1
+
+
+def _stop_actor_processes(processes, sidecar_queues, timeout_seconds: float) -> list[str]:
+    deadline = time.monotonic() + timeout_seconds
+    alive = list(processes)
+    while alive and time.monotonic() < deadline:
+        for sidecar_queue in sidecar_queues:
+            _drain_sidecar_queue(sidecar_queue)
+        for process in alive:
+            process.join(min(0.05, max(0.0, deadline - time.monotonic())))
+        alive = [process for process in alive if process.is_alive()]
+    for process in alive:
+        process.terminate()
+    for process in alive:
+        process.join(1.0)
+    return [process.name for process in alive if process.is_alive()]
 
 
 @dataclass
@@ -217,6 +283,8 @@ class V3H7RuntimeStats:
     learner_cardplay_samples: int = 0
     belief_labels_collected: int = 0
     belief_optimizer_steps: int = 0
+    oracle_labels_collected: int = 0
+    oracle_optimizer_steps: int = 0
     amp_fallbacks: int = 0
     episodes_per_team: dict[str, int] = field(
         default_factory=lambda: {"landlord": 0, "farmer": 0}
@@ -310,6 +378,75 @@ class V3H71ABeliefAlignment:
             )
 
 
+class V3H71BOracleAlignment:
+    """Bind finalized public replay to learner-only privileged Oracle data."""
+
+    def __init__(self, capacity: int) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+            raise ValueError("H7.1b alignment capacity must be positive")
+        self.capacity = capacity
+        self.public_rows: dict[AsyncReplayKey, V3ReplayTransition] = {}
+        self.sidecars: dict[AsyncReplayKey, V3H3OracleSidecar] = {}
+        self._completed = deque(maxlen=capacity)
+        self._completed_set: set[AsyncReplayKey] = set()
+
+    @property
+    def pending_count(self) -> int:
+        return len(self.public_rows) + len(self.sidecars)
+
+    def _check_new(self, key: AsyncReplayKey, store: Mapping) -> None:
+        if not isinstance(key, AsyncReplayKey):
+            raise TypeError("H7.1b alignment key has an invalid type")
+        if key in store or key in self._completed_set:
+            raise RuntimeError("duplicate H7.1b alignment key")
+
+    def add_public(self, key: AsyncReplayKey, row: V3ReplayTransition) -> None:
+        self._check_new(key, self.public_rows)
+        if not isinstance(row, V3ReplayTransition):
+            raise TypeError("H7.1b public alignment row has an invalid type")
+        if len(self.public_rows) >= self.capacity:
+            raise RuntimeError("H7.1b Oracle alignment backlog exceeded capacity")
+        self.public_rows[key] = row
+
+    def add_sidecar(self, key: AsyncReplayKey, sidecar: V3H3OracleSidecar) -> None:
+        self._check_new(key, self.sidecars)
+        if not isinstance(sidecar, V3H3OracleSidecar):
+            raise TypeError("H7.1b sidecar alignment row has an invalid type")
+        if len(self.sidecars) >= self.capacity:
+            raise RuntimeError("H7.1b Oracle alignment backlog exceeded capacity")
+        self.sidecars[key] = sidecar
+
+    def add_pair(self, key, row, sidecar):
+        self._check_new(key, self.public_rows)
+        self._check_new(key, self.sidecars)
+        sample = bind_v3_h3_oracle_sidecar(row, sidecar)
+        self._remember_completed(key)
+        return row, sample
+
+    def _remember_completed(self, key: AsyncReplayKey) -> None:
+        if len(self._completed) == self.capacity:
+            expired = self._completed.popleft()
+            self._completed_set.remove(expired)
+        self._completed.append(key)
+        self._completed_set.add(key)
+
+    def pop_ready(self):
+        result = []
+        for key in tuple(self.public_rows):
+            sidecar = self.sidecars.get(key)
+            if sidecar is None:
+                continue
+            row = self.public_rows.pop(key)
+            self.sidecars.pop(key)
+            result.append((row, bind_v3_h3_oracle_sidecar(row, sidecar)))
+            self._remember_completed(key)
+        return result
+
+    def assert_quiescent(self) -> None:
+        if self.pending_count:
+            raise RuntimeError("H7.1b cannot quiesce with unmatched Oracle sidecars")
+
+
 def validate_v3_h7_runtime_config(
     resolved_config: V3H6ResolvedConfig,
     runtime_config: V3H7RuntimeConfig,
@@ -328,7 +465,7 @@ def validate_v3_h7_runtime_config(
         )
     enabled = set(features.enabled_capabilities())
     unsupported = enabled - {
-        "role_model", "adaptive_dmc", "belief", "public_export"
+        "role_model", "adaptive_dmc", "belief", "oracle", "public_export"
     }
     if unsupported:
         raise NotImplementedError(
@@ -336,6 +473,11 @@ def validate_v3_h7_runtime_config(
             f"startup: {sorted(unsupported)}"
         )
     belief_enabled = "belief" in enabled
+    oracle_enabled = "oracle" in enabled
+    if belief_enabled and oracle_enabled:
+        raise NotImplementedError(
+            "H7.1b isolates Oracle async; combined belief+Oracle transport is deferred"
+        )
     if belief_enabled != runtime_config.belief_runtime_enabled:
         raise ValueError(
             "H7 runtime belief feature and belief runtime transport disagree"
@@ -356,6 +498,17 @@ def validate_v3_h7_runtime_config(
             raise ValueError(
                 "H7.1a belief sidecar capacity cannot be smaller than batch_size"
             )
+    if oracle_enabled != runtime_config.oracle_runtime_enabled:
+        raise ValueError(
+            "H7 runtime Oracle feature and Oracle runtime transport disagree"
+        )
+    if oracle_enabled:
+        if runtime_config.oracle_sidecar_capacity < runtime_config.batch_size:
+            raise ValueError(
+                "H7.1b Oracle sidecar capacity cannot be smaller than batch_size"
+            )
+        if not resolved_config.learner.base.base.base.schedule.enabled:
+            raise ValueError("H7.1b Oracle runtime requires an enabled H3 schedule")
     for capability in enabled:
         validate_capability_support(
             capability,
@@ -366,12 +519,13 @@ def validate_v3_h7_runtime_config(
             deployment=topology.deployment,
             search=False,
         )
-    if not features.adaptive_dmc and not belief_enabled:
+    if not features.adaptive_dmc and not belief_enabled and not oracle_enabled:
         raise ValueError("H7 async replay requires Adaptive DMC q_old provenance")
     if (
         resolved_config.learner.base.base.base.public.adaptive_dmc.mode
         == ADMC_DISABLED
         and not belief_enabled
+        and not oracle_enabled
     ):
         raise ValueError("H7 async runtime cannot use disabled Adaptive DMC")
     learner_batch_size = resolved_config.learner.base.base.base.public.batch_size
@@ -416,9 +570,27 @@ class V3AsyncSingleGPUTrainer:
             if runtime_config.belief_runtime_enabled
             else None
         )
+        self.oracle_buffer: deque | None = (
+            deque(maxlen=runtime_config.replay_capacity)
+            if runtime_config.oracle_runtime_enabled
+            else None
+        )
         self._belief_alignment = (
-            V3H71ABeliefAlignment(runtime_config.belief_sidecar_capacity)
+            V3H71ABeliefAlignment(
+                _h7_alignment_capacity(
+                    runtime_config, runtime_config.belief_sidecar_capacity
+                )
+            )
             if runtime_config.belief_runtime_enabled
+            else None
+        )
+        self._oracle_alignment = (
+            V3H71BOracleAlignment(
+                _h7_alignment_capacity(
+                    runtime_config, runtime_config.oracle_sidecar_capacity
+                )
+            )
+            if runtime_config.oracle_runtime_enabled
             else None
         )
         self._rng = random.Random(runtime_config.action_seed)
@@ -461,6 +633,11 @@ class V3AsyncSingleGPUTrainer:
                 "disabled"
                 if self.belief_model is None
                 else "separate-privileged-keyed-sidecar-never-public-replay-v1"
+            ),
+            "oracle_sidecar": (
+                "disabled"
+                if self.oracle_buffer is None
+                else "separate-privileged-keyed-sidecar-learner-only-v1"
             ),
         }
         self.runtime_hash = _stable_hash(self.runtime_identity)
@@ -529,6 +706,11 @@ class V3AsyncSingleGPUTrainer:
             if cfg.belief_runtime_enabled
             else None
         )
+        self._oracle_sidecar_queue = (
+            context.Queue(maxsize=cfg.oracle_sidecar_capacity)
+            if cfg.oracle_runtime_enabled
+            else None
+        )
         self._stagers: dict[int, PinnedObservationBatchStager] = {}
         self._workers = []
         for actor_id in range(cfg.num_actors):
@@ -554,6 +736,7 @@ class V3AsyncSingleGPUTrainer:
                     "games_per_actor": cfg.games_per_actor,
                     "runtime_kind": "v3_hybrid",
                     "belief_sidecar_queue": self._belief_sidecar_queue,
+                    "oracle_sidecar_queue": self._oracle_sidecar_queue,
                 },
                 name=f"douzero-v3-actor-{actor_id}",
             )
@@ -683,7 +866,7 @@ class V3AsyncSingleGPUTrainer:
 
     def _drain_replay(self) -> int:
         started = time.perf_counter()
-        if self.belief_buffer is None:
+        if self.belief_buffer is None and self.oracle_buffer is None:
             rows = self._replay_slots.read_ready_v3(
                 feature_schema_hash=self.model.schema.stable_hash(),
                 target_transform=self.model.config.dmc_target_transform,
@@ -697,40 +880,59 @@ class V3AsyncSingleGPUTrainer:
                 target_transform=self.model.config.dmc_target_transform,
                 ruleset_identity=self.learner.ruleset.identity(),
             )
+            sidecar_queue = (
+                self._belief_sidecar_queue
+                if self.belief_buffer is not None
+                else self._oracle_sidecar_queue
+            )
+            sidecar_type = (
+                V3H4BeliefSidecar
+                if self.belief_buffer is not None
+                else V3H3OracleSidecar
+            )
+            alignment = (
+                self._belief_alignment
+                if self.belief_buffer is not None
+                else self._oracle_alignment
+            )
             queued_sidecars = {}
             while True:
                 try:
-                    message = self._belief_sidecar_queue.get_nowait()
+                    message = sidecar_queue.get_nowait()
                 except queue.Empty:
                     break
                 if (
                     not isinstance(message, tuple)
                     or len(message) != 2
                     or not isinstance(message[0], AsyncReplayKey)
-                    or not isinstance(message[1], V3H4BeliefSidecar)
+                    or not isinstance(message[1], sidecar_type)
                 ):
-                    raise TypeError("H7.1a belief sidecar envelope mismatch")
+                    raise TypeError("H7 training sidecar envelope mismatch")
                 key, sidecar = message
                 if key in queued_sidecars:
-                    raise RuntimeError("duplicate H7.1a sidecar queue key")
+                    raise RuntimeError("duplicate H7 training sidecar queue key")
                 queued_sidecars[key] = sidecar
             paired = []
             for row, key in aligned:
                 sidecar = queued_sidecars.pop(key, None)
                 if sidecar is None:
-                    self._belief_alignment.add_public(key, row)
+                    alignment.add_public(key, row)
                 else:
                     paired.append(
-                        self._belief_alignment.add_pair(key, row, sidecar)
+                        alignment.add_pair(key, row, sidecar)
                     )
             for key, sidecar in queued_sidecars.items():
-                self._belief_alignment.add_sidecar(key, sidecar)
-            paired.extend(self._belief_alignment.pop_ready())
+                alignment.add_sidecar(key, sidecar)
+            paired.extend(alignment.pop_ready())
             completed = len(paired)
             for row, sample in paired:
                 self.buffer.append(row)
-                self.belief_buffer.append(sample)
-                self.stats.belief_labels_collected += 1
+                if self.belief_buffer is not None:
+                    self.belief_buffer.append(sample)
+                    self.stats.belief_labels_collected += 1
+                else:
+                    self.oracle_buffer.append(sample)
+                    self.stats.oracle_labels_collected += 1
         self._segments["replay_drain"] += time.perf_counter() - started
         return completed
 
@@ -815,13 +1017,19 @@ class V3AsyncSingleGPUTrainer:
                 if self.belief_buffer is None
                 else [self.belief_buffer[index] for index in indices]
             )
+            oracle_samples = self._oracle_samples_for_indices(indices)
             learner_policy_before = int(self.learner.policy_version)
             metrics = self.learner.train_batch(
-                learner_rows, belief_samples=belief_samples
+                learner_rows,
+                belief_samples=belief_samples,
+                oracle_samples=oracle_samples,
             )
             self._record_served_update(learner_policy_before, metrics)
             if metrics.base.base.belief_updated:
                 self.stats.belief_optimizer_steps += 1
+            h3_metrics = metrics.base.base.base
+            if h3_metrics is not None and h3_metrics.oracle_updated:
+                self.stats.oracle_optimizer_steps += 1
             self.stats.optimizer_steps += 1
             self.stats.learner_cardplay_samples += len(rows)
             self._segments["learner"] += time.perf_counter() - started
@@ -838,14 +1046,20 @@ class V3AsyncSingleGPUTrainer:
             if self.belief_buffer is None
             else [self.belief_buffer[index] for index in indices]
         )
+        oracle_samples = self._oracle_samples_for_indices(indices)
         started = time.perf_counter()
         learner_policy_before = int(self.learner.policy_version)
         metrics = self.learner.train_batch(
-            learner_rows, belief_samples=belief_samples
+            learner_rows,
+            belief_samples=belief_samples,
+            oracle_samples=oracle_samples,
         )
         self._record_served_update(learner_policy_before, metrics)
         if metrics.base.base.belief_updated:
             self.stats.belief_optimizer_steps += 1
+        h3_metrics = metrics.base.base.base
+        if h3_metrics is not None and h3_metrics.oracle_updated:
+            self.stats.oracle_optimizer_steps += 1
         self.stats.optimizer_steps += 1
         self.stats.learner_cardplay_samples += len(rows)
         self._segments["learner"] += time.perf_counter() - started
@@ -868,28 +1082,41 @@ class V3AsyncSingleGPUTrainer:
     ) -> list[V3ReplayTransition]:
         if self.resolved_config.learner.features.adaptive_dmc:
             return rows
-        if self.belief_buffer is None:
+        if self.belief_buffer is None and self.oracle_buffer is None:
             raise RuntimeError(
-                "H7 ordinary DMC replay is supported only by H7.1a belief"
+                "H7 ordinary DMC replay requires a sidecar-enabled runtime"
             )
         return [replace(row, adaptive_provenance=None) for row in rows]
+
+    def _oracle_samples_for_indices(self, indices: list[int]):
+        if self.oracle_buffer is None:
+            return None
+        h3 = self.learner.base.base.base
+        return (
+            [self.oracle_buffer[index] for index in indices]
+            if h3._privileged_needed(h3.schedule_state())
+            else None
+        )
 
     def _parameter_update_snapshot(self) -> tuple[torch.Tensor, ...]:
         return tuple(
             parameter.detach().clone()
-            for parameter in self._served_parameters()
+            for parameter in self._tracked_training_parameters()
         )
 
-    def _served_parameters(self) -> tuple[torch.nn.Parameter, ...]:
+    def _tracked_training_parameters(self) -> tuple[torch.nn.Parameter, ...]:
         parameters = tuple(self.model.parameters())
         if self.belief_model is not None:
             parameters += tuple(self.belief_model.parameters())
+        oracle = self.learner.base.base.base.oracle
+        if oracle is not None:
+            parameters += tuple(oracle.parameters())
         return parameters
 
     def _parameters_changed_since(
         self, snapshots: tuple[torch.Tensor, ...]
     ) -> bool:
-        parameters = self._served_parameters()
+        parameters = self._tracked_training_parameters()
         if len(snapshots) != len(parameters):
             raise ValueError("H7 parameter update snapshot shape changed")
         return any(
@@ -912,6 +1139,8 @@ class V3AsyncSingleGPUTrainer:
             raise RuntimeError("H7 policy lag exceeded its configured bound")
         if self._belief_alignment is not None:
             self._belief_alignment.assert_quiescent()
+        if self._oracle_alignment is not None:
+            self._oracle_alignment.assert_quiescent()
         latencies = sorted(self._queue_latencies_ms)
 
         def percentile(fraction: float) -> float:
@@ -929,6 +1158,19 @@ class V3AsyncSingleGPUTrainer:
             ),
             "belief_labels_collected": self.stats.belief_labels_collected,
             "belief_optimizer_steps": self.stats.belief_optimizer_steps,
+            "oracle_replay_occupancy": (
+                0 if self.oracle_buffer is None else len(self.oracle_buffer)
+            ),
+            "oracle_labels_collected": self.stats.oracle_labels_collected,
+            "oracle_optimizer_steps": self.stats.oracle_optimizer_steps,
+            "oracle_parameter_vram_bytes": sum(
+                parameter.numel() * parameter.element_size()
+                for parameter in (
+                    ()
+                    if self.learner.base.base.base.oracle is None
+                    else self.learner.base.base.base.oracle.parameters()
+                )
+            ),
             "requests_per_microbatch": self._requests / max(1, self._microbatches),
             "actions_per_microbatch": self._actions / max(1, self._microbatches),
             "inference_queue_p50_ms": percentile(0.50),
@@ -952,10 +1194,14 @@ class V3AsyncSingleGPUTrainer:
         self.buffer.clear()
         if self.belief_buffer is not None:
             self.belief_buffer.clear()
+        if self.oracle_buffer is not None:
+            self.oracle_buffer.clear()
 
     def save_training_checkpoint(self, path: str, *, long_running_state) -> None:
         if self._belief_alignment is not None:
             self._belief_alignment.assert_quiescent()
+        if self._oracle_alignment is not None:
+            self._oracle_alignment.assert_quiescent()
         with tempfile.TemporaryDirectory(prefix="douzero-h7-save-") as temporary:
             inner_path = Path(temporary) / "h6.pt"
             self.learner.save_checkpoint(inner_path)
@@ -1010,6 +1256,7 @@ class V3AsyncSingleGPUTrainer:
             "decisions_collected", "optimizer_steps", "episodes_per_team",
             "amp_fallbacks", "learner_cardplay_samples",
             "belief_labels_collected", "belief_optimizer_steps",
+            "oracle_labels_collected", "oracle_optimizer_steps",
         }:
             raise ValueError("H7 checkpoint statistics fields mismatch")
         candidate_stats = V3H7RuntimeStats(**stats_payload)
@@ -1018,6 +1265,7 @@ class V3AsyncSingleGPUTrainer:
             "decisions_collected", "optimizer_steps",
             "amp_fallbacks", "learner_cardplay_samples",
             "belief_labels_collected", "belief_optimizer_steps",
+            "oracle_labels_collected", "oracle_optimizer_steps",
         ):
             value = getattr(candidate_stats, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1036,6 +1284,11 @@ class V3AsyncSingleGPUTrainer:
             or candidate_stats.belief_optimizer_steps
         ):
             raise ValueError("H7 base checkpoint contains belief progress")
+        if not self.config.oracle_runtime_enabled and (
+            candidate_stats.oracle_labels_collected
+            or candidate_stats.oracle_optimizer_steps
+        ):
+            raise ValueError("H7 checkpoint contains unexpected Oracle progress")
         if (
             candidate_stats.belief_optimizer_steps
             > candidate_stats.optimizer_steps
@@ -1043,6 +1296,13 @@ class V3AsyncSingleGPUTrainer:
             > candidate_stats.transitions_collected
         ):
             raise ValueError("H7 checkpoint belief statistics are invalid")
+        if (
+            candidate_stats.oracle_optimizer_steps
+            > candidate_stats.optimizer_steps
+            or candidate_stats.oracle_labels_collected
+            > candidate_stats.transitions_collected
+        ):
+            raise ValueError("H7 checkpoint Oracle statistics are invalid")
         candidate_rng = random.Random()
         candidate_rng.setstate(bundle["rng_state"])
         snapshot_step = bundle["snapshot_step"]
@@ -1101,10 +1361,14 @@ class V3AsyncSingleGPUTrainer:
             self._coordinator.request_shutdown()
             for _ in self._workers:
                 self._tasks.put(None)
-            deadline = time.monotonic() + 5.0
-            for process in self._workers:
-                process.join(max(0.0, deadline - time.monotonic()))
-            alive = [process.name for process in self._workers if process.is_alive()]
+            alive = _stop_actor_processes(
+                self._workers,
+                (
+                    self._belief_sidecar_queue,
+                    self._oracle_sidecar_queue,
+                ),
+                5.0,
+            )
             if alive:
                 error = RuntimeError(f"H7 actor shutdown timed out: {alive}")
             from douzero.training.async_single_gpu import SlotState
@@ -1125,6 +1389,9 @@ class V3AsyncSingleGPUTrainer:
             if self._belief_sidecar_queue is not None:
                 self._belief_sidecar_queue.close()
                 self._belief_sidecar_queue.join_thread()
+            if self._oracle_sidecar_queue is not None:
+                self._oracle_sidecar_queue.close()
+                self._oracle_sidecar_queue.join_thread()
             self._tasks.close()
             self._events.close()
             self._runtime_started = False
@@ -1194,6 +1461,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
             env.reset()
             pending = []
             pending_belief = []
+            pending_oracle = []
             decisions = 0
             steps = 0
             while True:
@@ -1247,6 +1515,16 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                                 captured.model_inputs, sidecar
                             )
                         )
+                    if self.oracle_buffer is not None:
+                        pending_oracle.append(build_v3_h3_oracle_sidecar(
+                            observation,
+                            PrivilegedObservation(
+                                all_handcards=dict(env.infoset.all_handcards),
+                                acting_role=position,
+                            ),
+                            action_index=action_index,
+                            public_inputs=captured.model_inputs,
+                        ))
                     pending.append(replace(
                         captured,
                         adaptive_provenance=AdaptiveSnapshotProvenance(
@@ -1281,6 +1559,16 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                     )
                 self.belief_buffer.extend(pending_belief)
                 self.stats.belief_labels_collected += len(pending_belief)
+            if self.oracle_buffer is not None:
+                if len(pending_oracle) != len(rows):
+                    raise RuntimeError(
+                        "H7.1b single-process Oracle alignment mismatch"
+                    )
+                self.oracle_buffer.extend(
+                    bind_v3_h3_oracle_sidecar(row, sidecar)
+                    for row, sidecar in zip(rows, pending_oracle)
+                )
+                self.stats.oracle_labels_collected += len(pending_oracle)
             self.stats.games_collected += 1
             self.stats.episodes_completed += 1
             self.stats.transitions_collected += len(rows)

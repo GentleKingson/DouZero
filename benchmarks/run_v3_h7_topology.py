@@ -34,6 +34,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71A_REPLAY_PROTOCOL,
     V3_H71A_REQUEST_PROTOCOL,
     V3_H71A_SNAPSHOT_SEMANTICS,
+    V3_H71B_REPLAY_PROTOCOL,
+    V3_H71B_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -64,7 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--formal-config",
         type=Path,
-        help="run the H7.1a belief topology for a committed formal config",
+        help="run an H7 sidecar topology for a committed formal config",
     )
     return parser
 
@@ -118,11 +120,26 @@ def _validate_live_identity(
         if value != getattr(protocol, name):
             raise ValueError(f"H7 benchmark live {name} mismatch")
     belief_enabled = resolved.learner.features.belief
+    oracle_enabled = resolved.learner.features.oracle
+    if protocol.oracle_enabled != oracle_enabled:
+        raise ValueError("H7 benchmark Oracle capability identity mismatch")
     request = (
-        V3_H71A_REQUEST_PROTOCOL if belief_enabled else V3_H7_REQUEST_PROTOCOL
+        V3_H71A_REQUEST_PROTOCOL
+        if belief_enabled
+        else (
+            V3_H71B_REQUEST_PROTOCOL
+            if oracle_enabled
+            else V3_H7_REQUEST_PROTOCOL
+        )
     )
     replay = (
-        V3_H71A_REPLAY_PROTOCOL if belief_enabled else V3_H7_REPLAY_PROTOCOL
+        V3_H71A_REPLAY_PROTOCOL
+        if belief_enabled
+        else (
+            V3_H71B_REPLAY_PROTOCOL
+            if oracle_enabled
+            else V3_H7_REPLAY_PROTOCOL
+        )
     )
     trainer_identity_hash = h7_trainer_identity_hash(
         runtime_version=V3_H7_RUNTIME_VERSION,
@@ -216,6 +233,7 @@ def main() -> None:
         games, episodes = 4, 4
         trainer_type = V3AsyncSingleGPUTrainer
     belief_enabled = resolved.learner.features.belief
+    oracle_enabled = resolved.learner.features.oracle
     environment_seed, action_seed, seed_derivation = (
         resolve_v3_h7_seed_contract(
             formal_training_seeds=(
@@ -239,15 +257,24 @@ def main() -> None:
         environment_seed_derivation=seed_derivation,
         action_seed=action_seed,
         belief_runtime_enabled=belief_enabled,
+        oracle_runtime_enabled=oracle_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL
             if belief_enabled
-            else V3H7RuntimeConfig.request_protocol
+            else (
+                V3_H71B_REQUEST_PROTOCOL
+                if oracle_enabled
+                else V3H7RuntimeConfig.request_protocol
+            )
         ),
         replay_protocol=(
             V3_H71A_REPLAY_PROTOCOL
             if belief_enabled
-            else V3H7RuntimeConfig.replay_protocol
+            else (
+                V3_H71B_REPLAY_PROTOCOL
+                if oracle_enabled
+                else V3H7RuntimeConfig.replay_protocol
+            )
         ),
         snapshot_semantics=(
             V3_H71A_SNAPSHOT_SEMANTICS
@@ -278,6 +305,8 @@ def main() -> None:
             "transitions": trainer.stats.transitions_collected,
             "samples": trainer.stats.learner_cardplay_samples,
             "steps": trainer.stats.optimizer_steps,
+            "oracle_labels": trainer.stats.oracle_labels_collected,
+            "oracle_steps": trainer.stats.oracle_optimizer_steps,
         }
         parameter_snapshot = trainer._parameter_update_snapshot()
         started = time.monotonic()
@@ -293,6 +322,8 @@ def main() -> None:
             "transitions": trainer.stats.transitions_collected,
             "samples": trainer.stats.learner_cardplay_samples,
             "steps": trainer.stats.optimizer_steps,
+            "oracle_labels": trainer.stats.oracle_labels_collected,
+            "oracle_steps": trainer.stats.oracle_optimizer_steps,
         }
         shared_memory = _shared_memory_bytes(trainer)
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -335,6 +366,15 @@ def main() -> None:
             "optimizer_steps_per_second": (
                 after["steps"] - before["steps"]
             ) / elapsed,
+            "oracle_samples_per_second": (
+                after["oracle_labels"] - before["oracle_labels"]
+            ) / elapsed,
+            "oracle_optimizer_steps_per_second": (
+                after["oracle_steps"] - before["oracle_steps"]
+            ) / elapsed,
+            "oracle_parameter_vram_bytes": int(
+                boundary["oracle_parameter_vram_bytes"]
+            ),
             "requests_per_microbatch": float(boundary["requests_per_microbatch"]),
             "legal_actions_per_batch": float(boundary["actions_per_microbatch"]),
             "queue_wait_seconds": float(boundary["claim_wait_seconds"]),

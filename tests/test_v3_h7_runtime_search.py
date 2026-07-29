@@ -125,8 +125,8 @@ def test_h7_benchmark_waits_for_a_full_single_process_replay_batch():
     assert lag == 0
 
 
-def test_h7_support_matrix_enables_only_base_async_capabilities():
-    for capability in ("role_model", "adaptive_dmc", "public_export"):
+def test_h7_support_matrix_enables_implemented_async_capabilities():
+    for capability in ("role_model", "adaptive_dmc", "oracle", "public_export"):
         validate_capability_support(
             capability,
             topology=TOPOLOGY_ASYNC_SINGLE_GPU,
@@ -138,7 +138,7 @@ def test_h7_support_matrix_enables_only_base_async_capabilities():
         )
     with pytest.raises(ValueError, match="does not support async_single_gpu"):
         validate_capability_support(
-            "oracle",
+            "cooperation",
             topology=TOPOLOGY_ASYNC_SINGLE_GPU,
             ruleset=RULESET_LEGACY,
             checkpoint_resume=True,
@@ -374,6 +374,7 @@ def _benchmark_protocol():
         trainer_identity_hash="e" * 64,
         replay_protocol_hash="f" * 64,
         formal_config_hash=None,
+        oracle_enabled=False,
         gpu="gpu",
         driver="driver",
         pytorch="torch",
@@ -400,6 +401,9 @@ def _benchmark_record(protocol, topology, repeat):
         "transitions_per_second": 2.0,
         "learner_samples_per_second": 3.0,
         "optimizer_steps_per_second": 0.1,
+        "oracle_samples_per_second": 0.0,
+        "oracle_optimizer_steps_per_second": 0.0,
+        "oracle_parameter_vram_bytes": 0.0,
         "requests_per_microbatch": 2.0,
         "legal_actions_per_batch": 16.0,
         "queue_wait_seconds": 1.0,
@@ -439,6 +443,15 @@ def test_h7_benchmark_requires_three_matched_repeats_per_topology():
     corrupted[0]["measurement_seconds"] = 299.0
     with pytest.raises(ValueError, match="window is too short"):
         validate_h7_benchmark_evidence(corrupted, protocol)
+
+    oracle_protocol = replace(protocol, oracle_enabled=True)
+    oracle_records = [
+        _benchmark_record(oracle_protocol, topology, repeat)
+        for topology in H7_TOPOLOGIES
+        for repeat in range(3)
+    ]
+    with pytest.raises(ValueError, match="Oracle benchmark metric"):
+        validate_h7_benchmark_evidence(oracle_records, oracle_protocol)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA host")
