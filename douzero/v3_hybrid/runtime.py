@@ -234,6 +234,17 @@ class V3H7RuntimeConfig:
         return _stable_hash(self.identity())
 
 
+def _h7_alignment_capacity(config: V3H7RuntimeConfig, sidecar_capacity: int) -> int:
+    """Cover both the bounded sidecar queue and every ready replay slot."""
+
+    inference_slots = max(2, config.num_actors * config.games_per_actor)
+    replay_slots = max(
+        inference_slots * 2,
+        min(config.batch_size * 2, 64),
+    )
+    return max(sidecar_capacity, replay_slots)
+
+
 @dataclass
 class V3H7RuntimeStats:
     games_collected: int = 0
@@ -537,12 +548,20 @@ class V3AsyncSingleGPUTrainer:
             else None
         )
         self._belief_alignment = (
-            V3H71ABeliefAlignment(runtime_config.belief_sidecar_capacity)
+            V3H71ABeliefAlignment(
+                _h7_alignment_capacity(
+                    runtime_config, runtime_config.belief_sidecar_capacity
+                )
+            )
             if runtime_config.belief_runtime_enabled
             else None
         )
         self._oracle_alignment = (
-            V3H71BOracleAlignment(runtime_config.oracle_sidecar_capacity)
+            V3H71BOracleAlignment(
+                _h7_alignment_capacity(
+                    runtime_config, runtime_config.oracle_sidecar_capacity
+                )
+            )
             if runtime_config.oracle_runtime_enabled
             else None
         )

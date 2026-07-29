@@ -27,6 +27,7 @@ from douzero.v3_hybrid.runtime import (
     V3_H71B_REQUEST_PROTOCOL,
     V3H71BOracleAlignment,
     V3H7RuntimeConfig,
+    _h7_alignment_capacity,
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.training.h3_learner import (
@@ -158,6 +159,11 @@ def test_oracle_alignment_is_bounded_duplicate_safe_and_quiescent():
     pending.add_sidecar(key, sidecar)
     with pytest.raises(RuntimeError, match="unmatched Oracle"):
         pending.assert_quiescent()
+
+
+def test_oracle_alignment_capacity_covers_every_ready_replay_slot():
+    runtime = _runtime(batch_size=32, oracle_sidecar_capacity=32)
+    assert _h7_alignment_capacity(runtime, runtime.oracle_sidecar_capacity) == 64
 
 
 def test_primary_h7_cli_selects_oracle_sidecar_protocols_before_cuda(

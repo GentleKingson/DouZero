@@ -120,6 +120,7 @@ def main() -> None:
             if formal is None
             else str(formal.identity_dict()["config_sha256"])
         ),
+        oracle_enabled=oracle_enabled,
         gpu=args.gpu,
         driver=args.driver,
         pytorch=args.pytorch,

@@ -374,6 +374,7 @@ def _benchmark_protocol():
         trainer_identity_hash="e" * 64,
         replay_protocol_hash="f" * 64,
         formal_config_hash=None,
+        oracle_enabled=False,
         gpu="gpu",
         driver="driver",
         pytorch="torch",
@@ -442,6 +443,15 @@ def test_h7_benchmark_requires_three_matched_repeats_per_topology():
     corrupted[0]["measurement_seconds"] = 299.0
     with pytest.raises(ValueError, match="window is too short"):
         validate_h7_benchmark_evidence(corrupted, protocol)
+
+    oracle_protocol = replace(protocol, oracle_enabled=True)
+    oracle_records = [
+        _benchmark_record(oracle_protocol, topology, repeat)
+        for topology in H7_TOPOLOGIES
+        for repeat in range(3)
+    ]
+    with pytest.raises(ValueError, match="Oracle benchmark metric"):
+        validate_h7_benchmark_evidence(oracle_records, oracle_protocol)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA host")

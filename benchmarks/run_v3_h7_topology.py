@@ -121,6 +121,8 @@ def _validate_live_identity(
             raise ValueError(f"H7 benchmark live {name} mismatch")
     belief_enabled = resolved.learner.features.belief
     oracle_enabled = resolved.learner.features.oracle
+    if protocol.oracle_enabled != oracle_enabled:
+        raise ValueError("H7 benchmark Oracle capability identity mismatch")
     request = (
         V3_H71A_REQUEST_PROTOCOL
         if belief_enabled
