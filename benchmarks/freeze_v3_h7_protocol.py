@@ -52,10 +52,15 @@ def main() -> None:
     parser.add_argument("--warmup-seconds", type=float, default=30.0)
     parser.add_argument("--measurement-seconds", type=float, default=300.0)
     args = parser.parse_args()
+    formal = (
+        None
+        if args.formal_config is None
+        else load_formal_config(args.formal_config)
+    )
     resolved = (
         build_v3_h7_smoke_config()
-        if args.formal_config is None
-        else build_pilot_resolved_config(load_formal_config(args.formal_config))
+        if formal is None
+        else build_pilot_resolved_config(formal)
     )
     belief_enabled = resolved.learner.features.belief
     request_protocol = (
@@ -91,6 +96,11 @@ def main() -> None:
             ),
         ),
         replay_protocol_hash=_hash({"replay": replay_protocol}),
+        formal_config_hash=(
+            None
+            if formal is None
+            else str(formal.identity_dict()["config_sha256"])
+        ),
         gpu=args.gpu,
         driver=args.driver,
         pytorch=args.pytorch,
@@ -98,6 +108,11 @@ def main() -> None:
         cpu=args.cpu,
         warmup_seconds=args.warmup_seconds,
         measurement_seconds=args.measurement_seconds,
+        seeds=(
+            (101, 202, 303)
+            if formal is None
+            else formal.seeds.training
+        ),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(

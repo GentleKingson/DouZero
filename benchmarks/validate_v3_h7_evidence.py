@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from douzero.v3_hybrid.benchmark import (
+    H7_BENCHMARK_SCHEMA,
     V3H7BenchmarkProtocol,
     validate_h7_benchmark_evidence,
 )
@@ -18,7 +19,7 @@ def main() -> None:
     parser.add_argument("--records", required=True, type=Path)
     args = parser.parse_args()
     protocol_payload = json.loads(args.protocol.read_text(encoding="utf-8"))
-    if protocol_payload.pop("schema", None) != "v3-hybrid-h7-benchmark-v1":
+    if protocol_payload.pop("schema", None) != H7_BENCHMARK_SCHEMA:
         raise ValueError("H7 benchmark protocol schema mismatch")
     protocol_payload["seeds"] = tuple(protocol_payload["seeds"])
     protocol = V3H7BenchmarkProtocol(**protocol_payload)

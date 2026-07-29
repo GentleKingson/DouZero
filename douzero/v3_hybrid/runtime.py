@@ -54,7 +54,7 @@ from .training.h4_learner import (
     build_v3_h4_belief_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1a-runtime-v5"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1a-runtime-v6"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v3"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -67,6 +67,40 @@ V3_H71A_REPLAY_PROTOCOL = (
 V3_H71A_SNAPSHOT_SEMANTICS = (
     "game-boundary-quiescent-public-policy-plus-belief-copy-v1"
 )
+
+
+def resolve_v3_h7_seed_contract(
+    *,
+    formal_training_seeds: tuple[int, ...] | None,
+    formal_derivation: str | None,
+    requested_environment_seed: int | None,
+    requested_action_seed: int | None,
+) -> tuple[int, int, str]:
+    """Resolve topology seeds without bypassing a frozen formal contract."""
+
+    if formal_training_seeds is None:
+        return (
+            1 if requested_environment_seed is None else requested_environment_seed,
+            2 if requested_action_seed is None else requested_action_seed,
+            TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
+        )
+    if formal_derivation != FORMAL_SEED_DERIVATION_V1:
+        raise ValueError("H7 formal config seed derivation is unsupported")
+    if not formal_training_seeds:
+        raise ValueError("H7 formal config has no training seeds")
+    root_seed = (
+        formal_training_seeds[0]
+        if requested_environment_seed is None
+        else requested_environment_seed
+    )
+    if root_seed not in formal_training_seeds:
+        raise ValueError("H7 requested seed is not frozen by the formal config")
+    if requested_action_seed is not None:
+        raise ValueError("H7 formal action seed is derived and cannot be overridden")
+    action_seed = derive_formal_stream_seed(
+        root_seed, "action_rng_root", 0, 0
+    )
+    return root_seed, action_seed, FORMAL_SEED_DERIVATION_V1
 
 
 def _stable_hash(payload: Mapping[str, object]) -> str:
@@ -230,20 +264,23 @@ class V3H71ABeliefAlignment:
         key: AsyncReplayKey,
         row: V3ReplayTransition,
         sidecar: V3H4BeliefSidecar,
-    ) -> None:
+    ) -> tuple[V3ReplayTransition, V3H4BeliefSample]:
         self._check_new(key, self.public_rows)
         self._check_new(key, self.sidecars)
         if not isinstance(row, V3ReplayTransition):
             raise TypeError("H7.1a public alignment row has an invalid type")
         if not isinstance(sidecar, V3H4BeliefSidecar):
             raise TypeError("H7.1a sidecar alignment row has an invalid type")
-        if (
-            len(self.public_rows) >= self.capacity
-            or len(self.sidecars) >= self.capacity
-        ):
-            raise RuntimeError("H7.1a belief alignment backlog exceeded capacity")
-        self.public_rows[key] = row
-        self.sidecars[key] = sidecar
+        sample = bind_v3_h4_belief_sidecar(row.model_inputs, sidecar)
+        self._remember_completed(key)
+        return row, sample
+
+    def _remember_completed(self, key: AsyncReplayKey) -> None:
+        if len(self._completed) == self.capacity:
+            expired = self._completed.popleft()
+            self._completed_set.remove(expired)
+        self._completed.append(key)
+        self._completed_set.add(key)
 
     def pop_ready(
         self,
@@ -256,11 +293,7 @@ class V3H71ABeliefAlignment:
             row = self.public_rows.pop(key)
             self.sidecars.pop(key)
             sample = bind_v3_h4_belief_sidecar(row.model_inputs, sidecar)
-            if len(self._completed) == self.capacity:
-                expired = self._completed.popleft()
-                self._completed_set.remove(expired)
-            self._completed.append(key)
-            self._completed_set.add(key)
+            self._remember_completed(key)
             result.append((row, sample))
         return result
 
@@ -680,8 +713,9 @@ class V3AsyncSingleGPUTrainer:
                 if sidecar is None:
                     self._belief_alignment.add_public(key, row)
                 else:
-                    self._belief_alignment.add_pair(key, row, sidecar)
-                    paired.extend(self._belief_alignment.pop_ready())
+                    paired.append(
+                        self._belief_alignment.add_pair(key, row, sidecar)
+                    )
             for key, sidecar in queued_sidecars.items():
                 self._belief_alignment.add_sidecar(key, sidecar)
             paired.extend(self._belief_alignment.pop_ready())

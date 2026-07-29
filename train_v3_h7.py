@@ -32,6 +32,7 @@ from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
+    resolve_v3_h7_seed_contract,
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.support_matrix import (
@@ -73,8 +74,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--belief-sidecar-capacity", type=int, default=4096)
     parser.add_argument("--target-microbatch", type=int, default=4)
     parser.add_argument("--max-policy-lag", type=int, default=128)
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--action-seed", type=int, default=2)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--action-seed", type=int)
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--episodes-per-cycle", type=int, default=4)
     parser.add_argument("--optimizer-steps-per-cycle", type=int, default=1)
@@ -109,6 +110,18 @@ def main() -> None:
         )
     )
     belief_enabled = resolved.learner.features.belief
+    environment_seed, action_seed, seed_derivation = (
+        resolve_v3_h7_seed_contract(
+            formal_training_seeds=(
+                None if formal is None else formal.seeds.training
+            ),
+            formal_derivation=(
+                None if formal is None else formal.seeds.derivation
+            ),
+            requested_environment_seed=args.seed,
+            requested_action_seed=args.action_seed,
+        )
+    )
     runtime_config = V3H7RuntimeConfig(
         topology=args.topology,
         num_actors=args.num_actors,
@@ -118,8 +131,9 @@ def main() -> None:
         belief_sidecar_capacity=args.belief_sidecar_capacity,
         target_microbatch=args.target_microbatch,
         max_policy_lag=args.max_policy_lag,
-        environment_seed=args.seed,
-        action_seed=args.action_seed,
+        environment_seed=environment_seed,
+        environment_seed_derivation=seed_derivation,
+        action_seed=action_seed,
         epsilon=args.epsilon,
         belief_runtime_enabled=belief_enabled,
         request_protocol=(

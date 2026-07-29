@@ -41,6 +41,7 @@ from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
+    resolve_v3_h7_seed_contract,
 )
 from douzero.v3_hybrid.support_matrix import (
     TOPOLOGY_ASYNC_SINGLE_GPU,
@@ -187,6 +188,13 @@ def main() -> None:
         if formal is None
         else build_pilot_resolved_config(formal)
     )
+    formal_config_hash = (
+        None
+        if formal is None
+        else str(formal.identity_dict()["config_sha256"])
+    )
+    if protocol.formal_config_hash != formal_config_hash:
+        raise ValueError("H7 benchmark formal config identity mismatch")
     if resolved.stable_hash() != protocol.config_hash:
         raise ValueError("H7 benchmark config hash mismatch")
     if resolved.model.stable_hash() != protocol.model_identity_hash:
@@ -205,6 +213,18 @@ def main() -> None:
         games, episodes = 4, 4
         trainer_type = V3AsyncSingleGPUTrainer
     belief_enabled = resolved.learner.features.belief
+    environment_seed, action_seed, seed_derivation = (
+        resolve_v3_h7_seed_contract(
+            formal_training_seeds=(
+                None if formal is None else formal.seeds.training
+            ),
+            formal_derivation=(
+                None if formal is None else formal.seeds.derivation
+            ),
+            requested_environment_seed=seed,
+            requested_action_seed=None,
+        )
+    )
     runtime_config = V3H7RuntimeConfig(
         topology=topology,
         num_actors=actors,
@@ -212,8 +232,9 @@ def main() -> None:
         batch_size=32,
         replay_capacity=4096,
         target_microbatch=4,
-        environment_seed=seed,
-        action_seed=seed + 1,
+        environment_seed=environment_seed,
+        environment_seed_derivation=seed_derivation,
+        action_seed=action_seed,
         belief_runtime_enabled=belief_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL

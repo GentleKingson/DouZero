@@ -373,6 +373,7 @@ def _benchmark_protocol():
         model_identity_hash="d" * 64,
         trainer_identity_hash="e" * 64,
         replay_protocol_hash="f" * 64,
+        formal_config_hash=None,
         gpu="gpu",
         driver="driver",
         pytorch="torch",

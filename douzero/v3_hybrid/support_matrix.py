@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1a-support-matrix-v2"
+V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1a-support-matrix-v3"
 
 TOPOLOGY_SINGLE_PROCESS = "single_process"
 TOPOLOGY_ASYNC_SINGLE_GPU = "async_single_gpu"
@@ -98,6 +98,12 @@ _ROWS = {
 }
 
 V3_H6_SUPPORT_MATRIX: Mapping[str, CapabilitySupport] = MappingProxyType(_ROWS)
+V3_H6_UNSUPPORTED_COMBINATIONS = (
+    ("role_model", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
+    ("adaptive_dmc", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
+    ("belief", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
+    ("public_export", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
+)
 
 
 def v3_h6_support_matrix_dict() -> dict[str, object]:
@@ -106,6 +112,14 @@ def v3_h6_support_matrix_dict() -> dict[str, object]:
         "capabilities": {
             name: asdict(row) for name, row in sorted(V3_H6_SUPPORT_MATRIX.items())
         },
+        "unsupported_combinations": [
+            {
+                "capability": capability,
+                "topology": topology,
+                "ruleset": ruleset,
+            }
+            for capability, topology, ruleset in V3_H6_UNSUPPORTED_COMBINATIONS
+        ],
     }
 
 
@@ -142,6 +156,11 @@ def validate_capability_support(
     }.get(topology)
     if topology_field is None:
         raise ValueError(f"unknown V3 H6 topology {topology!r}")
+    if (capability, topology, ruleset) in V3_H6_UNSUPPORTED_COMBINATIONS:
+        raise ValueError(
+            f"V3 H6 capability {capability!r} does not support the "
+            f"{topology!r} + {ruleset!r} combination; {row.note}"
+        )
     checks = [
         (topology_field, True),
         ("legacy_rules" if ruleset == RULESET_LEGACY else "standard_rules", True),

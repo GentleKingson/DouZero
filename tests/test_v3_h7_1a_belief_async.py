@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from douzero.training.async_single_gpu import (
     AsyncRequestCoordinator,
     SharedBeliefInputSlots,
 )
+from douzero.training.seed_stream import FORMAL_SEED_DERIVATION_V1
 from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.benchmark import h7_trainer_identity_hash
 from douzero.v3_hybrid.integration_replay import assert_public_replay_payload
@@ -39,9 +41,11 @@ from douzero.v3_hybrid.runtime import (
     V3H71ABeliefAlignment,
     V3H7RuntimeConfig,
     validate_v3_h7_runtime_config,
+    resolve_v3_h7_seed_contract,
 )
 from douzero.v3_hybrid.support_matrix import (
     RULESET_LEGACY,
+    RULESET_STANDARD,
     TOPOLOGY_ASYNC_SINGLE_GPU,
     validate_capability_support,
 )
@@ -198,15 +202,34 @@ def test_ready_sidecar_pairs_are_aligned_atomically_at_capacity():
     row = _public_row(observation)
     alignment = V3H71ABeliefAlignment(1)
     for trace_index in range(2):
-        alignment.add_pair(
+        paired = alignment.add_pair(
             AsyncReplayKey(
                 actor_id=0, episode_id=0, trace_index=trace_index
             ),
             row,
             sidecar,
         )
-        assert len(alignment.pop_ready()) == 1
+        assert paired[0] is row
+        assert paired[1].label is sidecar.label
+        assert alignment.pop_ready() == []
     alignment.assert_quiescent()
+
+
+def test_ready_pair_does_not_consume_full_unmatched_backlog_capacity():
+    _env, observation, privileged = _observation_and_privileged()
+    row = _public_row(observation)
+    sidecar = build_v3_h4_belief_sidecar(observation, privileged)
+    alignment = V3H71ABeliefAlignment(1)
+    alignment.add_public(
+        AsyncReplayKey(actor_id=0, episode_id=0, trace_index=0), row
+    )
+    paired = alignment.add_pair(
+        AsyncReplayKey(actor_id=1, episode_id=0, trace_index=0),
+        row,
+        sidecar,
+    )
+    assert paired[0] is row
+    assert alignment.pending_count == 1
 
 
 def test_sidecar_alignment_rejects_backlog_and_unmatched_quiesce():
@@ -268,6 +291,45 @@ def test_formal_trainer_identity_always_binds_resolved_learner():
     )
 
 
+def test_formal_runtime_seeds_use_frozen_sha256_contract():
+    resolved = resolve_v3_h7_seed_contract(
+        formal_training_seeds=(101, 202, 303),
+        formal_derivation=FORMAL_SEED_DERIVATION_V1,
+        requested_environment_seed=None,
+        requested_action_seed=None,
+    )
+    assert resolved[0] == 101
+    assert resolved[1] != 2
+    assert resolved[2] == FORMAL_SEED_DERIVATION_V1
+    with pytest.raises(ValueError, match="not frozen"):
+        resolve_v3_h7_seed_contract(
+            formal_training_seeds=(101, 202, 303),
+            formal_derivation=FORMAL_SEED_DERIVATION_V1,
+            requested_environment_seed=404,
+            requested_action_seed=None,
+        )
+    with pytest.raises(ValueError, match="cannot be overridden"):
+        resolve_v3_h7_seed_contract(
+            formal_training_seeds=(101, 202, 303),
+            formal_derivation=FORMAL_SEED_DERIVATION_V1,
+            requested_environment_seed=101,
+            requested_action_seed=102,
+        )
+
+
+def test_belief_async_standard_combination_is_not_advertised():
+    with pytest.raises(ValueError, match="combination"):
+        validate_capability_support(
+            "belief",
+            topology=TOPOLOGY_ASYNC_SINGLE_GPU,
+            ruleset=RULESET_STANDARD,
+            checkpoint_resume=True,
+            export=True,
+            deployment=True,
+            search=False,
+        )
+
+
 @pytest.mark.parametrize(
     "config_name",
     ("v3_belief_standard.yaml", "v3_full_hybrid_legacy.yaml"),
@@ -302,6 +364,42 @@ def test_protocol_freeze_rejects_unsupported_formal_config_before_write(
     with pytest.raises((ValueError, NotImplementedError)):
         freeze_h7.main()
     assert not output.exists()
+
+
+def test_protocol_freeze_binds_complete_formal_identity_and_seeds(
+    monkeypatch, tmp_path
+):
+    formal = _belief_formal()
+    output = tmp_path / "protocol.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "freeze_v3_h7_protocol.py",
+            "--image-digest",
+            f"sha256:{'a' * 64}",
+            "--gpu",
+            "gpu",
+            "--driver",
+            "driver",
+            "--pytorch",
+            "pytorch",
+            "--cuda",
+            "cuda",
+            "--cpu",
+            "cpu",
+            "--formal-config",
+            str(ROOT / "configs/v3_formal/v3_belief_legacy.yaml"),
+            "--output",
+            str(output),
+        ],
+    )
+    freeze_h7.main()
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["formal_config_hash"] == formal.identity_dict()[
+        "config_sha256"
+    ]
+    assert payload["seeds"] == list(formal.seeds.training)
 
 
 def test_public_belief_request_is_invariant_to_hidden_hand_swap():
