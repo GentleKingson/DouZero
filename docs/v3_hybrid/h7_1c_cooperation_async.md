@@ -63,7 +63,7 @@ resume boundary.
 
 The runtime identity binds:
 
-- `v3-hybrid-h7-1c-runtime-v11`;
+- `v3-hybrid-h7-1c-runtime-v12`;
 - `v3-hybrid-h7-runtime-checkpoint-v6`;
 - the public cooperation request/replay protocols;
 - sidecar and episode capacities;

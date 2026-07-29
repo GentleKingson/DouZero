@@ -1382,6 +1382,7 @@ def async_actor_main(
                         selected_action_index=action_index,
                         trace_index=transition.trace_index,
                         public_inputs=observation_to_model_inputs(obs),
+                        snapshot_policy_version=int(game["snapshot"]),
                         policy_id=provenance,
                         teammate_policy_id=provenance,
                     )

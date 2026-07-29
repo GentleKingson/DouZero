@@ -41,7 +41,7 @@ H5_PUBLIC_FEATURE_NAMES = (
     "belief_entropy",
 )
 H5_PUBLIC_FEATURE_DIM = len(H5_PUBLIC_FEATURE_NAMES)
-H5_ASYNC_SIDECAR_VERSION = "public-decision-sidecar-source-bound-v1"
+H5_ASYNC_SIDECAR_VERSION = "public-decision-sidecar-snapshot-bound-v2"
 
 MIXER_DISABLED = "disabled"
 MIXER_PUBLIC = "public"
@@ -321,6 +321,7 @@ class V3H5AsyncDecisionSidecar:
     selected_action_is_pass: bool
     public_features: torch.Tensor
     source_state_identity: str
+    snapshot_policy_version: int
     policy_id: str
     teammate_policy_id: str
 
@@ -329,7 +330,11 @@ class V3H5AsyncDecisionSidecar:
             raise ValueError("H5 async sidecar version mismatch")
         if self.role not in FARMER_ROLES:
             raise ValueError("H5 async decision sidecars are farmer-only")
-        for name in ("trace_index", "selected_action_index"):
+        for name in (
+            "trace_index",
+            "selected_action_index",
+            "snapshot_policy_version",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"H5 async sidecar {name} must be non-negative")
@@ -363,6 +368,7 @@ def build_v3_h5_async_decision_sidecar(
     selected_action_index: int,
     trace_index: int,
     public_inputs: ModelInputBundle,
+    snapshot_policy_version: int,
     policy_id: str,
     teammate_policy_id: str,
 ) -> V3H5AsyncDecisionSidecar:
@@ -382,6 +388,7 @@ def build_v3_h5_async_decision_sidecar(
         selected_action_is_pass=len(action) == 0,
         public_features=features.detach().cpu().clone(),
         source_state_identity=h5_public_source_identity(public_inputs),
+        snapshot_policy_version=snapshot_policy_version,
         policy_id=policy_id,
         teammate_policy_id=teammate_policy_id,
     )
@@ -435,6 +442,12 @@ def bind_v3_h5_async_decision(
         != sidecar.source_state_identity
     ):
         raise ValueError("H5 async sidecar source-state identity mismatch")
+    provenance = transition.adaptive_provenance
+    if (
+        provenance is None
+        or provenance.policy_version != sidecar.snapshot_policy_version
+    ):
+        raise ValueError("H5 async sidecar policy snapshot mismatch")
     return V3H5FarmerDecision(
         trace_index=sidecar.trace_index,
         transition=transition,

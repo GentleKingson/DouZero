@@ -21,7 +21,10 @@ from douzero.v3_hybrid.pilot import (
     build_pilot_resolved_config,
     create_pilot_learner,
 )
-from douzero.v3_hybrid.replay import capture_plain_transition
+from douzero.v3_hybrid.replay import (
+    AdaptiveSnapshotProvenance,
+    capture_plain_transition,
+)
 from douzero.v3_hybrid.runtime import (
     V3_H71C_REPLAY_PROTOCOL,
     V3_H71C_REQUEST_PROTOCOL,
@@ -29,7 +32,9 @@ from douzero.v3_hybrid.runtime import (
     V3H71CCooperationAlignment,
     V3H7RuntimeConfig,
     V3H7RuntimeStats,
+    V3SingleProcessTrainer,
     _h71c_needs_collection_retry,
+    _h7_alignment_capacity,
     _remap_h7_cooperation_trajectories,
     _restore_h7_cooperation_alignment_counters,
     validate_v3_h7_runtime_config,
@@ -88,18 +93,28 @@ def _observation(role: str, seed: int):
 def _decision(role: str, trace_index: int, *, actor=1, episode=2):
     observation = _observation(role, 1000 + trace_index + 100 * actor)
     public_inputs = observation_to_model_inputs(observation)
-    row = capture_plain_transition(
+    row = replace(
+        capture_plain_transition(
         observation,
         selected_action_index=0,
         episode_id=f"actor-{actor}-episode-{episode}",
         deal_id=f"async-deal-{episode}",
         target_transform="raw",
-    ).finalize(2.0)
+        ).finalize(2.0),
+        adaptive_provenance=AdaptiveSnapshotProvenance(
+            q_old=0.0,
+            policy_version=7,
+            snapshot_slot=0,
+            owner_id=actor,
+            generation=episode + 1,
+        ),
+    )
     sidecar = build_v3_h5_async_decision_sidecar(
         observation,
         selected_action_index=0,
         trace_index=trace_index,
         public_inputs=public_inputs,
+        snapshot_policy_version=7,
         policy_id="policy@7",
         teammate_policy_id="policy@7",
     )
@@ -126,6 +141,15 @@ def test_cooperation_runtime_support_fails_closed_before_cuda():
             resolved, _runtime(cooperation_sidecar_capacity=4)
         )
 
+    low_capacity = _runtime(
+        num_actors=1,
+        games_per_actor=1,
+        batch_size=8,
+        cooperation_sidecar_capacity=8,
+        max_steps_per_episode=120,
+    )
+    assert _h7_alignment_capacity(low_capacity, 8) >= 120
+
 
 def test_public_sidecar_binds_exact_decision_and_never_enters_public_replay():
     _key, row, sidecar = _decision("landlord_up", 3)
@@ -140,6 +164,16 @@ def test_public_sidecar_binds_exact_decision_and_never_enters_public_replay():
     with pytest.raises(ValueError, match="selected action"):
         bind_v3_h5_async_decision(
             replace(row, selected_action_index=1), sidecar
+        )
+    with pytest.raises(ValueError, match="policy snapshot"):
+        bind_v3_h5_async_decision(
+            replace(
+                row,
+                adaptive_provenance=replace(
+                    row.adaptive_provenance, policy_version=8
+                ),
+            ),
+            sidecar,
         )
 
 
@@ -167,6 +201,39 @@ def test_alignment_builds_unequal_episode_atomic_farmer_pair():
     assert down.decision_indices == (4,)
     assert len(episodes[0].transitions) == 3
     alignment.assert_quiescent()
+
+
+def test_alignment_keeps_landlord_rows_in_episode_training_batch():
+    alignment = V3H71CCooperationAlignment(
+        capacity=16, max_episode_transitions=8
+    )
+    farmer_rows = []
+    for role, trace in zip(FARMER_ROLES, (1, 2)):
+        key, row, sidecar = _decision(role, trace)
+        farmer_rows.append(row)
+        alignment.add_pair(key, row, sidecar)
+    landlord_key, landlord_row, _sidecar = _decision("landlord_up", 0)
+    landlord_row = replace(landlord_row, role="landlord")
+    alignment.add_landlord(landlord_key, landlord_row)
+    alignment.mark_episode_complete(
+        1,
+        2,
+        {"landlord_up": 1, "landlord_down": 1},
+        total_count=3,
+    )
+    episode = alignment.pop_ready_episodes()[0]
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            episode.transitions,
+            (landlord_row, farmer_rows[0], farmer_rows[1]),
+        )
+    )
+    assert {row.role for row in episode.transitions} == {
+        "landlord",
+        "landlord_up",
+        "landlord_down",
+    }
 
 
 def test_ordinary_dmc_row_normalization_preserves_trajectory_alignment():
@@ -234,6 +301,12 @@ def test_collection_retries_only_after_all_rows_arrive_without_eligible_episode(
         _h71c_needs_collection_retry(
             completed=-1, target=4, received=0, expected=0, replay_size=0
         )
+
+
+def test_single_process_zero_episode_collection_is_exact_noop():
+    trainer = object.__new__(V3SingleProcessTrainer)
+    trainer.collect_episodes(0)
+    trainer.collect_episodes(None)
 
 
 def test_alignment_explicitly_skips_incomplete_and_oversized_episodes():

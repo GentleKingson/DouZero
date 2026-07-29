@@ -67,7 +67,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1c-runtime-v11"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1c-runtime-v12"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v6"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -272,7 +272,12 @@ def _h7_alignment_capacity(config: V3H7RuntimeConfig, sidecar_capacity: int) -> 
         inference_slots * 2,
         min(config.batch_size * 2, 64),
     )
-    return max(sidecar_capacity, replay_slots)
+    episode_rows = (
+        inference_slots * config.max_steps_per_episode
+        if config.cooperation_runtime_enabled
+        else 0
+    )
+    return max(sidecar_capacity, replay_slots, episode_rows)
 
 
 def _drain_sidecar_queue(sidecar_queue) -> int:
@@ -497,7 +502,14 @@ class V3H71CCooperationEpisode:
         trajectory_rows = tuple(
             row for trajectory in self.trajectories for row in trajectory.transitions
         )
-        if self.transitions != trajectory_rows:
+        transition_ids = tuple(id(row) for row in self.transitions)
+        trajectory_ids = tuple(id(row) for row in trajectory_rows)
+        if (
+            len(set(transition_ids)) != len(transition_ids)
+            or len(set(trajectory_ids)) != len(trajectory_ids)
+            or not set(trajectory_ids).issubset(transition_ids)
+            or any(row.role not in FARMER_ROLES for row in trajectory_rows)
+        ):
             raise ValueError("H7.1c episode rows and trajectories disagree")
 
 
@@ -521,7 +533,11 @@ class V3H71CCooperationAlignment:
             tuple[int, int],
             dict[str, list[tuple[object, V3H5AsyncDecisionSidecar]]],
         ] = {}
+        self._episode_public_rows: dict[
+            tuple[int, int], list[tuple[int, V3ReplayTransition]]
+        ] = {}
         self._expected: dict[tuple[int, int], dict[str, int]] = {}
+        self._expected_total: dict[tuple[int, int], int] = {}
         self._ready: deque[V3H71CCooperationEpisode] = deque()
         self._completed = deque(maxlen=capacity)
         self._completed_set: set[AsyncReplayKey] = set()
@@ -539,6 +555,7 @@ class V3H71CCooperationAlignment:
             len(self.public_rows)
             + len(self.sidecars)
             + staged
+            + sum(len(rows) for rows in self._episode_public_rows.values())
             + len(self._expected)
         )
 
@@ -600,6 +617,22 @@ class V3H71CCooperationAlignment:
             identity, {role: [] for role in FARMER_ROLES}
         )
         roles[row.role].append((decision, sidecar))
+        self._episode_public_rows.setdefault(identity, []).append(
+            (key.trace_index, row)
+        )
+        self._remember_completed(key)
+        self._finalize_ready(identity)
+
+    def add_landlord(
+        self, key: AsyncReplayKey, row: V3ReplayTransition
+    ) -> None:
+        if row.role != "landlord":
+            raise ValueError("H7.1c non-farmer episode row must be landlord")
+        self._check_new(key, self.public_rows)
+        identity = (key.actor_id, key.episode_id)
+        self._episode_public_rows.setdefault(identity, []).append(
+            (key.trace_index, row)
+        )
         self._remember_completed(key)
         self._finalize_ready(identity)
 
@@ -626,6 +659,7 @@ class V3H71CCooperationAlignment:
         actor_id: int,
         episode_id: int,
         farmer_counts: Mapping[str, object],
+        total_count: int | None = None,
     ) -> None:
         identity = (actor_id, episode_id)
         if identity in self._expected:
@@ -641,6 +675,15 @@ class V3H71CCooperationAlignment:
                 raise ValueError("H7.1c farmer decision count is invalid")
             normalized[role] = value
         self._expected[identity] = normalized
+        if total_count is None:
+            total_count = sum(normalized.values())
+        if (
+            isinstance(total_count, bool)
+            or not isinstance(total_count, int)
+            or total_count < sum(normalized.values())
+        ):
+            raise ValueError("H7.1c episode total count is invalid")
+        self._expected_total[identity] = total_count
         self._episode_decisions.setdefault(
             identity, {role: [] for role in FARMER_ROLES}
         )
@@ -656,8 +699,13 @@ class V3H71CCooperationAlignment:
             raise RuntimeError("H7.1c received excess farmer decisions")
         if actual != expected:
             return
+        public_rows = self._episode_public_rows.get(identity, [])
+        if len(public_rows) != self._expected_total[identity]:
+            return
         self._expected.pop(identity)
+        self._expected_total.pop(identity)
         self._episode_decisions.pop(identity)
+        self._episode_public_rows.pop(identity)
         if any(actual[role] == 0 for role in FARMER_ROLES):
             self.incomplete_episodes += 1
             return
@@ -687,9 +735,7 @@ class V3H71CCooperationAlignment:
             raise ValueError("H7.1c landlord-up teammate provenance mismatch")
         if down.teammate_policy_id != up.policy_id:
             raise ValueError("H7.1c landlord-down teammate provenance mismatch")
-        transitions = tuple(
-            row for trajectory in trajectories for row in trajectory.transitions
-        )
+        transitions = tuple(row for _trace, row in sorted(public_rows))
         if len(transitions) > self.max_episode_transitions:
             self.oversized_episodes += 1
             return
@@ -707,13 +753,17 @@ class V3H71CCooperationAlignment:
         identities = {
             *self._episode_decisions,
             *self._expected,
+            *self._expected_total,
+            *self._episode_public_rows,
             *((key.actor_id, key.episode_id) for key in self.public_rows),
             *((key.actor_id, key.episode_id) for key in self.sidecars),
         }
         self.public_rows.clear()
         self.sidecars.clear()
         self._episode_decisions.clear()
+        self._episode_public_rows.clear()
         self._expected.clear()
+        self._expected_total.clear()
         self._ready.clear()
         return len(identities)
 
@@ -1297,7 +1347,7 @@ class V3AsyncSingleGPUTrainer:
             completed = 0
             for row, key in aligned:
                 if row.role not in FARMER_ROLES:
-                    self.buffer.append(row)
+                    self._cooperation_alignment.add_landlord(key, row)
                     completed += 1
                     continue
                 sidecar = queued_sidecars.pop(key, None)
@@ -1487,7 +1537,10 @@ class V3AsyncSingleGPUTrainer:
                             "H7.1c completion event lacks farmer decision counts"
                         )
                     self._cooperation_alignment.mark_episode_complete(
-                        int(event[1]), int(event[2]), event[9]
+                        int(event[1]),
+                        int(event[2]),
+                        event[9],
+                        total_count=count,
                     )
                     episodes = self._cooperation_alignment.pop_ready_episodes()
                     for episode in episodes:
@@ -2049,6 +2102,8 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
         target = int(num_episodes or 0)
         if target < 0:
             raise ValueError("H7 episode target must be non-negative")
+        if target == 0:
+            return
         self._publish_snapshot()
         episode_number = self.stats.games_collected
         completed = 0
@@ -2176,6 +2231,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                                 selected_action_index=action_index,
                                 trace_index=steps,
                                 public_inputs=captured.model_inputs,
+                                snapshot_policy_version=self._snapshot_step,
                                 policy_id=provenance,
                                 teammate_policy_id=provenance,
                             ),
@@ -2251,11 +2307,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                             decisions=tuple(item[0] for item in entries),
                             team_return=first.mc_return,
                         ))
-                    episode_rows = tuple(
-                        row
-                        for trajectory in trajectories
-                        for row in trajectory.transitions
-                    )
+                    episode_rows = tuple(rows)
                     if len(episode_rows) > self.config.batch_size:
                         self.stats.cooperation_oversized_episodes += 1
                     else:
