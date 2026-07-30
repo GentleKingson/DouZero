@@ -303,7 +303,9 @@ def main() -> None:
         num_actors=args.num_actors,
         games_per_actor=args.games_per_actor,
         replay_schema_version=4 if bidding_enabled else 3,
-        compact_bidding_replay_schema_version=1 if bidding_enabled else 0,
+        # H7.1e owns its separate replay identity in runtime_config. The
+        # reserved V2 standard-async compact schema remains unsupported.
+        compact_bidding_replay_schema_version=0,
         snapshot_publication_semantics=runtime_config.snapshot_semantics,
         request_ordering_semantics=runtime_config.request_protocol,
         actor_rng_resume_semantics="restart-from-stable-task-and-domain-seeds-v1",
