@@ -35,6 +35,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71C_REQUEST_PROTOCOL,
     V3_H71D_REPLAY_PROTOCOL,
     V3_H71D_REQUEST_PROTOCOL,
+    V3_H71E_REPLAY_PROTOCOL,
+    V3_H71E_REQUEST_PROTOCOL,
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
@@ -93,6 +95,25 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--oracle-sidecar-capacity", type=int, default=4096)
     parser.add_argument("--cooperation-sidecar-capacity", type=int, default=4096)
     parser.add_argument("--cooperation-episode-capacity", type=int, default=1024)
+    parser.add_argument("--bidding-replay-capacity", type=int, default=4096)
+    parser.add_argument("--bidding-batch-size", type=int, default=16)
+    parser.add_argument("--bidding-update-interval", type=int, default=1)
+    parser.add_argument(
+        "--bidding-policy",
+        choices=("random", "rule", "max", "pass", "learned"),
+        default="learned",
+    )
+    parser.add_argument(
+        "--bidding-warm-start-policy",
+        choices=("random", "rule", "max", "pass"),
+        default="rule",
+    )
+    parser.add_argument("--bidding-learned-probability", type=float, default=0.5)
+    parser.add_argument(
+        "--first-bidder-mode",
+        choices=("rotate", "seeded_random"),
+        default="rotate",
+    )
     parser.add_argument("--target-microbatch", type=int, default=4)
     parser.add_argument("--max-policy-lag", type=int, default=128)
     parser.add_argument("--seed", type=int)
@@ -139,6 +160,7 @@ def main() -> None:
         resolved.learner.features.strategy
         or resolved.learner.features.style
     )
+    bidding_enabled = resolved.learner.features.bidding
     environment_seed, action_seed, seed_derivation = (
         resolve_v3_h7_seed_contract(
             formal_training_seeds=(
@@ -161,8 +183,16 @@ def main() -> None:
         oracle_sidecar_capacity=args.oracle_sidecar_capacity,
         cooperation_sidecar_capacity=args.cooperation_sidecar_capacity,
         cooperation_episode_capacity=args.cooperation_episode_capacity,
+        bidding_replay_capacity=args.bidding_replay_capacity,
+        bidding_batch_size=args.bidding_batch_size,
+        bidding_update_interval=args.bidding_update_interval,
+        bidding_policy=args.bidding_policy,
+        bidding_warm_start_policy=args.bidding_warm_start_policy,
+        bidding_learned_probability=args.bidding_learned_probability,
+        first_bidder_mode=args.first_bidder_mode,
         target_microbatch=args.target_microbatch,
         max_policy_lag=args.max_policy_lag,
+        optimizer_steps_per_cycle=args.optimizer_steps_per_cycle,
         environment_seed=environment_seed,
         environment_seed_derivation=seed_derivation,
         action_seed=action_seed,
@@ -171,6 +201,7 @@ def main() -> None:
         oracle_runtime_enabled=oracle_enabled,
         cooperation_runtime_enabled=cooperation_enabled,
         public_aux_runtime_enabled=public_aux_enabled,
+        bidding_runtime_enabled=bidding_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL
             if belief_enabled
@@ -183,7 +214,11 @@ def main() -> None:
                     else (
                         V3_H71D_REQUEST_PROTOCOL
                         if public_aux_enabled
-                        else V3H7RuntimeConfig.request_protocol
+                        else (
+                            V3_H71E_REQUEST_PROTOCOL
+                            if bidding_enabled
+                            else V3H7RuntimeConfig.request_protocol
+                        )
                     )
                 )
             )
@@ -200,7 +235,11 @@ def main() -> None:
                     else (
                         V3_H71D_REPLAY_PROTOCOL
                         if public_aux_enabled
-                        else V3H7RuntimeConfig.replay_protocol
+                        else (
+                            V3_H71E_REPLAY_PROTOCOL
+                            if bidding_enabled
+                            else V3H7RuntimeConfig.replay_protocol
+                        )
                     )
                 )
             )
@@ -221,7 +260,9 @@ def main() -> None:
         )
         learner = V3H6Learner(
             model,
-            ruleset=RuleSet.legacy(),
+            ruleset=(
+                RuleSet.standard() if bidding_enabled else RuleSet.legacy()
+            ),
             config=resolved,
             belief_model=belief_model,
         )
@@ -262,10 +303,15 @@ def main() -> None:
         v2_training_mode=args.topology,
         num_actors=args.num_actors,
         games_per_actor=args.games_per_actor,
-        replay_schema_version=3,
+        replay_schema_version=4 if bidding_enabled else 3,
+        # H7.1e owns its separate replay identity in runtime_config. The
+        # reserved V2 standard-async compact schema remains unsupported.
+        compact_bidding_replay_schema_version=0,
         snapshot_publication_semantics=runtime_config.snapshot_semantics,
         request_ordering_semantics=runtime_config.request_protocol,
-        actor_rng_resume_semantics="restart-from-stable-task-and-domain-seeds-v1",
+        actor_rng_resume_semantics=(
+            "restart-from-stable-task-domain-and-redeal-seeds-v2"
+        ),
     )
     print(json.dumps({
         "event": "h7_start",

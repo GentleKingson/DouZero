@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1d-support-matrix-v7"
+V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1e-support-matrix-v8"
 
 TOPOLOGY_SINGLE_PROCESS = "single_process"
 TOPOLOGY_ASYNC_SINGLE_GPU = "async_single_gpu"
@@ -84,8 +84,8 @@ _ROWS = {
         "V3 actor/coach runtime integration is deferred to H7",
     ),
     "bidding": CapabilitySupport(
-        True, False, False, False, True, True, True, True, False,
-        "learned bidding is a separate standard-rules decision head",
+        True, True, False, False, True, True, True, True, False,
+        "H7.1e transports separate neutral-seat bid decisions and replay",
     ),
     "selective_search": CapabilitySupport(
         True, False, False, True, True, True, True, True, True,
@@ -99,14 +99,11 @@ _ROWS = {
 
 V3_H6_SUPPORT_MATRIX: Mapping[str, CapabilitySupport] = MappingProxyType(_ROWS)
 V3_H6_UNSUPPORTED_COMBINATIONS = (
-    ("role_model", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
-    ("adaptive_dmc", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("belief", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("oracle", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("cooperation", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("strategy", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("style", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
-    ("public_export", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
 )
 
 

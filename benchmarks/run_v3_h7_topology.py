@@ -41,6 +41,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71C_REQUEST_PROTOCOL,
     V3_H71D_REPLAY_PROTOCOL,
     V3_H71D_REQUEST_PROTOCOL,
+    V3_H71E_REPLAY_PROTOCOL,
+    V3_H71E_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -137,12 +139,15 @@ def _validate_live_identity(
         resolved.learner.features.strategy
         or resolved.learner.features.style
     )
+    bidding_enabled = resolved.learner.features.bidding
     if protocol.oracle_enabled != oracle_enabled:
         raise ValueError("H7 benchmark Oracle capability identity mismatch")
     if protocol.cooperation_enabled != cooperation_enabled:
         raise ValueError("H7 benchmark cooperation capability identity mismatch")
     if protocol.public_aux_enabled != public_aux_enabled:
         raise ValueError("H7 benchmark public auxiliary identity mismatch")
+    if protocol.bidding_enabled != bidding_enabled:
+        raise ValueError("H7 benchmark bidding capability identity mismatch")
     request = (
         V3_H71A_REQUEST_PROTOCOL
         if belief_enabled
@@ -155,7 +160,11 @@ def _validate_live_identity(
                 else (
                     V3_H71D_REQUEST_PROTOCOL
                     if public_aux_enabled
-                    else V3_H7_REQUEST_PROTOCOL
+                    else (
+                        V3_H71E_REQUEST_PROTOCOL
+                        if bidding_enabled
+                        else V3_H7_REQUEST_PROTOCOL
+                    )
                 )
             )
         )
@@ -172,7 +181,11 @@ def _validate_live_identity(
                 else (
                     V3_H71D_REPLAY_PROTOCOL
                     if public_aux_enabled
-                    else V3_H7_REPLAY_PROTOCOL
+                    else (
+                        V3_H71E_REPLAY_PROTOCOL
+                        if bidding_enabled
+                        else V3_H7_REPLAY_PROTOCOL
+                    )
                 )
             )
         )
@@ -204,6 +217,8 @@ def _shared_memory_bytes(trainer) -> int:
     ]
     if trainer._coordinator.belief_inputs is not None:
         owners.append(trainer._coordinator.belief_inputs)
+    if trainer._coordinator.bidding_inputs is not None:
+        owners.append(trainer._coordinator.bidding_inputs)
     for owner in owners:
         for value in vars(owner).values():
             if not isinstance(value, torch.Tensor):
@@ -281,6 +296,7 @@ def main() -> None:
         resolved.learner.features.strategy
         or resolved.learner.features.style
     )
+    bidding_enabled = resolved.learner.features.bidding
     environment_seed, action_seed, seed_derivation = (
         resolve_v3_h7_seed_contract(
             formal_training_seeds=(
@@ -307,6 +323,7 @@ def main() -> None:
         oracle_runtime_enabled=oracle_enabled,
         cooperation_runtime_enabled=cooperation_enabled,
         public_aux_runtime_enabled=public_aux_enabled,
+        bidding_runtime_enabled=bidding_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL
             if belief_enabled
@@ -319,7 +336,11 @@ def main() -> None:
                     else (
                         V3_H71D_REQUEST_PROTOCOL
                         if public_aux_enabled
-                        else V3H7RuntimeConfig.request_protocol
+                        else (
+                            V3_H71E_REQUEST_PROTOCOL
+                            if bidding_enabled
+                            else V3H7RuntimeConfig.request_protocol
+                        )
                     )
                 )
             )
@@ -336,7 +357,11 @@ def main() -> None:
                     else (
                         V3_H71D_REPLAY_PROTOCOL
                         if public_aux_enabled
-                        else V3H7RuntimeConfig.replay_protocol
+                        else (
+                            V3_H71E_REPLAY_PROTOCOL
+                            if bidding_enabled
+                            else V3H7RuntimeConfig.replay_protocol
+                        )
                     )
                 )
             )
@@ -350,7 +375,11 @@ def main() -> None:
     if formal is None:
         model = V3HybridModel(build_v2_schema(), resolved.model)
         learner = V3H6Learner(
-            model, ruleset=RuleSet.legacy(), config=resolved
+            model,
+            ruleset=(
+                RuleSet.standard() if bidding_enabled else RuleSet.legacy()
+            ),
+            config=resolved,
         )
     else:
         learner, learner_resolved = create_pilot_learner(formal)
@@ -383,6 +412,8 @@ def main() -> None:
             ),
             "strategy_labels": trainer.stats.strategy_labels_collected,
             "strategy_steps": trainer.stats.strategy_optimizer_steps,
+            "bidding_samples": trainer.stats.learner_bidding_samples,
+            "bidding_steps": trainer.stats.bidding_optimizer_steps,
         }
         parameter_snapshot = trainer._parameter_update_snapshot()
         started = time.monotonic()
@@ -411,6 +442,8 @@ def main() -> None:
             ),
             "strategy_labels": trainer.stats.strategy_labels_collected,
             "strategy_steps": trainer.stats.strategy_optimizer_steps,
+            "bidding_samples": trainer.stats.learner_bidding_samples,
+            "bidding_steps": trainer.stats.bidding_optimizer_steps,
         }
         shared_memory = _shared_memory_bytes(trainer)
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -483,6 +516,15 @@ def main() -> None:
             ) / elapsed,
             "public_aux_parameter_vram_bytes": int(
                 boundary["public_aux_parameter_vram_bytes"]
+            ),
+            "bidding_samples_per_second": (
+                after["bidding_samples"] - before["bidding_samples"]
+            ) / elapsed,
+            "bidding_optimizer_steps_per_second": (
+                after["bidding_steps"] - before["bidding_steps"]
+            ) / elapsed,
+            "bidding_parameter_vram_bytes": int(
+                boundary["bidding_parameter_vram_bytes"]
             ),
             "requests_per_microbatch": float(boundary["requests_per_microbatch"]),
             "legal_actions_per_batch": float(boundary["actions_per_microbatch"]),

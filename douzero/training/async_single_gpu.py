@@ -22,7 +22,11 @@ import numpy as np
 
 from douzero.belief.constraints import NUM_BELIEF_RANKS
 from douzero.belief.features import BELIEF_INPUT_DIM, BeliefInput
-from douzero.models_v2.batch import BatchedModelInputBundle, ModelInputBundle
+from douzero.models_v2.batch import (
+    BatchedBiddingInput,
+    BatchedModelInputBundle,
+    ModelInputBundle,
+)
 from douzero.models_v2.config import SUPPORTED_ROLES
 from douzero.observation.seats import ALL_ROLES
 from douzero.observation.schema import (
@@ -52,6 +56,45 @@ def _formal_action_seed(root_seed: int, actor_id: int, episode_id: int) -> int:
     return derive_formal_stream_seed(
         root_seed, "action", actor_id, episode_id
     )
+
+
+def _async_redeal_seed(
+    root_seed: int,
+    environment_seed_derivation: str,
+    actor_id: int,
+    episode_id: int,
+    redeal_count: int,
+) -> int:
+    """Derive a redeal seed that cannot depend on interleaved game ordering."""
+
+    if environment_seed_derivation not in {
+        TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
+        FORMAL_SEED_DERIVATION_V1,
+    }:
+        raise ValueError("unsupported async environment seed derivation")
+    worker_id = (
+        0
+        if environment_seed_derivation == FORMAL_SEED_DERIVATION_V1
+        else actor_id
+    )
+    return derive_formal_stream_seed(
+        root_seed,
+        f"environment-redeal-{redeal_count}",
+        worker_id,
+        episode_id,
+    )
+
+
+def _check_actor_step_limit(steps: int, max_steps: int) -> None:
+    """Fail at the shared card-play/bidding actor step boundary."""
+
+    for name, value in (("steps", steps), ("max_steps", max_steps)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an int")
+    if steps < 0 or max_steps < 1:
+        raise ValueError("actor step counters are out of range")
+    if steps >= max_steps:
+        raise RuntimeError(f"actor episode exceeded max_steps={max_steps}")
 
 
 def inference_action_count_bucket(action_count: int) -> int | str:
@@ -100,6 +143,11 @@ class SlotState(IntEnum):
     SHUTDOWN = 6
 
 
+class RequestKind(IntEnum):
+    CARD_PLAY = 0
+    BIDDING = 1
+
+
 @dataclass(frozen=True)
 class RequestMetadata:
     slot_id: int
@@ -109,9 +157,12 @@ class RequestMetadata:
     action_count: int
     acting_role: int
     submitted_ns: int
+    request_kind: int = int(RequestKind.CARD_PLAY)
 
     @property
     def grouping_key(self) -> tuple[int, int | str]:
+        if self.request_kind == int(RequestKind.BIDDING):
+            return (self.policy_snapshot, "bidding")
         return (
             self.policy_snapshot,
             inference_action_count_bucket(self.action_count),
@@ -419,6 +470,81 @@ class SharedBeliefInputSlots:
             opponent_a_role=ALL_ROLES[int(self.roles[slot_id, 1])],
             opponent_b_role=ALL_ROLES[int(self.roles[slot_id, 2])],
             style_features=self.style_features[slot_id].numpy().copy(),
+        )
+
+
+class SharedBiddingSlots:
+    """Public 0/1/2/3 bidding inputs and logits on the shared request slab."""
+
+    _TENSOR_FIELDS = ("features", "legal_mask", "output_logits", "valid")
+
+    def __init__(self, num_slots: int, feature_width: int) -> None:
+        if (
+            isinstance(num_slots, bool)
+            or not isinstance(num_slots, int)
+            or num_slots < 1
+            or isinstance(feature_width, bool)
+            or not isinstance(feature_width, int)
+            or feature_width < 1
+        ):
+            raise ValueError("bidding slots require positive dimensions")
+        self.num_slots = num_slots
+        self.feature_width = feature_width
+        self._shared_owners = []
+        self._shared_specs = []
+
+        def shared(shape, dtype):
+            tensor, owner = _shared_tensor(shape, dtype)
+            self._shared_owners.append(owner)
+            self._shared_specs.append((tuple(shape), dtype))
+            return tensor
+
+        self.features = shared((num_slots, feature_width), torch.float32)
+        self.legal_mask = shared((num_slots, 4), torch.bool)
+        self.output_logits = shared((num_slots, 4), torch.float32)
+        self.valid = shared((num_slots,), torch.bool)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for name in self._TENSOR_FIELDS:
+            state.pop(name, None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        for name, owner, (shape, dtype) in zip(
+            self._TENSOR_FIELDS, self._shared_owners, self._shared_specs
+        ):
+            setattr(self, name, _restore_shared_tensor(owner, shape, dtype))
+
+    def clear(self, slot_id: int) -> None:
+        self.valid[slot_id] = False
+
+    def write(self, slot_id: int, observation) -> None:
+        from douzero.observation.bidding import BiddingObservationV2
+
+        if not isinstance(observation, BiddingObservationV2):
+            raise TypeError("async bidding slot requires BiddingObservationV2")
+        features = observation.to_tensor()
+        legal_mask = torch.from_numpy(observation.bid_action_mask.copy())
+        if features.shape != (self.feature_width,) or legal_mask.shape != (4,):
+            raise ValueError("async bidding observation layout mismatch")
+        self.features[slot_id].copy_(features)
+        self.legal_mask[slot_id].copy_(legal_mask)
+        self.valid[slot_id] = True
+
+    def batch(
+        self, slot_ids: list[int], feature_schema_hash: str
+    ) -> BatchedBiddingInput:
+        if not slot_ids:
+            raise ValueError("async bidding batch must not be empty")
+        indices = torch.tensor(slot_ids, dtype=torch.long)
+        if not bool(self.valid.index_select(0, indices).all()):
+            raise RuntimeError("async bidding batch contains an unwritten slot")
+        return BatchedBiddingInput(
+            features=self.features.index_select(0, indices),
+            legal_mask=self.legal_mask.index_select(0, indices),
+            feature_schema_hash=feature_schema_hash,
         )
 
 
@@ -982,6 +1108,7 @@ class AsyncRequestCoordinator:
         belief_inputs: bool = False,
         strategy_features: bool = False,
         style_features: bool = False,
+        bidding_feature_width: int | None = None,
     ) -> None:
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
@@ -1006,6 +1133,11 @@ class AsyncRequestCoordinator:
         self.belief_inputs = (
             SharedBeliefInputSlots(num_slots) if belief_inputs else None
         )
+        self.bidding_inputs = (
+            None
+            if bidding_feature_width is None
+            else SharedBiddingSlots(num_slots, bidding_feature_width)
+        )
         self._shared_owners = []
         self._shared_specs = []
         self.states, owner = _shared_tensor((num_slots,), torch.int8)
@@ -1026,6 +1158,10 @@ class AsyncRequestCoordinator:
         self.submitted_ns, owner = _shared_tensor((num_slots,), torch.int64)
         self._shared_owners.append(owner)
         self._shared_specs.append(((num_slots,), torch.int64))
+        self.request_kinds, owner = _shared_tensor((num_slots,), torch.int8)
+        self._shared_owners.append(owner)
+        self._shared_specs.append(((num_slots,), torch.int8))
+        self.request_kinds.fill_(int(RequestKind.CARD_PLAY))
         self.ready_queue = self.context.Queue()
         self.free_queue = self.context.Queue()
         # Shared result tensors use RawArray storage, so publishing DONE in a
@@ -1046,7 +1182,8 @@ class AsyncRequestCoordinator:
         self.completed_episodes_pending = 0
 
     _TENSOR_FIELDS = (
-        "states", "request_ids", "policy_snapshots", "actor_ids", "submitted_ns"
+        "states", "request_ids", "policy_snapshots", "actor_ids", "submitted_ns",
+        "request_kinds",
     )
 
     def __getstate__(self):
@@ -1091,6 +1228,8 @@ class AsyncRequestCoordinator:
         self.response_events[slot_id].clear()
         if self.belief_inputs is not None:
             self.belief_inputs.clear(slot_id)
+        if self.bidding_inputs is not None:
+            self.bidding_inputs.clear(slot_id)
         self.states[slot_id] = int(SlotState.WRITING)
         self.actor_ids[slot_id] = actor_id
         return slot_id
@@ -1117,6 +1256,29 @@ class AsyncRequestCoordinator:
                 raise ValueError("public policy and belief acting roles differ")
         self.request_ids[slot_id] = request_id
         self.policy_snapshots[slot_id] = policy_snapshot
+        self.request_kinds[slot_id] = int(RequestKind.CARD_PLAY)
+        self.states[slot_id] = int(SlotState.READY)
+        self._submitted_at[slot_id] = time.monotonic()
+        self.submitted_ns[slot_id] = time.monotonic_ns()
+        self.ready_queue.put(slot_id)
+
+    def submit_bidding(
+        self, slot_id: int, *, request_id: int, policy_snapshot: int
+    ) -> None:
+        self._raise_if_failed()
+        if self.bidding_inputs is None:
+            raise RuntimeError("async bidding transport is disabled")
+        if int(self.states[slot_id]) != SlotState.WRITING:
+            raise RuntimeError("only a WRITING slot may be submitted")
+        if not bool(self.bidding_inputs.valid[slot_id]):
+            self.states[slot_id] = int(SlotState.FAILED)
+            raise ValueError("bidding request slot was not written")
+        if not bool(self.bidding_inputs.legal_mask[slot_id].any()):
+            self.states[slot_id] = int(SlotState.FAILED)
+            raise ValueError("bidding request has zero legal bids")
+        self.request_ids[slot_id] = request_id
+        self.policy_snapshots[slot_id] = policy_snapshot
+        self.request_kinds[slot_id] = int(RequestKind.BIDDING)
         self.states[slot_id] = int(SlotState.READY)
         self._submitted_at[slot_id] = time.monotonic()
         self.submitted_ns[slot_id] = time.monotonic_ns()
@@ -1154,14 +1316,28 @@ class AsyncRequestCoordinator:
             if int(self.states[slot_id]) != SlotState.READY:
                 raise RuntimeError("ready queue returned a non-READY slot")
             self.states[slot_id] = int(SlotState.RUNNING)
+            request_kind = int(self.request_kinds[slot_id])
+            if request_kind not in {
+                int(RequestKind.CARD_PLAY), int(RequestKind.BIDDING)
+            }:
+                raise RuntimeError("ready queue contains an unknown request kind")
             metadata.append(RequestMetadata(
                 slot_id=slot_id,
                 actor_id=int(self.actor_ids[slot_id]),
                 request_id=int(self.request_ids[slot_id]),
                 policy_snapshot=int(self.policy_snapshots[slot_id]),
-                action_count=int(self.slots.action_counts[slot_id]),
-                acting_role=int(self.slots.roles[slot_id]),
+                action_count=(
+                    4
+                    if request_kind == int(RequestKind.BIDDING)
+                    else int(self.slots.action_counts[slot_id])
+                ),
+                acting_role=(
+                    -1
+                    if request_kind == int(RequestKind.BIDDING)
+                    else int(self.slots.roles[slot_id])
+                ),
                 submitted_ns=int(self.submitted_ns[slot_id]),
+                request_kind=request_kind,
             ))
         return metadata
 
@@ -1204,6 +1380,8 @@ class AsyncRequestCoordinator:
         self.states[slot_id] = int(SlotState.FREE)
         if self.belief_inputs is not None:
             self.belief_inputs.clear(slot_id)
+        if self.bidding_inputs is not None:
+            self.bidding_inputs.clear(slot_id)
         self.response_events[slot_id].clear()
         self._submitted_at.pop(slot_id, None)
         self.free_queue.put(slot_id)
@@ -1275,6 +1453,9 @@ def async_actor_main(
     strategy_targets_enabled: bool = False,
     strategy_node_budget: int = 500,
     strategy_time_budget_ms: int = 0,
+    bidding_replay_queue=None,
+    bidding_policy_config=None,
+    first_bidder_mode: str = "rotate",
 ) -> None:
     """CPU-only interleaved-game actor. CUDA is never initialized here."""
     import random
@@ -1284,6 +1465,12 @@ def async_actor_main(
     from douzero.models_v2.batch import observation_to_model_inputs
     from douzero.models_v2.output import ModelOutput
     from douzero.observation.encode_v2 import get_obs_v2
+    from douzero.observation.bidding import get_bidding_obs_v2
+    from douzero.training.bidding import (
+        BiddingPolicyConfig,
+        BiddingTransition,
+        select_bidding_action,
+    )
     from douzero.training.decision_policy import select_action
     from douzero.training.v2_buffer import Episode, Transition
 
@@ -1313,6 +1500,7 @@ def async_actor_main(
         coordinator.slots.strategy_features_enabled
         or coordinator.slots.style_features_enabled
     )
+    bidding_async = coordinator.bidding_inputs is not None
     for name, value in (
         ("style_enabled", style_enabled),
         ("strategy_targets_enabled", strategy_targets_enabled),
@@ -1342,7 +1530,28 @@ def async_actor_main(
         raise ValueError("async Oracle is supported only by the V3 runtime")
     if cooperation_async and runtime_kind != "v3_hybrid":
         raise ValueError("async cooperation is supported only by the V3 runtime")
-    if sum((belief_async, oracle_async, cooperation_async, public_aux_async)) > 1:
+    if bidding_async != (bidding_replay_queue is not None):
+        raise ValueError(
+            "async bidding inference and replay must be enabled together"
+        )
+    if bidding_async:
+        if runtime_kind != "v3_hybrid":
+            raise ValueError("async bidding is supported only by the V3 runtime")
+        if ruleset is None or ruleset.ruleset_id != "standard":
+            raise ValueError("async bidding requires the standard ruleset")
+        if not isinstance(bidding_policy_config, BiddingPolicyConfig):
+            raise TypeError("async bidding requires BiddingPolicyConfig")
+        if first_bidder_mode not in {"rotate", "seeded_random"}:
+            raise ValueError("async first_bidder_mode is unsupported")
+    elif bidding_policy_config is not None:
+        raise ValueError("bidding policy config requires async bidding transport")
+    if sum((
+        belief_async,
+        oracle_async,
+        cooperation_async,
+        public_aux_async,
+        bidding_async,
+    )) > 1:
         raise NotImplementedError(
             "combined async H7.1 capability transports are not supported"
         )
@@ -1414,6 +1623,24 @@ def async_actor_main(
             except queue.Full:
                 continue
 
+    def publish_bidding_transitions(transitions) -> None:
+        deadline = time.monotonic() + coordinator.request_timeout_seconds
+        payload = tuple(transitions)
+        while True:
+            coordinator._raise_if_failed()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "async bidding replay queue remained full past its deadline"
+                )
+            try:
+                bidding_replay_queue.put(
+                    payload, timeout=min(0.05, remaining)
+                )
+                return
+            except queue.Full:
+                continue
+
     def start_game(task):
         episode_id = int(task)
         if environment_seed_derivation == FORMAL_SEED_DERIVATION_V1:
@@ -1431,7 +1658,15 @@ def async_actor_main(
         snapshot = int(policy_step.value)
         event_queue.put(("started", actor_id, episode_id, snapshot))
         env = Env("adp", ruleset=ruleset)
-        env.reset()
+        bidding_order = None
+        if bidding_async:
+            seats = ["0", "1", "2"]
+            if first_bidder_mode == "rotate":
+                offset = episode_id % len(seats)
+            else:
+                offset = action_rng.randrange(len(seats))
+            bidding_order = seats[offset:] + seats[:offset]
+        env.reset(bidding_order=bidding_order)
         return {
             "episode_id": episode_id,
             "snapshot": snapshot,
@@ -1445,11 +1680,28 @@ def async_actor_main(
             "started_at": time.monotonic(),
             "blocked_seconds": 0.0,
             "action_rng": action_rng,
+            "bidding_transitions": [],
+            "bidding_decisions": 0,
+            "abandoned_bidding_transitions": 0,
+            "redeals": 0,
         }
 
     def finish_game(game) -> None:
         episode = game["episode"]
+        if episode.max_redeals_exceeded:
+            episode.excluded_from_training = True
+            episode.exclusion_reason = "redeal_cap_guard"
+            episode.transitions.clear()
+            game["bidding_transitions"].clear()
         episode.label_from_terminal()
+        if bidding_async:
+            seat_to_role = game["env"]._env._seat_to_role
+            for transition in game["bidding_transitions"]:
+                if not transition.actor_role:
+                    transition.assign_actor_role(seat_to_role)
+                transition.label_from_terminal(episode.terminal_result)
+                transition.validate()
+            publish_bidding_transitions(game["bidding_transitions"])
         if strategy_targets_enabled:
             episode.label_strategy_auxiliary(
                 node_budget=strategy_node_budget,
@@ -1520,14 +1772,22 @@ def async_actor_main(
             )
             for role in ("landlord_up", "landlord_down")
         }
-        event_queue.put((
+        completed_event = (
             "completed", actor_id, game["episode_id"], len(episode.transitions),
             0 if team == "landlord" else 1, game["snapshot"],
             len(episode.action_trace),
             float(game["blocked_seconds"]),
             float(time.monotonic() - game["started_at"]),
             farmer_counts,
-        ))
+        )
+        if bidding_async:
+            completed_event += (
+                len(game["bidding_transitions"]),
+                int(game["bidding_decisions"]),
+                int(game["abandoned_bidding_transitions"]),
+                int(game["redeals"]),
+            )
+        event_queue.put(completed_event)
 
     def apply_action(
         game,
@@ -1605,9 +1865,95 @@ def async_actor_main(
             raise RuntimeError(f"actor episode exceeded max_steps={max_steps}")
         return False
 
+    def apply_bidding_action(game, observation, bid: int, source: str) -> None:
+        if bid not in observation.legal_bids:
+            raise ValueError("async bidding selected an illegal environment bid")
+        game["bidding_transitions"].append(BiddingTransition(
+            obs=observation,
+            bid_action=bid,
+            policy_version=policy_version,
+            source_policy=source,
+        ))
+        game["bidding_decisions"] += 1
+        _obs, _reward, done, info = game["env"].step(None, bid_value=bid)
+        game["steps"] += 1
+        if done and info.get("redeal"):
+            abandoned = len(game["bidding_transitions"])
+            game["abandoned_bidding_transitions"] += abandoned
+            game["bidding_transitions"].clear()
+            game["redeals"] = int(info["redeal_count"])
+            np.random.seed(_async_redeal_seed(
+                environment_seed,
+                environment_seed_derivation,
+                actor_id,
+                int(game["episode_id"]),
+                game["redeals"],
+            ))
+            game["env"].redeal()
+            return
+        if info.get("max_redeals_exceeded"):
+            if game["env"].bidding_obs is not None:
+                raise RuntimeError(
+                    "environment redeal-cap transition did not enter card play"
+                )
+            game["abandoned_bidding_transitions"] += len(
+                game["bidding_transitions"]
+            )
+            game["bidding_transitions"].clear()
+            game["episode"].max_redeals_exceeded = True
+            return
+        if done:
+            raise RuntimeError(
+                "async bidding ended without a terminal card-play result"
+            )
+        if game["env"].bidding_obs is None:
+            seat_to_role = game["env"]._env._seat_to_role
+            for transition in game["bidding_transitions"]:
+                transition.assign_actor_role(seat_to_role)
+
     def advance_until_request_or_done(game) -> bool:
         nonlocal request_id
         while True:
+            if bidding_async and game["env"].bidding_obs is not None:
+                bid_obs = get_bidding_obs_v2(
+                    game["env"].bidding_obs,
+                    ruleset=ruleset,
+                    redeal_count=game["env"]._redeal_count,
+                )
+                action_rng = game["action_rng"]
+                use_learned = (
+                    bidding_policy_config.policy == "learned"
+                    and action_rng.random()
+                    < bidding_policy_config.learned_probability
+                )
+                if use_learned:
+                    slot_id = coordinator.acquire(actor_id)
+                    coordinator.bidding_inputs.write(slot_id, bid_obs)
+                    request_id += 1
+                    coordinator.submit_bidding(
+                        slot_id,
+                        request_id=request_id,
+                        policy_snapshot=game["snapshot"],
+                    )
+                    game["pending"] = (
+                        "bidding",
+                        slot_id,
+                        request_id,
+                        bid_obs,
+                    )
+                    return False
+                policy = bidding_policy_config
+                if policy.policy == "learned":
+                    policy = BiddingPolicyConfig(
+                        policy=policy.warm_start_policy,
+                        warm_start_policy=policy.warm_start_policy,
+                    )
+                bid, source = select_bidding_action(
+                    bid_obs, policy, action_rng
+                )
+                apply_bidding_action(game, bid_obs, bid, source)
+                _check_actor_step_limit(game["steps"], max_steps)
+                continue
             position = game["env"]._acting_player_position
             infoset = game["env"].infoset
             legal_actions = infoset.legal_actions
@@ -1655,6 +2001,7 @@ def async_actor_main(
                 policy_snapshot=game["snapshot"],
             )
             game["pending"] = (
+                "card_play",
                 slot_id,
                 request_id,
                 obs,
@@ -1666,7 +2013,24 @@ def async_actor_main(
             return False
 
     def resolve_request(game):
+        pending = game["pending"]
+        if pending[0] == "bidding":
+            _, slot_id, pending_id, bid_obs = pending
+            blocked_started = time.monotonic()
+            coordinator.wait_done(slot_id, pending_id)
+            game["blocked_seconds"] += time.monotonic() - blocked_started
+            logits = coordinator.bidding_inputs.output_logits[slot_id].clone()
+            legal_mask = coordinator.bidding_inputs.legal_mask[slot_id].clone()
+            coordinator.release(slot_id)
+            game["pending"] = None
+            bid = int(
+                torch.argmax(
+                    logits.masked_fill(~legal_mask, float("-inf"))
+                ).item()
+            )
+            return ("bidding", bid, bid_obs)
         (
+            _kind,
             slot_id,
             pending_id,
             obs,
@@ -1706,6 +2070,7 @@ def async_actor_main(
             action_index = select_action(output, decision_config)
             q_old = None
         return (
+            "card_play",
             action_index,
             obs,
             position,
@@ -1751,16 +2116,22 @@ def async_actor_main(
             resolved = [
                 (game, *resolve_request(game)) for game in pending_games
             ]
-            for (
-                game,
-                action_index,
-                obs,
-                position,
-                legal_actions,
-                q_old,
-                belief_sidecar,
-                public_inputs,
-            ) in resolved:
+            for item in resolved:
+                game, kind, *payload = item
+                if kind == "bidding":
+                    bid, bid_obs = payload
+                    apply_bidding_action(game, bid_obs, bid, "learned")
+                    _check_actor_step_limit(game["steps"], max_steps)
+                    continue
+                (
+                    action_index,
+                    obs,
+                    position,
+                    legal_actions,
+                    q_old,
+                    belief_sidecar,
+                    public_inputs,
+                ) = payload
                 if apply_action(
                     game,
                     action_index,
