@@ -214,6 +214,7 @@ def test_protocol_freeze_accepts_full_hybrid_identity(
     assert payload["bidding_enabled"] is config_name.endswith("standard.yaml")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_guided_benchmark_phase_priming_is_checkpoint_consistent(tmp_path):
     formal = load_formal_config(
         ROOT / "configs/v3_formal/v3_full_hybrid_standard.yaml"
