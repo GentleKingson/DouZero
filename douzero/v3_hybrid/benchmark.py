@@ -8,7 +8,7 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
-H7_BENCHMARK_SCHEMA = "v3-hybrid-h7-benchmark-v7"
+H7_BENCHMARK_SCHEMA = "v3-hybrid-h7-benchmark-v8"
 H7_TOPOLOGIES = ("single_process", "async_4x4", "async_8x4")
 
 
@@ -53,6 +53,7 @@ class V3H7BenchmarkProtocol:
     cpu: str
     formal_config_hash: str | None
     oracle_enabled: bool
+    learner_phase: str = "public"
     cooperation_enabled: bool = False
     public_aux_enabled: bool = False
     bidding_enabled: bool = False
@@ -87,6 +88,13 @@ class V3H7BenchmarkProtocol:
                 )
         if not isinstance(self.oracle_enabled, bool):
             raise TypeError("H7 benchmark oracle_enabled must be bool")
+        if self.learner_phase not in {"public", "oracle_guided"}:
+            raise ValueError("H7 benchmark learner_phase is unsupported")
+        expected_phase = "oracle_guided" if self.oracle_enabled else "public"
+        if self.learner_phase != expected_phase:
+            raise ValueError(
+                "H7 benchmark learner_phase does not match Oracle capability"
+            )
         if not isinstance(self.cooperation_enabled, bool):
             raise TypeError("H7 benchmark cooperation_enabled must be bool")
         if not isinstance(self.public_aux_enabled, bool):

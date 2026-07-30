@@ -307,6 +307,9 @@ def main() -> None:
         )
         if learner_resolved != resolved:
             raise RuntimeError("H7 benchmark formal resolution is not stable")
+    if protocol.learner_phase == "oracle_guided":
+        h3 = learner.base.base.base
+        h3.learner_updates = h3.config.schedule.warmup_updates
     trainer = trainer_type(learner, resolved, runtime_config)
     try:
         _run_until(

@@ -467,7 +467,9 @@ def test_h7_benchmark_requires_three_matched_repeats_per_topology():
     with pytest.raises(ValueError, match="window is too short"):
         validate_h7_benchmark_evidence(corrupted, protocol)
 
-    oracle_protocol = replace(protocol, oracle_enabled=True)
+    oracle_protocol = replace(
+        protocol, oracle_enabled=True, learner_phase="oracle_guided"
+    )
     oracle_records = [
         _benchmark_record(oracle_protocol, topology, repeat)
         for topology in H7_TOPOLOGIES

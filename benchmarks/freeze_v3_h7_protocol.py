@@ -124,6 +124,9 @@ def main() -> None:
             else str(formal.identity_dict()["config_sha256"])
         ),
         oracle_enabled=oracle_enabled,
+        learner_phase=(
+            "oracle_guided" if oracle_enabled else "public"
+        ),
         cooperation_enabled=cooperation_enabled,
         public_aux_enabled=public_aux_enabled,
         bidding_enabled=bidding_enabled,

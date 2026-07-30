@@ -208,6 +208,7 @@ def test_protocol_freeze_accepts_full_hybrid_identity(
     freeze_h7.main()
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["oracle_enabled"] is True
+    assert payload["learner_phase"] == "oracle_guided"
     assert payload["cooperation_enabled"] is True
     assert payload["public_aux_enabled"] is True
     assert payload["bidding_enabled"] is config_name.endswith("standard.yaml")
