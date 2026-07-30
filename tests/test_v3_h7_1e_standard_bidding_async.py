@@ -293,5 +293,17 @@ def test_h71e_cuda_update_checkpoint_resume_and_shutdown(tmp_path):
     try:
         assert resumed.load_training_checkpoint(checkpoint) == {"cycle": 1}
         assert resumed.stats.bidding_optimizer_steps == 1
+        before = resumed._parameter_update_snapshot()
+        resumed.collect_episodes(8)
+        metrics = resumed.step()
+        assert metrics is not None
+        assert resumed._parameters_changed_since(before)
+        assert resumed.stats.bidding_optimizer_steps == 2
+        tampered = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        tampered["runtime_hash"] = "0" * 64
+        wrong_identity = tmp_path / "wrong-identity.pt"
+        torch.save(tampered, wrong_identity)
+        with pytest.raises(ValueError, match="runtime identity"):
+            resumed.load_training_checkpoint(wrong_identity)
     finally:
         resumed.shutdown()
