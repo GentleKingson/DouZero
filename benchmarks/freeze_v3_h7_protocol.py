@@ -26,6 +26,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71C_REQUEST_PROTOCOL,
     V3_H71D_REPLAY_PROTOCOL,
     V3_H71D_REQUEST_PROTOCOL,
+    V3_H71E_REPLAY_PROTOCOL,
+    V3_H71E_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -89,6 +91,7 @@ def main() -> None:
         resolved.learner.features.strategy
         or resolved.learner.features.style
     )
+    bidding_enabled = resolved.learner.features.bidding
     request_protocol = (
         V3_H71A_REQUEST_PROTOCOL
         if belief_enabled
@@ -101,7 +104,11 @@ def main() -> None:
                 else (
                     V3_H71D_REQUEST_PROTOCOL
                     if public_aux_enabled
-                    else V3_H7_REQUEST_PROTOCOL
+                    else (
+                        V3_H71E_REQUEST_PROTOCOL
+                        if bidding_enabled
+                        else V3_H7_REQUEST_PROTOCOL
+                    )
                 )
             )
         )
@@ -118,7 +125,11 @@ def main() -> None:
                 else (
                     V3_H71D_REPLAY_PROTOCOL
                     if public_aux_enabled
-                    else V3_H7_REPLAY_PROTOCOL
+                    else (
+                        V3_H71E_REPLAY_PROTOCOL
+                        if bidding_enabled
+                        else V3_H7_REPLAY_PROTOCOL
+                    )
                 )
             )
         )
@@ -128,6 +139,7 @@ def main() -> None:
         oracle_runtime_enabled=oracle_enabled,
         cooperation_runtime_enabled=cooperation_enabled,
         public_aux_runtime_enabled=public_aux_enabled,
+        bidding_runtime_enabled=bidding_enabled,
         request_protocol=request_protocol,
         replay_protocol=replay_protocol,
         snapshot_semantics=(
@@ -161,6 +173,7 @@ def main() -> None:
         oracle_enabled=oracle_enabled,
         cooperation_enabled=cooperation_enabled,
         public_aux_enabled=public_aux_enabled,
+        bidding_enabled=bidding_enabled,
         gpu=args.gpu,
         driver=args.driver,
         pytorch=args.pytorch,

@@ -30,8 +30,14 @@ from douzero.training.async_single_gpu import (
     AsyncRequestCoordinator,
     PendingRequestScheduler,
     PinnedObservationBatchStager,
+    RequestKind,
     SharedReplaySlots,
     async_actor_main,
+)
+from douzero.training.bidding import (
+    BiddingMinibatch,
+    BiddingPolicyConfig,
+    BiddingTransition,
 )
 
 from .adaptive_dmc import ADMC_DISABLED
@@ -41,6 +47,7 @@ from .belief_policy import V3BeliefPolicy
 from .replay import V3ReplayTransition
 from .support_matrix import (
     RULESET_LEGACY,
+    RULESET_STANDARD,
     TOPOLOGY_ASYNC_SINGLE_GPU,
     TOPOLOGY_SINGLE_PROCESS,
     validate_capability_support,
@@ -67,8 +74,8 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1d-runtime-v13"
-V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v7"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v14"
+V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v8"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
 V3_H71A_REQUEST_PROTOCOL = (
@@ -95,6 +102,12 @@ V3_H71D_REQUEST_PROTOCOL = (
 )
 V3_H71D_REPLAY_PROTOCOL = (
     "v3-public-replay-plus-public-strategy-trajectory-labels-v1"
+)
+V3_H71E_REQUEST_PROTOCOL = (
+    "v2-shared-slots-v3-standard-separate-bid-cardplay-actions-v1"
+)
+V3_H71E_REPLAY_PROTOCOL = (
+    "v3-public-cardplay-plus-separate-terminal-labelled-bidding-replay-v1"
 )
 V3_H71AB_REQUEST_PROTOCOL = (
     "v2-shared-slots-v3-dmc-q-belief-oracle-sidecars-v1"
@@ -191,6 +204,14 @@ class V3H7RuntimeConfig:
     cooperation_sidecar_capacity: int = 4096
     cooperation_episode_capacity: int = 1024
     public_aux_runtime_enabled: bool = False
+    bidding_runtime_enabled: bool = False
+    bidding_replay_capacity: int = 4096
+    bidding_batch_size: int = 16
+    bidding_update_interval: int = 1
+    bidding_policy: str = "learned"
+    bidding_warm_start_policy: str = "rule"
+    bidding_learned_probability: float = 1.0
+    first_bidder_mode: str = "rotate"
 
     def __post_init__(self) -> None:
         if self.topology not in {
@@ -202,6 +223,7 @@ class V3H7RuntimeConfig:
             "oracle_runtime_enabled",
             "cooperation_runtime_enabled",
             "public_aux_runtime_enabled",
+            "bidding_runtime_enabled",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"H7 {name} must be bool")
@@ -211,6 +233,8 @@ class V3H7RuntimeConfig:
             "max_steps_per_episode", "belief_sidecar_capacity",
             "oracle_sidecar_capacity", "cooperation_sidecar_capacity",
             "cooperation_episode_capacity",
+            "bidding_replay_capacity", "bidding_batch_size",
+            "bidding_update_interval",
         )
         for name in positive:
             value = getattr(self, name)
@@ -236,11 +260,19 @@ class V3H7RuntimeConfig:
                 raise ValueError(f"H7 runtime {name} must be positive and finite")
         if not math.isfinite(self.epsilon) or not 0.0 <= self.epsilon <= 1.0:
             raise ValueError("H7 runtime epsilon must be in [0, 1]")
+        BiddingPolicyConfig(
+            policy=self.bidding_policy,
+            warm_start_policy=self.bidding_warm_start_policy,
+            learned_probability=self.bidding_learned_probability,
+        )
+        if self.first_bidder_mode not in {"rotate", "seeded_random"}:
+            raise ValueError("H7 first_bidder_mode is unsupported")
         enabled_sidecars = sum((
             self.belief_runtime_enabled,
             self.oracle_runtime_enabled,
             self.cooperation_runtime_enabled,
             self.public_aux_runtime_enabled,
+            self.bidding_runtime_enabled,
         ))
         if enabled_sidecars > 1:
             raise NotImplementedError(
@@ -258,6 +290,9 @@ class V3H7RuntimeConfig:
         elif self.public_aux_runtime_enabled:
             expected_request = V3_H71D_REQUEST_PROTOCOL
             expected_replay = V3_H71D_REPLAY_PROTOCOL
+        elif self.bidding_runtime_enabled:
+            expected_request = V3_H71E_REQUEST_PROTOCOL
+            expected_replay = V3_H71E_REPLAY_PROTOCOL
         else:
             expected_request = V3_H7_REQUEST_PROTOCOL
             expected_replay = V3_H7_REPLAY_PROTOCOL
@@ -282,6 +317,14 @@ class V3H7RuntimeConfig:
         if not self.cooperation_runtime_enabled:
             payload["cooperation_sidecar_capacity"] = None
             payload["cooperation_episode_capacity"] = None
+        if not self.bidding_runtime_enabled:
+            for name in (
+                "bidding_replay_capacity", "bidding_batch_size",
+                "bidding_update_interval", "bidding_policy",
+                "bidding_warm_start_policy", "bidding_learned_probability",
+                "first_bidder_mode",
+            ):
+                payload[name] = None
         return {"version": V3_H7_RUNTIME_VERSION, **payload}
 
     def stable_hash(self) -> str:
@@ -351,6 +394,13 @@ class V3H7RuntimeStats:
     cooperation_oversized_episodes: int = 0
     strategy_labels_collected: int = 0
     strategy_optimizer_steps: int = 0
+    bidding_transitions_collected: int = 0
+    bidding_decisions_collected: int = 0
+    abandoned_bidding_transitions: int = 0
+    bidding_eligible_steps: int = 0
+    bidding_optimizer_steps: int = 0
+    learner_bidding_samples: int = 0
+    redeals: int = 0
     amp_fallbacks: int = 0
     episodes_per_team: dict[str, int] = field(
         default_factory=lambda: {"landlord": 0, "farmer": 0}
@@ -872,14 +922,10 @@ def validate_v3_h7_runtime_config(
             "H7 runtime requires a validated single_process learner; "
             "the outer runtime owns async topology identity"
         )
-    if topology.ruleset != RULESET_LEGACY:
-        raise NotImplementedError(
-            "H7 async runtime currently supports legacy card-play rules only"
-        )
     enabled = set(features.enabled_capabilities())
     unsupported = enabled - {
         "role_model", "adaptive_dmc", "belief", "oracle", "cooperation",
-        "strategy", "style", "public_export",
+        "strategy", "style", "bidding", "public_export",
     }
     if unsupported:
         raise NotImplementedError(
@@ -890,11 +936,28 @@ def validate_v3_h7_runtime_config(
     oracle_enabled = "oracle" in enabled
     cooperation_enabled = "cooperation" in enabled
     public_aux_enabled = bool({"strategy", "style"} & enabled)
+    bidding_enabled = "bidding" in enabled
+    if bidding_enabled:
+        if topology.ruleset != RULESET_STANDARD:
+            raise ValueError("H7.1e bidding runtime requires standard rules")
+        allowed = {
+            "role_model", "adaptive_dmc", "bidding", "public_export",
+        }
+        if enabled - allowed:
+            raise NotImplementedError(
+                "H7.1e standard bidding remains isolated from other H7.1 "
+                f"capabilities: {sorted(enabled - allowed)}"
+            )
+    elif topology.ruleset != RULESET_LEGACY:
+        raise NotImplementedError(
+            "H7 async standard rules require the H7.1e bidding capability"
+        )
     if sum((
         belief_enabled,
         oracle_enabled,
         cooperation_enabled,
         public_aux_enabled,
+        bidding_enabled,
     )) > 1:
         raise NotImplementedError(
             "H7.1 capability transports remain isolated until a later integration"
@@ -964,6 +1027,19 @@ def validate_v3_h7_runtime_config(
             raise ValueError("H7.1d strategy runtime requires its auxiliary heads")
         if resolved_config.learner.losses.lambda_strategy <= 0.0:
             raise ValueError("H7.1d strategy runtime requires a positive loss weight")
+    if bidding_enabled != runtime_config.bidding_runtime_enabled:
+        raise ValueError(
+            "H7 runtime bidding feature and standard bidding transport disagree"
+        )
+    if bidding_enabled:
+        if not resolved_config.model.bidding_enabled:
+            raise ValueError("H7.1e requires the public bidding head")
+        if resolved_config.learner.losses.lambda_bidding <= 0.0:
+            raise ValueError("H7.1e requires a positive bidding loss weight")
+        if runtime_config.bidding_replay_capacity < runtime_config.bidding_batch_size:
+            raise ValueError(
+                "H7.1e bidding replay capacity cannot be smaller than its batch"
+            )
     for capability in enabled:
         validate_capability_support(
             capability,
@@ -1081,6 +1157,11 @@ class V3AsyncSingleGPUTrainer:
             if runtime_config.public_aux_runtime_enabled
             else None
         )
+        self.bidding_buffer: deque[BiddingTransition] | None = (
+            deque(maxlen=runtime_config.bidding_replay_capacity)
+            if runtime_config.bidding_runtime_enabled
+            else None
+        )
         self._belief_alignment = (
             V3H71ABeliefAlignment(
                 _h7_alignment_capacity(
@@ -1171,6 +1252,14 @@ class V3AsyncSingleGPUTrainer:
                     "labels-snapshot-bound-v1"
                 )
             ),
+            "bidding_transport": (
+                "disabled"
+                if self.bidding_buffer is None
+                else (
+                    "neutral-seat-public-observation-separate-action-space-"
+                    "terminal-labelled-replay-v1"
+                )
+            ),
         }
         self.runtime_hash = _stable_hash(self.runtime_identity)
 
@@ -1226,6 +1315,11 @@ class V3AsyncSingleGPUTrainer:
                 cfg.public_aux_runtime_enabled
                 and self.model.config.style_enabled
             ),
+            bidding_feature_width=(
+                self.model.bidding_schema.input_width
+                if cfg.bidding_runtime_enabled
+                else None
+            ),
         )
         self._replay_slots = SharedReplaySlots(
             self.model.schema,
@@ -1258,6 +1352,11 @@ class V3AsyncSingleGPUTrainer:
             if cfg.cooperation_runtime_enabled
             else None
         )
+        self._bidding_replay_queue = (
+            context.Queue(maxsize=cfg.bidding_replay_capacity)
+            if cfg.bidding_runtime_enabled
+            else None
+        )
         self._stagers: dict[int, PinnedObservationBatchStager] = {}
         self._workers = []
         for actor_id in range(cfg.num_actors):
@@ -1276,7 +1375,11 @@ class V3AsyncSingleGPUTrainer:
                     "epsilon": cfg.epsilon,
                     "max_steps": cfg.max_steps_per_episode,
                     "decision_config": DecisionConfig(),
-                    "ruleset": None,
+                    "ruleset": (
+                        self.learner.ruleset
+                        if cfg.bidding_runtime_enabled
+                        else None
+                    ),
                     "feature_schema_hash": self.model.schema.stable_hash(),
                     "policy_version": self.policy_version,
                     "policy_step": self._policy_step,
@@ -1303,6 +1406,17 @@ class V3AsyncSingleGPUTrainer:
                     "strategy_time_budget_ms": (
                         self.model.config.strategy_time_budget_ms
                     ),
+                    "bidding_replay_queue": self._bidding_replay_queue,
+                    "bidding_policy_config": (
+                        BiddingPolicyConfig(
+                            policy=cfg.bidding_policy,
+                            warm_start_policy=cfg.bidding_warm_start_policy,
+                            learned_probability=cfg.bidding_learned_probability,
+                        )
+                        if cfg.bidding_runtime_enabled
+                        else None
+                    ),
+                    "first_bidder_mode": cfg.first_bidder_mode,
                 },
                 name=f"douzero-v3-actor-{actor_id}",
             )
@@ -1325,6 +1439,53 @@ class V3AsyncSingleGPUTrainer:
         if scheduled is None:
             return 0
         (_snapshot, bucket), group = scheduled
+        if bucket == "bidding":
+            if self._coordinator.bidding_inputs is None:
+                raise RuntimeError("H7.1e scheduled bidding without its transport")
+            if any(
+                row.request_kind != int(RequestKind.BIDDING) for row in group
+            ):
+                raise RuntimeError("H7.1e mixed request kinds in bidding batch")
+            started = time.perf_counter()
+            batch = self._coordinator.bidding_inputs.batch(
+                [row.slot_id for row in group],
+                self.model.bidding_schema.stable_hash(),
+            )
+            self._segments["slot_read"] += time.perf_counter() - started
+            started = time.perf_counter()
+            batch.to(self.device, non_blocking=True)
+            torch.cuda.synchronize(self.device)
+            self._segments["h2d"] += time.perf_counter() - started
+            started = time.perf_counter()
+            with torch.inference_mode():
+                output = self.inference_model.forward_bidding_batched(batch)
+                logits = output.bid_logits.float().contiguous()
+            torch.cuda.synchronize(self.device)
+            self._segments["forward"] += time.perf_counter() - started
+            started = time.perf_counter()
+            logits_cpu = logits.to("cpu", non_blocking=True)
+            torch.cuda.synchronize(self.device)
+            self._segments["d2h"] += time.perf_counter() - started
+            started = time.perf_counter()
+            for index, request in enumerate(group):
+                self._coordinator.bidding_inputs.output_logits[
+                    request.slot_id
+                ].copy_(logits_cpu[index])
+                self._coordinator.complete(request.slot_id)
+                self._queue_latencies_ms.append(
+                    (time.monotonic_ns() - request.submitted_ns) / 1_000_000.0
+                )
+            self._segments["publish"] += time.perf_counter() - started
+            self._requests += len(group)
+            self._actions += 4 * len(group)
+            self._microbatches += 1
+            self._increment(self._batch_histogram, len(group))
+            self._increment(self._bucket_histogram, bucket)
+            return len(group)
+        if any(
+            row.request_kind != int(RequestKind.CARD_PLAY) for row in group
+        ):
+            raise RuntimeError("H7.1e mixed request kinds in card-play batch")
         capacity = (
             int(bucket)
             if isinstance(bucket, int)
@@ -1576,6 +1737,25 @@ class V3AsyncSingleGPUTrainer:
         self._segments["replay_drain"] += time.perf_counter() - started
         return completed
 
+    def _drain_bidding_replay(self) -> int:
+        if self.bidding_buffer is None:
+            return 0
+        received = 0
+        while True:
+            try:
+                transitions = self._bidding_replay_queue.get_nowait()
+            except queue.Empty:
+                break
+            if not isinstance(transitions, tuple):
+                raise TypeError("H7.1e bidding replay envelope mismatch")
+            for transition in transitions:
+                if not isinstance(transition, BiddingTransition):
+                    raise TypeError("H7.1e bidding replay row has an invalid type")
+                transition.validate()
+                self.bidding_buffer.append(transition)
+                received += 1
+        return received
+
     def _publish_snapshot(self) -> None:
         if self._runtime_started:
             self._coordinator.quiesce()
@@ -1614,12 +1794,18 @@ class V3AsyncSingleGPUTrainer:
         ):
             self._tasks.put(episode_id)
         completed = expected = received = 0
+        expected_bids = received_bids = 0
         deadline = time.monotonic() + self.config.request_timeout_seconds * max(1, target)
         while True:
             self._coordinator._raise_if_failed()
             self._service_requests()
             received += self._drain_replay()
-            if completed >= target and received >= expected:
+            received_bids += self._drain_bidding_replay()
+            if (
+                completed >= target
+                and received >= expected
+                and received_bids >= expected_bids
+            ):
                 needs_retry = (
                     self.cooperation_buffer is not None
                     and _h71c_needs_collection_retry(
@@ -1671,6 +1857,17 @@ class V3AsyncSingleGPUTrainer:
                 if len(event) >= 9:
                     self._actor_blocked_seconds += float(event[7])
                     self._actor_wall_seconds += float(event[8])
+                if self.bidding_buffer is not None:
+                    if len(event) != 14:
+                        raise ValueError(
+                            "H7.1e completion event lacks bidding counters"
+                        )
+                    bid_count = int(event[10])
+                    expected_bids += bid_count
+                    self.stats.bidding_transitions_collected += bid_count
+                    self.stats.bidding_decisions_collected += int(event[11])
+                    self.stats.abandoned_bidding_transitions += int(event[12])
+                    self.stats.redeals += int(event[13])
                 if self._cooperation_alignment is not None:
                     if len(event) != 10:
                         raise ValueError(
@@ -1698,6 +1895,17 @@ class V3AsyncSingleGPUTrainer:
         if num_steps < 0:
             raise ValueError("H7 optimizer steps must be non-negative")
         for _ in range(num_steps):
+            bidding_due = (
+                self.bidding_buffer is not None
+                and self.stats.bidding_eligible_steps
+                % self.config.bidding_update_interval
+                == 0
+            )
+            if (
+                bidding_due
+                and len(self.bidding_buffer) < self.config.bidding_batch_size
+            ):
+                raise ValueError("H7.1e bidding replay has fewer rows than batch_size")
             if self.cooperation_buffer is not None:
                 if not self.cooperation_buffer:
                     raise ValueError(
@@ -1727,6 +1935,13 @@ class V3AsyncSingleGPUTrainer:
             )
             oracle_samples = self._oracle_samples_for_indices(indices)
             strategy_targets = self._strategy_targets_for_indices(indices)
+            bidding_batch = (
+                BiddingMinibatch(self._rng.sample(
+                    list(self.bidding_buffer), self.config.bidding_batch_size
+                ))
+                if bidding_due
+                else None
+            )
             learner_policy_before = int(self.learner.policy_version)
             metrics = self.learner.train_batch(
                 learner_rows,
@@ -1734,6 +1949,7 @@ class V3AsyncSingleGPUTrainer:
                 belief_samples=belief_samples,
                 oracle_samples=oracle_samples,
                 strategy_targets=strategy_targets,
+                bidding_batch=bidding_batch,
             )
             self._record_served_update(learner_policy_before, metrics)
             if metrics.base.base.belief_updated:
@@ -1749,11 +1965,29 @@ class V3AsyncSingleGPUTrainer:
             ):
                 self.stats.strategy_optimizer_steps += 1
             self.stats.optimizer_steps += 1
+            if self.bidding_buffer is not None:
+                self.stats.bidding_eligible_steps += 1
+            if bidding_batch is not None:
+                self.stats.bidding_optimizer_steps += 1
+                self.stats.learner_bidding_samples += len(
+                    bidding_batch.transitions
+                )
             self.stats.learner_cardplay_samples += len(rows)
             self._segments["learner"] += time.perf_counter() - started
 
     def step(self):
         """Run one learner update for the shared long-running controller."""
+        bidding_due = (
+            self.bidding_buffer is not None
+            and self.stats.bidding_eligible_steps
+            % self.config.bidding_update_interval
+            == 0
+        )
+        if (
+            bidding_due
+            and len(self.bidding_buffer) < self.config.bidding_batch_size
+        ):
+            return None
         if self.cooperation_buffer is not None:
             if not self.cooperation_buffer:
                 return None
@@ -1780,6 +2014,13 @@ class V3AsyncSingleGPUTrainer:
         )
         oracle_samples = self._oracle_samples_for_indices(indices)
         strategy_targets = self._strategy_targets_for_indices(indices)
+        bidding_batch = (
+            BiddingMinibatch(self._rng.sample(
+                list(self.bidding_buffer), self.config.bidding_batch_size
+            ))
+            if bidding_due
+            else None
+        )
         started = time.perf_counter()
         learner_policy_before = int(self.learner.policy_version)
         metrics = self.learner.train_batch(
@@ -1788,6 +2029,7 @@ class V3AsyncSingleGPUTrainer:
             belief_samples=belief_samples,
             oracle_samples=oracle_samples,
             strategy_targets=strategy_targets,
+            bidding_batch=bidding_batch,
         )
         self._record_served_update(learner_policy_before, metrics)
         if metrics.base.base.belief_updated:
@@ -1803,6 +2045,13 @@ class V3AsyncSingleGPUTrainer:
         ):
             self.stats.strategy_optimizer_steps += 1
         self.stats.optimizer_steps += 1
+        if self.bidding_buffer is not None:
+            self.stats.bidding_eligible_steps += 1
+        if bidding_batch is not None:
+            self.stats.bidding_optimizer_steps += 1
+            self.stats.learner_bidding_samples += len(
+                bidding_batch.transitions
+            )
         self.stats.learner_cardplay_samples += len(rows)
         self._segments["learner"] += time.perf_counter() - started
         return metrics
@@ -1968,6 +2217,21 @@ class V3AsyncSingleGPUTrainer:
                 _public_aux_parameter_bytes(self.model)
                 + _public_aux_parameter_bytes(self.inference_model)
             ),
+            "bidding_replay_occupancy": (
+                0 if self.bidding_buffer is None else len(self.bidding_buffer)
+            ),
+            "bidding_transitions_collected": (
+                self.stats.bidding_transitions_collected
+            ),
+            "bidding_optimizer_steps": self.stats.bidding_optimizer_steps,
+            "bidding_parameter_vram_bytes": (
+                0
+                if self.model.bidding_heads is None
+                else 2 * sum(
+                    parameter.numel() * parameter.element_size()
+                    for parameter in self.model.bidding_heads.parameters()
+                )
+            ),
             "requests_per_microbatch": self._requests / max(1, self._microbatches),
             "actions_per_microbatch": self._actions / max(1, self._microbatches),
             "inference_queue_p50_ms": percentile(0.50),
@@ -1997,6 +2261,8 @@ class V3AsyncSingleGPUTrainer:
             self.cooperation_buffer.clear()
         if self.strategy_target_buffer is not None:
             self.strategy_target_buffer.clear()
+        if self.bidding_buffer is not None:
+            self.bidding_buffer.clear()
 
     def save_training_checkpoint(self, path: str, *, long_running_state) -> None:
         if self._belief_alignment is not None:
@@ -2066,6 +2332,9 @@ class V3AsyncSingleGPUTrainer:
             "cooperation_incomplete_episodes",
             "cooperation_oversized_episodes",
             "strategy_labels_collected", "strategy_optimizer_steps",
+            "bidding_transitions_collected", "bidding_decisions_collected",
+            "abandoned_bidding_transitions", "bidding_eligible_steps",
+            "bidding_optimizer_steps", "learner_bidding_samples", "redeals",
         }:
             raise ValueError("H7 checkpoint statistics fields mismatch")
         candidate_stats = V3H7RuntimeStats(**stats_payload)
@@ -2081,6 +2350,9 @@ class V3AsyncSingleGPUTrainer:
             "cooperation_incomplete_episodes",
             "cooperation_oversized_episodes",
             "strategy_labels_collected", "strategy_optimizer_steps",
+            "bidding_transitions_collected", "bidding_decisions_collected",
+            "abandoned_bidding_transitions", "bidding_eligible_steps",
+            "bidding_optimizer_steps", "learner_bidding_samples", "redeals",
         ):
             value = getattr(candidate_stats, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -2121,6 +2393,16 @@ class V3AsyncSingleGPUTrainer:
             raise ValueError(
                 "H7 checkpoint contains unexpected strategy progress"
             )
+        if not self.config.bidding_runtime_enabled and any((
+            candidate_stats.bidding_transitions_collected,
+            candidate_stats.bidding_decisions_collected,
+            candidate_stats.abandoned_bidding_transitions,
+            candidate_stats.bidding_eligible_steps,
+            candidate_stats.bidding_optimizer_steps,
+            candidate_stats.learner_bidding_samples,
+            candidate_stats.redeals,
+        )):
+            raise ValueError("H7 checkpoint contains unexpected bidding progress")
         if (
             candidate_stats.belief_optimizer_steps
             > candidate_stats.optimizer_steps
@@ -2157,6 +2439,16 @@ class V3AsyncSingleGPUTrainer:
             > candidate_stats.transitions_collected
         ):
             raise ValueError("H7 checkpoint strategy statistics are invalid")
+        if self.config.bidding_runtime_enabled and (
+            candidate_stats.bidding_decisions_collected
+            != candidate_stats.bidding_transitions_collected
+            + candidate_stats.abandoned_bidding_transitions
+            or candidate_stats.bidding_eligible_steps
+            != candidate_stats.optimizer_steps
+            or candidate_stats.bidding_optimizer_steps
+            > candidate_stats.bidding_eligible_steps
+        ):
+            raise ValueError("H7 checkpoint bidding statistics are invalid")
         candidate_rng = random.Random()
         candidate_rng.setstate(bundle["rng_state"])
         snapshot_step = bundle["snapshot_step"]
@@ -2224,6 +2516,7 @@ class V3AsyncSingleGPUTrainer:
                     self._belief_sidecar_queue,
                     self._oracle_sidecar_queue,
                     self._cooperation_sidecar_queue,
+                    self._bidding_replay_queue,
                 ),
                 5.0,
             )
@@ -2253,6 +2546,9 @@ class V3AsyncSingleGPUTrainer:
             if self._cooperation_sidecar_queue is not None:
                 self._cooperation_sidecar_queue.close()
                 self._cooperation_sidecar_queue.join_thread()
+            if self._bidding_replay_queue is not None:
+                self._bidding_replay_queue.close()
+                self._bidding_replay_queue.join_thread()
             if self._cooperation_alignment is not None:
                 self._cooperation_alignment.discard_pending()
             self._tasks.close()
@@ -2282,6 +2578,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
 
         from douzero.env.env import Env
         from douzero.observation.encode_v2 import get_obs_v2
+        from douzero.observation.bidding import get_bidding_obs_v2
         from douzero.observation.privileged import PrivilegedObservation
         from douzero.training.v2_buffer import Episode, Transition
 
@@ -2344,17 +2641,123 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                 == FORMAL_SEED_DERIVATION_V1
                 else self._rng
             )
-            env = Env("adp")
-            env.reset()
+            env = Env(
+                "adp",
+                ruleset=(
+                    self.learner.ruleset
+                    if self.config.bidding_runtime_enabled
+                    else None
+                ),
+            )
+            bidding_order = None
+            if self.config.bidding_runtime_enabled:
+                seats = ["0", "1", "2"]
+                offset = (
+                    episode_number % len(seats)
+                    if self.config.first_bidder_mode == "rotate"
+                    else action_rng.randrange(len(seats))
+                )
+                bidding_order = seats[offset:] + seats[:offset]
+            env.reset(bidding_order=bidding_order)
             pending = []
             pending_belief = []
             pending_oracle = []
             pending_cooperation = []
             pending_strategy_transitions = []
+            pending_bidding = []
+            bidding_decisions = 0
+            abandoned_bidding = 0
+            redeals = 0
             action_trace = []
             decisions = 0
             steps = 0
             while True:
+                if (
+                    self.config.bidding_runtime_enabled
+                    and env.bidding_obs is not None
+                ):
+                    bid_obs = get_bidding_obs_v2(
+                        env.bidding_obs,
+                        ruleset=self.learner.ruleset,
+                        redeal_count=env._redeal_count,
+                    )
+                    bidding_config = BiddingPolicyConfig(
+                        policy=self.config.bidding_policy,
+                        warm_start_policy=self.config.bidding_warm_start_policy,
+                        learned_probability=(
+                            self.config.bidding_learned_probability
+                        ),
+                    )
+                    use_learned = (
+                        bidding_config.policy == "learned"
+                        and action_rng.random()
+                        < bidding_config.learned_probability
+                    )
+                    if use_learned:
+                        started = time.perf_counter()
+                        with torch.inference_mode():
+                            bid = self.inference_model.forward_bidding(
+                                bid_obs
+                            ).argmax_bid()
+                        torch.cuda.synchronize(self.device)
+                        self._segments["forward"] += (
+                            time.perf_counter() - started
+                        )
+                        source = "learned"
+                    else:
+                        policy = bidding_config
+                        if policy.policy == "learned":
+                            policy = BiddingPolicyConfig(
+                                policy=policy.warm_start_policy,
+                                warm_start_policy=policy.warm_start_policy,
+                            )
+                        from douzero.training.bidding import select_bidding_action
+
+                        bid, source = select_bidding_action(
+                            bid_obs, policy, action_rng
+                        )
+                    pending_bidding.append(BiddingTransition(
+                        obs=bid_obs,
+                        bid_action=bid,
+                        policy_version=self.policy_version,
+                        source_policy=source,
+                    ))
+                    bidding_decisions += 1
+                    _obs, _reward, done, info = env.step(
+                        None, bid_value=bid
+                    )
+                    steps += 1
+                    if done and info.get("redeal"):
+                        abandoned_bidding += len(pending_bidding)
+                        pending_bidding.clear()
+                        redeals = int(info["redeal_count"])
+                        env.redeal()
+                        continue
+                    if info.get("max_redeals_exceeded"):
+                        if env.bidding_obs is not None:
+                            raise RuntimeError(
+                                "environment redeal-cap transition did not enter "
+                                "card play"
+                            )
+                        for transition in pending_bidding:
+                            transition.assign_actor_role(
+                                env._env._seat_to_role
+                            )
+                        continue
+                    if done:
+                        raise RuntimeError(
+                            "H7.1e bidding ended without card play"
+                        )
+                    if env.bidding_obs is None:
+                        for transition in pending_bidding:
+                            transition.assign_actor_role(
+                                env._env._seat_to_role
+                            )
+                    if steps >= self.config.max_steps_per_episode:
+                        raise RuntimeError(
+                            "H7 single-process episode exceeded max_steps_per_episode"
+                        )
+                    continue
                 position = env._acting_player_position
                 legal_actions = env.infoset.legal_actions
                 decisions += 1
@@ -2476,6 +2879,17 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                 row.finalize(float(team_targets[row.role]["target_score"]))
                 for row in pending
             ]
+            if self.bidding_buffer is not None:
+                for transition in pending_bidding:
+                    transition.label_from_terminal(terminal)
+                    transition.validate()
+                    self.bidding_buffer.append(transition)
+                self.stats.bidding_transitions_collected += len(
+                    pending_bidding
+                )
+                self.stats.bidding_decisions_collected += bidding_decisions
+                self.stats.abandoned_bidding_transitions += abandoned_bidding
+                self.stats.redeals += redeals
             self.buffer.extend(rows)
             if self.strategy_target_buffer is not None:
                 episode = Episode(
@@ -2586,6 +3000,8 @@ __all__ = [
     "V3_H71C_REQUEST_PROTOCOL",
     "V3_H71D_REPLAY_PROTOCOL",
     "V3_H71D_REQUEST_PROTOCOL",
+    "V3_H71E_REPLAY_PROTOCOL",
+    "V3_H71E_REQUEST_PROTOCOL",
     "V3_H7_CHECKPOINT_FORMAT",
     "V3_H7_REPLAY_PROTOCOL",
     "V3_H7_REQUEST_PROTOCOL",
