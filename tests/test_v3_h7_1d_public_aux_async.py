@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import inspect
 import sys
-import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -215,15 +214,13 @@ def test_public_feature_cache_and_strategy_labels_round_trip_exactly():
     transition.target_structure_cost = 4.0
     slots.write_transition(transition, bundle, 7, 1.0)
     try:
-        deadline = time.monotonic() + 1.0
-        records = []
-        while not records and time.monotonic() < deadline:
-            records = slots.read_ready_v3_aligned(
-                feature_schema_hash=bundle.feature_schema_hash,
-                target_transform="raw",
-                ruleset_identity=RuleSet.legacy().identity(),
-                include_strategy_targets=True,
-            )
+        assert slots.ready_queue._reader.poll(5.0)
+        records = slots.read_ready_v3_aligned(
+            feature_schema_hash=bundle.feature_schema_hash,
+            target_transform="raw",
+            ruleset_identity=RuleSet.legacy().identity(),
+            include_strategy_targets=True,
+        )
     finally:
         slots.close()
     assert len(records) == 1
