@@ -2320,8 +2320,12 @@ class V3AsyncSingleGPUTrainer:
 
     def step(self):
         """Run one learner update for the shared long-running controller."""
+        public_auxiliary_active = (
+            self.learner.public_auxiliary_training_active()
+        )
         bidding_due = (
             self.bidding_buffer is not None
+            and public_auxiliary_active
             and self.stats.bidding_eligible_steps
             % self.config.bidding_update_interval
             == 0
@@ -2368,8 +2372,12 @@ class V3AsyncSingleGPUTrainer:
         oracle_samples = self._oracle_samples_for_indices(
             indices, episode_oracle_samples
         )
-        strategy_targets = self._strategy_targets_for_indices(
-            indices, episode_strategy_targets
+        strategy_targets = (
+            self._strategy_targets_for_indices(
+                indices, episode_strategy_targets
+            )
+            if public_auxiliary_active
+            else None
         )
         bidding_batch = (
             BiddingMinibatch(self._rng.sample(
@@ -2402,7 +2410,7 @@ class V3AsyncSingleGPUTrainer:
         ):
             self.stats.strategy_optimizer_steps += 1
         self.stats.optimizer_steps += 1
-        if self.bidding_buffer is not None:
+        if self.bidding_buffer is not None and public_auxiliary_active:
             self.stats.bidding_eligible_steps += 1
         if bidding_batch is not None:
             self.stats.bidding_optimizer_steps += 1

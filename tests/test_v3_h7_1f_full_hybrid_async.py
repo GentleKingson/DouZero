@@ -389,6 +389,8 @@ def test_full_hybrid_standard_cuda_updates_cardplay_and_bidding():
         ROOT / "configs/v3_formal/v3_full_hybrid_standard.yaml"
     )
     learner, resolved = create_pilot_learner(formal, allow_standard=True)
+    h3 = learner.base.base.base
+    h3.learner_updates = h3.config.schedule.warmup_updates
     runtime = V3AsyncSingleGPUTrainer(
         learner, resolved, _runtime_config(bidding=True)
     )
