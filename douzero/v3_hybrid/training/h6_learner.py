@@ -819,6 +819,23 @@ class V3H6Learner:
             BELIEF_PHASE_POLICY,
         }
 
+    def prime_guided_benchmark_phase(self) -> None:
+        """Prime every nested learner counter to the guided benchmark boundary."""
+
+        if (
+            self.eligible_updates != 0
+            or self.samples_consumed != 0
+            or self.public_aux_updates != 0
+            or self.statistics.state_dict() != H6CumulativeStats().state_dict()
+        ):
+            raise RuntimeError(
+                "guided benchmark phase can only prime a fresh H6 learner"
+            )
+        self.base.prime_guided_benchmark_phase()
+        warmup_updates = self.base.eligible_updates
+        self.eligible_updates = warmup_updates
+        self.statistics.steps = warmup_updates
+
     def _inner_bundle(self) -> dict[str, object]:
         with tempfile.TemporaryDirectory(prefix="douzero-h6-save-") as temporary:
             path = Path(temporary) / "h5.pt"

@@ -220,16 +220,27 @@ def test_guided_benchmark_phase_priming_is_checkpoint_consistent(tmp_path):
         ROOT / "configs/v3_formal/v3_full_hybrid_standard.yaml"
     )
     learner, _ = create_pilot_learner(formal, allow_standard=True)
-    h3 = learner.base.base.base
-    h3.prime_guided_benchmark_phase()
-    checkpoint = tmp_path / "guided-h3.pt"
-    h3.save_checkpoint(checkpoint)
+    learner.prime_guided_benchmark_phase()
+    checkpoint = tmp_path / "guided-h6.pt"
+    learner.save_checkpoint(checkpoint)
 
     restored, _ = create_pilot_learner(formal, allow_standard=True)
+    restored.load_checkpoint(checkpoint)
     restored_h3 = restored.base.base.base
-    restored_h3.load_checkpoint(checkpoint)
     assert restored_h3.schedule_state().phase == "guided"
-    assert restored_h3.learner_updates == h3.config.schedule.warmup_updates
+    assert (
+        restored.eligible_updates
+        == restored.base.eligible_updates
+        == restored.base.base.eligible_updates
+        == restored_h3.learner_updates
+        == restored_h3.config.schedule.warmup_updates
+    )
+    assert restored.statistics.steps == restored.eligible_updates
+    assert restored.base.statistics.steps == restored.base.eligible_updates
+    assert (
+        restored.base.base.statistics.steps
+        == restored.base.base.eligible_updates
+    )
     assert restored_h3.statistics.steps == restored_h3.learner_updates
     assert restored_h3.statistics.decisions == restored_h3.samples_consumed == 0
 
@@ -420,8 +431,7 @@ def test_full_hybrid_standard_cuda_updates_cardplay_and_bidding():
         ROOT / "configs/v3_formal/v3_full_hybrid_standard.yaml"
     )
     learner, resolved = create_pilot_learner(formal, allow_standard=True)
-    h3 = learner.base.base.base
-    h3.prime_guided_benchmark_phase()
+    learner.prime_guided_benchmark_phase()
     runtime = V3AsyncSingleGPUTrainer(
         learner, resolved, _runtime_config(bidding=True)
     )
@@ -440,3 +450,45 @@ def test_full_hybrid_standard_cuda_updates_cardplay_and_bidding():
         assert counts["pending_requests"] == 0
     finally:
         runtime.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_full_hybrid_standard_warmup_checkpoint_resume(tmp_path):
+    formal = load_formal_config(
+        ROOT / "configs/v3_formal/v3_full_hybrid_standard.yaml"
+    )
+    learner, resolved = create_pilot_learner(formal, allow_standard=True)
+    runtime_config = _runtime_config(bidding=True)
+    runtime = V3AsyncSingleGPUTrainer(learner, resolved, runtime_config)
+    checkpoint = tmp_path / "h71f-standard-warmup.pt"
+    try:
+        runtime.collect_episodes(1)
+        runtime.optimize(1)
+        assert runtime.stats.bidding_optimizer_steps == 0
+        assert (
+            runtime.stats.bidding_eligible_steps
+            == runtime.stats.optimizer_steps
+            == 1
+        )
+        runtime.quiesce_cycle_boundary()
+        runtime.save_training_checkpoint(
+            checkpoint, long_running_state={"cycle": 1}
+        )
+    finally:
+        runtime.shutdown()
+
+    restored_learner, restored_resolved = create_pilot_learner(
+        formal, allow_standard=True
+    )
+    restored = V3AsyncSingleGPUTrainer(
+        restored_learner, restored_resolved, runtime_config
+    )
+    try:
+        assert restored.load_training_checkpoint(checkpoint) == {"cycle": 1}
+        assert (
+            restored.stats.bidding_eligible_steps
+            == restored.stats.optimizer_steps
+            == 1
+        )
+    finally:
+        restored.shutdown()

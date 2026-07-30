@@ -2405,7 +2405,7 @@ class V3AsyncSingleGPUTrainer:
         ):
             self.stats.strategy_optimizer_steps += 1
         self.stats.optimizer_steps += 1
-        if self.bidding_buffer is not None and public_auxiliary_active:
+        if self.bidding_buffer is not None:
             self.stats.bidding_eligible_steps += 1
         if bidding_batch is not None:
             self.stats.bidding_optimizer_steps += 1

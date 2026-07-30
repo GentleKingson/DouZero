@@ -428,6 +428,22 @@ class V3H5Learner:
             raise RuntimeError("H5 H6 policy-version owner binding is invalid")
         self._h6_policy_version_owner = owner
 
+    def prime_guided_benchmark_phase(self) -> None:
+        """Prime the nested Oracle schedule and matching H5 progress."""
+
+        if (
+            self.eligible_updates != 0
+            or self.samples_consumed != 0
+            or self.statistics.state_dict() != H5CumulativeStats().state_dict()
+        ):
+            raise RuntimeError(
+                "guided benchmark phase can only prime a fresh H5 learner"
+            )
+        self.base.prime_guided_benchmark_phase()
+        warmup_updates = self.base.eligible_updates
+        self.eligible_updates = warmup_updates
+        self.statistics.steps = warmup_updates
+
     @staticmethod
     def _gradient_norm(parameters: Sequence[torch.nn.Parameter]) -> float:
         values = [
