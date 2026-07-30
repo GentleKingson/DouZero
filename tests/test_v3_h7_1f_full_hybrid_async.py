@@ -318,6 +318,8 @@ def test_full_hybrid_alignment_attaches_every_auxiliary_atomically():
     trainer._full_oracle_samples = {}
     trainer._full_strategy_targets = {}
     trainer._pending_cooperation_episodes = deque()
+    trainer._full_discarded_keys = deque()
+    trainer._full_discarded_key_set = set()
     trainer.buffer = deque(maxlen=32)
     trainer.belief_buffer = deque(maxlen=32)
     trainer.oracle_buffer = deque(maxlen=32)

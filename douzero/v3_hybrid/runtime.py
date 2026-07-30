@@ -1360,6 +1360,8 @@ class V3AsyncSingleGPUTrainer:
         self._pending_cooperation_episodes: deque[
             V3H71CCooperationEpisode
         ] = deque()
+        self._full_discarded_keys: deque[AsyncReplayKey] = deque()
+        self._full_discarded_key_set: set[AsyncReplayKey] = set()
         self._rng = random.Random(runtime_config.action_seed)
         self._runtime_started = False
         self._served_version_offset = 0
@@ -1978,15 +1980,20 @@ class V3AsyncSingleGPUTrainer:
                         key, row, cooperation_sidecar
                     )
         for key, sidecar in belief_sidecars.items():
-            self._belief_alignment.add_sidecar(key, sidecar)
+            if key not in self._full_discarded_key_set:
+                self._belief_alignment.add_sidecar(key, sidecar)
         for key, sidecar in oracle_sidecars.items():
-            self._oracle_alignment.add_sidecar(key, sidecar)
+            if key not in self._full_discarded_key_set:
+                self._oracle_alignment.add_sidecar(key, sidecar)
         for key, sidecar in cooperation_sidecars.items():
-            self._cooperation_alignment.add_sidecar(key, sidecar)
+            if key not in self._full_discarded_key_set:
+                self._cooperation_alignment.add_sidecar(key, sidecar)
         for key, _row, sample in self._belief_alignment.pop_ready_keyed():
-            self._full_belief_samples[key] = sample
+            if key not in self._full_discarded_key_set:
+                self._full_belief_samples[key] = sample
         for key, _row, sample in self._oracle_alignment.pop_ready_keyed():
-            self._full_oracle_samples[key] = sample
+            if key not in self._full_discarded_key_set:
+                self._full_oracle_samples[key] = sample
         self._cooperation_alignment.pop_ready_pairs()
         self._pending_cooperation_episodes.extend(
             self._cooperation_alignment.pop_ready_episodes()
@@ -2006,9 +2013,14 @@ class V3AsyncSingleGPUTrainer:
         ):
             raise RuntimeError("H7.1f complete episode staging exceeded capacity")
         for key in self._cooperation_alignment.pop_discarded_keys():
+            self._remember_full_discarded_key(key)
             self._full_belief_samples.pop(key, None)
             self._full_oracle_samples.pop(key, None)
             self._full_strategy_targets.pop(key, None)
+            self._belief_alignment.public_rows.pop(key, None)
+            self._belief_alignment.sidecars.pop(key, None)
+            self._oracle_alignment.public_rows.pop(key, None)
+            self._oracle_alignment.sidecars.pop(key, None)
         pending = deque()
         while self._pending_cooperation_episodes:
             episode = self._pending_cooperation_episodes.popleft()
@@ -2056,6 +2068,16 @@ class V3AsyncSingleGPUTrainer:
             self._cooperation_alignment.oversized_episodes
         )
         return len(enriched)
+
+    def _remember_full_discarded_key(self, key: AsyncReplayKey) -> None:
+        if key in self._full_discarded_key_set:
+            return
+        capacity = self._cooperation_alignment.capacity
+        if len(self._full_discarded_keys) == capacity:
+            expired = self._full_discarded_keys.popleft()
+            self._full_discarded_key_set.remove(expired)
+        self._full_discarded_keys.append(key)
+        self._full_discarded_key_set.add(key)
 
     def _drain_bidding_replay(self) -> int:
         if self.bidding_buffer is None:
@@ -2657,6 +2679,8 @@ class V3AsyncSingleGPUTrainer:
         self._full_oracle_samples.clear()
         self._full_strategy_targets.clear()
         self._pending_cooperation_episodes.clear()
+        self._full_discarded_keys.clear()
+        self._full_discarded_key_set.clear()
 
     def save_training_checkpoint(self, path: str, *, long_running_state) -> None:
         if self._belief_alignment is not None:
@@ -2965,6 +2989,8 @@ class V3AsyncSingleGPUTrainer:
             self._full_oracle_samples.clear()
             self._full_strategy_targets.clear()
             self._pending_cooperation_episodes.clear()
+            self._full_discarded_keys.clear()
+            self._full_discarded_key_set.clear()
             self._tasks.close()
             self._events.close()
             self._runtime_started = False
