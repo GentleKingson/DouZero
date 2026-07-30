@@ -21,9 +21,10 @@ checkpoint I/O.
 - Request protocol:
   `v2-shared-slots-v3-standard-separate-bid-cardplay-actions-v1`.
 - Replay protocol:
-  `v3-public-cardplay-plus-separate-terminal-labelled-bidding-replay-v1`.
+  `v3-public-cardplay-plus-separate-bidding-replay-redeal-cap-excluded-v2`.
 - Replay: card-play and bidding rows use separate bounded buffers.
 - Commit: abandoned all-pass auction rows never receive a later deal's labels.
+- Guard: a redeal-cap fallback game is excluded from all training replay.
 - Cadence: `bidding_eligible_steps` advances after each successful public
   optimizer update; `bidding_update_interval` and its counter are checkpointed.
 - Resume: replay is flushed at the checkpoint boundary; model, optimizer,

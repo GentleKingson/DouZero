@@ -74,7 +74,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v14"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v15"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v8"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -107,7 +107,7 @@ V3_H71E_REQUEST_PROTOCOL = (
     "v2-shared-slots-v3-standard-separate-bid-cardplay-actions-v1"
 )
 V3_H71E_REPLAY_PROTOCOL = (
-    "v3-public-cardplay-plus-separate-terminal-labelled-bidding-replay-v1"
+    "v3-public-cardplay-plus-separate-bidding-replay-redeal-cap-excluded-v2"
 )
 V3_H71AB_REQUEST_PROTOCOL = (
     "v2-shared-slots-v3-dmc-q-belief-oracle-sidecars-v1"
