@@ -218,7 +218,10 @@ def test_h71d_cuda_update_checkpoint_resume_and_shutdown(tmp_path):
         assert metrics is not None
         assert metrics.public_aux_updated
         assert trainer.stats.strategy_optimizer_steps == 1
-        assert trainer.stats.strategy_labels_collected == len(trainer.buffer)
+        assert (
+            trainer.stats.strategy_labels_collected
+            == trainer.stats.transitions_collected
+        )
         assert trainer._parameters_changed_since(before)
         boundary = trainer.quiesce_cycle_boundary()
         assert boundary["active_slots"] == 0
