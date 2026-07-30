@@ -1362,6 +1362,11 @@ class V3AsyncSingleGPUTrainer:
         ] = deque()
         self._full_discarded_keys: deque[AsyncReplayKey] = deque()
         self._full_discarded_key_set: set[AsyncReplayKey] = set()
+        self._full_sidecars_received = {
+            "belief": 0,
+            "oracle": 0,
+            "cooperation": 0,
+        }
         self._rng = random.Random(runtime_config.action_seed)
         self._runtime_started = False
         self._served_version_offset = 0
@@ -1951,6 +1956,11 @@ class V3AsyncSingleGPUTrainer:
             V3H5AsyncDecisionSidecar,
             "cooperation",
         )
+        self._full_sidecars_received["belief"] += len(belief_sidecars)
+        self._full_sidecars_received["oracle"] += len(oracle_sidecars)
+        self._full_sidecars_received["cooperation"] += len(
+            cooperation_sidecars
+        )
         for row, key, targets in enriched:
             self._full_strategy_targets[key] = targets
             belief_sidecar = belief_sidecars.pop(key, None)
@@ -2142,16 +2152,28 @@ class V3AsyncSingleGPUTrainer:
             self._tasks.put(episode_id)
         completed = expected = received = 0
         expected_bids = received_bids = 0
+        expected_sidecars = {"belief": 0, "oracle": 0, "cooperation": 0}
+        initial_sidecars = dict(self._full_sidecars_received)
         deadline = time.monotonic() + self.config.request_timeout_seconds * max(1, target)
         while True:
             self._coordinator._raise_if_failed()
             self._service_requests()
             received += self._drain_replay()
             received_bids += self._drain_bidding_replay()
+            sidecars_complete = (
+                not self._full_hybrid_runtime
+                or all(
+                    self._full_sidecars_received[name]
+                    - initial_sidecars[name]
+                    >= expected_sidecars[name]
+                    for name in expected_sidecars
+                )
+            )
             if (
                 completed >= target
                 and received >= expected
                 and received_bids >= expected_bids
+                and sidecars_complete
             ):
                 needs_retry = (
                     self.cooperation_buffer is not None
@@ -2242,6 +2264,12 @@ class V3AsyncSingleGPUTrainer:
                         event[9],
                         total_count=count,
                     )
+                    if self._full_hybrid_runtime:
+                        expected_sidecars["belief"] += count
+                        expected_sidecars["oracle"] += count
+                        expected_sidecars["cooperation"] += sum(
+                            int(event[9][role]) for role in FARMER_ROLES
+                        )
                     if not self._full_hybrid_runtime:
                         episodes = self._cooperation_alignment.pop_ready_episodes()
                         self._cooperation_alignment.pop_discarded_keys()

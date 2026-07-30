@@ -320,6 +320,11 @@ def test_full_hybrid_alignment_attaches_every_auxiliary_atomically():
     trainer._pending_cooperation_episodes = deque()
     trainer._full_discarded_keys = deque()
     trainer._full_discarded_key_set = set()
+    trainer._full_sidecars_received = {
+        "belief": 0,
+        "oracle": 0,
+        "cooperation": 0,
+    }
     trainer.buffer = deque(maxlen=32)
     trainer.belief_buffer = deque(maxlen=32)
     trainer.oracle_buffer = deque(maxlen=32)
