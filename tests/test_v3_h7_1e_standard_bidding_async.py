@@ -103,6 +103,19 @@ def test_h71e_support_and_startup_fail_closed_before_cuda():
             request_protocol=V3_H71E_REQUEST_PROTOCOL,
             replay_protocol=V3_H71E_REPLAY_PROTOCOL,
         )
+    assert V3H7RuntimeConfig(optimizer_steps_per_cycle=0)
+    assert _runtime(
+        bidding_policy="pass",
+        optimizer_steps_per_cycle=0,
+    )
+    with pytest.raises(ValueError, match="pass-only bidding"):
+        _runtime(bidding_policy="pass")
+    with pytest.raises(ValueError, match="pass-only bidding"):
+        _runtime(
+            bidding_policy="learned",
+            bidding_learned_probability=0.0,
+            bidding_warm_start_policy="pass",
+        )
 
 
 def test_bidding_slots_round_trip_public_neutral_seat_action_space():
@@ -224,6 +237,9 @@ def test_h71e_collection_retry_requires_due_underfilled_bidding_replay():
             "update_interval": 2,
             "planned_optimizer_steps": 2,
         }
+    )
+    assert not _h71e_needs_collection_retry(
+        **{**base, "planned_optimizer_steps": 0}
     )
     assert not _h71e_needs_collection_retry(
         **{**base, "received": 11}
@@ -351,6 +367,7 @@ def test_h71e_redeal_cap_guard_excludes_entire_episode():
         games_per_actor=1,
         bidding_policy="pass",
         bidding_update_interval=2,
+        optimizer_steps_per_cycle=0,
     )
     model = V3HybridModel(build_v2_schema(), resolved.model)
     learner = V3H6Learner(
@@ -376,6 +393,7 @@ def test_h71e_redeal_cap_guard_excludes_entire_episode():
         games_per_actor=1,
         bidding_policy="pass",
         bidding_update_interval=2,
+        optimizer_steps_per_cycle=0,
     )
     async_model = V3HybridModel(build_v2_schema(), resolved.model)
     async_learner = V3H6Learner(

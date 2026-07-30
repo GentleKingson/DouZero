@@ -74,7 +74,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v18"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v19"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v8"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -231,7 +231,6 @@ class V3H7RuntimeConfig:
         positive = (
             "num_actors", "games_per_actor", "batch_size", "replay_capacity",
             "max_actions", "target_microbatch", "max_policy_lag",
-            "optimizer_steps_per_cycle",
             "max_steps_per_episode", "belief_sidecar_capacity",
             "oracle_sidecar_capacity", "cooperation_sidecar_capacity",
             "cooperation_episode_capacity",
@@ -242,6 +241,15 @@ class V3H7RuntimeConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"H7 runtime {name} must be a positive int")
+        if (
+            isinstance(self.optimizer_steps_per_cycle, bool)
+            or not isinstance(self.optimizer_steps_per_cycle, int)
+            or self.optimizer_steps_per_cycle < 0
+        ):
+            raise ValueError(
+                "H7 runtime optimizer_steps_per_cycle must be a "
+                "non-negative int"
+            )
         for name in ("environment_seed", "action_seed"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -267,6 +275,24 @@ class V3H7RuntimeConfig:
             warm_start_policy=self.bidding_warm_start_policy,
             learned_probability=self.bidding_learned_probability,
         )
+        bidding_replay_is_impossible = (
+            self.bidding_policy == "pass"
+            or (
+                self.bidding_policy == "learned"
+                and self.bidding_learned_probability == 0.0
+                and self.bidding_warm_start_policy == "pass"
+            )
+        )
+        if (
+            self.bidding_runtime_enabled
+            and self.optimizer_steps_per_cycle > 0
+            and bidding_replay_is_impossible
+        ):
+            raise ValueError(
+                "H7.1e pass-only bidding cannot populate replay for "
+                "optimizer updates; use a non-pass policy or a zero-step "
+                "collection cycle"
+            )
         if self.first_bidder_mode not in {"rotate", "seeded_random"}:
             raise ValueError("H7 first_bidder_mode is unsupported")
         enabled_sidecars = sum((
@@ -942,8 +968,10 @@ def _h71e_needs_collection_retry(
         for value in values
     ):
         raise ValueError("H7.1e collection retry counters must be non-negative ints")
-    if batch_size < 1 or update_interval < 1 or planned_optimizer_steps < 1:
+    if batch_size < 1 or update_interval < 1:
         raise ValueError("H7.1e collection retry sizes must be positive")
+    if planned_optimizer_steps == 0:
+        return False
     steps_until_due = (-eligible_steps) % update_interval
     return (
         completed >= target
