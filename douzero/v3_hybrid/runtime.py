@@ -32,6 +32,7 @@ from douzero.training.async_single_gpu import (
     PinnedObservationBatchStager,
     RequestKind,
     SharedReplaySlots,
+    _check_actor_step_limit,
     async_actor_main,
 )
 from douzero.training.bidding import (
@@ -74,7 +75,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v19"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v20"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v8"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -2841,6 +2842,9 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                         None, bid_value=bid
                     )
                     steps += 1
+                    _check_actor_step_limit(
+                        steps, self.config.max_steps_per_episode
+                    )
                     if done and info.get("redeal"):
                         abandoned_bidding += len(pending_bidding)
                         pending_bidding.clear()
@@ -2866,10 +2870,6 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                             transition.assign_actor_role(
                                 env._env._seat_to_role
                             )
-                    if steps >= self.config.max_steps_per_episode:
-                        raise RuntimeError(
-                            "H7 single-process episode exceeded max_steps_per_episode"
-                        )
                     continue
                 position = env._acting_player_position
                 legal_actions = env.infoset.legal_actions
