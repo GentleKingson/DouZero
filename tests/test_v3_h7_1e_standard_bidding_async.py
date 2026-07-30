@@ -310,6 +310,37 @@ def test_h71e_redeal_cap_guard_excludes_entire_episode():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_h71e_default_cycle_collects_until_bidding_batch_is_ready():
+    from douzero.v3_hybrid import V3HybridModel
+    from douzero.v3_hybrid.training.h6_learner import V3H6Learner
+
+    resolved = _resolved()
+    runtime = _runtime(
+        topology="single_process",
+        num_actors=1,
+        games_per_actor=1,
+        batch_size=32,
+        bidding_batch_size=16,
+    )
+    model = V3HybridModel(build_v2_schema(), resolved.model)
+    learner = V3H6Learner(
+        model,
+        ruleset=RuleSet.standard(),
+        config=resolved,
+    )
+    trainer = V3SingleProcessTrainer(learner, resolved, runtime)
+    try:
+        trainer.collect_episodes(4)
+        assert len(trainer.buffer) >= runtime.batch_size
+        assert trainer.bidding_buffer is not None
+        assert len(trainer.bidding_buffer) >= runtime.bidding_batch_size
+        assert trainer.step() is not None
+        assert trainer.stats.bidding_optimizer_steps == 1
+    finally:
+        trainer.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_h71e_cuda_update_checkpoint_resume_and_shutdown(tmp_path):
     from douzero.v3_hybrid import V3HybridModel
     from douzero.v3_hybrid.training.h6_learner import V3H6Learner
