@@ -2668,6 +2668,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
             bidding_decisions = 0
             abandoned_bidding = 0
             redeals = 0
+            redeal_cap_guard = False
             action_trace = []
             decisions = 0
             steps = 0
@@ -2739,10 +2740,9 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                                 "environment redeal-cap transition did not enter "
                                 "card play"
                             )
-                        for transition in pending_bidding:
-                            transition.assign_actor_role(
-                                env._env._seat_to_role
-                            )
+                        abandoned_bidding += len(pending_bidding)
+                        pending_bidding.clear()
+                        redeal_cap_guard = True
                         continue
                     if done:
                         raise RuntimeError(
@@ -2875,6 +2875,13 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
             team_targets = terminal.get("team_targets")
             if not isinstance(team_targets, dict):
                 raise ValueError("H7 terminal result is missing team_targets")
+            if redeal_cap_guard:
+                pending.clear()
+                pending_bidding.clear()
+                pending_strategy_transitions.clear()
+                pending_belief.clear()
+                pending_oracle.clear()
+                pending_cooperation.clear()
             rows = [
                 row.finalize(float(team_targets[row.role]["target_score"]))
                 for row in pending

@@ -26,6 +26,7 @@ from douzero.v3_hybrid.integration_config import load_v3_hybrid_config
 from douzero.v3_hybrid.runtime import (
     V3_H71E_REPLAY_PROTOCOL,
     V3_H71E_REQUEST_PROTOCOL,
+    V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
     validate_v3_h7_runtime_config,
@@ -281,6 +282,31 @@ def test_h71e_redeal_cap_guard_excludes_entire_episode():
         assert trainer.stats.abandoned_bidding_transitions > 0
     finally:
         trainer.shutdown()
+
+    async_runtime = _runtime(
+        num_actors=1,
+        games_per_actor=1,
+        bidding_policy="pass",
+    )
+    async_model = V3HybridModel(build_v2_schema(), resolved.model)
+    async_learner = V3H6Learner(
+        async_model,
+        ruleset=RuleSet.standard(),
+        config=resolved,
+    )
+    async_trainer = V3AsyncSingleGPUTrainer(
+        async_learner, resolved, async_runtime
+    )
+    try:
+        async_trainer.collect_episodes(1)
+        assert not async_trainer.buffer
+        assert async_trainer.bidding_buffer is not None
+        assert not async_trainer.bidding_buffer
+        assert async_trainer.stats.transitions_collected == 0
+        assert async_trainer.stats.bidding_transitions_collected == 0
+        assert async_trainer.stats.abandoned_bidding_transitions > 0
+    finally:
+        async_trainer.shutdown()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -1649,6 +1649,11 @@ def async_actor_main(
 
     def finish_game(game) -> None:
         episode = game["episode"]
+        if episode.max_redeals_exceeded:
+            episode.excluded_from_training = True
+            episode.exclusion_reason = "redeal_cap_guard"
+            episode.transitions.clear()
+            game["bidding_transitions"].clear()
         episode.label_from_terminal()
         if bidding_async:
             seat_to_role = game["env"]._env._seat_to_role
@@ -1845,9 +1850,11 @@ def async_actor_main(
                 raise RuntimeError(
                     "environment redeal-cap transition did not enter card play"
                 )
-            seat_to_role = game["env"]._env._seat_to_role
-            for transition in game["bidding_transitions"]:
-                transition.assign_actor_role(seat_to_role)
+            game["abandoned_bidding_transitions"] += len(
+                game["bidding_transitions"]
+            )
+            game["bidding_transitions"].clear()
+            game["episode"].max_redeals_exceeded = True
             return
         if done:
             raise RuntimeError(
