@@ -26,6 +26,7 @@ from douzero.v3_hybrid.benchmark import (
 )
 from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
+from douzero.v3_hybrid.integration_config import load_v3_hybrid_config
 from douzero.v3_hybrid.pilot import (
     build_pilot_resolved_config,
     create_pilot_learner,
@@ -38,6 +39,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71B_REQUEST_PROTOCOL,
     V3_H71C_REPLAY_PROTOCOL,
     V3_H71C_REQUEST_PROTOCOL,
+    V3_H71D_REPLAY_PROTOCOL,
+    V3_H71D_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -65,10 +68,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--repeat", type=int, choices=range(3), required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
+    config = parser.add_mutually_exclusive_group()
+    config.add_argument(
         "--formal-config",
         type=Path,
         help="run an H7 sidecar topology for a committed formal config",
+    )
+    config.add_argument(
+        "--config",
+        type=Path,
+        help="run a committed H7 resolved H6 configuration",
     )
     return parser
 
@@ -94,7 +103,7 @@ def _hash(payload: object) -> str:
 
 
 def _validate_live_identity(
-    protocol: V3H7BenchmarkProtocol, resolved, *, formal_config: bool
+    protocol: V3H7BenchmarkProtocol, resolved, *, bound_config: bool
 ) -> None:
     image_digest = os.environ.get("DOUZERO_IMAGE_DIGEST")
     if image_digest != protocol.image_digest:
@@ -124,10 +133,16 @@ def _validate_live_identity(
     belief_enabled = resolved.learner.features.belief
     oracle_enabled = resolved.learner.features.oracle
     cooperation_enabled = resolved.learner.features.cooperation
+    public_aux_enabled = (
+        resolved.learner.features.strategy
+        or resolved.learner.features.style
+    )
     if protocol.oracle_enabled != oracle_enabled:
         raise ValueError("H7 benchmark Oracle capability identity mismatch")
     if protocol.cooperation_enabled != cooperation_enabled:
         raise ValueError("H7 benchmark cooperation capability identity mismatch")
+    if protocol.public_aux_enabled != public_aux_enabled:
+        raise ValueError("H7 benchmark public auxiliary identity mismatch")
     request = (
         V3_H71A_REQUEST_PROTOCOL
         if belief_enabled
@@ -137,7 +152,11 @@ def _validate_live_identity(
             else (
                 V3_H71C_REQUEST_PROTOCOL
                 if cooperation_enabled
-                else V3_H7_REQUEST_PROTOCOL
+                else (
+                    V3_H71D_REQUEST_PROTOCOL
+                    if public_aux_enabled
+                    else V3_H7_REQUEST_PROTOCOL
+                )
             )
         )
     )
@@ -150,7 +169,11 @@ def _validate_live_identity(
             else (
                 V3_H71C_REPLAY_PROTOCOL
                 if cooperation_enabled
-                else V3_H7_REPLAY_PROTOCOL
+                else (
+                    V3_H71D_REPLAY_PROTOCOL
+                    if public_aux_enabled
+                    else V3_H7_REPLAY_PROTOCOL
+                )
             )
         )
     )
@@ -159,7 +182,7 @@ def _validate_live_identity(
         checkpoint_format=V3_H7_CHECKPOINT_FORMAT,
         request_protocol=request,
         resolved_learner_hash=(
-            resolved.learner.stable_hash() if formal_config else None
+            resolved.learner.stable_hash() if bound_config else None
         ),
     )
     if protocol.trainer_identity_hash != trainer_identity_hash:
@@ -217,9 +240,13 @@ def main() -> None:
     if formal is not None:
         validate_v3_h7_formal_initialization(formal.initialization.kind)
     resolved = (
-        build_v3_h7_smoke_config()
-        if formal is None
-        else build_pilot_resolved_config(formal)
+        load_v3_hybrid_config(args.config)
+        if args.config is not None
+        else (
+            build_v3_h7_smoke_config()
+            if formal is None
+            else build_pilot_resolved_config(formal)
+        )
     )
     formal_config_hash = (
         None
@@ -233,7 +260,9 @@ def main() -> None:
     if resolved.model.stable_hash() != protocol.model_identity_hash:
         raise ValueError("H7 benchmark model hash mismatch")
     _validate_live_identity(
-        protocol, resolved, formal_config=formal is not None
+        protocol,
+        resolved,
+        bound_config=formal is not None or args.config is not None,
     )
 
     if args.topology == "single_process":
@@ -248,6 +277,10 @@ def main() -> None:
     belief_enabled = resolved.learner.features.belief
     oracle_enabled = resolved.learner.features.oracle
     cooperation_enabled = resolved.learner.features.cooperation
+    public_aux_enabled = (
+        resolved.learner.features.strategy
+        or resolved.learner.features.style
+    )
     environment_seed, action_seed, seed_derivation = (
         resolve_v3_h7_seed_contract(
             formal_training_seeds=(
@@ -273,6 +306,7 @@ def main() -> None:
         belief_runtime_enabled=belief_enabled,
         oracle_runtime_enabled=oracle_enabled,
         cooperation_runtime_enabled=cooperation_enabled,
+        public_aux_runtime_enabled=public_aux_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL
             if belief_enabled
@@ -282,7 +316,11 @@ def main() -> None:
                 else (
                     V3_H71C_REQUEST_PROTOCOL
                     if cooperation_enabled
-                    else V3H7RuntimeConfig.request_protocol
+                    else (
+                        V3_H71D_REQUEST_PROTOCOL
+                        if public_aux_enabled
+                        else V3H7RuntimeConfig.request_protocol
+                    )
                 )
             )
         ),
@@ -295,7 +333,11 @@ def main() -> None:
                 else (
                     V3_H71C_REPLAY_PROTOCOL
                     if cooperation_enabled
-                    else V3H7RuntimeConfig.replay_protocol
+                    else (
+                        V3_H71D_REPLAY_PROTOCOL
+                        if public_aux_enabled
+                        else V3H7RuntimeConfig.replay_protocol
+                    )
                 )
             )
         ),
@@ -339,6 +381,8 @@ def main() -> None:
             "cooperation_steps": (
                 trainer.stats.cooperation_optimizer_steps
             ),
+            "strategy_labels": trainer.stats.strategy_labels_collected,
+            "strategy_steps": trainer.stats.strategy_optimizer_steps,
         }
         parameter_snapshot = trainer._parameter_update_snapshot()
         started = time.monotonic()
@@ -365,6 +409,8 @@ def main() -> None:
             "cooperation_steps": (
                 trainer.stats.cooperation_optimizer_steps
             ),
+            "strategy_labels": trainer.stats.strategy_labels_collected,
+            "strategy_steps": trainer.stats.strategy_optimizer_steps,
         }
         shared_memory = _shared_memory_bytes(trainer)
         args.checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -428,6 +474,15 @@ def main() -> None:
             ) / elapsed,
             "cooperation_parameter_vram_bytes": int(
                 boundary["cooperation_parameter_vram_bytes"]
+            ),
+            "strategy_samples_per_second": (
+                after["strategy_labels"] - before["strategy_labels"]
+            ) / elapsed,
+            "strategy_optimizer_steps_per_second": (
+                after["strategy_steps"] - before["strategy_steps"]
+            ) / elapsed,
+            "public_aux_parameter_vram_bytes": int(
+                boundary["public_aux_parameter_vram_bytes"]
             ),
             "requests_per_microbatch": float(boundary["requests_per_microbatch"]),
             "legal_actions_per_batch": float(boundary["actions_per_microbatch"]),
