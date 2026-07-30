@@ -74,7 +74,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v17"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v18"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v8"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -188,6 +188,7 @@ class V3H7RuntimeConfig:
     microbatch_delay_ms: float = 2.0
     request_timeout_seconds: float = 30.0
     max_policy_lag: int = 128
+    optimizer_steps_per_cycle: int = 1
     environment_seed: int = 1
     environment_seed_derivation: str = TOPOLOGY_LOCAL_SEED_DERIVATION_V1
     action_seed: int = 2
@@ -230,6 +231,7 @@ class V3H7RuntimeConfig:
         positive = (
             "num_actors", "games_per_actor", "batch_size", "replay_capacity",
             "max_actions", "target_microbatch", "max_policy_lag",
+            "optimizer_steps_per_cycle",
             "max_steps_per_episode", "belief_sidecar_capacity",
             "oracle_sidecar_capacity", "cooperation_sidecar_capacity",
             "cooperation_episode_capacity",
@@ -920,6 +922,7 @@ def _h71e_needs_collection_retry(
     batch_size: int,
     eligible_steps: int,
     update_interval: int,
+    planned_optimizer_steps: int,
 ) -> bool:
     """Return whether a due bidding update still needs eligible replay rows."""
 
@@ -932,18 +935,20 @@ def _h71e_needs_collection_retry(
         batch_size,
         eligible_steps,
         update_interval,
+        planned_optimizer_steps,
     )
     if any(
         isinstance(value, bool) or not isinstance(value, int) or value < 0
         for value in values
     ):
         raise ValueError("H7.1e collection retry counters must be non-negative ints")
-    if batch_size < 1 or update_interval < 1:
+    if batch_size < 1 or update_interval < 1 or planned_optimizer_steps < 1:
         raise ValueError("H7.1e collection retry sizes must be positive")
+    steps_until_due = (-eligible_steps) % update_interval
     return (
         completed >= target
         and received >= expected
-        and eligible_steps % update_interval == 0
+        and steps_until_due < planned_optimizer_steps
         and replay_size < batch_size
     )
 
@@ -1491,7 +1496,7 @@ class V3AsyncSingleGPUTrainer:
             )
             self._segments["slot_read"] += time.perf_counter() - started
             started = time.perf_counter()
-            batch.to(self.device, non_blocking=True)
+            batch = batch.to(self.device, non_blocking=True)
             torch.cuda.synchronize(self.device)
             self._segments["h2d"] += time.perf_counter() - started
             started = time.perf_counter()
@@ -1870,6 +1875,9 @@ class V3AsyncSingleGPUTrainer:
                         batch_size=self.config.bidding_batch_size,
                         eligible_steps=self.stats.bidding_eligible_steps,
                         update_interval=self.config.bidding_update_interval,
+                        planned_optimizer_steps=(
+                            self.config.optimizer_steps_per_cycle
+                        ),
                     )
                 )
                 if not needs_retry:
@@ -2683,6 +2691,9 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                     batch_size=self.config.bidding_batch_size,
                     eligible_steps=self.stats.bidding_eligible_steps,
                     update_interval=self.config.bidding_update_interval,
+                    planned_optimizer_steps=(
+                        self.config.optimizer_steps_per_cycle
+                    ),
                 )
             )
             if completed >= target and not needs_retry:

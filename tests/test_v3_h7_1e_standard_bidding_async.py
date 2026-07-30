@@ -15,7 +15,13 @@ from douzero.training.async_single_gpu import (
     AsyncRequestCoordinator,
     RequestKind,
     SharedBiddingSlots,
+    _async_redeal_seed,
+    _check_actor_step_limit,
     async_actor_main,
+)
+from douzero.training.seed_stream import (
+    FORMAL_SEED_DERIVATION_V1,
+    TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
 )
 from douzero.v3_hybrid.benchmark import (
     H7_TOPOLOGIES,
@@ -162,11 +168,17 @@ def test_actor_contract_uses_environment_bids_and_separate_replay():
     assert "max_redeals_exceeded" in source
 
 
+def test_h71e_bidding_h2d_uses_returned_frozen_batch():
+    source = inspect.getsource(V3AsyncSingleGPUTrainer._service_requests)
+    assert "batch = batch.to(self.device, non_blocking=True)" in source
+
+
 def test_h71e_identity_covers_cadence_and_action_semantics():
     base = _runtime()
     assert base.identity()["bidding_update_interval"] == 1
     assert base.identity()["first_bidder_mode"] == "rotate"
     assert base.bidding_learned_probability == 0.5
+    assert base.identity()["optimizer_steps_per_cycle"] == 1
     assert base.stable_hash() != replace(
         base, bidding_update_interval=2
     ).stable_hash()
@@ -175,6 +187,9 @@ def test_h71e_identity_covers_cadence_and_action_semantics():
     ).stable_hash()
     assert base.stable_hash() != replace(
         base, bidding_learned_probability=1.0
+    ).stable_hash()
+    assert base.stable_hash() != replace(
+        base, optimizer_steps_per_cycle=2
     ).stable_hash()
 
 
@@ -188,19 +203,63 @@ def test_h71e_collection_retry_requires_due_underfilled_bidding_replay():
         "batch_size": 16,
         "eligible_steps": 0,
         "update_interval": 1,
+        "planned_optimizer_steps": 1,
     }
     assert _h71e_needs_collection_retry(**base)
     assert not _h71e_needs_collection_retry(
         **{**base, "replay_size": 16}
     )
     assert not _h71e_needs_collection_retry(
-        **{**base, "eligible_steps": 1, "update_interval": 2}
+        **{
+            **base,
+            "eligible_steps": 1,
+            "update_interval": 2,
+            "planned_optimizer_steps": 1,
+        }
+    )
+    assert _h71e_needs_collection_retry(
+        **{
+            **base,
+            "eligible_steps": 1,
+            "update_interval": 2,
+            "planned_optimizer_steps": 2,
+        }
     )
     assert not _h71e_needs_collection_retry(
         **{**base, "received": 11}
     )
     with pytest.raises(ValueError, match="non-negative ints"):
         _h71e_needs_collection_retry(**{**base, "completed": -1})
+
+
+def test_h71e_redeal_seed_is_episode_local_and_order_independent():
+    coordinates = [
+        (7, FORMAL_SEED_DERIVATION_V1, 3, 41, 1),
+        (7, FORMAL_SEED_DERIVATION_V1, 3, 99, 1),
+        (7, FORMAL_SEED_DERIVATION_V1, 3, 41, 2),
+    ]
+    forward = [_async_redeal_seed(*row) for row in coordinates]
+    reverse = {
+        row: _async_redeal_seed(*row) for row in reversed(coordinates)
+    }
+    assert forward == [reverse[row] for row in coordinates]
+    assert len(set(forward)) == len(forward)
+    assert _async_redeal_seed(
+        7, FORMAL_SEED_DERIVATION_V1, 0, 41, 1
+    ) == _async_redeal_seed(
+        7, FORMAL_SEED_DERIVATION_V1, 8, 41, 1
+    )
+    assert _async_redeal_seed(
+        7, TOPOLOGY_LOCAL_SEED_DERIVATION_V1, 0, 41, 1
+    ) != _async_redeal_seed(
+        7, TOPOLOGY_LOCAL_SEED_DERIVATION_V1, 8, 41, 1
+    )
+
+
+def test_h71e_actor_step_limit_applies_at_bidding_boundary():
+    _check_actor_step_limit(3, 4)
+    with pytest.raises(RuntimeError, match="max_steps=4"):
+        _check_actor_step_limit(4, 4)
 
 
 def test_h71e_benchmark_requires_positive_bidding_metrics():

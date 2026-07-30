@@ -192,6 +192,7 @@ def main() -> None:
         first_bidder_mode=args.first_bidder_mode,
         target_microbatch=args.target_microbatch,
         max_policy_lag=args.max_policy_lag,
+        optimizer_steps_per_cycle=args.optimizer_steps_per_cycle,
         environment_seed=environment_seed,
         environment_seed_derivation=seed_derivation,
         action_seed=action_seed,
@@ -308,7 +309,9 @@ def main() -> None:
         compact_bidding_replay_schema_version=0,
         snapshot_publication_semantics=runtime_config.snapshot_semantics,
         request_ordering_semantics=runtime_config.request_protocol,
-        actor_rng_resume_semantics="restart-from-stable-task-and-domain-seeds-v1",
+        actor_rng_resume_semantics=(
+            "restart-from-stable-task-domain-and-redeal-seeds-v2"
+        ),
     )
     print(json.dumps({
         "event": "h7_start",

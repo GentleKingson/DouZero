@@ -58,6 +58,45 @@ def _formal_action_seed(root_seed: int, actor_id: int, episode_id: int) -> int:
     )
 
 
+def _async_redeal_seed(
+    root_seed: int,
+    environment_seed_derivation: str,
+    actor_id: int,
+    episode_id: int,
+    redeal_count: int,
+) -> int:
+    """Derive a redeal seed that cannot depend on interleaved game ordering."""
+
+    if environment_seed_derivation not in {
+        TOPOLOGY_LOCAL_SEED_DERIVATION_V1,
+        FORMAL_SEED_DERIVATION_V1,
+    }:
+        raise ValueError("unsupported async environment seed derivation")
+    worker_id = (
+        0
+        if environment_seed_derivation == FORMAL_SEED_DERIVATION_V1
+        else actor_id
+    )
+    return derive_formal_stream_seed(
+        root_seed,
+        f"environment-redeal-{redeal_count}",
+        worker_id,
+        episode_id,
+    )
+
+
+def _check_actor_step_limit(steps: int, max_steps: int) -> None:
+    """Fail at the shared card-play/bidding actor step boundary."""
+
+    for name, value in (("steps", steps), ("max_steps", max_steps)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an int")
+    if steps < 0 or max_steps < 1:
+        raise ValueError("actor step counters are out of range")
+    if steps >= max_steps:
+        raise RuntimeError(f"actor episode exceeded max_steps={max_steps}")
+
+
 def inference_action_count_bucket(action_count: int) -> int | str:
     """Return the coarse centralized-inference padding bucket."""
     if isinstance(action_count, bool) or not isinstance(action_count, int):
@@ -1843,6 +1882,13 @@ def async_actor_main(
             game["abandoned_bidding_transitions"] += abandoned
             game["bidding_transitions"].clear()
             game["redeals"] = int(info["redeal_count"])
+            np.random.seed(_async_redeal_seed(
+                environment_seed,
+                environment_seed_derivation,
+                actor_id,
+                int(game["episode_id"]),
+                game["redeals"],
+            ))
             game["env"].redeal()
             return
         if info.get("max_redeals_exceeded"):
@@ -1906,10 +1952,7 @@ def async_actor_main(
                     bid_obs, policy, action_rng
                 )
                 apply_bidding_action(game, bid_obs, bid, source)
-                if game["steps"] >= max_steps:
-                    raise RuntimeError(
-                        f"actor episode exceeded max_steps={max_steps}"
-                    )
+                _check_actor_step_limit(game["steps"], max_steps)
                 continue
             position = game["env"]._acting_player_position
             infoset = game["env"].infoset
@@ -2078,6 +2121,7 @@ def async_actor_main(
                 if kind == "bidding":
                     bid, bid_obs = payload
                     apply_bidding_action(game, bid_obs, bid, "learned")
+                    _check_actor_step_limit(game["steps"], max_steps)
                     continue
                 (
                     action_index,
