@@ -29,6 +29,7 @@ from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
+    _h71e_needs_collection_retry,
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid.support_matrix import (
@@ -174,6 +175,31 @@ def test_h71e_identity_covers_cadence_and_action_semantics():
     assert base.stable_hash() != replace(
         base, bidding_learned_probability=0.5
     ).stable_hash()
+
+
+def test_h71e_collection_retry_requires_due_underfilled_bidding_replay():
+    base = {
+        "completed": 4,
+        "target": 4,
+        "received": 12,
+        "expected": 12,
+        "replay_size": 12,
+        "batch_size": 16,
+        "eligible_steps": 0,
+        "update_interval": 1,
+    }
+    assert _h71e_needs_collection_retry(**base)
+    assert not _h71e_needs_collection_retry(
+        **{**base, "replay_size": 16}
+    )
+    assert not _h71e_needs_collection_retry(
+        **{**base, "eligible_steps": 1, "update_interval": 2}
+    )
+    assert not _h71e_needs_collection_retry(
+        **{**base, "received": 11}
+    )
+    with pytest.raises(ValueError, match="non-negative ints"):
+        _h71e_needs_collection_retry(**{**base, "completed": -1})
 
 
 def test_h71e_benchmark_requires_positive_bidding_metrics():

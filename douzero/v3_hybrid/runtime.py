@@ -74,7 +74,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v15"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v16"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v8"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -908,6 +908,44 @@ def _h71c_needs_collection_retry(
     ):
         raise ValueError("H7.1c collection retry counters must be non-negative ints")
     return completed >= target and received >= expected and replay_size == 0
+
+
+def _h71e_needs_collection_retry(
+    *,
+    completed: int,
+    target: int,
+    received: int,
+    expected: int,
+    replay_size: int,
+    batch_size: int,
+    eligible_steps: int,
+    update_interval: int,
+) -> bool:
+    """Return whether a due bidding update still needs eligible replay rows."""
+
+    values = (
+        completed,
+        target,
+        received,
+        expected,
+        replay_size,
+        batch_size,
+        eligible_steps,
+        update_interval,
+    )
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in values
+    ):
+        raise ValueError("H7.1e collection retry counters must be non-negative ints")
+    if batch_size < 1 or update_interval < 1:
+        raise ValueError("H7.1e collection retry sizes must be positive")
+    return (
+        completed >= target
+        and received >= expected
+        and eligible_steps % update_interval == 0
+        and replay_size < batch_size
+    )
 
 
 def validate_v3_h7_runtime_config(
@@ -1785,6 +1823,11 @@ class V3AsyncSingleGPUTrainer:
             if self.cooperation_buffer is not None
             else 0
         )
+        if self.bidding_buffer is not None:
+            retry_limit = max(
+                retry_limit,
+                self.config.bidding_batch_size * 4,
+            )
         if not self._runtime_started:
             self._start_runtime()
         self._publish_snapshot()
@@ -1816,12 +1859,25 @@ class V3AsyncSingleGPUTrainer:
                         replay_size=len(self.cooperation_buffer),
                     )
                 )
+                needs_retry = needs_retry or (
+                    self.bidding_buffer is not None
+                    and _h71e_needs_collection_retry(
+                        completed=completed,
+                        target=target,
+                        received=received_bids,
+                        expected=expected_bids,
+                        replay_size=len(self.bidding_buffer),
+                        batch_size=self.config.bidding_batch_size,
+                        eligible_steps=self.stats.bidding_eligible_steps,
+                        update_interval=self.config.bidding_update_interval,
+                    )
+                )
                 if not needs_retry:
                     break
                 retries = target - requested_target
                 if retries >= retry_limit:
                     raise RuntimeError(
-                        "H7.1c collection exhausted its bounded eligible-episode "
+                        "H7 collection exhausted its bounded eligible-episode "
                         "retry budget"
                     )
                 self._tasks.put(initial_episode_id + target)
@@ -2600,6 +2656,11 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
             if self.cooperation_buffer is not None
             else 0
         )
+        if self.bidding_buffer is not None:
+            retry_limit = max(
+                retry_limit,
+                self.config.bidding_batch_size * 4,
+            )
         while True:
             needs_retry = (
                 self.cooperation_buffer is not None
@@ -2611,11 +2672,24 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                     replay_size=len(self.cooperation_buffer),
                 )
             )
+            needs_retry = needs_retry or (
+                self.bidding_buffer is not None
+                and _h71e_needs_collection_retry(
+                    completed=completed,
+                    target=target,
+                    received=len(self.bidding_buffer),
+                    expected=len(self.bidding_buffer),
+                    replay_size=len(self.bidding_buffer),
+                    batch_size=self.config.bidding_batch_size,
+                    eligible_steps=self.stats.bidding_eligible_steps,
+                    update_interval=self.config.bidding_update_interval,
+                )
+            )
             if completed >= target and not needs_retry:
                 break
             if needs_retry and completed - target >= retry_limit:
                 raise RuntimeError(
-                    "H7.1c collection exhausted its bounded eligible-episode "
+                    "H7 collection exhausted its bounded eligible-episode "
                     "retry budget"
                 )
             environment_seed = (

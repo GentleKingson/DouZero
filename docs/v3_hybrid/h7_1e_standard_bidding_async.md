@@ -27,6 +27,8 @@ checkpoint I/O.
 - Guard: a redeal-cap fallback game is excluded from all training replay.
 - Cadence: `bidding_eligible_steps` advances after each successful public
   optimizer update; `bidding_update_interval` and its counter are checkpointed.
+- Collection: when a bidding update is due, the bounded collector continues
+  until the bidding batch is eligible instead of issuing an empty update.
 - Resume: replay is flushed at the checkpoint boundary; model, optimizer,
   loss schedules, RNG, policy version, bidding cadence, and cumulative counters
   restore strictly.
