@@ -140,7 +140,7 @@ def test_one_coordinator_keeps_bid_and_cardplay_request_kinds_separate():
     slot = coordinator.acquire(3)
     coordinator.bidding_inputs.write(slot, observation)
     coordinator.submit_bidding(slot, request_id=7, policy_snapshot=11)
-    request = coordinator.claim_ready(1)[0]
+    request = coordinator.claim_ready(1, wait_seconds=0.1)[0]
     assert request.request_kind == int(RequestKind.BIDDING)
     assert request.grouping_key == (11, "bidding")
     assert request.action_count == 4
@@ -152,7 +152,7 @@ def test_one_coordinator_keeps_bid_and_cardplay_request_kinds_separate():
 
 def test_actor_contract_uses_environment_bids_and_separate_replay():
     source = inspect.getsource(async_actor_main)
-    assert "env.step(None, bid_value=bid)" in source
+    assert 'game["env"].step(None, bid_value=bid)' in source
     assert "game[\"bidding_transitions\"]" in source
     assert "bidding_replay_queue.put" in source
     assert "bid not in observation.legal_bids" in source
