@@ -227,7 +227,7 @@ def test_h71d_cuda_update_checkpoint_resume_and_shutdown(tmp_path):
         assert boundary["active_slots"] == 0
         assert boundary["in_flight_slots"] == 0
         assert boundary["pending_requests"] == 0
-        assert boundary["strategy_parameter_vram_bytes"] > 0
+        assert boundary["public_aux_parameter_vram_bytes"] > 0
         trainer.save_training_checkpoint(
             str(checkpoint), long_running_state={"cycle": 1}
         )
