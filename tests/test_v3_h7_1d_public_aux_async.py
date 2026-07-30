@@ -26,6 +26,7 @@ from douzero.training.v2_buffer import Transition
 from douzero.v3_hybrid.runtime import (
     V3_H71D_REPLAY_PROTOCOL,
     V3_H71D_REQUEST_PROTOCOL,
+    V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     validate_v3_h7_runtime_config,
 )
@@ -181,6 +182,71 @@ def test_actor_reuses_served_public_bundle_and_never_reads_hidden_style_data():
             "douzero.style.features", fromlist=["build_style_features"]
         ).build_style_features
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_h71d_cuda_update_checkpoint_resume_and_shutdown(tmp_path):
+    from douzero.observation.schema import build_v2_schema
+    from douzero.v3_hybrid import V3HybridModel
+    from douzero.v3_hybrid.training.h6_learner import V3H6Learner
+
+    resolved = _resolved()
+    runtime_config = _runtime(
+        batch_size=32,
+        num_actors=1,
+        games_per_actor=1,
+        replay_capacity=256,
+    )
+    checkpoint = tmp_path / "public-aux-async.pt"
+
+    def build():
+        model = V3HybridModel(build_v2_schema(), resolved.model)
+        learner = V3H6Learner(
+            model,
+            ruleset=RuleSet.legacy(),
+            config=resolved,
+        )
+        return learner, V3AsyncSingleGPUTrainer(
+            learner, resolved, runtime_config
+        )
+
+    learner, trainer = build()
+    try:
+        trainer.collect_episodes(8)
+        before = trainer._parameter_update_snapshot()
+        metrics = trainer.step()
+        assert metrics is not None
+        assert metrics.public_aux_updated
+        assert trainer.stats.strategy_optimizer_steps == 1
+        assert trainer.stats.strategy_labels_collected == len(trainer.buffer)
+        assert trainer._parameters_changed_since(before)
+        boundary = trainer.quiesce_cycle_boundary()
+        assert boundary["active_slots"] == 0
+        assert boundary["in_flight_slots"] == 0
+        assert boundary["pending_requests"] == 0
+        assert boundary["strategy_parameter_vram_bytes"] > 0
+        trainer.save_training_checkpoint(
+            str(checkpoint), long_running_state={"cycle": 1}
+        )
+    finally:
+        trainer.shutdown()
+
+    resumed_learner, resumed = build()
+    try:
+        assert resumed.load_training_checkpoint(checkpoint) == {"cycle": 1}
+        assert resumed.stats.strategy_optimizer_steps == 1
+        resumed.collect_episodes(8)
+        metrics = resumed.step()
+        assert metrics is not None
+        assert metrics.public_aux_updated
+        assert resumed.stats.strategy_optimizer_steps == 2
+        boundary = resumed.quiesce_cycle_boundary()
+        assert boundary["active_slots"] == 0
+        assert boundary["in_flight_slots"] == 0
+        assert boundary["pending_requests"] == 0
+    finally:
+        resumed.shutdown()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_primary_h7_cli_selects_public_aux_protocol_before_cuda(
