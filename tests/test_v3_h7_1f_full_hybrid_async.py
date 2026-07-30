@@ -214,6 +214,28 @@ def test_protocol_freeze_accepts_full_hybrid_identity(
     assert payload["bidding_enabled"] is config_name.endswith("standard.yaml")
 
 
+def test_guided_benchmark_phase_priming_is_checkpoint_consistent(tmp_path):
+    formal = load_formal_config(
+        ROOT / "configs/v3_formal/v3_full_hybrid_standard.yaml"
+    )
+    learner, _ = create_pilot_learner(formal, allow_standard=True)
+    h3 = learner.base.base.base
+    h3.prime_guided_benchmark_phase()
+    checkpoint = tmp_path / "guided-h3.pt"
+    h3.save_checkpoint(checkpoint)
+
+    restored, _ = create_pilot_learner(formal, allow_standard=True)
+    restored_h3 = restored.base.base.base
+    restored_h3.load_checkpoint(checkpoint)
+    assert restored_h3.schedule_state().phase == "guided"
+    assert restored_h3.learner_updates == h3.config.schedule.warmup_updates
+    assert restored_h3.statistics.steps == restored_h3.learner_updates
+    assert restored_h3.statistics.decisions == restored_h3.samples_consumed == 0
+
+    with pytest.raises(RuntimeError, match="fresh H3 learner"):
+        restored_h3.prime_guided_benchmark_phase()
+
+
 def _decision(role: str, trace_index: int):
     np.random.seed(900 + trace_index)
     env = Env("adp")
@@ -398,14 +420,14 @@ def test_full_hybrid_standard_cuda_updates_cardplay_and_bidding():
     )
     learner, resolved = create_pilot_learner(formal, allow_standard=True)
     h3 = learner.base.base.base
-    h3.learner_updates = h3.config.schedule.warmup_updates
+    h3.prime_guided_benchmark_phase()
     runtime = V3AsyncSingleGPUTrainer(
         learner, resolved, _runtime_config(bidding=True)
     )
     try:
         runtime.collect_episodes(1)
         before = runtime._parameter_update_snapshot()
-        assert runtime.step() is not None
+        runtime.optimize(1)
         assert runtime._parameters_changed_since(before)
         assert runtime.stats.bidding_optimizer_steps == 1
         assert runtime.stats.belief_labels_collected > 0

@@ -2288,8 +2288,12 @@ class V3AsyncSingleGPUTrainer:
         if num_steps < 0:
             raise ValueError("H7 optimizer steps must be non-negative")
         for _ in range(num_steps):
+            public_auxiliary_active = (
+                self.learner.public_auxiliary_training_active()
+            )
             bidding_due = (
                 self.bidding_buffer is not None
+                and public_auxiliary_active
                 and self.stats.bidding_eligible_steps
                 % self.config.bidding_update_interval
                 == 0
@@ -2304,69 +2308,10 @@ class V3AsyncSingleGPUTrainer:
                     raise ValueError(
                         "H7.1c replay has no complete farmer episode"
                     )
-                episode = self._rng.choice(tuple(self.cooperation_buffer))
-                rows = list(episode.transitions)
-                trajectories = episode.trajectories
-                indices = []
             elif len(self.buffer) < self.config.batch_size:
                 raise ValueError("H7 replay has fewer rows than batch_size")
-            else:
-                indices = self._rng.sample(
-                    range(len(self.buffer)), self.config.batch_size
-                )
-                rows = [self.buffer[index] for index in indices]
-                trajectories = None
-            started = time.perf_counter()
-            learner_rows = self._learner_rows(rows)
-            learner_trajectories = _remap_h7_cooperation_trajectories(
-                rows, learner_rows, trajectories
-            )
-            belief_samples = (
-                None
-                if self.belief_buffer is None
-                else [self.belief_buffer[index] for index in indices]
-            )
-            oracle_samples = self._oracle_samples_for_indices(indices)
-            strategy_targets = self._strategy_targets_for_indices(indices)
-            bidding_batch = (
-                BiddingMinibatch(self._rng.sample(
-                    list(self.bidding_buffer), self.config.bidding_batch_size
-                ))
-                if bidding_due
-                else None
-            )
-            learner_policy_before = int(self.learner.policy_version)
-            metrics = self.learner.train_batch(
-                learner_rows,
-                trajectories=learner_trajectories,
-                belief_samples=belief_samples,
-                oracle_samples=oracle_samples,
-                strategy_targets=strategy_targets,
-                bidding_batch=bidding_batch,
-            )
-            self._record_served_update(learner_policy_before, metrics)
-            if metrics.base.base.belief_updated:
-                self.stats.belief_optimizer_steps += 1
-            h3_metrics = metrics.base.base.base
-            if h3_metrics is not None and h3_metrics.oracle_updated:
-                self.stats.oracle_optimizer_steps += 1
-            if metrics.base.cooperation_updated:
-                self.stats.cooperation_optimizer_steps += 1
-            if (
-                self.strategy_target_buffer is not None
-                and _strategy_loss_updated(metrics)
-            ):
-                self.stats.strategy_optimizer_steps += 1
-            self.stats.optimizer_steps += 1
-            if self.bidding_buffer is not None:
-                self.stats.bidding_eligible_steps += 1
-            if bidding_batch is not None:
-                self.stats.bidding_optimizer_steps += 1
-                self.stats.learner_bidding_samples += len(
-                    bidding_batch.transitions
-                )
-            self.stats.learner_cardplay_samples += len(rows)
-            self._segments["learner"] += time.perf_counter() - started
+            if self.step() is None:
+                raise RuntimeError("H7 optimizer made no learner update")
 
     def step(self):
         """Run one learner update for the shared long-running controller."""
