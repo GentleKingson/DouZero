@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1c-support-matrix-v6"
+V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1d-support-matrix-v7"
 
 TOPOLOGY_SINGLE_PROCESS = "single_process"
 TOPOLOGY_ASYNC_SINGLE_GPU = "async_single_gpu"
@@ -68,12 +68,12 @@ _ROWS = {
         "validated human-data replay is currently bound to legacy rules",
     ),
     "strategy": CapabilitySupport(
-        True, False, False, True, True, True, True, True, False,
-        "public strategy features and auxiliary heads are supported in H6",
+        True, True, False, True, True, True, True, True, False,
+        "H7.1d transports public strategy features and learner trajectory labels",
     ),
     "style": CapabilitySupport(
-        True, False, False, True, True, True, True, True, False,
-        "style encoding consumes public action history only",
+        True, True, False, True, True, True, True, True, False,
+        "H7.1d binds public-history style features to the served policy snapshot",
     ),
     "league": CapabilitySupport(
         False, False, False, True, True, False, False, False, False,
@@ -104,6 +104,8 @@ V3_H6_UNSUPPORTED_COMBINATIONS = (
     ("belief", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("oracle", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("cooperation", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
+    ("strategy", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
+    ("style", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
     ("public_export", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
 )
 

@@ -33,6 +33,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71B_REQUEST_PROTOCOL,
     V3_H71C_REPLAY_PROTOCOL,
     V3_H71C_REQUEST_PROTOCOL,
+    V3_H71D_REPLAY_PROTOCOL,
+    V3_H71D_REQUEST_PROTOCOL,
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
@@ -133,6 +135,10 @@ def main() -> None:
     belief_enabled = resolved.learner.features.belief
     oracle_enabled = resolved.learner.features.oracle
     cooperation_enabled = resolved.learner.features.cooperation
+    public_aux_enabled = (
+        resolved.learner.features.strategy
+        or resolved.learner.features.style
+    )
     environment_seed, action_seed, seed_derivation = (
         resolve_v3_h7_seed_contract(
             formal_training_seeds=(
@@ -164,6 +170,7 @@ def main() -> None:
         belief_runtime_enabled=belief_enabled,
         oracle_runtime_enabled=oracle_enabled,
         cooperation_runtime_enabled=cooperation_enabled,
+        public_aux_runtime_enabled=public_aux_enabled,
         request_protocol=(
             V3_H71A_REQUEST_PROTOCOL
             if belief_enabled
@@ -173,7 +180,11 @@ def main() -> None:
                 else (
                     V3_H71C_REQUEST_PROTOCOL
                     if cooperation_enabled
-                    else V3H7RuntimeConfig.request_protocol
+                    else (
+                        V3_H71D_REQUEST_PROTOCOL
+                        if public_aux_enabled
+                        else V3H7RuntimeConfig.request_protocol
+                    )
                 )
             )
         ),
@@ -186,7 +197,11 @@ def main() -> None:
                 else (
                     V3_H71C_REPLAY_PROTOCOL
                     if cooperation_enabled
-                    else V3H7RuntimeConfig.replay_protocol
+                    else (
+                        V3_H71D_REPLAY_PROTOCOL
+                        if public_aux_enabled
+                        else V3H7RuntimeConfig.replay_protocol
+                    )
                 )
             )
         ),

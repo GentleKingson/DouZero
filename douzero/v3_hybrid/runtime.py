@@ -67,8 +67,8 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1c-runtime-v12"
-V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v6"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1d-runtime-v13"
+V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v7"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
 V3_H71A_REQUEST_PROTOCOL = (
@@ -89,6 +89,12 @@ V3_H71C_REQUEST_PROTOCOL = (
 )
 V3_H71C_REPLAY_PROTOCOL = (
     "v3-public-replay-plus-episode-atomic-farmer-trajectories-v1"
+)
+V3_H71D_REQUEST_PROTOCOL = (
+    "v2-shared-slots-v3-dmc-q-public-strategy-style-v1"
+)
+V3_H71D_REPLAY_PROTOCOL = (
+    "v3-public-replay-plus-public-strategy-trajectory-labels-v1"
 )
 V3_H71AB_REQUEST_PROTOCOL = (
     "v2-shared-slots-v3-dmc-q-belief-oracle-sidecars-v1"
@@ -145,6 +151,18 @@ def _stable_hash(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded.encode("ascii")).hexdigest()
 
 
+def _strategy_target_from_transition(transition) -> dict[str, float]:
+    return {
+        "min_turns_after": float(transition.target_min_turns_after),
+        "min_turns_exact_mask": float(transition.target_min_turns_exact_mask),
+        "regain_initiative": float(transition.target_regain_initiative),
+        "teammate_finish": float(transition.target_teammate_finish),
+        "teammate_finish_mask": float(transition.target_teammate_finish_mask),
+        "spring_probability": float(transition.target_spring_probability),
+        "structure_cost": float(transition.target_structure_cost),
+    }
+
+
 @dataclass(frozen=True)
 class V3H7RuntimeConfig:
     topology: str = TOPOLOGY_ASYNC_SINGLE_GPU
@@ -172,6 +190,7 @@ class V3H7RuntimeConfig:
     cooperation_runtime_enabled: bool = False
     cooperation_sidecar_capacity: int = 4096
     cooperation_episode_capacity: int = 1024
+    public_aux_runtime_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.topology not in {
@@ -182,6 +201,7 @@ class V3H7RuntimeConfig:
             "belief_runtime_enabled",
             "oracle_runtime_enabled",
             "cooperation_runtime_enabled",
+            "public_aux_runtime_enabled",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"H7 {name} must be bool")
@@ -220,6 +240,7 @@ class V3H7RuntimeConfig:
             self.belief_runtime_enabled,
             self.oracle_runtime_enabled,
             self.cooperation_runtime_enabled,
+            self.public_aux_runtime_enabled,
         ))
         if enabled_sidecars > 1:
             raise NotImplementedError(
@@ -234,6 +255,9 @@ class V3H7RuntimeConfig:
         elif self.cooperation_runtime_enabled:
             expected_request = V3_H71C_REQUEST_PROTOCOL
             expected_replay = V3_H71C_REPLAY_PROTOCOL
+        elif self.public_aux_runtime_enabled:
+            expected_request = V3_H71D_REQUEST_PROTOCOL
+            expected_replay = V3_H71D_REPLAY_PROTOCOL
         else:
             expected_request = V3_H7_REQUEST_PROTOCOL
             expected_replay = V3_H7_REPLAY_PROTOCOL
@@ -325,6 +349,8 @@ class V3H7RuntimeStats:
     cooperation_optimizer_steps: int = 0
     cooperation_incomplete_episodes: int = 0
     cooperation_oversized_episodes: int = 0
+    strategy_labels_collected: int = 0
+    strategy_optimizer_steps: int = 0
     amp_fallbacks: int = 0
     episodes_per_team: dict[str, int] = field(
         default_factory=lambda: {"landlord": 0, "farmer": 0}
@@ -853,7 +879,7 @@ def validate_v3_h7_runtime_config(
     enabled = set(features.enabled_capabilities())
     unsupported = enabled - {
         "role_model", "adaptive_dmc", "belief", "oracle", "cooperation",
-        "public_export",
+        "strategy", "style", "public_export",
     }
     if unsupported:
         raise NotImplementedError(
@@ -863,7 +889,13 @@ def validate_v3_h7_runtime_config(
     belief_enabled = "belief" in enabled
     oracle_enabled = "oracle" in enabled
     cooperation_enabled = "cooperation" in enabled
-    if sum((belief_enabled, oracle_enabled, cooperation_enabled)) > 1:
+    public_aux_enabled = bool({"strategy", "style"} & enabled)
+    if sum((
+        belief_enabled,
+        oracle_enabled,
+        cooperation_enabled,
+        public_aux_enabled,
+    )) > 1:
         raise NotImplementedError(
             "H7.1 capability transports remain isolated until a later integration"
         )
@@ -915,6 +947,23 @@ def validate_v3_h7_runtime_config(
             raise ValueError(
                 "H7.1c cooperation sidecar capacity cannot be smaller than batch_size"
             )
+    if public_aux_enabled != runtime_config.public_aux_runtime_enabled:
+        raise ValueError(
+            "H7 runtime strategy/style features and public auxiliary transport disagree"
+        )
+    if public_aux_enabled:
+        if not resolved_config.model.strategy_features_enabled:
+            raise ValueError(
+                "H7.1d requires public strategy features for snapshot binding"
+            )
+        if "strategy" not in enabled:
+            raise NotImplementedError(
+                "H7.1d style-only async transport has no training target contract"
+            )
+        if not resolved_config.model.strategy_aux_enabled:
+            raise ValueError("H7.1d strategy runtime requires its auxiliary heads")
+        if resolved_config.learner.losses.lambda_strategy <= 0.0:
+            raise ValueError("H7.1d strategy runtime requires a positive loss weight")
     for capability in enabled:
         validate_capability_support(
             capability,
@@ -930,6 +979,7 @@ def validate_v3_h7_runtime_config(
         and not belief_enabled
         and not oracle_enabled
         and not cooperation_enabled
+        and not public_aux_enabled
     ):
         raise ValueError("H7 async replay requires Adaptive DMC q_old provenance")
     if (
@@ -938,6 +988,7 @@ def validate_v3_h7_runtime_config(
         and not belief_enabled
         and not oracle_enabled
         and not cooperation_enabled
+        and not public_aux_enabled
     ):
         raise ValueError("H7 async runtime cannot use disabled Adaptive DMC")
     learner_batch_size = resolved_config.learner.base.base.base.public.batch_size
@@ -990,6 +1041,11 @@ class V3AsyncSingleGPUTrainer:
         self.cooperation_buffer: deque[V3H71CCooperationEpisode] | None = (
             deque(maxlen=runtime_config.cooperation_episode_capacity)
             if runtime_config.cooperation_runtime_enabled
+            else None
+        )
+        self.strategy_target_buffer: deque[dict[str, float]] | None = (
+            deque(maxlen=runtime_config.replay_capacity)
+            if runtime_config.public_aux_runtime_enabled
             else None
         )
         self._belief_alignment = (
@@ -1074,6 +1130,14 @@ class V3AsyncSingleGPUTrainer:
                     "never-public-replay-v1"
                 )
             ),
+            "public_aux_transport": (
+                "disabled"
+                if self.strategy_target_buffer is None
+                else (
+                    "served-public-feature-cache-plus-public-trajectory-"
+                    "labels-snapshot-bound-v1"
+                )
+            ),
         }
         self.runtime_hash = _stable_hash(self.runtime_identity)
 
@@ -1124,12 +1188,22 @@ class V3AsyncSingleGPUTrainer:
             output_width=6,
             request_timeout_seconds=cfg.request_timeout_seconds,
             belief_inputs=cfg.belief_runtime_enabled,
+            strategy_features=cfg.public_aux_runtime_enabled,
+            style_features=(
+                cfg.public_aux_runtime_enabled
+                and self.model.config.style_enabled
+            ),
         )
         self._replay_slots = SharedReplaySlots(
             self.model.schema,
             num_slots=max(slots * 2, min(cfg.batch_size * 2, 64)),
             max_actions=cfg.max_actions,
             v3_provenance=True,
+            strategy_features=cfg.public_aux_runtime_enabled,
+            style_features=(
+                cfg.public_aux_runtime_enabled
+                and self.model.config.style_enabled
+            ),
         )
         self._scheduler = PendingRequestScheduler(
             max_batch_size=slots,
@@ -1178,6 +1252,24 @@ class V3AsyncSingleGPUTrainer:
                     "belief_sidecar_queue": self._belief_sidecar_queue,
                     "oracle_sidecar_queue": self._oracle_sidecar_queue,
                     "cooperation_sidecar_queue": self._cooperation_sidecar_queue,
+                    "strategy_config": (
+                        self.model.strategy_feature_config()
+                        if cfg.public_aux_runtime_enabled
+                        else None
+                    ),
+                    "style_enabled": (
+                        cfg.public_aux_runtime_enabled
+                        and self.model.config.style_enabled
+                    ),
+                    "strategy_targets_enabled": (
+                        cfg.public_aux_runtime_enabled
+                    ),
+                    "strategy_node_budget": (
+                        self.model.config.strategy_node_budget
+                    ),
+                    "strategy_time_budget_ms": (
+                        self.model.config.strategy_time_budget_ms
+                    ),
                 },
                 name=f"douzero-v3-actor-{actor_id}",
             )
@@ -1272,6 +1364,8 @@ class V3AsyncSingleGPUTrainer:
                 batch.action_mask,
                 batch.acting_role,
                 belief_features=belief_features,
+                strategy_features=batch.strategy_features,
+                style_features=batch.style_features,
             )
             packed = torch.stack((
                 output.win_logit.squeeze(-1),
@@ -1307,10 +1401,23 @@ class V3AsyncSingleGPUTrainer:
 
     def _drain_replay(self) -> int:
         started = time.perf_counter()
-        if (
+        if self.strategy_target_buffer is not None:
+            enriched = self._replay_slots.read_ready_v3_aligned(
+                feature_schema_hash=self.model.schema.stable_hash(),
+                target_transform=self.model.config.dmc_target_transform,
+                ruleset_identity=self.learner.ruleset.identity(),
+                include_strategy_targets=True,
+            )
+            for row, _key, targets in enriched:
+                self.buffer.append(row)
+                self.strategy_target_buffer.append(targets)
+            completed = len(enriched)
+            self.stats.strategy_labels_collected += completed
+        elif (
             self.belief_buffer is None
             and self.oracle_buffer is None
             and self.cooperation_buffer is None
+            and self.strategy_target_buffer is None
         ):
             rows = self._replay_slots.read_ready_v3(
                 feature_schema_hash=self.model.schema.stable_hash(),
@@ -1586,12 +1693,14 @@ class V3AsyncSingleGPUTrainer:
                 else [self.belief_buffer[index] for index in indices]
             )
             oracle_samples = self._oracle_samples_for_indices(indices)
+            strategy_targets = self._strategy_targets_for_indices(indices)
             learner_policy_before = int(self.learner.policy_version)
             metrics = self.learner.train_batch(
                 learner_rows,
                 trajectories=learner_trajectories,
                 belief_samples=belief_samples,
                 oracle_samples=oracle_samples,
+                strategy_targets=strategy_targets,
             )
             self._record_served_update(learner_policy_before, metrics)
             if metrics.base.base.belief_updated:
@@ -1601,6 +1710,8 @@ class V3AsyncSingleGPUTrainer:
                 self.stats.oracle_optimizer_steps += 1
             if metrics.base.cooperation_updated:
                 self.stats.cooperation_optimizer_steps += 1
+            if self.strategy_target_buffer is not None and metrics.public_aux_updated:
+                self.stats.strategy_optimizer_steps += 1
             self.stats.optimizer_steps += 1
             self.stats.learner_cardplay_samples += len(rows)
             self._segments["learner"] += time.perf_counter() - started
@@ -1632,6 +1743,7 @@ class V3AsyncSingleGPUTrainer:
             else [self.belief_buffer[index] for index in indices]
         )
         oracle_samples = self._oracle_samples_for_indices(indices)
+        strategy_targets = self._strategy_targets_for_indices(indices)
         started = time.perf_counter()
         learner_policy_before = int(self.learner.policy_version)
         metrics = self.learner.train_batch(
@@ -1639,6 +1751,7 @@ class V3AsyncSingleGPUTrainer:
             trajectories=learner_trajectories,
             belief_samples=belief_samples,
             oracle_samples=oracle_samples,
+            strategy_targets=strategy_targets,
         )
         self._record_served_update(learner_policy_before, metrics)
         if metrics.base.base.belief_updated:
@@ -1648,6 +1761,8 @@ class V3AsyncSingleGPUTrainer:
             self.stats.oracle_optimizer_steps += 1
         if metrics.base.cooperation_updated:
             self.stats.cooperation_optimizer_steps += 1
+        if self.strategy_target_buffer is not None and metrics.public_aux_updated:
+            self.stats.strategy_optimizer_steps += 1
         self.stats.optimizer_steps += 1
         self.stats.learner_cardplay_samples += len(rows)
         self._segments["learner"] += time.perf_counter() - started
@@ -1689,6 +1804,13 @@ class V3AsyncSingleGPUTrainer:
             if h3._privileged_needed(h3.schedule_state())
             else None
         )
+
+    def _strategy_targets_for_indices(self, indices: list[int]):
+        if self.strategy_target_buffer is None:
+            return None
+        if len(self.strategy_target_buffer) != len(self.buffer):
+            raise RuntimeError("H7.1d strategy labels drifted from public replay")
+        return [self.strategy_target_buffer[index] for index in indices]
 
     def _parameter_update_snapshot(self) -> tuple[torch.Tensor, ...]:
         return tuple(
@@ -1796,6 +1918,22 @@ class V3AsyncSingleGPUTrainer:
                     else self.learner.base.cooperation.parameters()
                 )
             ),
+            "strategy_replay_occupancy": (
+                0
+                if self.strategy_target_buffer is None
+                else len(self.strategy_target_buffer)
+            ),
+            "strategy_labels_collected": self.stats.strategy_labels_collected,
+            "strategy_optimizer_steps": self.stats.strategy_optimizer_steps,
+            "public_aux_parameter_vram_bytes": sum(
+                parameter.numel() * parameter.element_size()
+                for module in (
+                    self.model.strategy_aux_heads,
+                    self.model.style_encoder,
+                )
+                if module is not None
+                for parameter in module.parameters()
+            ),
             "requests_per_microbatch": self._requests / max(1, self._microbatches),
             "actions_per_microbatch": self._actions / max(1, self._microbatches),
             "inference_queue_p50_ms": percentile(0.50),
@@ -1823,6 +1961,8 @@ class V3AsyncSingleGPUTrainer:
             self.oracle_buffer.clear()
         if self.cooperation_buffer is not None:
             self.cooperation_buffer.clear()
+        if self.strategy_target_buffer is not None:
+            self.strategy_target_buffer.clear()
 
     def save_training_checkpoint(self, path: str, *, long_running_state) -> None:
         if self._belief_alignment is not None:
@@ -1891,6 +2031,7 @@ class V3AsyncSingleGPUTrainer:
             "cooperation_optimizer_steps",
             "cooperation_incomplete_episodes",
             "cooperation_oversized_episodes",
+            "strategy_labels_collected", "strategy_optimizer_steps",
         }:
             raise ValueError("H7 checkpoint statistics fields mismatch")
         candidate_stats = V3H7RuntimeStats(**stats_payload)
@@ -1905,6 +2046,7 @@ class V3AsyncSingleGPUTrainer:
             "cooperation_optimizer_steps",
             "cooperation_incomplete_episodes",
             "cooperation_oversized_episodes",
+            "strategy_labels_collected", "strategy_optimizer_steps",
         ):
             value = getattr(candidate_stats, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -1938,6 +2080,13 @@ class V3AsyncSingleGPUTrainer:
             raise ValueError(
                 "H7 checkpoint contains unexpected cooperation progress"
             )
+        if not self.config.public_aux_runtime_enabled and (
+            candidate_stats.strategy_labels_collected
+            or candidate_stats.strategy_optimizer_steps
+        ):
+            raise ValueError(
+                "H7 checkpoint contains unexpected strategy progress"
+            )
         if (
             candidate_stats.belief_optimizer_steps
             > candidate_stats.optimizer_steps
@@ -1967,6 +2116,13 @@ class V3AsyncSingleGPUTrainer:
             )
         ):
             raise ValueError("H7 checkpoint cooperation statistics are invalid")
+        if (
+            candidate_stats.strategy_optimizer_steps
+            > candidate_stats.optimizer_steps
+            or candidate_stats.strategy_labels_collected
+            > candidate_stats.transitions_collected
+        ):
+            raise ValueError("H7 checkpoint strategy statistics are invalid")
         candidate_rng = random.Random()
         candidate_rng.setstate(bundle["rng_state"])
         snapshot_step = bundle["snapshot_step"]
@@ -2093,6 +2249,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
         from douzero.env.env import Env
         from douzero.observation.encode_v2 import get_obs_v2
         from douzero.observation.privileged import PrivilegedObservation
+        from douzero.training.v2_buffer import Episode, Transition
 
         from .replay import (
             AdaptiveSnapshotProvenance,
@@ -2159,6 +2316,8 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
             pending_belief = []
             pending_oracle = []
             pending_cooperation = []
+            pending_strategy_transitions = []
+            action_trace = []
             decisions = 0
             steps = 0
             while True:
@@ -2197,7 +2356,26 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                         episode_id=f"single-episode-{episode_number}",
                         deal_id=f"single-deal-{episode_number}",
                         target_transform=self.model.config.dmc_target_transform,
+                        strategy_config=(
+                            self.model.strategy_feature_config()
+                            if self.config.public_aux_runtime_enabled
+                            else None
+                        ),
+                        style_enabled=(
+                            self.config.public_aux_runtime_enabled
+                            and self.model.config.style_enabled
+                        ),
                     )
+                    if self.strategy_target_buffer is not None:
+                        pending_strategy_transitions.append(Transition(
+                            obs=observation,
+                            action_index=action_index,
+                            position=position,
+                            trace_index=steps,
+                            policy_id=self.policy_version,
+                            policy_version=self.policy_version,
+                            policy_step=self._snapshot_step,
+                        ))
                     if self.belief_buffer is not None:
                         sidecar = build_v3_h4_belief_sidecar(
                             observation,
@@ -2246,7 +2424,9 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                             generation=episode_number + 1,
                         ),
                     ))
-                _obs, _reward, done, info = env.step(legal_actions[action_index])
+                action = legal_actions[action_index]
+                action_trace.append((position, tuple(sorted(action))))
+                _obs, _reward, done, info = env.step(action)
                 steps += 1
                 if done:
                     break
@@ -2263,6 +2443,27 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                 for row in pending
             ]
             self.buffer.extend(rows)
+            if self.strategy_target_buffer is not None:
+                episode = Episode(
+                    transitions=pending_strategy_transitions,
+                    terminal_result=terminal,
+                    action_trace=action_trace,
+                )
+                episode.label_from_terminal()
+                episode.label_strategy_auxiliary(
+                    node_budget=self.model.config.strategy_node_budget,
+                    time_budget_ms=self.model.config.strategy_time_budget_ms,
+                )
+                if len(pending_strategy_transitions) != len(rows):
+                    raise RuntimeError(
+                        "H7.1d single-process strategy alignment mismatch"
+                    )
+                strategy_targets = [
+                    _strategy_target_from_transition(transition)
+                    for transition in pending_strategy_transitions
+                ]
+                self.strategy_target_buffer.extend(strategy_targets)
+                self.stats.strategy_labels_collected += len(strategy_targets)
             if self.belief_buffer is not None:
                 if len(pending_belief) != len(rows):
                     raise RuntimeError(
@@ -2349,6 +2550,8 @@ __all__ = [
     "V3_H71B_REQUEST_PROTOCOL",
     "V3_H71C_REPLAY_PROTOCOL",
     "V3_H71C_REQUEST_PROTOCOL",
+    "V3_H71D_REPLAY_PROTOCOL",
+    "V3_H71D_REQUEST_PROTOCOL",
     "V3_H7_CHECKPOINT_FORMAT",
     "V3_H7_REPLAY_PROTOCOL",
     "V3_H7_REQUEST_PROTOCOL",

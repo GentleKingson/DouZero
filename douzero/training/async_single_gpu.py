@@ -31,6 +31,7 @@ from douzero.observation.schema import (
     history_token_width,
     state_width,
 )
+from douzero.strategy.features import STRATEGY_FEATURE_WIDTH
 from douzero.style.features import STYLE_FEATURE_WIDTH
 from douzero.training.seed_stream import (
     FORMAL_SEED_DERIVATION_V1,
@@ -142,6 +143,8 @@ class SharedObservationSlots:
         max_actions: int = 256,
         *,
         output_width: int = 5,
+        strategy_features: bool = False,
+        style_features: bool = False,
     ) -> None:
         if num_slots < 1 or max_actions < 1:
             raise ValueError("shared slot dimensions must be positive")
@@ -155,9 +158,18 @@ class SharedObservationSlots:
         self.num_slots = int(num_slots)
         self.max_actions = int(max_actions)
         self.output_width = int(output_width)
+        for name, value in (
+            ("strategy_features", strategy_features),
+            ("style_features", style_features),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool")
+        self.strategy_features_enabled = strategy_features
+        self.style_features_enabled = style_features
 
         self._shared_owners = []
         self._shared_specs = []
+        self._tensor_fields = list(self._TENSOR_FIELDS)
 
         def shared(shape, dtype=torch.float32):
             tensor, owner = _shared_tensor(shape, dtype)
@@ -186,6 +198,20 @@ class SharedObservationSlots:
         self._bind_output_views()
         self.action_counts = shared((num_slots,), torch.int32)
         self.roles = shared((num_slots,), torch.int64)
+        self.strategy_features = (
+            shared((num_slots, max_actions, STRATEGY_FEATURE_WIDTH))
+            if strategy_features
+            else None
+        )
+        if strategy_features:
+            self._tensor_fields.append("strategy_features")
+        self.style_features = (
+            shared((num_slots, STYLE_FEATURE_WIDTH))
+            if style_features
+            else None
+        )
+        if style_features:
+            self._tensor_fields.append("style_features")
 
     _TENSOR_FIELDS = (
         "state_cards", "state_flat", "context_cards", "context_flat",
@@ -210,16 +236,20 @@ class SharedObservationSlots:
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        for name in self._TENSOR_FIELDS + self._OUTPUT_VIEW_FIELDS:
+        for name in tuple(self._tensor_fields) + self._OUTPUT_VIEW_FIELDS:
             state.pop(name, None)
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         for name, owner, (shape, dtype) in zip(
-            self._TENSOR_FIELDS, self._shared_owners, self._shared_specs
+            self._tensor_fields, self._shared_owners, self._shared_specs
         ):
             setattr(self, name, _restore_shared_tensor(owner, shape, dtype))
+        if not self.strategy_features_enabled:
+            self.strategy_features = None
+        if not self.style_features_enabled:
+            self.style_features = None
         self._bind_output_views()
 
     def write(self, slot_id: int, bundle: ModelInputBundle) -> None:
@@ -244,6 +274,26 @@ class SharedObservationSlots:
             self.action_mask[slot_id, :previous_count].zero_()
         self.actions[slot_id, :count].copy_(bundle.action_features)
         self.action_mask[slot_id, :count].copy_(bundle.action_mask)
+        if self.strategy_features_enabled != (bundle.strategy_features is not None):
+            raise ValueError(
+                "shared slot strategy feature contract does not match the request"
+            )
+        if self.strategy_features is not None:
+            if bundle.strategy_features.shape != (
+                count, STRATEGY_FEATURE_WIDTH
+            ):
+                raise ValueError("shared slot strategy feature layout mismatch")
+            self.strategy_features[slot_id, :count].copy_(
+                bundle.strategy_features
+            )
+        if self.style_features_enabled != (bundle.style_features is not None):
+            raise ValueError(
+                "shared slot style feature contract does not match the request"
+            )
+        if self.style_features is not None:
+            if bundle.style_features.shape != (STYLE_FEATURE_WIDTH,):
+                raise ValueError("shared slot style feature layout mismatch")
+            self.style_features[slot_id].copy_(bundle.style_features)
         self.action_counts[slot_id] = count
         try:
             role = SUPPORTED_ROLES.index(bundle.acting_role)
@@ -265,6 +315,16 @@ class SharedObservationSlots:
             action_mask=self.action_mask[slot_id, :count],
             acting_role=role,
             feature_schema_hash=feature_schema_hash,
+            strategy_features=(
+                None
+                if self.strategy_features is None
+                else self.strategy_features[slot_id, :count]
+            ),
+            style_features=(
+                None
+                if self.style_features is None
+                else self.style_features[slot_id]
+            ),
         )
 
 
@@ -409,6 +469,21 @@ class PinnedObservationBatchStager:
             (batch, action_capacity), slots.action_mask.dtype
         )
         self.roles = pinned((batch,), slots.roles.dtype)
+        self.strategy_features = (
+            None
+            if slots.strategy_features is None
+            else pinned(
+                (batch, action_capacity, STRATEGY_FEATURE_WIDTH),
+                slots.strategy_features.dtype,
+            )
+        )
+        self.style_features = (
+            None
+            if slots.style_features is None
+            else pinned(
+                (batch, STYLE_FEATURE_WIDTH), slots.style_features.dtype
+            )
+        )
         self.output_values = pinned(
             (batch, action_capacity, slots.output_width), torch.float32
         )
@@ -450,6 +525,18 @@ class PinnedObservationBatchStager:
             self.action_mask[:batch_size],
         )
         self._gather(self.slots.roles, indices, self.roles[:batch_size])
+        if self.strategy_features is not None:
+            self._gather(
+                self.slots.strategy_features[:, :self.action_capacity],
+                indices,
+                self.strategy_features[:batch_size],
+            )
+        if self.style_features is not None:
+            self._gather(
+                self.slots.style_features,
+                indices,
+                self.style_features[:batch_size],
+            )
         return batch_size
 
     def batch_view(
@@ -478,6 +565,16 @@ class PinnedObservationBatchStager:
             acting_role=self.roles[:batch_size],
             chosen_action_index=None,
             feature_schema_hashes=(feature_schema_hash,) * batch_size,
+            strategy_features=(
+                None
+                if self.strategy_features is None
+                else self.strategy_features[:batch_size]
+            ),
+            style_features=(
+                None
+                if self.style_features is None
+                else self.style_features[:batch_size]
+            ),
         )
 
     def stage_inputs(
@@ -582,9 +679,17 @@ class SharedReplaySlots:
         max_actions: int = 256,
         *,
         v3_provenance: bool = False,
+        strategy_features: bool = False,
+        style_features: bool = False,
     ) -> None:
         self.context = mp.get_context("spawn")
-        self.observations = SharedObservationSlots(schema, num_slots, max_actions)
+        self.observations = SharedObservationSlots(
+            schema,
+            num_slots,
+            max_actions,
+            strategy_features=strategy_features,
+            style_features=style_features,
+        )
         self.v3_provenance = bool(v3_provenance)
         self._validation_shapes = compact_model_input_shapes(schema)
         self._shared_owners = []
@@ -736,10 +841,20 @@ class SharedReplaySlots:
         feature_schema_hash: str,
         target_transform: str,
         ruleset_identity,
+        include_strategy_targets: bool = False,
     ):
         """Drain public V3 rows with exact actor-snapshot Q provenance."""
         if not self.v3_provenance:
             raise RuntimeError("shared replay was not configured for V3 provenance")
+        if not isinstance(include_strategy_targets, bool):
+            raise TypeError("include_strategy_targets must be bool")
+        if (
+            include_strategy_targets
+            and not self.observations.strategy_features_enabled
+        ):
+            raise ValueError(
+                "strategy targets require strategy-enriched public replay"
+            )
         from douzero.v3_hybrid.replay import (
             AdaptiveSnapshotProvenance,
             V3ReplayTransition,
@@ -767,6 +882,16 @@ class SharedReplaySlots:
                     action_mask=source.action_mask.clone(),
                     acting_role=source.acting_role,
                     feature_schema_hash=feature_schema_hash,
+                    strategy_features=(
+                        None
+                        if source.strategy_features is None
+                        else source.strategy_features.clone()
+                    ),
+                    style_features=(
+                        None
+                        if source.style_features is None
+                        else source.style_features.clone()
+                    ),
                 ),
                 selected_action_index=int(self.action_indices[slot_id]),
                 role=source.acting_role,
@@ -788,15 +913,37 @@ class SharedReplaySlots:
                 expected_target_transform=target_transform,
                 expected_ruleset_identity=ruleset_identity,
                 adaptive_required=True,
+                strategy_features_allowed=(
+                    self.observations.strategy_features_enabled
+                ),
+                style_features_allowed=self.observations.style_features_enabled,
             )
-            records.append((
-                record,
-                AsyncReplayKey(
+            key = AsyncReplayKey(
                     actor_id=actor_id,
                     episode_id=episode_id,
                     trace_index=int(self.trace_indices[slot_id]),
-                ),
-            ))
+                )
+            if include_strategy_targets:
+                target_names = (
+                    "min_turns_after",
+                    "min_turns_exact_mask",
+                    "regain_initiative",
+                    "teammate_finish",
+                    "teammate_finish_mask",
+                    "spring_probability",
+                    "structure_cost",
+                )
+                targets = {
+                    name: float(self.labels[slot_id, index + 3].item())
+                    for index, name in enumerate(target_names)
+                }
+                if not all(math.isfinite(value) for value in targets.values()):
+                    raise ValueError(
+                        "async strategy replay contains non-finite labels"
+                    )
+                records.append((record, key, targets))
+            else:
+                records.append((record, key))
             self.free_queue.put(slot_id)
         return records
 
@@ -833,16 +980,28 @@ class AsyncRequestCoordinator:
         output_width: int = 5,
         request_timeout_seconds: float = 30.0,
         belief_inputs: bool = False,
+        strategy_features: bool = False,
+        style_features: bool = False,
     ) -> None:
         if request_timeout_seconds <= 0:
             raise ValueError("request_timeout_seconds must be positive")
-        if not isinstance(belief_inputs, bool):
-            raise TypeError("belief_inputs must be bool")
+        for name, value in (
+            ("belief_inputs", belief_inputs),
+            ("strategy_features", strategy_features),
+            ("style_features", style_features),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool")
         self.context = mp.get_context("spawn")
         if self.context.get_start_method() != "spawn":
             raise RuntimeError("async V2 requires multiprocessing spawn")
         self.slots = SharedObservationSlots(
-            schema, num_slots, max_actions, output_width=output_width
+            schema,
+            num_slots,
+            max_actions,
+            output_width=output_width,
+            strategy_features=strategy_features,
+            style_features=style_features,
         )
         self.belief_inputs = (
             SharedBeliefInputSlots(num_slots) if belief_inputs else None
@@ -1111,6 +1270,11 @@ def async_actor_main(
     belief_sidecar_queue=None,
     oracle_sidecar_queue=None,
     cooperation_sidecar_queue=None,
+    strategy_config=None,
+    style_enabled: bool = False,
+    strategy_targets_enabled: bool = False,
+    strategy_node_budget: int = 500,
+    strategy_time_budget_ms: int = 0,
 ) -> None:
     """CPU-only interleaved-game actor. CUDA is never initialized here."""
     import random
@@ -1145,6 +1309,29 @@ def async_actor_main(
     belief_async = coordinator.belief_inputs is not None
     oracle_async = oracle_sidecar_queue is not None
     cooperation_async = cooperation_sidecar_queue is not None
+    public_aux_async = (
+        coordinator.slots.strategy_features_enabled
+        or coordinator.slots.style_features_enabled
+    )
+    for name, value in (
+        ("style_enabled", style_enabled),
+        ("strategy_targets_enabled", strategy_targets_enabled),
+    ):
+        if not isinstance(value, bool):
+            raise TypeError(f"async {name} must be bool")
+    if coordinator.slots.style_features_enabled != style_enabled:
+        raise ValueError("async style feature transport and actor config disagree")
+    if (
+        coordinator.slots.strategy_features_enabled
+        != (strategy_config is not None)
+    ):
+        raise ValueError(
+            "async strategy feature transport and actor config disagree"
+        )
+    if strategy_targets_enabled != coordinator.slots.strategy_features_enabled:
+        raise ValueError(
+            "async strategy target and public feature transport must match"
+        )
     if belief_async != (belief_sidecar_queue is not None):
         raise ValueError(
             "async belief inference and training sidecar must be enabled together"
@@ -1155,9 +1342,9 @@ def async_actor_main(
         raise ValueError("async Oracle is supported only by the V3 runtime")
     if cooperation_async and runtime_kind != "v3_hybrid":
         raise ValueError("async cooperation is supported only by the V3 runtime")
-    if sum((belief_async, oracle_async, cooperation_async)) > 1:
+    if sum((belief_async, oracle_async, cooperation_async, public_aux_async)) > 1:
         raise NotImplementedError(
-            "combined async H7.1 sidecar capabilities are not supported"
+            "combined async H7.1 capability transports are not supported"
         )
     if belief_async or oracle_async:
         from douzero.observation.privileged import PrivilegedObservation
@@ -1263,10 +1450,22 @@ def async_actor_main(
     def finish_game(game) -> None:
         episode = game["episode"]
         episode.label_from_terminal()
+        if strategy_targets_enabled:
+            episode.label_strategy_auxiliary(
+                node_budget=strategy_node_budget,
+                time_budget_ms=strategy_time_budget_ms,
+            )
         for transition in episode.transitions:
+            public_inputs = getattr(transition, "public_model_inputs", None)
+            if public_inputs is None:
+                public_inputs = observation_to_model_inputs(
+                    transition.obs,
+                    strategy_config,
+                    style_enabled=style_enabled,
+                )
             replay_slots.write_transition(
                 transition,
-                observation_to_model_inputs(transition.obs),
+                public_inputs,
                 game["snapshot"],
                 coordinator.request_timeout_seconds,
                 coordinator.abort_event,
@@ -1339,6 +1538,7 @@ def async_actor_main(
         *,
         q_old=None,
         belief_sidecar=None,
+        public_inputs=None,
     ) -> bool:
         episode = game["episode"]
         if obs is not None:
@@ -1357,6 +1557,11 @@ def async_actor_main(
                 transition.actor_q_old = float(q_old)
                 transition.actor_id = int(actor_id)
                 transition.episode_id = int(game["episode_id"])
+                if public_inputs is None:
+                    raise ValueError(
+                        "V3 actor decision requires its served public inputs"
+                    )
+                transition.public_model_inputs = public_inputs
             if belief_async:
                 if belief_sidecar is None:
                     raise ValueError(
@@ -1372,7 +1577,7 @@ def async_actor_main(
                     obs,
                     privileged,
                     action_index=action_index,
-                    public_inputs=observation_to_model_inputs(obs),
+                    public_inputs=public_inputs,
                 )
             if cooperation_async and position in FARMER_ROLES:
                 provenance = f"{policy_version}@{game['snapshot']}"
@@ -1381,7 +1586,7 @@ def async_actor_main(
                         obs,
                         selected_action_index=action_index,
                         trace_index=transition.trace_index,
-                        public_inputs=observation_to_model_inputs(obs),
+                        public_inputs=public_inputs,
                         snapshot_policy_version=int(game["snapshot"]),
                         policy_id=provenance,
                         teammate_policy_id=provenance,
@@ -1425,7 +1630,11 @@ def async_actor_main(
                     return True
                 continue
 
-            bundle = observation_to_model_inputs(obs)
+            bundle = observation_to_model_inputs(
+                obs,
+                strategy_config,
+                style_enabled=style_enabled,
+            )
             slot_id = coordinator.acquire(actor_id)
             coordinator.slots.write(slot_id, bundle)
             belief_sidecar = None
@@ -1452,6 +1661,7 @@ def async_actor_main(
                 position,
                 legal_actions,
                 belief_sidecar,
+                bundle,
             )
             return False
 
@@ -1463,6 +1673,7 @@ def async_actor_main(
             position,
             legal_actions,
             belief_sidecar,
+            public_inputs,
         ) = game["pending"]
         blocked_started = time.monotonic()
         coordinator.wait_done(slot_id, pending_id)
@@ -1501,6 +1712,7 @@ def async_actor_main(
             legal_actions,
             q_old,
             belief_sidecar,
+            public_inputs,
         )
 
     try:
@@ -1547,6 +1759,7 @@ def async_actor_main(
                 legal_actions,
                 q_old,
                 belief_sidecar,
+                public_inputs,
             ) in resolved:
                 if apply_action(
                     game,
@@ -1556,6 +1769,7 @@ def async_actor_main(
                     legal_actions,
                     q_old=q_old,
                     belief_sidecar=belief_sidecar,
+                    public_inputs=public_inputs,
                 ):
                     active.remove(game)
     except BaseException as exc:

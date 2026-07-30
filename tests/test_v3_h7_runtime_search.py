@@ -139,9 +139,9 @@ def test_h7_support_matrix_enables_implemented_async_capabilities():
             deployment=True,
             search=False,
         )
-    with pytest.raises(ValueError, match="does not support async_single_gpu"):
+    for capability in ("strategy", "style"):
         validate_capability_support(
-            "strategy",
+            capability,
             topology=TOPOLOGY_ASYNC_SINGLE_GPU,
             ruleset=RULESET_LEGACY,
             checkpoint_resume=True,
@@ -421,6 +421,9 @@ def _benchmark_record(protocol, topology, repeat):
         "cooperation_episodes_per_second": 0.0,
         "cooperation_optimizer_steps_per_second": 0.0,
         "cooperation_parameter_vram_bytes": 0.0,
+        "strategy_samples_per_second": 0.0,
+        "strategy_optimizer_steps_per_second": 0.0,
+        "public_aux_parameter_vram_bytes": 0.0,
         "requests_per_microbatch": 2.0,
         "legal_actions_per_batch": 16.0,
         "queue_wait_seconds": 1.0,

@@ -14,6 +14,7 @@ from douzero.v3_hybrid.benchmark import (
 )
 from douzero.v3_hybrid.formal_config import load_formal_config
 from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
+from douzero.v3_hybrid.integration_config import load_v3_hybrid_config
 from douzero.v3_hybrid.pilot import build_pilot_resolved_config
 from douzero.v3_hybrid.runtime import (
     V3_H71A_REPLAY_PROTOCOL,
@@ -23,6 +24,8 @@ from douzero.v3_hybrid.runtime import (
     V3_H71B_REQUEST_PROTOCOL,
     V3_H71C_REPLAY_PROTOCOL,
     V3_H71C_REQUEST_PROTOCOL,
+    V3_H71D_REPLAY_PROTOCOL,
+    V3_H71D_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -49,10 +52,16 @@ def main() -> None:
     parser.add_argument("--cuda", required=True)
     parser.add_argument("--cpu", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
+    config = parser.add_mutually_exclusive_group()
+    config.add_argument(
         "--formal-config",
         type=Path,
         help="freeze an H7 sidecar protocol for a committed formal config",
+    )
+    config.add_argument(
+        "--config",
+        type=Path,
+        help="freeze an H7 protocol for a committed resolved H6 config",
     )
     parser.add_argument("--warmup-seconds", type=float, default=30.0)
     parser.add_argument("--measurement-seconds", type=float, default=300.0)
@@ -65,13 +74,21 @@ def main() -> None:
     if formal is not None:
         validate_v3_h7_formal_initialization(formal.initialization.kind)
     resolved = (
-        build_v3_h7_smoke_config()
-        if formal is None
-        else build_pilot_resolved_config(formal)
+        load_v3_hybrid_config(args.config)
+        if args.config is not None
+        else (
+            build_v3_h7_smoke_config()
+            if formal is None
+            else build_pilot_resolved_config(formal)
+        )
     )
     belief_enabled = resolved.learner.features.belief
     oracle_enabled = resolved.learner.features.oracle
     cooperation_enabled = resolved.learner.features.cooperation
+    public_aux_enabled = (
+        resolved.learner.features.strategy
+        or resolved.learner.features.style
+    )
     request_protocol = (
         V3_H71A_REQUEST_PROTOCOL
         if belief_enabled
@@ -81,7 +98,11 @@ def main() -> None:
             else (
                 V3_H71C_REQUEST_PROTOCOL
                 if cooperation_enabled
-                else V3_H7_REQUEST_PROTOCOL
+                else (
+                    V3_H71D_REQUEST_PROTOCOL
+                    if public_aux_enabled
+                    else V3_H7_REQUEST_PROTOCOL
+                )
             )
         )
     )
@@ -94,7 +115,11 @@ def main() -> None:
             else (
                 V3_H71C_REPLAY_PROTOCOL
                 if cooperation_enabled
-                else V3_H7_REPLAY_PROTOCOL
+                else (
+                    V3_H71D_REPLAY_PROTOCOL
+                    if public_aux_enabled
+                    else V3_H7_REPLAY_PROTOCOL
+                )
             )
         )
     )
@@ -102,6 +127,7 @@ def main() -> None:
         belief_runtime_enabled=belief_enabled,
         oracle_runtime_enabled=oracle_enabled,
         cooperation_runtime_enabled=cooperation_enabled,
+        public_aux_runtime_enabled=public_aux_enabled,
         request_protocol=request_protocol,
         replay_protocol=replay_protocol,
         snapshot_semantics=(
@@ -122,7 +148,7 @@ def main() -> None:
             request_protocol=request_protocol,
             resolved_learner_hash=(
                 resolved.learner.stable_hash()
-                if args.formal_config is not None
+                if args.formal_config is not None or args.config is not None
                 else None
             ),
         ),
@@ -134,6 +160,7 @@ def main() -> None:
         ),
         oracle_enabled=oracle_enabled,
         cooperation_enabled=cooperation_enabled,
+        public_aux_enabled=public_aux_enabled,
         gpu=args.gpu,
         driver=args.driver,
         pytorch=args.pytorch,
