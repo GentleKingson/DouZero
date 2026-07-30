@@ -149,9 +149,9 @@ def test_h7_support_matrix_enables_implemented_async_capabilities():
             deployment=False,
             search=False,
         )
-    with pytest.raises(ValueError, match="async_single_gpu.*standard"):
+    for capability in ("belief", "oracle", "cooperation", "strategy", "style"):
         validate_capability_support(
-            "cooperation",
+            capability,
             topology=TOPOLOGY_ASYNC_SINGLE_GPU,
             ruleset=RULESET_STANDARD,
             checkpoint_resume=True,

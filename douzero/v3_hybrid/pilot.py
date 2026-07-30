@@ -105,12 +105,17 @@ def derive_pilot_stream_seed(
 
 def build_pilot_resolved_config(
     formal: FormalExperimentConfig,
+    *,
+    allow_standard: bool = False,
 ) -> V3H6ResolvedConfig:
     """Convert a frozen P1 V3 config to the executable H6 config exactly once."""
 
     if formal.variant not in P2_VARIANTS:
         raise ValueError("P2 runner only accepts the six frozen V3 pilot variants")
-    if formal.ruleset["id"] != "legacy":
+    ruleset_id = str(formal.ruleset["id"])
+    if ruleset_id not in {"legacy", "standard"}:
+        raise ValueError("formal V3 runtime ruleset is unsupported")
+    if ruleset_id == "standard" and not allow_standard:
         raise ValueError("P2 first-pass pilot is frozen to legacy card-play")
     model = formal.model["config"]
     model_config = V3HybridModelConfig.from_dict(dict(model))
@@ -209,7 +214,7 @@ def build_pilot_resolved_config(
             base=base,
             losses=losses,
             features=flags,
-            topology=V3H6TopologyConfig(ruleset="legacy"),
+            topology=V3H6TopologyConfig(ruleset=ruleset_id),
         ),
     )
 
@@ -583,8 +588,12 @@ def train_pilot_batch(learner: V3H6Learner, batch: PilotBatch):
 
 def create_pilot_learner(
     formal: FormalExperimentConfig,
+    *,
+    allow_standard: bool = False,
 ) -> tuple[V3H6Learner, V3H6ResolvedConfig]:
-    resolved = build_pilot_resolved_config(formal)
+    resolved = build_pilot_resolved_config(
+        formal, allow_standard=allow_standard
+    )
     torch.manual_seed(formal.initialization.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(formal.initialization.seed)
@@ -594,7 +603,11 @@ def create_pilot_learner(
         belief_model = BeliefModel(BeliefConfig())
     learner = V3H6Learner(
         model,
-        ruleset=RuleSet.legacy(),
+        ruleset=(
+            RuleSet.standard()
+            if resolved.learner.topology.ruleset == "standard"
+            else RuleSet.legacy()
+        ),
         config=resolved,
         belief_model=belief_model,
     )

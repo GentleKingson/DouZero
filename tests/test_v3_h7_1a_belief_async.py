@@ -353,22 +353,21 @@ def test_belief_only_update_advances_coupled_served_version():
     assert runtime.policy_step == 9
 
 
-def test_belief_async_standard_combination_is_not_advertised():
-    with pytest.raises(ValueError, match="combination"):
-        validate_capability_support(
-            "belief",
-            topology=TOPOLOGY_ASYNC_SINGLE_GPU,
-            ruleset=RULESET_STANDARD,
-            checkpoint_resume=True,
-            export=True,
-            deployment=True,
-            search=False,
-        )
+def test_belief_async_standard_support_is_advertised_for_full_hybrid():
+    validate_capability_support(
+        "belief",
+        topology=TOPOLOGY_ASYNC_SINGLE_GPU,
+        ruleset=RULESET_STANDARD,
+        checkpoint_resume=True,
+        export=True,
+        deployment=True,
+        search=False,
+    )
 
 
 @pytest.mark.parametrize(
     "config_name",
-    ("v3_belief_standard.yaml", "v3_full_hybrid_legacy.yaml"),
+    ("v3_belief_standard.yaml",),
 )
 def test_protocol_freeze_rejects_unsupported_formal_config_before_write(
     config_name, monkeypatch, tmp_path

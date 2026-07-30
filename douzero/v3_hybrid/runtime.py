@@ -14,7 +14,7 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import torch
 import numpy as np
@@ -75,7 +75,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v20"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1f-runtime-v21"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v8"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -110,12 +110,81 @@ V3_H71E_REQUEST_PROTOCOL = (
 V3_H71E_REPLAY_PROTOCOL = (
     "v3-public-cardplay-plus-separate-bidding-replay-redeal-cap-excluded-v2"
 )
-V3_H71AB_REQUEST_PROTOCOL = (
-    "v2-shared-slots-v3-dmc-q-belief-oracle-sidecars-v1"
+V3_H71F_LEGACY_REQUEST_PROTOCOL = (
+    "v2-shared-slots-v3-full-hybrid-public-cardplay-multi-sidecar-v1"
 )
-V3_H71AB_REPLAY_PROTOCOL = (
-    "v3-public-replay-plus-separate-belief-oracle-sidecars-v1"
+V3_H71F_LEGACY_REPLAY_PROTOCOL = (
+    "v3-public-replay-plus-belief-oracle-cooperation-public-aux-v1"
 )
+V3_H71F_STANDARD_REQUEST_PROTOCOL = (
+    "v2-shared-slots-v3-full-hybrid-standard-bid-cardplay-multi-sidecar-v1"
+)
+V3_H71F_STANDARD_REPLAY_PROTOCOL = (
+    "v3-public-cardplay-plus-belief-oracle-cooperation-public-aux-bidding-v1"
+)
+
+
+def resolve_v3_h7_protocols(
+    *,
+    belief: bool,
+    oracle: bool,
+    cooperation: bool,
+    public_aux: bool,
+    bidding: bool,
+) -> tuple[str, str, str]:
+    """Resolve only protocol combinations with an implemented transport."""
+
+    flags = (belief, oracle, cooperation, public_aux, bidding)
+    if flags == (True, True, True, True, False):
+        return (
+            V3_H71F_LEGACY_REQUEST_PROTOCOL,
+            V3_H71F_LEGACY_REPLAY_PROTOCOL,
+            V3_H71A_SNAPSHOT_SEMANTICS,
+        )
+    if flags == (True, True, True, True, True):
+        return (
+            V3_H71F_STANDARD_REQUEST_PROTOCOL,
+            V3_H71F_STANDARD_REPLAY_PROTOCOL,
+            V3_H71A_SNAPSHOT_SEMANTICS,
+        )
+    enabled = sum(flags)
+    if enabled > 1:
+        raise NotImplementedError(
+            "partial combined async H7.1 capability transports are not supported"
+        )
+    protocols = {
+        (False, False, False, False, False): (
+            V3_H7_REQUEST_PROTOCOL,
+            V3_H7_REPLAY_PROTOCOL,
+        ),
+        (True, False, False, False, False): (
+            V3_H71A_REQUEST_PROTOCOL,
+            V3_H71A_REPLAY_PROTOCOL,
+        ),
+        (False, True, False, False, False): (
+            V3_H71B_REQUEST_PROTOCOL,
+            V3_H71B_REPLAY_PROTOCOL,
+        ),
+        (False, False, True, False, False): (
+            V3_H71C_REQUEST_PROTOCOL,
+            V3_H71C_REPLAY_PROTOCOL,
+        ),
+        (False, False, False, True, False): (
+            V3_H71D_REQUEST_PROTOCOL,
+            V3_H71D_REPLAY_PROTOCOL,
+        ),
+        (False, False, False, False, True): (
+            V3_H71E_REQUEST_PROTOCOL,
+            V3_H71E_REPLAY_PROTOCOL,
+        ),
+    }
+    request, replay = protocols[flags]
+    snapshot = (
+        V3_H71A_SNAPSHOT_SEMANTICS
+        if belief
+        else "game-boundary-quiescent-copy-v1"
+    )
+    return request, replay, snapshot
 
 
 def resolve_v3_h7_seed_contract(
@@ -296,39 +365,14 @@ class V3H7RuntimeConfig:
             )
         if self.first_bidder_mode not in {"rotate", "seeded_random"}:
             raise ValueError("H7 first_bidder_mode is unsupported")
-        enabled_sidecars = sum((
-            self.belief_runtime_enabled,
-            self.oracle_runtime_enabled,
-            self.cooperation_runtime_enabled,
-            self.public_aux_runtime_enabled,
-            self.bidding_runtime_enabled,
-        ))
-        if enabled_sidecars > 1:
-            raise NotImplementedError(
-                "combined async H7.1 capability transports are not supported"
+        expected_request, expected_replay, expected_snapshot = (
+            resolve_v3_h7_protocols(
+                belief=self.belief_runtime_enabled,
+                oracle=self.oracle_runtime_enabled,
+                cooperation=self.cooperation_runtime_enabled,
+                public_aux=self.public_aux_runtime_enabled,
+                bidding=self.bidding_runtime_enabled,
             )
-        if self.belief_runtime_enabled:
-            expected_request = V3_H71A_REQUEST_PROTOCOL
-            expected_replay = V3_H71A_REPLAY_PROTOCOL
-        elif self.oracle_runtime_enabled:
-            expected_request = V3_H71B_REQUEST_PROTOCOL
-            expected_replay = V3_H71B_REPLAY_PROTOCOL
-        elif self.cooperation_runtime_enabled:
-            expected_request = V3_H71C_REQUEST_PROTOCOL
-            expected_replay = V3_H71C_REPLAY_PROTOCOL
-        elif self.public_aux_runtime_enabled:
-            expected_request = V3_H71D_REQUEST_PROTOCOL
-            expected_replay = V3_H71D_REPLAY_PROTOCOL
-        elif self.bidding_runtime_enabled:
-            expected_request = V3_H71E_REQUEST_PROTOCOL
-            expected_replay = V3_H71E_REPLAY_PROTOCOL
-        else:
-            expected_request = V3_H7_REQUEST_PROTOCOL
-            expected_replay = V3_H7_REPLAY_PROTOCOL
-        expected_snapshot = (
-            V3_H71A_SNAPSHOT_SEMANTICS
-            if self.belief_runtime_enabled
-            else "game-boundary-quiescent-copy-v1"
         )
         if self.request_protocol != expected_request:
             raise ValueError("unknown H7 request protocol for selected capabilities")
@@ -504,6 +548,11 @@ class V3H71ABeliefAlignment:
     def pop_ready(
         self,
     ) -> list[tuple[V3ReplayTransition, V3H4BeliefSample]]:
+        return [(row, sample) for _key, row, sample in self.pop_ready_keyed()]
+
+    def pop_ready_keyed(
+        self,
+    ) -> list[tuple[AsyncReplayKey, V3ReplayTransition, V3H4BeliefSample]]:
         result = []
         for key in tuple(self.public_rows):
             sidecar = self.sidecars.get(key)
@@ -513,7 +562,7 @@ class V3H71ABeliefAlignment:
             self.sidecars.pop(key)
             sample = bind_v3_h4_belief_sidecar(row.model_inputs, sidecar)
             self._remember_completed(key)
-            result.append((row, sample))
+            result.append((key, row, sample))
         return result
 
     def assert_quiescent(self) -> None:
@@ -576,6 +625,9 @@ class V3H71BOracleAlignment:
         self._completed_set.add(key)
 
     def pop_ready(self):
+        return [(row, sample) for _key, row, sample in self.pop_ready_keyed()]
+
+    def pop_ready_keyed(self):
         result = []
         for key in tuple(self.public_rows):
             sidecar = self.sidecars.get(key)
@@ -583,7 +635,11 @@ class V3H71BOracleAlignment:
                 continue
             row = self.public_rows.pop(key)
             self.sidecars.pop(key)
-            result.append((row, bind_v3_h3_oracle_sidecar(row, sidecar)))
+            result.append((
+                key,
+                row,
+                bind_v3_h3_oracle_sidecar(row, sidecar),
+            ))
             self._remember_completed(key)
         return result
 
@@ -598,6 +654,10 @@ class V3H71CCooperationEpisode:
 
     transitions: tuple[V3ReplayTransition, ...]
     trajectories: tuple[V3H5FarmerTrajectory, V3H5FarmerTrajectory]
+    keys: tuple[AsyncReplayKey, ...] = ()
+    belief_samples: tuple[V3H4BeliefSample, ...] | None = None
+    oracle_samples: tuple[object, ...] | None = None
+    strategy_targets: tuple[dict[str, float], ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.transitions:
@@ -616,6 +676,12 @@ class V3H71CCooperationEpisode:
             or any(row.role not in FARMER_ROLES for row in trajectory_rows)
         ):
             raise ValueError("H7.1c episode rows and trajectories disagree")
+        if self.keys and len(self.keys) != len(self.transitions):
+            raise ValueError("H7.1f episode keys and transitions disagree")
+        for name in ("belief_samples", "oracle_samples", "strategy_targets"):
+            samples = getattr(self, name)
+            if samples is not None and len(samples) != len(self.transitions):
+                raise ValueError(f"H7.1f episode {name} and transitions disagree")
 
 
 class V3H71CCooperationAlignment:
@@ -639,13 +705,14 @@ class V3H71CCooperationAlignment:
             dict[str, list[tuple[object, V3H5AsyncDecisionSidecar]]],
         ] = {}
         self._episode_public_rows: dict[
-            tuple[int, int], list[tuple[int, V3ReplayTransition]]
+            tuple[int, int], list[tuple[AsyncReplayKey, V3ReplayTransition]]
         ] = {}
         self._expected: dict[tuple[int, int], dict[str, int]] = {}
         self._expected_total: dict[tuple[int, int], int] = {}
         self._ready: deque[V3H71CCooperationEpisode] = deque()
         self._completed = deque(maxlen=capacity)
         self._completed_set: set[AsyncReplayKey] = set()
+        self._discarded_keys: deque[AsyncReplayKey] = deque()
         self.incomplete_episodes = 0
         self.oversized_episodes = 0
 
@@ -723,7 +790,7 @@ class V3H71CCooperationAlignment:
         )
         roles[row.role].append((decision, sidecar))
         self._episode_public_rows.setdefault(identity, []).append(
-            (key.trace_index, row)
+            (key, row)
         )
         self._remember_completed(key)
         self._finalize_ready(identity)
@@ -736,7 +803,7 @@ class V3H71CCooperationAlignment:
         self._check_new(key, self.public_rows)
         identity = (key.actor_id, key.episode_id)
         self._episode_public_rows.setdefault(identity, []).append(
-            (key.trace_index, row)
+            (key, row)
         )
         self._remember_completed(key)
         self._finalize_ready(identity)
@@ -813,6 +880,7 @@ class V3H71CCooperationAlignment:
         self._episode_public_rows.pop(identity)
         if any(actual[role] == 0 for role in FARMER_ROLES):
             self.incomplete_episodes += 1
+            self._discarded_keys.extend(key for key, _row in public_rows)
             return
         trajectories = []
         for role in FARMER_ROLES:
@@ -840,18 +908,27 @@ class V3H71CCooperationAlignment:
             raise ValueError("H7.1c landlord-up teammate provenance mismatch")
         if down.teammate_policy_id != up.policy_id:
             raise ValueError("H7.1c landlord-down teammate provenance mismatch")
-        transitions = tuple(row for _trace, row in sorted(public_rows))
+        ordered_rows = sorted(public_rows, key=lambda item: item[0].trace_index)
+        keys = tuple(key for key, _row in ordered_rows)
+        transitions = tuple(row for _key, row in ordered_rows)
         if len(transitions) > self.max_episode_transitions:
             self.oversized_episodes += 1
+            self._discarded_keys.extend(keys)
             return
         self._ready.append(V3H71CCooperationEpisode(
             transitions=transitions,
             trajectories=(up, down),
+            keys=keys,
         ))
 
     def pop_ready_episodes(self) -> list[V3H71CCooperationEpisode]:
         result = list(self._ready)
         self._ready.clear()
+        return result
+
+    def pop_discarded_keys(self) -> tuple[AsyncReplayKey, ...]:
+        result = tuple(self._discarded_keys)
+        self._discarded_keys.clear()
         return result
 
     def discard_pending(self) -> int:
@@ -870,6 +947,7 @@ class V3H71CCooperationAlignment:
         self._expected.clear()
         self._expected_total.clear()
         self._ready.clear()
+        self._discarded_keys.clear()
         return len(identities)
 
     def assert_quiescent(self) -> None:
@@ -1009,30 +1087,34 @@ def validate_v3_h7_runtime_config(
     cooperation_enabled = "cooperation" in enabled
     public_aux_enabled = bool({"strategy", "style"} & enabled)
     bidding_enabled = "bidding" in enabled
-    if bidding_enabled:
-        if topology.ruleset != RULESET_STANDARD:
-            raise ValueError("H7.1e bidding runtime requires standard rules")
-        allowed = {
-            "role_model", "adaptive_dmc", "bidding", "public_export",
-        }
-        if enabled - allowed:
-            raise NotImplementedError(
-                "H7.1e standard bidding remains isolated from other H7.1 "
-                f"capabilities: {sorted(enabled - allowed)}"
-            )
-    elif topology.ruleset != RULESET_LEGACY:
-        raise NotImplementedError(
-            "H7 async standard rules require the H7.1e bidding capability"
-        )
-    if sum((
+    transport_flags = (
         belief_enabled,
         oracle_enabled,
         cooperation_enabled,
         public_aux_enabled,
         bidding_enabled,
-    )) > 1:
+    )
+    full_legacy = transport_flags == (True, True, True, True, False)
+    full_standard = transport_flags == (True, True, True, True, True)
+    if bidding_enabled:
+        if topology.ruleset != RULESET_STANDARD:
+            raise ValueError("H7.1e bidding runtime requires standard rules")
+        allowed = {"role_model", "adaptive_dmc", "bidding", "public_export"}
+        full_allowed = allowed | {
+            "belief", "oracle", "cooperation", "strategy", "style",
+        }
+        if enabled - (full_allowed if full_standard else allowed):
+            raise NotImplementedError(
+                "H7.1f standard full-hybrid capability set is unsupported: "
+                f"{sorted(enabled)}"
+            )
+    elif topology.ruleset != RULESET_LEGACY:
         raise NotImplementedError(
-            "H7.1 capability transports remain isolated until a later integration"
+            "H7 async standard rules require the H7.1e bidding capability"
+        )
+    if sum(transport_flags) > 1 and not (full_legacy or full_standard):
+        raise NotImplementedError(
+            "partial combined H7.1 capability transports remain unsupported"
         )
     if belief_enabled != runtime_config.belief_runtime_enabled:
         raise ValueError(
@@ -1262,6 +1344,22 @@ class V3AsyncSingleGPUTrainer:
             if runtime_config.cooperation_runtime_enabled
             else None
         )
+        self._full_hybrid_runtime = all((
+            runtime_config.belief_runtime_enabled,
+            runtime_config.oracle_runtime_enabled,
+            runtime_config.cooperation_runtime_enabled,
+            runtime_config.public_aux_runtime_enabled,
+        ))
+        self._full_belief_samples: dict[
+            AsyncReplayKey, V3H4BeliefSample
+        ] = {}
+        self._full_oracle_samples: dict[AsyncReplayKey, object] = {}
+        self._full_strategy_targets: dict[
+            AsyncReplayKey, dict[str, float]
+        ] = {}
+        self._pending_cooperation_episodes: deque[
+            V3H71CCooperationEpisode
+        ] = deque()
         self._rng = random.Random(runtime_config.action_seed)
         self._runtime_started = False
         self._served_version_offset = 0
@@ -1667,7 +1765,9 @@ class V3AsyncSingleGPUTrainer:
 
     def _drain_replay(self) -> int:
         started = time.perf_counter()
-        if self.strategy_target_buffer is not None:
+        if self._full_hybrid_runtime:
+            completed = self._drain_full_hybrid_replay()
+        elif self.strategy_target_buffer is not None:
             enriched = self._replay_slots.read_ready_v3_aligned(
                 feature_schema_hash=self.model.schema.stable_hash(),
                 target_transform=self.model.config.dmc_target_transform,
@@ -1737,6 +1837,7 @@ class V3AsyncSingleGPUTrainer:
             completed += paired
             self.stats.cooperation_labels_collected += paired
             episodes = self._cooperation_alignment.pop_ready_episodes()
+            self._cooperation_alignment.pop_discarded_keys()
             for episode in episodes:
                 self.cooperation_buffer.append(episode)
                 self.buffer.extend(episode.transitions)
@@ -1808,6 +1909,153 @@ class V3AsyncSingleGPUTrainer:
                     self.stats.oracle_labels_collected += 1
         self._segments["replay_drain"] += time.perf_counter() - started
         return completed
+
+    @staticmethod
+    def _drain_keyed_sidecars(sidecar_queue, sidecar_type, label: str) -> dict:
+        queued = {}
+        while True:
+            try:
+                message = sidecar_queue.get_nowait()
+            except queue.Empty:
+                break
+            if (
+                not isinstance(message, tuple)
+                or len(message) != 2
+                or not isinstance(message[0], AsyncReplayKey)
+                or not isinstance(message[1], sidecar_type)
+            ):
+                raise TypeError(f"H7.1f {label} sidecar envelope mismatch")
+            key, sidecar = message
+            if key in queued:
+                raise RuntimeError(f"duplicate H7.1f {label} sidecar queue key")
+            queued[key] = sidecar
+        return queued
+
+    def _drain_full_hybrid_replay(self) -> int:
+        enriched = self._replay_slots.read_ready_v3_aligned(
+            feature_schema_hash=self.model.schema.stable_hash(),
+            target_transform=self.model.config.dmc_target_transform,
+            ruleset_identity=self.learner.ruleset.identity(),
+            include_strategy_targets=True,
+        )
+        belief_sidecars = self._drain_keyed_sidecars(
+            self._belief_sidecar_queue, V3H4BeliefSidecar, "belief"
+        )
+        oracle_sidecars = self._drain_keyed_sidecars(
+            self._oracle_sidecar_queue, V3H3OracleSidecar, "Oracle"
+        )
+        cooperation_sidecars = self._drain_keyed_sidecars(
+            self._cooperation_sidecar_queue,
+            V3H5AsyncDecisionSidecar,
+            "cooperation",
+        )
+        for row, key, targets in enriched:
+            self._full_strategy_targets[key] = targets
+            belief_sidecar = belief_sidecars.pop(key, None)
+            if belief_sidecar is None:
+                self._belief_alignment.add_public(key, row)
+            else:
+                _row, sample = self._belief_alignment.add_pair(
+                    key, row, belief_sidecar
+                )
+                self._full_belief_samples[key] = sample
+            oracle_sidecar = oracle_sidecars.pop(key, None)
+            if oracle_sidecar is None:
+                self._oracle_alignment.add_public(key, row)
+            else:
+                _row, sample = self._oracle_alignment.add_pair(
+                    key, row, oracle_sidecar
+                )
+                self._full_oracle_samples[key] = sample
+            if row.role not in FARMER_ROLES:
+                self._cooperation_alignment.add_landlord(key, row)
+            else:
+                cooperation_sidecar = cooperation_sidecars.pop(key, None)
+                if cooperation_sidecar is None:
+                    self._cooperation_alignment.add_public(key, row)
+                else:
+                    self._cooperation_alignment.add_pair(
+                        key, row, cooperation_sidecar
+                    )
+        for key, sidecar in belief_sidecars.items():
+            self._belief_alignment.add_sidecar(key, sidecar)
+        for key, sidecar in oracle_sidecars.items():
+            self._oracle_alignment.add_sidecar(key, sidecar)
+        for key, sidecar in cooperation_sidecars.items():
+            self._cooperation_alignment.add_sidecar(key, sidecar)
+        for key, _row, sample in self._belief_alignment.pop_ready_keyed():
+            self._full_belief_samples[key] = sample
+        for key, _row, sample in self._oracle_alignment.pop_ready_keyed():
+            self._full_oracle_samples[key] = sample
+        self._cooperation_alignment.pop_ready_pairs()
+        self._pending_cooperation_episodes.extend(
+            self._cooperation_alignment.pop_ready_episodes()
+        )
+        if any(
+            len(store) > self._cooperation_alignment.capacity
+            for store in (
+                self._full_belief_samples,
+                self._full_oracle_samples,
+                self._full_strategy_targets,
+            )
+        ):
+            raise RuntimeError("H7.1f auxiliary alignment exceeded capacity")
+        if (
+            len(self._pending_cooperation_episodes)
+            > self.config.cooperation_episode_capacity
+        ):
+            raise RuntimeError("H7.1f complete episode staging exceeded capacity")
+        for key in self._cooperation_alignment.pop_discarded_keys():
+            self._full_belief_samples.pop(key, None)
+            self._full_oracle_samples.pop(key, None)
+            self._full_strategy_targets.pop(key, None)
+        pending = deque()
+        while self._pending_cooperation_episodes:
+            episode = self._pending_cooperation_episodes.popleft()
+            if not all(
+                key in self._full_belief_samples
+                and key in self._full_oracle_samples
+                and key in self._full_strategy_targets
+                for key in episode.keys
+            ):
+                pending.append(episode)
+                continue
+            belief_samples = tuple(
+                self._full_belief_samples.pop(key) for key in episode.keys
+            )
+            oracle_samples = tuple(
+                self._full_oracle_samples.pop(key) for key in episode.keys
+            )
+            strategy_targets = tuple(
+                self._full_strategy_targets.pop(key) for key in episode.keys
+            )
+            bound_episode = replace(
+                episode,
+                belief_samples=belief_samples,
+                oracle_samples=oracle_samples,
+                strategy_targets=strategy_targets,
+            )
+            self.cooperation_buffer.append(bound_episode)
+            self.buffer.extend(bound_episode.transitions)
+            self.belief_buffer.extend(belief_samples)
+            self.oracle_buffer.extend(oracle_samples)
+            self.strategy_target_buffer.extend(strategy_targets)
+            self.stats.belief_labels_collected += len(episode.keys)
+            self.stats.oracle_labels_collected += len(episode.keys)
+            self.stats.cooperation_labels_collected += sum(
+                len(trajectory.transitions)
+                for trajectory in episode.trajectories
+            )
+            self.stats.strategy_labels_collected += len(episode.keys)
+            self.stats.cooperation_episodes_collected += 1
+        self._pending_cooperation_episodes = pending
+        self.stats.cooperation_incomplete_episodes = (
+            self._cooperation_alignment.incomplete_episodes
+        )
+        self.stats.cooperation_oversized_episodes = (
+            self._cooperation_alignment.oversized_episodes
+        )
+        return len(enriched)
 
     def _drain_bidding_replay(self) -> int:
         if self.bidding_buffer is None:
@@ -1951,7 +2199,7 @@ class V3AsyncSingleGPUTrainer:
                     self._actor_blocked_seconds += float(event[7])
                     self._actor_wall_seconds += float(event[8])
                 if self.bidding_buffer is not None:
-                    if len(event) != 14:
+                    if len(event) < 14:
                         raise ValueError(
                             "H7.1e completion event lacks bidding counters"
                         )
@@ -1962,7 +2210,7 @@ class V3AsyncSingleGPUTrainer:
                     self.stats.abandoned_bidding_transitions += int(event[12])
                     self.stats.redeals += int(event[13])
                 if self._cooperation_alignment is not None:
-                    if len(event) != 10:
+                    if len(event) < 10:
                         raise ValueError(
                             "H7.1c completion event lacks farmer decision counts"
                         )
@@ -1972,11 +2220,13 @@ class V3AsyncSingleGPUTrainer:
                         event[9],
                         total_count=count,
                     )
-                    episodes = self._cooperation_alignment.pop_ready_episodes()
-                    for episode in episodes:
-                        self.cooperation_buffer.append(episode)
-                        self.buffer.extend(episode.transitions)
-                        self.stats.cooperation_episodes_collected += 1
+                    if not self._full_hybrid_runtime:
+                        episodes = self._cooperation_alignment.pop_ready_episodes()
+                        self._cooperation_alignment.pop_discarded_keys()
+                        for episode in episodes:
+                            self.cooperation_buffer.append(episode)
+                            self.buffer.extend(episode.transitions)
+                            self.stats.cooperation_episodes_collected += 1
                     self.stats.cooperation_incomplete_episodes = (
                         self._cooperation_alignment.incomplete_episodes
                     )
@@ -2088,6 +2338,9 @@ class V3AsyncSingleGPUTrainer:
             rows = list(episode.transitions)
             trajectories = episode.trajectories
             indices = []
+            episode_belief_samples = episode.belief_samples
+            episode_oracle_samples = episode.oracle_samples
+            episode_strategy_targets = episode.strategy_targets
         else:
             if len(self.buffer) < self.config.batch_size:
                 return None
@@ -2096,6 +2349,9 @@ class V3AsyncSingleGPUTrainer:
             )
             rows = [self.buffer[index] for index in indices]
             trajectories = None
+            episode_belief_samples = None
+            episode_oracle_samples = None
+            episode_strategy_targets = None
         learner_rows = self._learner_rows(rows)
         learner_trajectories = _remap_h7_cooperation_trajectories(
             rows, learner_rows, trajectories
@@ -2103,10 +2359,18 @@ class V3AsyncSingleGPUTrainer:
         belief_samples = (
             None
             if self.belief_buffer is None
-            else [self.belief_buffer[index] for index in indices]
+            else (
+                list(episode_belief_samples)
+                if episode_belief_samples is not None
+                else [self.belief_buffer[index] for index in indices]
+            )
         )
-        oracle_samples = self._oracle_samples_for_indices(indices)
-        strategy_targets = self._strategy_targets_for_indices(indices)
+        oracle_samples = self._oracle_samples_for_indices(
+            indices, episode_oracle_samples
+        )
+        strategy_targets = self._strategy_targets_for_indices(
+            indices, episode_strategy_targets
+        )
         bidding_batch = (
             BiddingMinibatch(self._rng.sample(
                 list(self.bidding_buffer), self.config.bidding_batch_size
@@ -2176,22 +2440,38 @@ class V3AsyncSingleGPUTrainer:
             )
         return [replace(row, adaptive_provenance=None) for row in rows]
 
-    def _oracle_samples_for_indices(self, indices: list[int]):
+    def _oracle_samples_for_indices(
+        self,
+        indices: list[int],
+        episode_samples: Sequence[object] | None = None,
+    ):
         if self.oracle_buffer is None:
             return None
         h3 = self.learner.base.base.base
         return (
-            [self.oracle_buffer[index] for index in indices]
+            (
+                list(episode_samples)
+                if episode_samples is not None
+                else [self.oracle_buffer[index] for index in indices]
+            )
             if h3._privileged_needed(h3.schedule_state())
             else None
         )
 
-    def _strategy_targets_for_indices(self, indices: list[int]):
+    def _strategy_targets_for_indices(
+        self,
+        indices: list[int],
+        episode_targets: Sequence[dict[str, float]] | None = None,
+    ):
         if self.strategy_target_buffer is None:
             return None
         if len(self.strategy_target_buffer) != len(self.buffer):
             raise RuntimeError("H7.1d strategy labels drifted from public replay")
-        return [self.strategy_target_buffer[index] for index in indices]
+        return (
+            list(episode_targets)
+            if episode_targets is not None
+            else [self.strategy_target_buffer[index] for index in indices]
+        )
 
     def _parameter_update_snapshot(self) -> tuple[torch.Tensor, ...]:
         return tuple(
@@ -2241,6 +2521,15 @@ class V3AsyncSingleGPUTrainer:
             self._oracle_alignment.assert_quiescent()
         if self._cooperation_alignment is not None:
             self._cooperation_alignment.assert_quiescent()
+        if self._full_hybrid_runtime and any((
+            self._full_belief_samples,
+            self._full_oracle_samples,
+            self._full_strategy_targets,
+            self._pending_cooperation_episodes,
+        )):
+            raise RuntimeError(
+                "H7.1f cannot quiesce with unmatched full-hybrid auxiliaries"
+            )
         latencies = sorted(self._queue_latencies_ms)
 
         def percentile(fraction: float) -> float:
@@ -2356,6 +2645,10 @@ class V3AsyncSingleGPUTrainer:
             self.strategy_target_buffer.clear()
         if self.bidding_buffer is not None:
             self.bidding_buffer.clear()
+        self._full_belief_samples.clear()
+        self._full_oracle_samples.clear()
+        self._full_strategy_targets.clear()
+        self._pending_cooperation_episodes.clear()
 
     def save_training_checkpoint(self, path: str, *, long_running_state) -> None:
         if self._belief_alignment is not None:
@@ -2364,6 +2657,15 @@ class V3AsyncSingleGPUTrainer:
             self._oracle_alignment.assert_quiescent()
         if self._cooperation_alignment is not None:
             self._cooperation_alignment.assert_quiescent()
+        if self._full_hybrid_runtime and any((
+            self._full_belief_samples,
+            self._full_oracle_samples,
+            self._full_strategy_targets,
+            self._pending_cooperation_episodes,
+        )):
+            raise RuntimeError(
+                "H7.1f cannot checkpoint unmatched full-hybrid auxiliaries"
+            )
         with tempfile.TemporaryDirectory(prefix="douzero-h7-save-") as temporary:
             inner_path = Path(temporary) / "h6.pt"
             self.learner.save_checkpoint(inner_path)
@@ -2644,6 +2946,17 @@ class V3AsyncSingleGPUTrainer:
                 self._bidding_replay_queue.join_thread()
             if self._cooperation_alignment is not None:
                 self._cooperation_alignment.discard_pending()
+            for alignment in (
+                self._belief_alignment,
+                self._oracle_alignment,
+            ):
+                if alignment is not None:
+                    alignment.public_rows.clear()
+                    alignment.sidecars.clear()
+            self._full_belief_samples.clear()
+            self._full_oracle_samples.clear()
+            self._full_strategy_targets.clear()
+            self._pending_cooperation_episodes.clear()
             self._tasks.close()
             self._events.close()
             self._runtime_started = False
@@ -3011,6 +3324,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                 self.stats.abandoned_bidding_transitions += abandoned_bidding
                 self.stats.redeals += redeals
             self.buffer.extend(rows)
+            strategy_targets = None
             if self.strategy_target_buffer is not None:
                 episode = Episode(
                     transitions=pending_strategy_transitions,
@@ -3044,10 +3358,11 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                     raise RuntimeError(
                         "H7.1b single-process Oracle alignment mismatch"
                     )
-                self.oracle_buffer.extend(
+                bound_oracle = [
                     bind_v3_h3_oracle_sidecar(row, sidecar)
                     for row, sidecar in zip(rows, pending_oracle)
-                )
+                ]
+                self.oracle_buffer.extend(bound_oracle)
                 self.stats.oracle_labels_collected += len(pending_oracle)
             if self.cooperation_buffer is not None:
                 by_role = {role: [] for role in FARMER_ROLES}
@@ -3084,6 +3399,21 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
                             transitions=episode_rows,
                             trajectories=(
                                 trajectories[0], trajectories[1]
+                            ),
+                            belief_samples=(
+                                tuple(pending_belief)
+                                if self.belief_buffer is not None
+                                else None
+                            ),
+                            oracle_samples=(
+                                tuple(bound_oracle)
+                                if self.oracle_buffer is not None
+                                else None
+                            ),
+                            strategy_targets=(
+                                tuple(strategy_targets)
+                                if strategy_targets is not None
+                                else None
                             ),
                         )
                         self.cooperation_buffer.append(episode)
@@ -3122,6 +3452,10 @@ __all__ = [
     "V3_H71D_REQUEST_PROTOCOL",
     "V3_H71E_REPLAY_PROTOCOL",
     "V3_H71E_REQUEST_PROTOCOL",
+    "V3_H71F_LEGACY_REPLAY_PROTOCOL",
+    "V3_H71F_LEGACY_REQUEST_PROTOCOL",
+    "V3_H71F_STANDARD_REPLAY_PROTOCOL",
+    "V3_H71F_STANDARD_REQUEST_PROTOCOL",
     "V3_H7_CHECKPOINT_FORMAT",
     "V3_H7_REPLAY_PROTOCOL",
     "V3_H7_REQUEST_PROTOCOL",
@@ -3134,6 +3468,7 @@ __all__ = [
     "V3SingleProcessTrainer",
     "V3H7RuntimeConfig",
     "V3H7RuntimeStats",
+    "resolve_v3_h7_protocols",
     "validate_v3_h7_runtime_config",
     "validate_v3_h7_formal_initialization",
 ]
