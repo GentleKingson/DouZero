@@ -166,6 +166,7 @@ def test_h71e_identity_covers_cadence_and_action_semantics():
     base = _runtime()
     assert base.identity()["bidding_update_interval"] == 1
     assert base.identity()["first_bidder_mode"] == "rotate"
+    assert base.bidding_learned_probability == 0.5
     assert base.stable_hash() != replace(
         base, bidding_update_interval=2
     ).stable_hash()
@@ -173,7 +174,7 @@ def test_h71e_identity_covers_cadence_and_action_semantics():
         base, first_bidder_mode="seeded_random"
     ).stable_hash()
     assert base.stable_hash() != replace(
-        base, bidding_learned_probability=0.5
+        base, bidding_learned_probability=1.0
     ).stable_hash()
 
 
@@ -360,12 +361,14 @@ def test_h71e_default_cycle_collects_until_bidding_batch_is_ready():
     )
     trainer = V3SingleProcessTrainer(learner, resolved, runtime)
     try:
-        trainer.collect_episodes(4)
-        assert len(trainer.buffer) >= runtime.batch_size
-        assert trainer.bidding_buffer is not None
-        assert len(trainer.bidding_buffer) >= runtime.bidding_batch_size
-        assert trainer.step() is not None
-        assert trainer.stats.bidding_optimizer_steps == 1
+        for expected_steps in range(1, 4):
+            trainer.collect_episodes(4)
+            assert len(trainer.buffer) >= runtime.batch_size
+            assert trainer.bidding_buffer is not None
+            assert len(trainer.bidding_buffer) >= runtime.bidding_batch_size
+            assert trainer.step() is not None
+            assert trainer.stats.bidding_optimizer_steps == expected_steps
+            trainer.clear_replay()
     finally:
         trainer.shutdown()
 

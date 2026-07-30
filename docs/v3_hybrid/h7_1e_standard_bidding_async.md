@@ -41,6 +41,10 @@ Warm-start rule bids remain explicit imitation samples. A bid is never routed
 through the card-action encoder, and bidding never changes the environment's
 score calculation.
 
+The runtime default mixes learned and rule warm-start bids at probability
+`0.5`, preventing an untrained pass-only head from starving the first due
+bidding batch. Both the probability and bounded retry policy are identity-bound.
+
 ## Evidence Gate
 
 Current-head evidence must include CUDA parameter update, real SIGTERM,

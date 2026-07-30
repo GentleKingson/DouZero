@@ -74,7 +74,7 @@ from .training.cooperation import (
     build_v3_h5_async_decision_sidecar,
 )
 
-V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v16"
+V3_H7_RUNTIME_VERSION = "v3-hybrid-h7-1e-runtime-v17"
 V3_H7_CHECKPOINT_FORMAT = "v3-hybrid-h7-runtime-checkpoint-v8"
 V3_H7_REQUEST_PROTOCOL = "v2-shared-slots-v3-dmc-q-v1"
 V3_H7_REPLAY_PROTOCOL = "v3-public-selected-action-q-old-v1"
@@ -210,7 +210,7 @@ class V3H7RuntimeConfig:
     bidding_update_interval: int = 1
     bidding_policy: str = "learned"
     bidding_warm_start_policy: str = "rule"
-    bidding_learned_probability: float = 1.0
+    bidding_learned_probability: float = 0.5
     first_bidder_mode: str = "rotate"
 
     def __post_init__(self) -> None:
@@ -1826,7 +1826,7 @@ class V3AsyncSingleGPUTrainer:
         if self.bidding_buffer is not None:
             retry_limit = max(
                 retry_limit,
-                self.config.bidding_batch_size * 4,
+                self.config.bidding_batch_size * 8,
             )
         if not self._runtime_started:
             self._start_runtime()
@@ -2659,7 +2659,7 @@ class V3SingleProcessTrainer(V3AsyncSingleGPUTrainer):
         if self.bidding_buffer is not None:
             retry_limit = max(
                 retry_limit,
-                self.config.bidding_batch_size * 4,
+                self.config.bidding_batch_size * 8,
             )
         while True:
             needs_retry = (

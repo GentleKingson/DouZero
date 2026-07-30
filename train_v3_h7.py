@@ -108,7 +108,7 @@ def _parser() -> argparse.ArgumentParser:
         choices=("random", "rule", "max", "pass"),
         default="rule",
     )
-    parser.add_argument("--bidding-learned-probability", type=float, default=1.0)
+    parser.add_argument("--bidding-learned-probability", type=float, default=0.5)
     parser.add_argument(
         "--first-bidder-mode",
         choices=("rotate", "seeded_random"),
