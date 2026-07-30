@@ -979,7 +979,6 @@ def validate_v3_h7_runtime_config(
         and not belief_enabled
         and not oracle_enabled
         and not cooperation_enabled
-        and not public_aux_enabled
     ):
         raise ValueError("H7 async replay requires Adaptive DMC q_old provenance")
     if (
@@ -988,7 +987,6 @@ def validate_v3_h7_runtime_config(
         and not belief_enabled
         and not oracle_enabled
         and not cooperation_enabled
-        and not public_aux_enabled
     ):
         raise ValueError("H7 async runtime cannot use disabled Adaptive DMC")
     learner_batch_size = resolved_config.learner.base.base.base.public.batch_size
@@ -996,6 +994,41 @@ def validate_v3_h7_runtime_config(
         raise ValueError(
             "H7 runtime batch_size cannot exceed the learner batch_size"
         )
+
+
+def _strategy_loss_updated(metrics) -> bool:
+    """Return whether the strategy term contributed to this optimizer step."""
+
+    if not metrics.public_aux_updated:
+        return False
+    try:
+        strategy = metrics.losses["strategy"]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            "H7.1d learner metrics omit the strategy term"
+        ) from exc
+    if not isinstance(strategy, Mapping):
+        raise RuntimeError("H7.1d strategy metrics have an invalid type")
+    return (
+        strategy.get("phase") == "active"
+        and int(strategy.get("valid_samples", 0)) > 0
+    )
+
+
+def _public_aux_parameter_bytes(model: V3HybridModel) -> int:
+    """Count incremental public-auxiliary parameters in one resident model."""
+
+    total = sum(
+        parameter.numel() * parameter.element_size()
+        for module in (model.strategy_aux_heads, model.style_encoder)
+        if module is not None
+        for parameter in module.parameters()
+    )
+    strategy_width = model.action_encoder.strategy_width
+    if strategy_width:
+        weight = model.action_encoder.proj.weight
+        total += weight.shape[0] * strategy_width * weight.element_size()
+    return total
 
 
 class V3AsyncSingleGPUTrainer:
@@ -1710,7 +1743,10 @@ class V3AsyncSingleGPUTrainer:
                 self.stats.oracle_optimizer_steps += 1
             if metrics.base.cooperation_updated:
                 self.stats.cooperation_optimizer_steps += 1
-            if self.strategy_target_buffer is not None and metrics.public_aux_updated:
+            if (
+                self.strategy_target_buffer is not None
+                and _strategy_loss_updated(metrics)
+            ):
                 self.stats.strategy_optimizer_steps += 1
             self.stats.optimizer_steps += 1
             self.stats.learner_cardplay_samples += len(rows)
@@ -1761,7 +1797,10 @@ class V3AsyncSingleGPUTrainer:
             self.stats.oracle_optimizer_steps += 1
         if metrics.base.cooperation_updated:
             self.stats.cooperation_optimizer_steps += 1
-        if self.strategy_target_buffer is not None and metrics.public_aux_updated:
+        if (
+            self.strategy_target_buffer is not None
+            and _strategy_loss_updated(metrics)
+        ):
             self.stats.strategy_optimizer_steps += 1
         self.stats.optimizer_steps += 1
         self.stats.learner_cardplay_samples += len(rows)
@@ -1925,14 +1964,9 @@ class V3AsyncSingleGPUTrainer:
             ),
             "strategy_labels_collected": self.stats.strategy_labels_collected,
             "strategy_optimizer_steps": self.stats.strategy_optimizer_steps,
-            "public_aux_parameter_vram_bytes": sum(
-                parameter.numel() * parameter.element_size()
-                for module in (
-                    self.model.strategy_aux_heads,
-                    self.model.style_encoder,
-                )
-                if module is not None
-                for parameter in module.parameters()
+            "public_aux_parameter_vram_bytes": (
+                _public_aux_parameter_bytes(self.model)
+                + _public_aux_parameter_bytes(self.inference_model)
             ),
             "requests_per_microbatch": self._requests / max(1, self._microbatches),
             "actions_per_microbatch": self._actions / max(1, self._microbatches),

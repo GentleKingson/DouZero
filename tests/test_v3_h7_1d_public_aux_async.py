@@ -6,6 +6,7 @@ import sys
 import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -23,17 +24,20 @@ from douzero.training.async_single_gpu import (
     async_actor_main,
 )
 from douzero.training.v2_buffer import Transition
+from douzero.v3_hybrid.adaptive_dmc import ADMC_DISABLED
+from douzero.v3_hybrid.benchmark import (
+    H7_TOPOLOGIES,
+    V3H7BenchmarkProtocol,
+    validate_h7_benchmark_evidence,
+)
 from douzero.v3_hybrid.runtime import (
     V3_H71D_REPLAY_PROTOCOL,
     V3_H71D_REQUEST_PROTOCOL,
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
+    _public_aux_parameter_bytes,
+    _strategy_loss_updated,
     validate_v3_h7_runtime_config,
-)
-from douzero.v3_hybrid.benchmark import (
-    H7_TOPOLOGIES,
-    V3H7BenchmarkProtocol,
-    validate_h7_benchmark_evidence,
 )
 
 
@@ -85,6 +89,75 @@ def test_public_aux_runtime_fails_closed_before_cuda_or_worker_start():
             request_protocol=V3_H71D_REQUEST_PROTOCOL,
             replay_protocol=V3_H71D_REPLAY_PROTOCOL,
         )
+
+
+def test_public_aux_runtime_rejects_disabled_adaptive_dmc():
+    resolved = _resolved()
+    h3 = resolved.learner.base.base.base
+    public = replace(
+        h3.public,
+        adaptive_dmc=replace(h3.public.adaptive_dmc, mode=ADMC_DISABLED),
+    )
+    h4 = replace(resolved.learner.base.base, base=replace(h3, public=public))
+    h5 = replace(resolved.learner.base, base=h4)
+    learner = replace(
+        resolved.learner,
+        base=h5,
+        features=replace(
+            resolved.learner.features,
+            adaptive_dmc=False,
+        ),
+    )
+    without_admc = replace(resolved, learner=learner)
+    with pytest.raises(ValueError, match="Adaptive DMC"):
+        validate_v3_h7_runtime_config(without_admc, _runtime())
+
+
+def test_strategy_update_counter_requires_an_active_strategy_loss():
+    active = SimpleNamespace(
+        public_aux_updated=True,
+        losses={"strategy": {"phase": "active", "valid_samples": 8}},
+    )
+    scheduled_zero = SimpleNamespace(
+        public_aux_updated=True,
+        losses={"strategy": {"phase": "scheduled_zero", "valid_samples": 8}},
+    )
+    no_targets = SimpleNamespace(
+        public_aux_updated=True,
+        losses={"strategy": {"phase": "no_valid_targets", "valid_samples": 0}},
+    )
+    assert _strategy_loss_updated(active)
+    assert not _strategy_loss_updated(scheduled_zero)
+    assert not _strategy_loss_updated(no_targets)
+    assert not _strategy_loss_updated(
+        SimpleNamespace(public_aux_updated=False, losses={})
+    )
+
+
+def test_public_aux_parameter_bytes_include_projection_and_served_copy():
+    from douzero.v3_hybrid import V3HybridModel
+
+    model = V3HybridModel(build_v2_schema(), _resolved().model)
+    module_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for module in (model.strategy_aux_heads, model.style_encoder)
+        if module is not None
+        for parameter in module.parameters()
+    )
+    projection = model.action_encoder.proj.weight
+    projection_bytes = (
+        projection.shape[0]
+        * model.action_encoder.strategy_width
+        * projection.element_size()
+    )
+    assert projection_bytes > 0
+    assert _public_aux_parameter_bytes(model) == module_bytes + projection_bytes
+    served = copy.deepcopy(model)
+    assert (
+        _public_aux_parameter_bytes(model)
+        + _public_aux_parameter_bytes(served)
+        == 2 * (module_bytes + projection_bytes)
+    )
 
 
 def test_shared_slots_are_exact_noop_when_public_aux_is_disabled():
@@ -227,7 +300,9 @@ def test_h71d_cuda_update_checkpoint_resume_and_shutdown(tmp_path):
         assert boundary["active_slots"] == 0
         assert boundary["in_flight_slots"] == 0
         assert boundary["pending_requests"] == 0
-        assert boundary["public_aux_parameter_vram_bytes"] > 0
+        assert boundary["public_aux_parameter_vram_bytes"] == 2 * (
+            _public_aux_parameter_bytes(trainer.model)
+        )
         trainer.save_training_checkpoint(
             str(checkpoint), long_running_state={"cycle": 1}
         )
