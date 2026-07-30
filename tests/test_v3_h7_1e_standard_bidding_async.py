@@ -290,6 +290,7 @@ def test_h71e_redeal_cap_guard_excludes_entire_episode():
         num_actors=1,
         games_per_actor=1,
         bidding_policy="pass",
+        bidding_update_interval=2,
     )
     model = V3HybridModel(build_v2_schema(), resolved.model)
     learner = V3H6Learner(
@@ -299,6 +300,7 @@ def test_h71e_redeal_cap_guard_excludes_entire_episode():
     )
     trainer = V3SingleProcessTrainer(learner, resolved, runtime)
     try:
+        trainer.stats.bidding_eligible_steps = 1
         trainer.collect_episodes(1)
         assert not trainer.buffer
         assert trainer.bidding_buffer is not None
@@ -313,6 +315,7 @@ def test_h71e_redeal_cap_guard_excludes_entire_episode():
         num_actors=1,
         games_per_actor=1,
         bidding_policy="pass",
+        bidding_update_interval=2,
     )
     async_model = V3HybridModel(build_v2_schema(), resolved.model)
     async_learner = V3H6Learner(
@@ -324,6 +327,7 @@ def test_h71e_redeal_cap_guard_excludes_entire_episode():
         async_learner, resolved, async_runtime
     )
     try:
+        async_trainer.stats.bidding_eligible_steps = 1
         async_trainer.collect_episodes(1)
         assert not async_trainer.buffer
         assert async_trainer.bidding_buffer is not None
