@@ -5,6 +5,7 @@ import threading
 import time
 import timeit
 import pprint
+import signal
 import statistics
 import subprocess
 from contextlib import ExitStack, contextmanager
@@ -34,6 +35,34 @@ from .centralized_actor import (
 from douzero.runtime import SafeMixedPrecision, VersionedPolicyPool
 
 mean_episode_return_buf = {p:deque(maxlen=100) for p in ['landlord', 'landlord_up', 'landlord_down']}
+
+
+def _legacy_checkpoint_due(
+    *,
+    learner_updates,
+    last_checkpoint_update,
+    checkpoint_every_updates,
+    now,
+    last_checkpoint_time,
+    save_interval_minutes,
+):
+    return bool(
+        (
+            checkpoint_every_updates
+            and learner_updates - last_checkpoint_update
+            >= checkpoint_every_updates
+        )
+        or now - last_checkpoint_time > save_interval_minutes * 60
+    )
+
+
+def _legacy_wall_limit_reached(
+    *, now, training_started, max_wall_time_minutes
+):
+    return bool(
+        max_wall_time_minutes
+        and now - training_started >= max_wall_time_minutes * 60.0
+    )
 
 
 def _save_legacy_sidecars(learner_model, directory, frames, retention):
@@ -451,6 +480,14 @@ def train(flags):
         raise ValueError("benchmark_warmup_frames must be >= 0")
     if getattr(flags, 'benchmark_warmup_frames', 0) >= flags.total_frames:
         raise ValueError("benchmark_warmup_frames must be less than total_frames")
+    if getattr(flags, 'checkpoint_every_updates', 0) < 0:
+        raise ValueError("checkpoint_every_updates must be >= 0")
+    max_wall_time_minutes = getattr(flags, 'max_wall_time_minutes', 0.0)
+    if (
+        not math.isfinite(max_wall_time_minutes)
+        or max_wall_time_minutes < 0.0
+    ):
+        raise ValueError("max_wall_time_minutes must be finite and >= 0")
     sidecar_retention = getattr(flags, 'checkpoint_sidecar_retention', 2)
     if sidecar_retention < -1:
         raise ValueError("checkpoint_sidecar_retention must be -1 or greater")
@@ -988,10 +1025,26 @@ def train(flags):
         })
         write_metrics(flags.legacy_metrics_path, payload)
 
+    termination_requested = threading.Event()
+
+    def request_termination(_signum, _frame):
+        termination_requested.set()
+
+    previous_sigterm = signal.signal(signal.SIGTERM, request_termination)
+    training_started = timer()
     try:
         last_checkpoint_time = timer() - flags.save_interval * 60
+        last_checkpoint_update = learner_updates
         last_periodic_log = timer()
-        while frames < flags.total_frames:
+        while (
+            frames < flags.total_frames
+            and not termination_requested.is_set()
+            and not _legacy_wall_limit_reached(
+                now=timer(),
+                training_started=training_started,
+                max_wall_time_minutes=max_wall_time_minutes,
+            )
+        ):
             learner_supervisor.raise_if_failed()
             for actor, device, actor_id in actor_processes:
                 if actor.exitcode not in (None, 0):
@@ -1034,9 +1087,17 @@ def train(flags):
                     })
                 last_periodic_log = timer()
 
-            if timer() - last_checkpoint_time > flags.save_interval * 60:  
+            if _legacy_checkpoint_due(
+                learner_updates=learner_updates,
+                last_checkpoint_update=last_checkpoint_update,
+                checkpoint_every_updates=flags.checkpoint_every_updates,
+                now=timer(),
+                last_checkpoint_time=last_checkpoint_time,
+                save_interval_minutes=flags.save_interval,
+            ):
                 checkpoint()
                 last_checkpoint_time = timer()
+                last_checkpoint_update = learner_updates
             end_time = timer()
 
             fps = (frames - start_frames) / (end_time - start_time)
@@ -1058,8 +1119,15 @@ def train(flags):
                      position_fps['landlord_down'],
                      pprint.pformat(stats))
         learner_supervisor.raise_if_failed()
+        if termination_requested.is_set():
+            checkpoint()
+            stop_workers()
+            final_metrics('interrupted')
+            plogger.close(successful=False)
+            return
 
     except KeyboardInterrupt:
+        checkpoint()
         stop_workers()
         final_metrics('interrupted')
         plogger.close(successful=False)
@@ -1072,6 +1140,8 @@ def train(flags):
     else:
         stop_workers()
         log.info('Learning finished after %d frames.', frames)
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
     checkpoint()
     final_metrics('completed')

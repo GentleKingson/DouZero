@@ -7,6 +7,10 @@ parser.add_argument('--xpid', default='douzero',
                     help='Experiment id (default: douzero)')
 parser.add_argument('--save_interval', default=30, type=int,
                     help='Time interval (in minutes) at which to save the model')
+parser.add_argument('--checkpoint_every_updates', default=0, type=int,
+                    help='Checkpoint after this many learner updates; 0 disables')
+parser.add_argument('--max_wall_time_minutes', default=0.0, type=float,
+                    help='Optional bounded training wall time; 0 disables')
 parser.add_argument('--checkpoint_sidecar_retention', default=2, type=int,
                     help='Per-role eval sidecars to retain: 0 disables, -1 keeps all')
 parser.add_argument('--objective', default='adp', type=str, choices=['adp', 'wp', 'logadp'],
