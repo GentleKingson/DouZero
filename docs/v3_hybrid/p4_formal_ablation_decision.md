@@ -17,11 +17,13 @@ Playing strength: NOT MEASURED
   separate bid action space. Standard evidence without bidding is rejected
   rather than silently running legacy card play under a standard label.
 - Runtime topology is frozen per executable capability combination. Legacy
-  A1 and the standard Oracle, belief, and cooperation ablations use
-  `single_process`; Model V2, the other V3 ablations, and both full-hybrid
-  variants use `async_single_gpu`. The three standard partial sidecar
-  ablations remain single-process because H7.1 intentionally does not define
-  a partial sidecar-plus-bidding async transport.
+  A1, both role-only controls, and the standard Oracle, belief, and
+  cooperation ablations use `single_process`; Model V2, the remaining V3
+  ablations, and both full-hybrid variants use `async_single_gpu`. The role
+  controls have neither Adaptive DMC q_old provenance nor a training sidecar,
+  so the H7 async replay contract rejects them. The three standard partial
+  sidecar ablations remain single-process because H7.1 intentionally does not
+  define a partial sidecar-plus-bidding async transport.
 - Runtime workload identity also freezes the family-owned profile, actor and
   game counts, cycle cadence, batch and replay sizes, checkpoint cadence, and
   Legacy A1 unroll length. The strict P4 dispatcher rejects a seed or resume

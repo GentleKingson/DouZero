@@ -156,7 +156,7 @@ def test_formal_runtime_cli_drift_fails_before_side_effects(tmp_path):
     )
     checkpoint = tmp_path / "must-not-exist.pt"
     args = SimpleNamespace(
-        topology="single_process",
+        topology="async_single_gpu",
         num_actors=formal.runtime.num_actors,
         games_per_actor=formal.runtime.games_per_actor,
         episodes_per_cycle=formal.runtime.episodes_per_cycle,

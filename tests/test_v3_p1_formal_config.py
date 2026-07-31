@@ -44,6 +44,7 @@ def test_complete_supported_matrix_loads_and_is_exact() -> None:
             "single_process"
             if (
                 config.variant == "legacy_a1"
+                or config.variant == "v3_role"
                 or (
                     config.ruleset["id"] == "standard"
                     and config.variant
