@@ -1205,14 +1205,16 @@ def validate_v3_h7_runtime_config(
             search=False,
         )
     if (
-        not features.adaptive_dmc
+        runtime_config.topology == TOPOLOGY_ASYNC_SINGLE_GPU
+        and not features.adaptive_dmc
         and not belief_enabled
         and not oracle_enabled
         and not cooperation_enabled
     ):
         raise ValueError("H7 async replay requires Adaptive DMC q_old provenance")
     if (
-        resolved_config.learner.base.base.base.public.adaptive_dmc.mode
+        runtime_config.topology == TOPOLOGY_ASYNC_SINGLE_GPU
+        and resolved_config.learner.base.base.base.public.adaptive_dmc.mode
         == ADMC_DISABLED
         and not belief_enabled
         and not oracle_enabled

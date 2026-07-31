@@ -32,6 +32,7 @@ from douzero.v3_hybrid.runtime import (
     validate_v3_h7_runtime_config,
 )
 from douzero.v3_hybrid import (
+    ADMC_DISABLED,
     ADMC_SAFE_HYBRID,
     AdaptiveDMCConfig,
     V3H2LearnerConfig,
@@ -63,6 +64,7 @@ from douzero.v3_hybrid.support_matrix import (
     RULESET_LEGACY,
     RULESET_STANDARD,
     TOPOLOGY_ASYNC_SINGLE_GPU,
+    TOPOLOGY_SINGLE_PROCESS,
     validate_capability_support,
 )
 
@@ -181,6 +183,41 @@ def test_h7_preflight_rejects_batch_mismatch_before_cuda_or_workers():
     with pytest.raises(ValueError, match="cannot exceed the learner batch_size"):
         validate_v3_h7_runtime_config(
             resolved, V3H7RuntimeConfig(batch_size=5)
+        )
+
+
+def test_role_only_runtime_is_single_process_only():
+    public = V3H2LearnerConfig(
+        batch_size=4,
+        device="cpu",
+        adaptive_dmc=AdaptiveDMCConfig(mode=ADMC_DISABLED),
+    )
+    resolved = V3H6ResolvedConfig(
+        model=V3HybridModelConfig(),
+        learner=V3H6LearnerConfig(
+            base=V3H5LearnerConfig(
+                base=V3H4LearnerConfig(base=V3H3LearnerConfig(public=public))
+            ),
+            losses=V3HybridLossComposerConfig(lambda_dmc=1.0),
+            features=V3H6FeatureFlags(),
+            topology=V3H6TopologyConfig(ruleset="legacy"),
+        ),
+    )
+    validate_v3_h7_runtime_config(
+        resolved,
+        V3H7RuntimeConfig(
+            topology=TOPOLOGY_SINGLE_PROCESS,
+            batch_size=4,
+            max_policy_lag=1,
+        ),
+    )
+    with pytest.raises(ValueError, match="q_old provenance"):
+        validate_v3_h7_runtime_config(
+            resolved,
+            V3H7RuntimeConfig(
+                topology=TOPOLOGY_ASYNC_SINGLE_GPU,
+                batch_size=4,
+            ),
         )
 
 
