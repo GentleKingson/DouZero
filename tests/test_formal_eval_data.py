@@ -270,6 +270,8 @@ def test_generate_eval_data_cli_writes_loadable_formal_json(
             str(output),
             "--num_games",
             "2",
+            "--seed",
+            "51001",
             "--ruleset",
             ruleset_name,
             "--output-format",
@@ -289,6 +291,37 @@ def test_generate_eval_data_cli_writes_loadable_formal_json(
         expected_ruleset=ruleset,
     )
     assert len(loaded) == 2
+
+
+@pytest.mark.parametrize("ruleset_name", ["legacy", "standard"])
+def test_generate_eval_data_seed_is_byte_deterministic(tmp_path, ruleset_name):
+    outputs = [tmp_path / f"{ruleset_name}-{suffix}" for suffix in ("a", "b")]
+    for output in outputs:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "generate_eval_data.py",
+                "--output",
+                str(output),
+                "--num_games",
+                "8",
+                "--seed",
+                "51001",
+                "--ruleset",
+                ruleset_name,
+                "--output-format",
+                "formal-json",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
+    assert Path(f"{outputs[0]}.json").read_bytes() == Path(
+        f"{outputs[1]}.json"
+    ).read_bytes()
 
 
 def test_writer_rejects_duplicate_deals(tmp_path):

@@ -12,6 +12,12 @@ def get_parser():
     parser = argparse.ArgumentParser(description='DouZero: random data generator')
     parser.add_argument('--output', default='eval_data', type=str)
     parser.add_argument('--num_games', default=10000, type=int)
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='Optional deterministic NumPy seed for an identity-bound deal set.',
+    )
     parser.add_argument('--ruleset', default='legacy', type=str,
                         choices=['legacy', 'standard'],
                         help='Deal format: legacy (4-key card_play_data) or '
@@ -137,6 +143,9 @@ if __name__ == '__main__':
     flags = get_parser().parse_args()
     from douzero.env.rules import RuleSet
 
+    if flags.seed is not None:
+        np.random.seed(flags.seed)
+
     output_path = flags.output + (
         '.json' if flags.output_format == 'formal-json' else '.pkl'
     )
@@ -167,6 +176,5 @@ if __name__ == '__main__':
         print("saving pickle file...")
         with open(output_path, 'wb') as g:
             pickle.dump(data, g, pickle.HIGHEST_PROTOCOL)
-
 
 
