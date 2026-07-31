@@ -14,4 +14,4 @@ feature_configs:
     guidance_weight_start: 1.0
     guidance_weight_end: 0.0
   bidding: {enabled: true}
-runtime: {topology: single_process, num_actors: 1, games_per_actor: 1, policy_lag_limit: 0}
+runtime: {topology: single_process, num_actors: 1, games_per_actor: 1, policy_lag_limit: 1}

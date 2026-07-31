@@ -65,6 +65,12 @@ def test_complete_supported_matrix_loads_and_is_exact() -> None:
         assert config.runtime.episodes_per_cycle == 4
         assert config.runtime.optimizer_steps_per_cycle == 1
         assert config.runtime.legacy_unroll_length == 50
+        assert config.runtime.policy_lag_limit == (
+            0 if config.variant == "legacy_a1" else (
+                1 if config.variant.startswith("v3_") and expected == "single_process"
+                else 128
+            )
+        )
         assert config.runtime.profile == (
             "legacy_a1_production_v1"
             if config.variant == "legacy_a1"

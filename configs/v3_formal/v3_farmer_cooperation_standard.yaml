@@ -8,4 +8,4 @@ losses: {weights: {cooperation: 1.0, bidding: 1.0}}
 feature_configs:
   cooperation: {enabled: true, mode: team_value_consistency, mixer: disabled}
   bidding: {enabled: true}
-runtime: {topology: single_process, num_actors: 1, games_per_actor: 1, policy_lag_limit: 0}
+runtime: {topology: single_process, num_actors: 1, games_per_actor: 1, policy_lag_limit: 1}
