@@ -2436,7 +2436,8 @@ class V3AsyncSingleGPUTrainer:
         if self.resolved_config.learner.features.adaptive_dmc:
             return rows
         if (
-            self.belief_buffer is None
+            self.config.topology == TOPOLOGY_ASYNC_SINGLE_GPU
+            and self.belief_buffer is None
             and self.oracle_buffer is None
             and self.cooperation_buffer is None
         ):

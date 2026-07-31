@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 import time
 
@@ -219,6 +219,29 @@ def test_role_only_runtime_is_single_process_only():
                 batch_size=4,
             ),
         )
+
+
+def test_role_only_single_process_strips_unused_adaptive_provenance():
+    @dataclass(frozen=True)
+    class Row:
+        adaptive_provenance: object
+
+    trainer = object.__new__(V3SingleProcessTrainer)
+    trainer.resolved_config = SimpleNamespace(
+        learner=SimpleNamespace(
+            features=SimpleNamespace(adaptive_dmc=False)
+        )
+    )
+    trainer.config = SimpleNamespace(topology=TOPOLOGY_SINGLE_PROCESS)
+    trainer.belief_buffer = None
+    trainer.oracle_buffer = None
+    trainer.cooperation_buffer = None
+    rows = trainer._learner_rows([Row(adaptive_provenance=object())])
+    assert rows[0].adaptive_provenance is None
+
+    trainer.config = SimpleNamespace(topology=TOPOLOGY_ASYNC_SINGLE_GPU)
+    with pytest.raises(RuntimeError, match="sidecar-enabled"):
+        trainer._learner_rows([Row(adaptive_provenance=object())])
 
 
 def test_shared_protocol_keeps_v2_width_and_adds_explicit_v3_dmc_q():
