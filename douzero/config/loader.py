@@ -545,7 +545,8 @@ def serialize(cfg: TrainingConfig) -> dict:
 # The set of attribute names train(flags) reads off the Namespace. These are
 # the EXACT argparse dests from douzero/dmc/arguments.py.
 _TRAINING_NAMESPACE_FIELDS: tuple[str, ...] = (
-    "xpid", "save_interval", "checkpoint_sidecar_retention", "objective",
+    "xpid", "save_interval", "checkpoint_every_updates",
+    "max_wall_time_minutes", "checkpoint_sidecar_retention", "objective",
     "actor_device_cpu", "gpu_devices", "num_actor_devices", "num_actors",
     "training_device", "load_model", "disable_checkpoint", "savedir",
     "total_frames", "exp_epsilon", "batch_size", "bidding_batch_size",

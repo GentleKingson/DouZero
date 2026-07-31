@@ -498,6 +498,8 @@ class TrainingConfig:
     # General
     xpid: str = "douzero"
     save_interval: int = 30
+    checkpoint_every_updates: int = 0
+    max_wall_time_minutes: float = 0.0
     checkpoint_sidecar_retention: int = 2
     objective: str = "adp"
 

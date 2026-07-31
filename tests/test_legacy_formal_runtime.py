@@ -1,4 +1,6 @@
-from douzero.dmc.arguments import parser
+from pathlib import Path
+
+from douzero.dmc.arguments import parse_args, parser
 from douzero.dmc.dmc import (
     _legacy_checkpoint_due,
     _legacy_wall_limit_reached,
@@ -9,6 +11,20 @@ def test_legacy_formal_runtime_controls_are_default_off():
     args = parser.parse_args([])
     assert args.checkpoint_every_updates == 0
     assert args.max_wall_time_minutes == 0.0
+
+
+def test_legacy_yaml_merge_preserves_explicit_formal_runtime_controls():
+    root = Path(__file__).resolve().parents[1]
+    args = parse_args([
+        "--config",
+        str(root / "configs/legacy_single_gpu_a1.yaml"),
+        "--checkpoint_every_updates",
+        "17",
+        "--max_wall_time_minutes",
+        "2.5",
+    ])
+    assert args.checkpoint_every_updates == 17
+    assert args.max_wall_time_minutes == 2.5
 
 
 def test_legacy_update_checkpoint_cadence_is_exact():
