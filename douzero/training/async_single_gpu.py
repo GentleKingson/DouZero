@@ -1545,15 +1545,20 @@ def async_actor_main(
             raise ValueError("async first_bidder_mode is unsupported")
     elif bidding_policy_config is not None:
         raise ValueError("bidding policy config requires async bidding transport")
-    if sum((
+    transport_flags = (
         belief_async,
         oracle_async,
         cooperation_async,
         public_aux_async,
         bidding_async,
-    )) > 1:
+    )
+    full_hybrid_transport = transport_flags in {
+        (True, True, True, True, False),
+        (True, True, True, True, True),
+    }
+    if sum(transport_flags) > 1 and not full_hybrid_transport:
         raise NotImplementedError(
-            "combined async H7.1 capability transports are not supported"
+            "partial combined async H7.1 capability transports are not supported"
         )
     if belief_async or oracle_async:
         from douzero.observation.privileged import PrivilegedObservation

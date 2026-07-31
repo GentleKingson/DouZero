@@ -734,13 +734,7 @@ class V3H6Learner:
                 raise ValueError(
                     "H6 auxiliary-only batches reject card-play sidecars"
                 )
-        oracle_state = self.base.base.base.schedule_state()
-        belief_phase = self.base.base.phase()
-        public_phase = oracle_state.public_training and belief_phase in {
-            BELIEF_PHASE_DISABLED,
-            BELIEF_PHASE_AUXILIARY,
-            BELIEF_PHASE_POLICY,
-        }
+        public_phase = self.public_auxiliary_training_active()
         if not public_phase and any(
             value is not None for value in (bc_samples, bidding_batch, strategy_targets)
         ):
@@ -813,6 +807,34 @@ class V3H6Learner:
             except Exception:
                 self._restore_rollback(snapshot, state)
                 raise
+
+    def public_auxiliary_training_active(self) -> bool:
+        """Return whether public auxiliary targets are eligible this update."""
+
+        oracle_state = self.base.base.base.schedule_state()
+        belief_phase = self.base.base.phase()
+        return oracle_state.public_training and belief_phase in {
+            BELIEF_PHASE_DISABLED,
+            BELIEF_PHASE_AUXILIARY,
+            BELIEF_PHASE_POLICY,
+        }
+
+    def prime_guided_benchmark_phase(self) -> None:
+        """Prime every nested learner counter to the guided benchmark boundary."""
+
+        if (
+            self.eligible_updates != 0
+            or self.samples_consumed != 0
+            or self.public_aux_updates != 0
+            or self.statistics.state_dict() != H6CumulativeStats().state_dict()
+        ):
+            raise RuntimeError(
+                "guided benchmark phase can only prime a fresh H6 learner"
+            )
+        self.base.prime_guided_benchmark_phase()
+        warmup_updates = self.base.eligible_updates
+        self.eligible_updates = warmup_updates
+        self.statistics.steps = warmup_updates
 
     def _inner_bundle(self) -> dict[str, object]:
         with tempfile.TemporaryDirectory(prefix="douzero-h6-save-") as temporary:

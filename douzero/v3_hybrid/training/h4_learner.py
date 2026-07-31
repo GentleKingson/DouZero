@@ -590,6 +590,23 @@ class V3H4Learner:
     def phase(self) -> str:
         return self.config.belief.phase_at(self.eligible_updates)
 
+    def prime_guided_benchmark_phase(self) -> None:
+        """Prime H3 and matching H4 progress for a guided benchmark."""
+
+        if (
+            self.eligible_updates != 0
+            or self.samples_consumed != 0
+            or self.statistics.state_dict() != H4CumulativeStats().state_dict()
+        ):
+            raise RuntimeError(
+                "guided benchmark phase can only prime a fresh H4 learner"
+            )
+        self.base.prime_guided_benchmark_phase()
+        warmup_updates = self.base.learner_updates
+        self.eligible_updates = warmup_updates
+        self.statistics.steps = warmup_updates
+        self.statistics.base_updates = warmup_updates
+
     def _validate_samples(
         self,
         transitions: Sequence[V3ReplayTransition],

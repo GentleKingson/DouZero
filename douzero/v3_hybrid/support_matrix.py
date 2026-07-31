@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1e-support-matrix-v8"
+V3_H6_SUPPORT_MATRIX_VERSION = "v3-hybrid-h7-1f-support-matrix-v9"
 
 TOPOLOGY_SINGLE_PROCESS = "single_process"
 TOPOLOGY_ASYNC_SINGLE_GPU = "async_single_gpu"
@@ -98,13 +98,28 @@ _ROWS = {
 }
 
 V3_H6_SUPPORT_MATRIX: Mapping[str, CapabilitySupport] = MappingProxyType(_ROWS)
-V3_H6_UNSUPPORTED_COMBINATIONS = (
-    ("belief", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
-    ("oracle", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
-    ("cooperation", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
-    ("strategy", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
-    ("style", TOPOLOGY_ASYNC_SINGLE_GPU, RULESET_STANDARD),
-)
+V3_H6_UNSUPPORTED_COMBINATIONS = ()
+
+V3_H7_ASYNC_CAPABILITY_BUNDLES = {
+    "full_hybrid_legacy_v1": {
+        "ruleset": RULESET_LEGACY,
+        "required": (
+            "role_model", "adaptive_dmc", "belief", "oracle", "cooperation",
+            "strategy", "public_export",
+        ),
+        "optional": ("style",),
+        "forbidden": ("bidding",),
+    },
+    "full_hybrid_standard_v1": {
+        "ruleset": RULESET_STANDARD,
+        "required": (
+            "role_model", "adaptive_dmc", "belief", "oracle", "cooperation",
+            "strategy", "bidding", "public_export",
+        ),
+        "optional": ("style",),
+        "forbidden": (),
+    },
+}
 
 
 def v3_h6_support_matrix_dict() -> dict[str, object]:
@@ -121,6 +136,7 @@ def v3_h6_support_matrix_dict() -> dict[str, object]:
             }
             for capability, topology, ruleset in V3_H6_UNSUPPORTED_COMBINATIONS
         ],
+        "async_capability_bundles": V3_H7_ASYNC_CAPABILITY_BUNDLES,
     }
 
 

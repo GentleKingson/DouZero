@@ -17,22 +17,12 @@ from douzero.v3_hybrid.h7_smoke import build_v3_h7_smoke_config
 from douzero.v3_hybrid.integration_config import load_v3_hybrid_config
 from douzero.v3_hybrid.pilot import build_pilot_resolved_config
 from douzero.v3_hybrid.runtime import (
-    V3_H71A_REPLAY_PROTOCOL,
-    V3_H71A_REQUEST_PROTOCOL,
-    V3_H71A_SNAPSHOT_SEMANTICS,
-    V3_H71B_REPLAY_PROTOCOL,
-    V3_H71B_REQUEST_PROTOCOL,
-    V3_H71C_REPLAY_PROTOCOL,
-    V3_H71C_REQUEST_PROTOCOL,
-    V3_H71D_REPLAY_PROTOCOL,
-    V3_H71D_REQUEST_PROTOCOL,
-    V3_H71E_REPLAY_PROTOCOL,
-    V3_H71E_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
     V3_H7_RUNTIME_VERSION,
     V3H7RuntimeConfig,
+    resolve_v3_h7_protocols,
     validate_v3_h7_formal_initialization,
     validate_v3_h7_runtime_config,
 )
@@ -81,7 +71,7 @@ def main() -> None:
         else (
             build_v3_h7_smoke_config()
             if formal is None
-            else build_pilot_resolved_config(formal)
+            else build_pilot_resolved_config(formal, allow_standard=True)
         )
     )
     belief_enabled = resolved.learner.features.belief
@@ -92,46 +82,13 @@ def main() -> None:
         or resolved.learner.features.style
     )
     bidding_enabled = resolved.learner.features.bidding
-    request_protocol = (
-        V3_H71A_REQUEST_PROTOCOL
-        if belief_enabled
-        else (
-            V3_H71B_REQUEST_PROTOCOL
-            if oracle_enabled
-            else (
-                V3_H71C_REQUEST_PROTOCOL
-                if cooperation_enabled
-                else (
-                    V3_H71D_REQUEST_PROTOCOL
-                    if public_aux_enabled
-                    else (
-                        V3_H71E_REQUEST_PROTOCOL
-                        if bidding_enabled
-                        else V3_H7_REQUEST_PROTOCOL
-                    )
-                )
-            )
-        )
-    )
-    replay_protocol = (
-        V3_H71A_REPLAY_PROTOCOL
-        if belief_enabled
-        else (
-            V3_H71B_REPLAY_PROTOCOL
-            if oracle_enabled
-            else (
-                V3_H71C_REPLAY_PROTOCOL
-                if cooperation_enabled
-                else (
-                    V3_H71D_REPLAY_PROTOCOL
-                    if public_aux_enabled
-                    else (
-                        V3_H71E_REPLAY_PROTOCOL
-                        if bidding_enabled
-                        else V3_H7_REPLAY_PROTOCOL
-                    )
-                )
-            )
+    request_protocol, replay_protocol, snapshot_semantics = (
+        resolve_v3_h7_protocols(
+            belief=belief_enabled,
+            oracle=oracle_enabled,
+            cooperation=cooperation_enabled,
+            public_aux=public_aux_enabled,
+            bidding=bidding_enabled,
         )
     )
     runtime_config = V3H7RuntimeConfig(
@@ -142,11 +99,7 @@ def main() -> None:
         bidding_runtime_enabled=bidding_enabled,
         request_protocol=request_protocol,
         replay_protocol=replay_protocol,
-        snapshot_semantics=(
-            V3_H71A_SNAPSHOT_SEMANTICS
-            if belief_enabled
-            else V3H7RuntimeConfig.snapshot_semantics
-        ),
+        snapshot_semantics=snapshot_semantics,
     )
     validate_v3_h7_runtime_config(resolved, runtime_config)
     protocol = V3H7BenchmarkProtocol(
@@ -171,6 +124,9 @@ def main() -> None:
             else str(formal.identity_dict()["config_sha256"])
         ),
         oracle_enabled=oracle_enabled,
+        learner_phase=(
+            "oracle_guided" if oracle_enabled else "public"
+        ),
         cooperation_enabled=cooperation_enabled,
         public_aux_enabled=public_aux_enabled,
         bidding_enabled=bidding_enabled,

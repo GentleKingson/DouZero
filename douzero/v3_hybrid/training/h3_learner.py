@@ -662,6 +662,29 @@ class V3H3Learner:
     def schedule_state(self) -> OracleScheduleState:
         return self.config.schedule.at(self.learner_updates)
 
+    def prime_guided_benchmark_phase(self) -> None:
+        """Advance a fresh learner to guided phase without fabricating samples."""
+
+        if (
+            self.learner_updates != 0
+            or self.samples_consumed != 0
+            or self.statistics.state_dict() != H3CumulativeStats().state_dict()
+        ):
+            raise RuntimeError(
+                "guided benchmark phase can only prime a fresh H3 learner"
+            )
+        warmup_updates = self.config.schedule.warmup_updates
+        if warmup_updates <= 0:
+            raise RuntimeError(
+                "guided benchmark phase requires a positive warmup boundary"
+            )
+        if self.config.schedule.at(warmup_updates).phase != "guided":
+            raise RuntimeError(
+                "guided benchmark phase does not resolve to guided training"
+            )
+        self.learner_updates = warmup_updates
+        self.statistics.steps = warmup_updates
+
     def _bind_h5_policy_version_owner(self, owner: object) -> None:
         if owner is None or self._h5_policy_version_owner is not None:
             raise RuntimeError("H3 H5 policy-version owner binding is invalid")

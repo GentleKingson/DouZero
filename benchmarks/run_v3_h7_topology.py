@@ -32,17 +32,6 @@ from douzero.v3_hybrid.pilot import (
     create_pilot_learner,
 )
 from douzero.v3_hybrid.runtime import (
-    V3_H71A_REPLAY_PROTOCOL,
-    V3_H71A_REQUEST_PROTOCOL,
-    V3_H71A_SNAPSHOT_SEMANTICS,
-    V3_H71B_REPLAY_PROTOCOL,
-    V3_H71B_REQUEST_PROTOCOL,
-    V3_H71C_REPLAY_PROTOCOL,
-    V3_H71C_REQUEST_PROTOCOL,
-    V3_H71D_REPLAY_PROTOCOL,
-    V3_H71D_REQUEST_PROTOCOL,
-    V3_H71E_REPLAY_PROTOCOL,
-    V3_H71E_REQUEST_PROTOCOL,
     V3_H7_CHECKPOINT_FORMAT,
     V3_H7_REPLAY_PROTOCOL,
     V3_H7_REQUEST_PROTOCOL,
@@ -50,6 +39,7 @@ from douzero.v3_hybrid.runtime import (
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
+    resolve_v3_h7_protocols,
     resolve_v3_h7_seed_contract,
     validate_v3_h7_formal_initialization,
 )
@@ -148,47 +138,12 @@ def _validate_live_identity(
         raise ValueError("H7 benchmark public auxiliary identity mismatch")
     if protocol.bidding_enabled != bidding_enabled:
         raise ValueError("H7 benchmark bidding capability identity mismatch")
-    request = (
-        V3_H71A_REQUEST_PROTOCOL
-        if belief_enabled
-        else (
-            V3_H71B_REQUEST_PROTOCOL
-            if oracle_enabled
-            else (
-                V3_H71C_REQUEST_PROTOCOL
-                if cooperation_enabled
-                else (
-                    V3_H71D_REQUEST_PROTOCOL
-                    if public_aux_enabled
-                    else (
-                        V3_H71E_REQUEST_PROTOCOL
-                        if bidding_enabled
-                        else V3_H7_REQUEST_PROTOCOL
-                    )
-                )
-            )
-        )
-    )
-    replay = (
-        V3_H71A_REPLAY_PROTOCOL
-        if belief_enabled
-        else (
-            V3_H71B_REPLAY_PROTOCOL
-            if oracle_enabled
-            else (
-                V3_H71C_REPLAY_PROTOCOL
-                if cooperation_enabled
-                else (
-                    V3_H71D_REPLAY_PROTOCOL
-                    if public_aux_enabled
-                    else (
-                        V3_H71E_REPLAY_PROTOCOL
-                        if bidding_enabled
-                        else V3_H7_REPLAY_PROTOCOL
-                    )
-                )
-            )
-        )
+    request, replay, _snapshot = resolve_v3_h7_protocols(
+        belief=belief_enabled,
+        oracle=oracle_enabled,
+        cooperation=cooperation_enabled,
+        public_aux=public_aux_enabled,
+        bidding=bidding_enabled,
     )
     trainer_identity_hash = h7_trainer_identity_hash(
         runtime_version=V3_H7_RUNTIME_VERSION,
@@ -260,7 +215,7 @@ def main() -> None:
         else (
             build_v3_h7_smoke_config()
             if formal is None
-            else build_pilot_resolved_config(formal)
+            else build_pilot_resolved_config(formal, allow_standard=True)
         )
     )
     formal_config_hash = (
@@ -309,6 +264,15 @@ def main() -> None:
             requested_action_seed=None,
         )
     )
+    request_protocol, replay_protocol, snapshot_semantics = (
+        resolve_v3_h7_protocols(
+            belief=belief_enabled,
+            oracle=oracle_enabled,
+            cooperation=cooperation_enabled,
+            public_aux=public_aux_enabled,
+            bidding=bidding_enabled,
+        )
+    )
     runtime_config = V3H7RuntimeConfig(
         topology=topology,
         num_actors=actors,
@@ -324,53 +288,9 @@ def main() -> None:
         cooperation_runtime_enabled=cooperation_enabled,
         public_aux_runtime_enabled=public_aux_enabled,
         bidding_runtime_enabled=bidding_enabled,
-        request_protocol=(
-            V3_H71A_REQUEST_PROTOCOL
-            if belief_enabled
-            else (
-                V3_H71B_REQUEST_PROTOCOL
-                if oracle_enabled
-                else (
-                    V3_H71C_REQUEST_PROTOCOL
-                    if cooperation_enabled
-                    else (
-                        V3_H71D_REQUEST_PROTOCOL
-                        if public_aux_enabled
-                        else (
-                            V3_H71E_REQUEST_PROTOCOL
-                            if bidding_enabled
-                            else V3H7RuntimeConfig.request_protocol
-                        )
-                    )
-                )
-            )
-        ),
-        replay_protocol=(
-            V3_H71A_REPLAY_PROTOCOL
-            if belief_enabled
-            else (
-                V3_H71B_REPLAY_PROTOCOL
-                if oracle_enabled
-                else (
-                    V3_H71C_REPLAY_PROTOCOL
-                    if cooperation_enabled
-                    else (
-                        V3_H71D_REPLAY_PROTOCOL
-                        if public_aux_enabled
-                        else (
-                            V3_H71E_REPLAY_PROTOCOL
-                            if bidding_enabled
-                            else V3H7RuntimeConfig.replay_protocol
-                        )
-                    )
-                )
-            )
-        ),
-        snapshot_semantics=(
-            V3_H71A_SNAPSHOT_SEMANTICS
-            if belief_enabled
-            else V3H7RuntimeConfig.snapshot_semantics
-        ),
+        request_protocol=request_protocol,
+        replay_protocol=replay_protocol,
+        snapshot_semantics=snapshot_semantics,
     )
     if formal is None:
         model = V3HybridModel(build_v2_schema(), resolved.model)
@@ -382,9 +302,13 @@ def main() -> None:
             config=resolved,
         )
     else:
-        learner, learner_resolved = create_pilot_learner(formal)
+        learner, learner_resolved = create_pilot_learner(
+            formal, allow_standard=True
+        )
         if learner_resolved != resolved:
             raise RuntimeError("H7 benchmark formal resolution is not stable")
+    if protocol.learner_phase == "oracle_guided":
+        learner.prime_guided_benchmark_phase()
     trainer = trainer_type(learner, resolved, runtime_config)
     try:
         _run_until(

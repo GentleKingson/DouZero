@@ -26,20 +26,10 @@ from douzero.v3_hybrid.pilot import (
     create_pilot_learner,
 )
 from douzero.v3_hybrid.runtime import (
-    V3_H71A_REPLAY_PROTOCOL,
-    V3_H71A_REQUEST_PROTOCOL,
-    V3_H71A_SNAPSHOT_SEMANTICS,
-    V3_H71B_REPLAY_PROTOCOL,
-    V3_H71B_REQUEST_PROTOCOL,
-    V3_H71C_REPLAY_PROTOCOL,
-    V3_H71C_REQUEST_PROTOCOL,
-    V3_H71D_REPLAY_PROTOCOL,
-    V3_H71D_REQUEST_PROTOCOL,
-    V3_H71E_REPLAY_PROTOCOL,
-    V3_H71E_REQUEST_PROTOCOL,
     V3AsyncSingleGPUTrainer,
     V3H7RuntimeConfig,
     V3SingleProcessTrainer,
+    resolve_v3_h7_protocols,
     resolve_v3_h7_seed_contract,
     validate_v3_h7_formal_initialization,
     validate_v3_h7_runtime_config,
@@ -150,7 +140,7 @@ def main() -> None:
         else (
             load_v3_hybrid_config(args.config)
             if formal is None
-            else build_pilot_resolved_config(formal)
+            else build_pilot_resolved_config(formal, allow_standard=True)
         )
     )
     belief_enabled = resolved.learner.features.belief
@@ -171,6 +161,15 @@ def main() -> None:
             ),
             requested_environment_seed=args.seed,
             requested_action_seed=args.action_seed,
+        )
+    )
+    request_protocol, replay_protocol, snapshot_semantics = (
+        resolve_v3_h7_protocols(
+            belief=belief_enabled,
+            oracle=oracle_enabled,
+            cooperation=cooperation_enabled,
+            public_aux=public_aux_enabled,
+            bidding=bidding_enabled,
         )
     )
     runtime_config = V3H7RuntimeConfig(
@@ -202,53 +201,9 @@ def main() -> None:
         cooperation_runtime_enabled=cooperation_enabled,
         public_aux_runtime_enabled=public_aux_enabled,
         bidding_runtime_enabled=bidding_enabled,
-        request_protocol=(
-            V3_H71A_REQUEST_PROTOCOL
-            if belief_enabled
-            else (
-                V3_H71B_REQUEST_PROTOCOL
-                if oracle_enabled
-                else (
-                    V3_H71C_REQUEST_PROTOCOL
-                    if cooperation_enabled
-                    else (
-                        V3_H71D_REQUEST_PROTOCOL
-                        if public_aux_enabled
-                        else (
-                            V3_H71E_REQUEST_PROTOCOL
-                            if bidding_enabled
-                            else V3H7RuntimeConfig.request_protocol
-                        )
-                    )
-                )
-            )
-        ),
-        replay_protocol=(
-            V3_H71A_REPLAY_PROTOCOL
-            if belief_enabled
-            else (
-                V3_H71B_REPLAY_PROTOCOL
-                if oracle_enabled
-                else (
-                    V3_H71C_REPLAY_PROTOCOL
-                    if cooperation_enabled
-                    else (
-                        V3_H71D_REPLAY_PROTOCOL
-                        if public_aux_enabled
-                        else (
-                            V3_H71E_REPLAY_PROTOCOL
-                            if bidding_enabled
-                            else V3H7RuntimeConfig.replay_protocol
-                        )
-                    )
-                )
-            )
-        ),
-        snapshot_semantics=(
-            V3_H71A_SNAPSHOT_SEMANTICS
-            if belief_enabled
-            else V3H7RuntimeConfig.snapshot_semantics
-        ),
+        request_protocol=request_protocol,
+        replay_protocol=replay_protocol,
+        snapshot_semantics=snapshot_semantics,
     )
     validate_v3_h7_runtime_config(resolved, runtime_config)
     if not torch.cuda.is_available():
@@ -267,7 +222,9 @@ def main() -> None:
             belief_model=belief_model,
         )
     else:
-        learner, learner_resolved = create_pilot_learner(formal)
+        learner, learner_resolved = create_pilot_learner(
+            formal, allow_standard=True
+        )
         if learner_resolved != resolved:
             raise RuntimeError("H7 formal config resolution is not stable")
         model = learner.model
