@@ -42,6 +42,9 @@ def test_v2_command_uses_ruleset_owned_config_and_strict_resume(tmp_path):
     assert command[command.index("--v2_training_mode") + 1] == (
         "async_single_gpu"
     )
+    assert command[command.index("--checkpoint_path") + 1].endswith(
+        "training.pt"
+    )
     assert command[command.index("--resume_checkpoint") + 1].endswith(
         "training-latest.json"
     )

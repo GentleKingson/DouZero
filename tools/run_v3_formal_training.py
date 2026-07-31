@@ -100,7 +100,7 @@ def _v2_command(formal, tier, seed, output, resume):
         "--checkpoint_every_steps",
         str(formal.runtime.checkpoint_cadence_updates),
         "--checkpoint_path",
-        str(output / "training"),
+        str(output / "training.pt"),
         "--metrics_path",
         str(output / "metrics.json"),
     ]
