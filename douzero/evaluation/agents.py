@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from douzero.env.rules import RuleSet
+from douzero.search.budget import SearchConfig
 
 from .checkpoint_inputs import load_verified_checkpoint
 from .scenario import BundleSpec
@@ -139,8 +140,6 @@ class BundleFactory:
             from douzero.evaluation.deep_agent import DeepAgentV2, load_v2_model
             from douzero.models_v2.config import ModelV2Config
             from douzero.observation.schema import build_v2_schema
-            from douzero.search.budget import SearchConfig
-
             config = ModelV2Config(**dict(bundle.model_config))
             schema = build_v2_schema()
             model = load_verified_checkpoint(
@@ -174,6 +173,35 @@ class BundleFactory:
                 belief_model=belief_model,
                 search_config=search_config,
             )
+        if bundle.backend == "v3":
+            from douzero.evaluation.deep_agent_v3 import (
+                DeepAgentV3,
+                load_v3_evaluation_policy,
+                parse_v3_evaluation_config,
+            )
+            from douzero.observation.schema import build_v2_schema
+
+            model_config, belief_config = parse_v3_evaluation_config(
+                bundle.model_config
+            )
+            policy = load_verified_checkpoint(
+                checkpoint,
+                bundle.checkpoint_sha256.get(role),
+                lambda verified_path: load_v3_evaluation_policy(
+                    verified_path,
+                    schema=build_v2_schema(),
+                    ruleset=self.ruleset,
+                    model_config=model_config,
+                    belief_config=belief_config,
+                ),
+                label=f"{bundle.name}.{role}",
+            )
+            return DeepAgentV3(
+                role,
+                policy,
+                ruleset=self.ruleset,
+                search_config=SearchConfig(**dict(bundle.search_config)),
+            )
         raise ValueError(f"unsupported bundle backend {bundle.backend!r}")
 
     def choose_bid(
@@ -189,6 +217,25 @@ class BundleFactory:
 
         if bundle.bidding_policy != "learned":
             return choose_bid(bundle, bidding_observation, legal_bids, rng)
+        if bundle.backend == "v3":
+            key = (id(bundle), "landlord")
+            if key not in self._model_agents:
+                self._model_agents[key] = self._load_model_agent(bundle, "landlord")
+            model = self._model_agents[key].model
+            from douzero.observation.bidding import get_bidding_obs_v2
+
+            observation = get_bidding_obs_v2(
+                {**bidding_observation, "legal_bids": list(legal_bids)},
+                ruleset=self.ruleset,
+                redeal_count=redeal_count,
+            )
+            import torch
+
+            with torch.inference_mode():
+                bid = model.forward_bidding(observation).argmax_bid()
+            if bid not in legal_bids:
+                raise RuntimeError("V3 bidding model selected an illegal bid")
+            return bid
         key = id(bundle)
         if key not in self._bidding_models:
             from douzero.evaluation.deep_agent import load_v2_model

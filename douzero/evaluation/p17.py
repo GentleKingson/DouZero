@@ -201,6 +201,42 @@ def _validate_available_bundle_checkpoints(
                 fail("belief", exc)
         return
 
+    if bundle.backend == "v3":
+        from douzero.evaluation.deep_agent_v3 import (
+            load_v3_evaluation_policy,
+            parse_v3_evaluation_config,
+        )
+        from douzero.observation.schema import build_v2_schema
+
+        try:
+            v3_config, belief_config = parse_v3_evaluation_config(
+                bundle.model_config
+            )
+        except Exception as exc:
+            fail("model_config", exc)
+        seen: set[tuple[str, str]] = set()
+        for role, path in bundle.checkpoints.items():
+            checkpoint_identity = (path, bundle.checkpoint_sha256[role])
+            if checkpoint_identity in seen:
+                continue
+            seen.add(checkpoint_identity)
+            try:
+                load_verified_checkpoint(
+                    path,
+                    bundle.checkpoint_sha256[role],
+                    lambda verified_path: load_v3_evaluation_policy(
+                        verified_path,
+                        schema=build_v2_schema(),
+                        ruleset=ruleset,
+                        model_config=v3_config,
+                        belief_config=belief_config,
+                    ),
+                    label=f"{model_name}.{protocol}.{role}",
+                )
+            except Exception as exc:
+                fail(role, exc)
+        return
+
     if bundle.backend in ("legacy", "legacy_factorized"):
         from douzero.checkpoint import load_position_state_dict_strict
 
@@ -293,6 +329,15 @@ def _parse_entry(
                 f"{model_name}.{protocol} supplies a belief_checkpoint while "
                 "model_config.belief_enabled=false"
             )
+    elif bundle.backend == "v3":
+        from douzero.evaluation.deep_agent_v3 import parse_v3_evaluation_config
+
+        try:
+            config, _ = parse_v3_evaluation_config(bundle.model_config)
+        except (TypeError, ValueError) as exc:
+            raise P17MatrixError(
+                f"{model_name}.{protocol} has invalid V3 model_config: {exc}"
+            ) from exc
     if protocol == "full_game":
         if bundle.bidding_policy != "learned":
             raise P17MatrixError(

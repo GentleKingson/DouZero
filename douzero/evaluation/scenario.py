@@ -22,7 +22,7 @@ from .protocol import (
 
 SCENARIO_MODES = ("cardplay_only", "full_game")
 DATASET_SCOPES = ("public", "private_holdout")
-BACKENDS = ("random", "rule", "legacy", "legacy_factorized", "v2", "bc")
+BACKENDS = ("random", "rule", "legacy", "legacy_factorized", "v2", "bc", "v3")
 BIDDING_POLICIES = ("rule", "random", "pass", "max", "learned")
 SEATS = ("0", "1", "2")
 ROLES = ("landlord", "landlord_up", "landlord_down")
@@ -164,20 +164,28 @@ class BundleSpec:
             self.bidding_checkpoint, str
         ):
             raise TypeError("belief_checkpoint and bidding_checkpoint must be strings")
-        if self.backend in ("legacy", "legacy_factorized", "v2", "bc"):
+        if self.backend in ("legacy", "legacy_factorized", "v2", "bc", "v3"):
             missing = [role for role in ROLES if not self.checkpoints.get(role)]
             if missing:
                 raise ValueError(
                     f"bundle {self.name!r} is missing checkpoints for {missing}"
                 )
         if self.bidding_policy == "learned":
-            if self.backend not in ("v2", "bc"):
-                raise ValueError("learned bidding requires a V2 bundle backend")
-            if not self.bidding_checkpoint:
+            if self.backend not in ("v2", "bc", "v3"):
+                raise ValueError("learned bidding requires a V2 or V3 bundle backend")
+            if self.backend in ("v2", "bc") and not self.bidding_checkpoint:
                 raise ValueError("learned bidding requires bidding_checkpoint")
+            if self.backend == "v3" and self.bidding_checkpoint:
+                raise ValueError(
+                    "V3 learned bidding is part of the public policy checkpoint"
+                )
         elif self.bidding_checkpoint:
             raise ValueError(
                 "bidding_checkpoint is only valid with bidding_policy='learned'"
+            )
+        if self.backend == "v3" and self.belief_checkpoint:
+            raise ValueError(
+                "V3 belief feedback is part of the coupled public checkpoint"
             )
         if not isinstance(self.belief_checkpoint_sha256, str) or not isinstance(
             self.bidding_checkpoint_sha256, str

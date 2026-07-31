@@ -130,13 +130,13 @@ def _json_result_value(value: Any) -> Any:
 
 def _bundle_feature_schema(bundle: Mapping[str, Any]) -> dict[str, Any]:
     backend = str(bundle.get("backend", ""))
-    if backend in {"v2", "bc"}:
+    if backend in {"v2", "bc", "v3"}:
         from douzero.observation.bidding import build_bidding_schema
         from douzero.observation.schema import build_v2_schema
 
         learned_bidding = bundle.get("bidding_policy") == "learned"
         return {
-            "feature_version": "v2",
+            "feature_version": "v3_hybrid" if backend == "v3" else "v2",
             "feature_schema_hash": build_v2_schema().stable_hash(),
             "bidding_feature_schema_hash": (
                 build_bidding_schema().stable_hash() if learned_bidding else None
