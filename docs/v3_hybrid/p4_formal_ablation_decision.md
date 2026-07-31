@@ -13,6 +13,15 @@ Playing strength: NOT MEASURED
 ## Fixed Protocol
 
 - The runnable matrix is exactly the configurations in `configs/v3_formal/`.
+- Every standard-rules control enables the same learned-bidding objective and
+  separate bid action space. Standard evidence without bidding is rejected
+  rather than silently running legacy card play under a standard label.
+- Runtime topology is frozen per executable capability combination. Legacy
+  A1 and the standard Oracle, belief, and cooperation ablations use
+  `single_process`; Model V2, the other V3 ablations, and both full-hybrid
+  variants use `async_single_gpu`. The three standard partial sidecar
+  ablations remain single-process because H7.1 intentionally does not define
+  a partial sidecar-plus-bidding async transport.
 - Training seeds are `101`, `202`, and `303`.
 - Development uses the frozen 14,400-second wall ceiling, 5,000,000-sample
   ceiling, 50,000 optimizer-step ceiling, and 20,000 paired deals.

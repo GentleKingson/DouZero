@@ -63,6 +63,60 @@ def _oracle_update_limit(learner, oracle_enabled: bool) -> int:
     )
 
 
+def _validate_formal_runtime_args(formal, args: argparse.Namespace) -> None:
+    formal_runtime = formal.runtime
+    runtime_mismatches = {
+        name: (actual, expected)
+        for name, actual, expected in (
+            ("topology", args.topology, formal_runtime.topology),
+            ("batch_size", args.batch_size, formal_runtime.batch_size),
+            (
+                "replay_capacity",
+                args.replay_capacity,
+                formal_runtime.replay_capacity,
+            ),
+            (
+                "max_policy_lag",
+                args.max_policy_lag,
+                formal_runtime.policy_lag_limit,
+            ),
+            (
+                "checkpoint_every_steps",
+                args.checkpoint_every_steps,
+                formal_runtime.checkpoint_cadence_updates,
+            ),
+        )
+        if actual != expected
+    }
+    if runtime_mismatches:
+        raise ValueError(
+            f"H7 formal runtime arguments drifted: {runtime_mismatches}"
+        )
+
+
+def _resolve_runtime_args(formal, args: argparse.Namespace) -> None:
+    defaults = {
+        "topology": TOPOLOGY_ASYNC_SINGLE_GPU,
+        "batch_size": 32,
+        "replay_capacity": 4096,
+        "max_policy_lag": 128,
+        "checkpoint_every_steps": 0,
+    }
+    if formal is not None:
+        defaults.update({
+            "topology": formal.runtime.topology,
+            "batch_size": formal.runtime.batch_size,
+            "replay_capacity": formal.runtime.replay_capacity,
+            "max_policy_lag": formal.runtime.policy_lag_limit,
+            "checkpoint_every_steps": (
+                formal.runtime.checkpoint_cadence_updates
+            ),
+        })
+    for name, default in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, default)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     config = parser.add_mutually_exclusive_group(required=True)
@@ -79,8 +133,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-actors", type=int, default=4)
     parser.add_argument("--games-per-actor", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--replay-capacity", type=int, default=4096)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--replay-capacity", type=int)
     parser.add_argument("--belief-sidecar-capacity", type=int, default=4096)
     parser.add_argument("--oracle-sidecar-capacity", type=int, default=4096)
     parser.add_argument("--cooperation-sidecar-capacity", type=int, default=4096)
@@ -105,7 +159,7 @@ def _parser() -> argparse.ArgumentParser:
         default="rotate",
     )
     parser.add_argument("--target-microbatch", type=int, default=4)
-    parser.add_argument("--max-policy-lag", type=int, default=128)
+    parser.add_argument("--max-policy-lag", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--action-seed", type=int)
     parser.add_argument("--epsilon", type=float, default=0.01)
@@ -115,12 +169,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-wall-time-minutes", type=float, default=0.0)
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--checkpoint-every-cycles", type=int, default=1)
+    parser.add_argument("--checkpoint-every-steps", type=int)
     parser.add_argument("--keep-last-checkpoints", type=int, default=3)
     parser.add_argument("--resume", default="")
     parser.add_argument(
         "--topology",
         choices=(TOPOLOGY_SINGLE_PROCESS, TOPOLOGY_ASYNC_SINGLE_GPU),
-        default=TOPOLOGY_ASYNC_SINGLE_GPU,
     )
     return parser
 
@@ -132,8 +186,10 @@ def main() -> None:
         if args.formal_config is None
         else load_formal_config(args.formal_config)
     )
+    _resolve_runtime_args(formal, args)
     if formal is not None:
         validate_v3_h7_formal_initialization(formal.initialization.kind)
+        _validate_formal_runtime_args(formal, args)
     resolved = (
         build_v3_h7_smoke_config()
         if args.smoke_config
@@ -255,6 +311,7 @@ def main() -> None:
         max_cycles=args.max_cycles,
         max_wall_time_minutes=args.max_wall_time_minutes,
         checkpoint_every_cycles=args.checkpoint_every_cycles,
+        checkpoint_every_steps=args.checkpoint_every_steps,
         keep_last_checkpoints=args.keep_last_checkpoints,
         save_on_interrupt=True,
         v2_training_mode=args.topology,

@@ -1,4 +1,4 @@
-schema_version: v3-formal-experiment-config-v1
+schema_version: v3-formal-experiment-config-v2
 metadata:
   name: overridden-by-runnable-config
   description: overridden-by-runnable-config
@@ -129,12 +129,12 @@ feature_configs:
     enabled: false
     training_semantics: deployment_wrapper_shared_checkpoint_v1
 runtime:
-  topology: single_process
+  topology: async_single_gpu
   device: cuda
   batch_size: 32
   replay_capacity: 100000
   checkpoint_cadence_updates: 1000
-  policy_lag_limit: 0
+  policy_lag_limit: 128
   checkpoint_enabled: true
 seeds:
   training: [101, 202, 303]

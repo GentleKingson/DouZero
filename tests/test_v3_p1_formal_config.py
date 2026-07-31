@@ -39,6 +39,23 @@ def test_complete_supported_matrix_loads_and_is_exact() -> None:
             "v3_farmer_cooperation", "v3_full_hybrid",
         ) for ruleset in ("legacy", "standard")),
     }
+    for config in map(load_formal_config, RUNNABLE_CONFIGS):
+        expected = (
+            "single_process"
+            if (
+                config.variant == "legacy_a1"
+                or (
+                    config.ruleset["id"] == "standard"
+                    and config.variant
+                    in {"v3_oracle", "v3_belief", "v3_farmer_cooperation"}
+                )
+            )
+            else "async_single_gpu"
+        )
+        assert config.runtime.topology == expected
+        assert config.features["bidding"] is (
+            config.ruleset["id"] == "standard"
+        )
 
 
 def test_metadata_does_not_change_training_semantics() -> None:

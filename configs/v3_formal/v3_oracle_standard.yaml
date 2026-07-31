@@ -2,8 +2,9 @@ extends: _defaults.yaml.inc
 metadata: {name: v3_oracle_standard, description: V3 online Oracle ablation under standard rules}
 variant: v3_oracle
 ruleset: {id: standard, version: standard-v1, hash: 05a383c5ac992aefbce757060e13320a5f476b501df19ba33a7048e6ef9ee13f}
-features: {oracle: true}
-losses: {weights: {oracle: 1.0}}
+model: {config: {bidding_enabled: true}}
+features: {oracle: true, bidding: true}
+losses: {weights: {oracle: 1.0, bidding: 1.0}}
 feature_configs:
   oracle:
     enabled: true
@@ -12,3 +13,5 @@ feature_configs:
     finetune_updates: 20000
     guidance_weight_start: 1.0
     guidance_weight_end: 0.0
+  bidding: {enabled: true}
+runtime: {topology: single_process, policy_lag_limit: 0}

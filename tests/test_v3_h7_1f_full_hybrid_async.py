@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import benchmarks.freeze_v3_h7_protocol as freeze_h7
+from train_v3_h7 import _validate_formal_runtime_args
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.models_v2.batch import observation_to_model_inputs
@@ -144,6 +145,24 @@ def test_full_hybrid_runtime_validates_before_cuda(
     )
     validate_v3_h7_runtime_config(resolved, runtime)
     assert runtime.identity()["request_protocol"] == request_protocol
+
+
+def test_formal_runtime_cli_drift_fails_before_side_effects(tmp_path):
+    formal = load_formal_config(
+        ROOT / "configs/v3_formal/v3_role_legacy.yaml"
+    )
+    checkpoint = tmp_path / "must-not-exist.pt"
+    args = SimpleNamespace(
+        topology="single_process",
+        batch_size=formal.runtime.batch_size,
+        replay_capacity=formal.runtime.replay_capacity,
+        max_policy_lag=formal.runtime.policy_lag_limit,
+        checkpoint_every_steps=formal.runtime.checkpoint_cadence_updates,
+        checkpoint_path=str(checkpoint),
+    )
+    with pytest.raises(ValueError, match="formal runtime arguments drifted"):
+        _validate_formal_runtime_args(formal, args)
+    assert not checkpoint.exists()
 
 
 def test_partial_combined_transport_fails_closed():

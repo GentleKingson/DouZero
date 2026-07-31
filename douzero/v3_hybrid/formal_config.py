@@ -26,10 +26,10 @@ from .formal_evidence import (
     h8a_support_matrix_hash,
 )
 
-V3_FORMAL_CONFIG_SCHEMA = "v3-formal-experiment-config-v1"
-V3_FORMAL_IDENTITY_SCHEMA = "v3-formal-experiment-identity-v1"
-TRAINING_SEMANTICS_VERSION = "v3-formal-training-semantics-v1"
-WORKLOAD_IDENTITY_VERSION = "v3-formal-workload-v1"
+V3_FORMAL_CONFIG_SCHEMA = "v3-formal-experiment-config-v2"
+V3_FORMAL_IDENTITY_SCHEMA = "v3-formal-experiment-identity-v2"
+TRAINING_SEMANTICS_VERSION = "v3-formal-training-semantics-v2"
+WORKLOAD_IDENTITY_VERSION = "v3-formal-workload-v2"
 V3_FORMAL_INITIAL_CHECKPOINT_SCHEMA = "v3-formal-initial-checkpoint-v1"
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -192,8 +192,10 @@ class FormalRuntime:
     def from_dict(cls, value: object) -> "FormalRuntime":
         data = _mapping(value, "runtime")
         _exact(data, set(cls.__dataclass_fields__), "runtime")
-        if data["topology"] != "single_process":
-            raise FormalConfigError("P1 formal configs support single_process only")
+        if data["topology"] not in {"single_process", "async_single_gpu"}:
+            raise FormalConfigError(
+                "formal topology must be single_process or async_single_gpu"
+            )
         if data["device"] != "cuda":
             raise FormalConfigError("formal training device must be cuda")
         return cls(
@@ -303,7 +305,7 @@ class FormalExperimentConfig:
         _exact(features, set(_FEATURE_NAMES), "features")
         enabled = {name for name, flag in features.items() if _boolean(flag, f"features.{name}")}
         expected_features = set(_EXPECTED_FEATURES[variant])
-        if variant == "v3_full_hybrid" and ruleset_id == "standard":
+        if ruleset_id == "standard":
             expected_features.add("bidding")
         if enabled != expected_features:
             raise FormalConfigError(
