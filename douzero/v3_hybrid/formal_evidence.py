@@ -18,8 +18,8 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-H8_EVIDENCE_SCHEMA_VERSION = "v3-hybrid-h8a-formal-evidence-v2"
-H8_REPORT_SCHEMA_VERSION = "v3-hybrid-h8a-release-report-v2"
+H8_EVIDENCE_SCHEMA_VERSION = "v3-hybrid-h8a-formal-evidence-v3"
+H8_REPORT_SCHEMA_VERSION = "v3-hybrid-h8a-release-report-v3"
 H8A_SUPPORT_MATRIX_VERSION = "v3-hybrid-h8a-variant-ruleset-v1"
 
 DEVELOPMENT = "development"
@@ -356,10 +356,23 @@ def _validate_training_run(
     for name in boolean_fields[:-1]:
         if not run[name]:
             issues.append(f"{variant}/{ruleset}/seed-{seed}: {name} is false")
-    if samples != identity["sample_budget"]:
-        issues.append(f"{variant}/{ruleset}/seed-{seed}: sample budget mismatch")
-    if wall != float(identity["wall_clock_budget_seconds"]):
-        issues.append(f"{variant}/{ruleset}/seed-{seed}: wall-clock budget mismatch")
+    sample_budget = identity["sample_budget"]
+    wall_budget = float(identity["wall_clock_budget_seconds"])
+    # P1 freezes two matched stopping ceilings. A run completes when either
+    # ceiling is reached; requiring both exact values is generally impossible
+    # because throughput is itself an experimental result. Permit only bounded
+    # checkpoint-cycle overshoot on wall time and never sample-budget overflow.
+    wall_overshoot_limit = wall_budget * 1.01 + 60.0
+    if samples > sample_budget:
+        issues.append(f"{variant}/{ruleset}/seed-{seed}: sample budget exceeded")
+    if wall > wall_overshoot_limit:
+        issues.append(
+            f"{variant}/{ruleset}/seed-{seed}: wall-clock budget exceeded"
+        )
+    if samples < sample_budget and wall < wall_budget:
+        issues.append(
+            f"{variant}/{ruleset}/seed-{seed}: neither frozen budget was reached"
+        )
     if cumulative < 7200.0:
         issues.append(
             f"{variant}/{ruleset}/seed-{seed}: cumulative training is under two hours"
@@ -905,12 +918,6 @@ def validate_h8_formal_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
     development_evaluation_issues: list[str] = []
     promotion_evaluation_issues: list[str] = []
     training: dict[tuple[str, str, int], Mapping[str, Any]] = {}
-    samples_by_seed: dict[int, set[int]] = {
-        seed: set() for seed in identity["training_seeds"]
-    }
-    wall_by_seed: dict[int, set[float]] = {
-        seed: set() for seed in identity["training_seeds"]
-    }
     for index, raw in enumerate(training_rows):
         row = _mapping(raw, f"training_runs[{index}]")
         training_issues.extend(_validate_training_run(row, identity))
@@ -918,8 +925,6 @@ def validate_h8_formal_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
         if key in training:
             raise H8EvidenceError(f"duplicate training row: {key}")
         training[key] = row
-        samples_by_seed[row["seed"]].add(row["samples"])
-        wall_by_seed[row["seed"]].add(float(row["wall_clock_seconds"]))
     expected_training = _expected_training_keys(identity)
     missing_training = sorted(expected_training - set(training))
     if missing_training:
@@ -970,10 +975,6 @@ def validate_h8_formal_evidence(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise H8EvidenceError(
                 f"{variant}/{ruleset} training seeds must share one ruleset identity"
             )
-    for seed in identity["training_seeds"]:
-        if len(samples_by_seed[seed]) > 1 or len(wall_by_seed[seed]) > 1:
-            raise H8EvidenceError(f"seed {seed} does not use matched budgets")
-
     expected_development = _expected_development_keys(identity)
     expected_promotion = _expected_promotion_keys(identity)
     expected_evaluations = expected_development | expected_promotion

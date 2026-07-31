@@ -258,6 +258,44 @@ def test_complete_development_report_is_valid_but_never_release_ready() -> None:
     report = validate_h8_formal_evidence(_evidence())
     assert report["development_status"] == "COMPLETE"
     assert report["release_candidate"] == "NONE"
+
+
+def test_wall_clock_budget_can_complete_before_sample_ceiling() -> None:
+    payload = _evidence()
+    for index, run in enumerate(payload["training_runs"]):
+        run["samples"] = 10_000 + index
+        run["wall_clock_seconds"] = 7200.5
+    report = validate_h8_formal_evidence(payload)
+    assert report["development_status"] == "COMPLETE"
+
+
+def test_training_must_reach_one_frozen_budget_without_large_overshoot() -> None:
+    payload = _evidence()
+    payload["training_runs"][0]["samples"] = 999_999
+    payload["training_runs"][0]["wall_clock_seconds"] = 7199.0
+    report = validate_h8_formal_evidence(payload)
+    assert report["development_status"] == "INCOMPLETE"
+    assert any(
+        "neither frozen budget was reached" in issue
+        for issue in report["issues"]
+    )
+
+    payload = _evidence()
+    payload["training_runs"][0]["samples"] = 1_000_001
+    report = validate_h8_formal_evidence(payload)
+    assert report["development_status"] == "INCOMPLETE"
+    assert any(
+        "sample budget exceeded" in issue for issue in report["issues"]
+    )
+
+    payload = _evidence()
+    payload["training_runs"][0]["wall_clock_seconds"] = 7400.0
+    report = validate_h8_formal_evidence(payload)
+    assert report["development_status"] == "INCOMPLETE"
+    assert any(
+        "wall-clock budget exceeded" in issue
+        for issue in report["issues"]
+    )
     assert report["release_status"] == "NOT READY"
     assert report["playing_strength"] == "NOT MEASURED"
     assert not any("100000" in issue for issue in report["issues"])
