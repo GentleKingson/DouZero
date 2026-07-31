@@ -157,6 +157,12 @@ def test_formal_runtime_cli_drift_fails_before_side_effects(tmp_path):
     checkpoint = tmp_path / "must-not-exist.pt"
     args = SimpleNamespace(
         topology="single_process",
+        num_actors=formal.runtime.num_actors,
+        games_per_actor=formal.runtime.games_per_actor,
+        episodes_per_cycle=formal.runtime.episodes_per_cycle,
+        optimizer_steps_per_cycle=(
+            formal.runtime.optimizer_steps_per_cycle
+        ),
         batch_size=formal.runtime.batch_size,
         replay_capacity=formal.runtime.replay_capacity,
         max_policy_lag=formal.runtime.policy_lag_limit,

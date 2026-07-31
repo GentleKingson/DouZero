@@ -22,6 +22,10 @@ Playing strength: NOT MEASURED
   variants use `async_single_gpu`. The three standard partial sidecar
   ablations remain single-process because H7.1 intentionally does not define
   a partial sidecar-plus-bidding async transport.
+- Runtime workload identity also freezes the family-owned profile, actor and
+  game counts, cycle cadence, batch and replay sizes, checkpoint cadence, and
+  Legacy A1 unroll length. The strict P4 dispatcher rejects a seed or resume
+  mode outside that frozen contract before launching a trainer.
 - Training seeds are `101`, `202`, and `303`.
 - Development uses the frozen 14,400-second wall ceiling, 5,000,000-sample
   ceiling, 50,000 optimizer-step ceiling, and 20,000 paired deals.

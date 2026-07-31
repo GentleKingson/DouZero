@@ -53,6 +53,26 @@ def test_complete_supported_matrix_loads_and_is_exact() -> None:
             else "async_single_gpu"
         )
         assert config.runtime.topology == expected
+        assert config.runtime.num_actors == (
+            12 if config.variant == "legacy_a1" else (
+                1 if expected == "single_process" else 4
+            )
+        )
+        assert config.runtime.games_per_actor == (
+            1 if expected == "single_process" else 4
+        )
+        assert config.runtime.episodes_per_cycle == 4
+        assert config.runtime.optimizer_steps_per_cycle == 1
+        assert config.runtime.legacy_unroll_length == 50
+        assert config.runtime.profile == (
+            "legacy_a1_production_v1"
+            if config.variant == "legacy_a1"
+            else (
+                "model_v2_formal_v1"
+                if config.variant == "model_v2"
+                else "v3_h71_formal_v1"
+            )
+        )
         assert config.features["bidding"] is (
             config.ruleset["id"] == "standard"
         )

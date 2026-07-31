@@ -26,10 +26,10 @@ from .formal_evidence import (
     h8a_support_matrix_hash,
 )
 
-V3_FORMAL_CONFIG_SCHEMA = "v3-formal-experiment-config-v2"
-V3_FORMAL_IDENTITY_SCHEMA = "v3-formal-experiment-identity-v2"
-TRAINING_SEMANTICS_VERSION = "v3-formal-training-semantics-v2"
-WORKLOAD_IDENTITY_VERSION = "v3-formal-workload-v2"
+V3_FORMAL_CONFIG_SCHEMA = "v3-formal-experiment-config-v3"
+V3_FORMAL_IDENTITY_SCHEMA = "v3-formal-experiment-identity-v3"
+TRAINING_SEMANTICS_VERSION = "v3-formal-training-semantics-v3"
+WORKLOAD_IDENTITY_VERSION = "v3-formal-workload-v3"
 V3_FORMAL_INITIAL_CHECKPOINT_SCHEMA = "v3-formal-initial-checkpoint-v1"
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -180,8 +180,14 @@ class FormalSeeds:
 
 @dataclass(frozen=True)
 class FormalRuntime:
+    profile: str
     topology: str
     device: str
+    num_actors: int
+    games_per_actor: int
+    episodes_per_cycle: int
+    optimizer_steps_per_cycle: int
+    legacy_unroll_length: int
     batch_size: int
     replay_capacity: int
     checkpoint_cadence_updates: int
@@ -198,8 +204,32 @@ class FormalRuntime:
             )
         if data["device"] != "cuda":
             raise FormalConfigError("formal training device must be cuda")
+        if data["profile"] not in {
+            "legacy_a1_production_v1",
+            "model_v2_formal_v1",
+            "v3_h71_formal_v1",
+        }:
+            raise FormalConfigError("formal runtime profile is unsupported")
         return cls(
+            profile=data["profile"],
             topology=data["topology"], device=data["device"],
+            num_actors=_integer(data["num_actors"], "runtime.num_actors", 1),
+            games_per_actor=_integer(
+                data["games_per_actor"], "runtime.games_per_actor", 1
+            ),
+            episodes_per_cycle=_integer(
+                data["episodes_per_cycle"], "runtime.episodes_per_cycle", 1
+            ),
+            optimizer_steps_per_cycle=_integer(
+                data["optimizer_steps_per_cycle"],
+                "runtime.optimizer_steps_per_cycle",
+                1,
+            ),
+            legacy_unroll_length=_integer(
+                data["legacy_unroll_length"],
+                "runtime.legacy_unroll_length",
+                1,
+            ),
             batch_size=_integer(data["batch_size"], "runtime.batch_size", 1),
             replay_capacity=_integer(data["replay_capacity"], "runtime.replay_capacity", 1),
             checkpoint_cadence_updates=_integer(
@@ -361,11 +391,19 @@ class FormalExperimentConfig:
         if evaluation["bootstrap_unit"] != "deal" or _number(evaluation["confidence"], "evaluation.confidence") != 0.95:
             raise FormalConfigError("formal evaluation requires deal bootstrap at 95% confidence")
 
+        runtime = FormalRuntime.from_dict(data["runtime"])
+        expected_profile = {
+            "legacy_a1": "legacy_a1_production_v1",
+            "model_v2": "model_v2_formal_v1",
+        }.get(variant, "v3_h71_formal_v1")
+        if runtime.profile != expected_profile:
+            raise FormalConfigError("variant/runtime profile mismatch")
+
         return cls(
             metadata=dict(metadata), variant=variant, ruleset=dict(ruleset_data),
             model=dict(model), features=dict(features), losses=dict(losses),
             feature_configs=dict(feature_configs),
-            runtime=FormalRuntime.from_dict(data["runtime"]),
+            runtime=runtime,
             seeds=FormalSeeds.from_dict(data["seeds"]), budgets=budgets,
             initialization=FormalInitialization.from_dict(data["initialization"]),
             evaluation=dict(evaluation),

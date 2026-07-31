@@ -69,6 +69,22 @@ def _validate_formal_runtime_args(formal, args: argparse.Namespace) -> None:
         name: (actual, expected)
         for name, actual, expected in (
             ("topology", args.topology, formal_runtime.topology),
+            ("num_actors", args.num_actors, formal_runtime.num_actors),
+            (
+                "games_per_actor",
+                args.games_per_actor,
+                formal_runtime.games_per_actor,
+            ),
+            (
+                "episodes_per_cycle",
+                args.episodes_per_cycle,
+                formal_runtime.episodes_per_cycle,
+            ),
+            (
+                "optimizer_steps_per_cycle",
+                args.optimizer_steps_per_cycle,
+                formal_runtime.optimizer_steps_per_cycle,
+            ),
             ("batch_size", args.batch_size, formal_runtime.batch_size),
             (
                 "replay_capacity",
@@ -97,6 +113,10 @@ def _validate_formal_runtime_args(formal, args: argparse.Namespace) -> None:
 def _resolve_runtime_args(formal, args: argparse.Namespace) -> None:
     defaults = {
         "topology": TOPOLOGY_ASYNC_SINGLE_GPU,
+        "num_actors": 4,
+        "games_per_actor": 4,
+        "episodes_per_cycle": 4,
+        "optimizer_steps_per_cycle": 1,
         "batch_size": 32,
         "replay_capacity": 4096,
         "max_policy_lag": 128,
@@ -105,6 +125,12 @@ def _resolve_runtime_args(formal, args: argparse.Namespace) -> None:
     if formal is not None:
         defaults.update({
             "topology": formal.runtime.topology,
+            "num_actors": formal.runtime.num_actors,
+            "games_per_actor": formal.runtime.games_per_actor,
+            "episodes_per_cycle": formal.runtime.episodes_per_cycle,
+            "optimizer_steps_per_cycle": (
+                formal.runtime.optimizer_steps_per_cycle
+            ),
             "batch_size": formal.runtime.batch_size,
             "replay_capacity": formal.runtime.replay_capacity,
             "max_policy_lag": formal.runtime.policy_lag_limit,
@@ -149,8 +175,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use the explicit tiny CUDA test identity; never a strength run.",
     )
-    parser.add_argument("--num-actors", type=int, default=4)
-    parser.add_argument("--games-per-actor", type=int, default=4)
+    parser.add_argument("--num-actors", type=int)
+    parser.add_argument("--games-per-actor", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--replay-capacity", type=int)
     parser.add_argument("--belief-sidecar-capacity", type=int, default=4096)
@@ -181,8 +207,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--action-seed", type=int)
     parser.add_argument("--epsilon", type=float, default=0.01)
-    parser.add_argument("--episodes-per-cycle", type=int, default=4)
-    parser.add_argument("--optimizer-steps-per-cycle", type=int, default=1)
+    parser.add_argument("--episodes-per-cycle", type=int)
+    parser.add_argument("--optimizer-steps-per-cycle", type=int)
     parser.add_argument("--max-cycles", type=int, default=0)
     parser.add_argument("--max-wall-time-minutes", type=float, default=0.0)
     parser.add_argument(

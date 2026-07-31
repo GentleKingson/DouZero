@@ -11,4 +11,5 @@ features: {role_model: false, bidding: true}
 losses: {weights: {bidding: 1.0}}
 feature_configs:
   bidding: {enabled: true}
+runtime: {profile: model_v2_formal_v1}
 initialization: {source: model-v2-seeded-fresh-v1}

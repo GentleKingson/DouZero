@@ -7,5 +7,10 @@ model:
   config:
     __replace__: {architecture: legacy_lstm, hidden_size: 512, observation: legacy}
 features: {role_model: false}
-runtime: {topology: single_process, policy_lag_limit: 0}
+runtime:
+  profile: legacy_a1_production_v1
+  topology: single_process
+  num_actors: 12
+  games_per_actor: 1
+  policy_lag_limit: 0
 initialization: {source: legacy-a1-seeded-fresh-v1}

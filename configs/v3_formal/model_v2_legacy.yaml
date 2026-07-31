@@ -7,4 +7,5 @@ model:
   config:
     __replace__: {architecture: model_v2, observation: v2, hidden_size: 256}
 features: {role_model: false}
+runtime: {profile: model_v2_formal_v1}
 initialization: {source: model-v2-seeded-fresh-v1}

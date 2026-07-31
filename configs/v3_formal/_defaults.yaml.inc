@@ -1,4 +1,4 @@
-schema_version: v3-formal-experiment-config-v2
+schema_version: v3-formal-experiment-config-v3
 metadata:
   name: overridden-by-runnable-config
   description: overridden-by-runnable-config
@@ -129,8 +129,14 @@ feature_configs:
     enabled: false
     training_semantics: deployment_wrapper_shared_checkpoint_v1
 runtime:
+  profile: v3_h71_formal_v1
   topology: async_single_gpu
   device: cuda
+  num_actors: 4
+  games_per_actor: 4
+  episodes_per_cycle: 4
+  optimizer_steps_per_cycle: 1
+  legacy_unroll_length: 50
   batch_size: 32
   replay_capacity: 100000
   checkpoint_cadence_updates: 1000
