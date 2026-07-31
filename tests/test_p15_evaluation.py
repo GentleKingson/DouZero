@@ -421,6 +421,65 @@ def test_formal_runtime_identity_binds_workflow_container_and_hardware():
         )
 
 
+def test_formal_runtime_identity_accepts_attested_local_docker():
+    payload = evaluate_scenario(_scenario("cardplay_only", deals=1)).to_dict()
+    runtime = payload["runtime_identity"]
+    source_sha = runtime["source_git_sha"]
+    runtime.update({
+        "source_worktree_clean": True,
+        "source_identity_stable": True,
+        "source_identity_samples": 2,
+    })
+    runtime["execution_environment"].update({
+        "provider": "local_docker",
+        "repository": "GentleKingson/DouZero",
+        "workflow_ref": None,
+        "workflow_sha": None,
+        "source_ref": None,
+        "source_sha": source_sha,
+        "run_id": None,
+        "run_attempt": None,
+        "run_url": None,
+        "runner_environment": "self-hosted",
+        "container_image_digest": "sha256:" + "b" * 64,
+    })
+    payload = attach_result_integrity({
+        key: value for key, value in payload.items() if key != "result_integrity"
+    })
+
+    validate_evaluation_runtime_identity(
+        payload,
+        expected_source_git_shas=[source_sha],
+        require_formal_source=True,
+    )
+
+    malformed = json.loads(json.dumps(payload))
+    malformed["runtime_identity"]["execution_environment"]["run_id"] = "123"
+    malformed = attach_result_integrity({
+        key: value
+        for key, value in malformed.items()
+        if key != "result_integrity"
+    })
+    with pytest.raises(ValueError, match="workflow/container identity"):
+        validate_evaluation_runtime_identity(
+            malformed,
+            require_formal_source=True,
+        )
+
+
+def test_local_docker_execution_identity_is_explicit(monkeypatch):
+    monkeypatch.setenv("DOUZERO_FORMAL_LOCAL_DOCKER", "true")
+    monkeypatch.setenv("DOUZERO_FORMAL_REPOSITORY", "GentleKingson/DouZero")
+    monkeypatch.setenv("DOUZERO_EVALUATOR_IMAGE_DIGEST", "sha256:" + "b" * 64)
+    payload = evaluate_scenario(_scenario("cardplay_only", deals=1)).to_dict()
+    execution = payload["runtime_identity"]["execution_environment"]
+    assert execution["provider"] == "local_docker"
+    assert execution["repository"] == "GentleKingson/DouZero"
+    assert execution["runner_environment"] == "self-hosted"
+    assert execution["container_image_digest"] == "sha256:" + "b" * 64
+    assert execution["workflow_ref"] is None
+
+
 def test_runtime_source_identity_ignores_environment_sha(monkeypatch):
     monkeypatch.setenv("DOUZERO_GIT_SHA", "0" * 40)
     runtime = evaluate_scenario(

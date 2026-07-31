@@ -71,7 +71,12 @@ def _execution_environment_identity() -> dict[str, Any]:
             except (AssertionError, RuntimeError):
                 cuda_device_names.append("unavailable")
 
-    repository = os.environ.get("GITHUB_REPOSITORY")
+    local_docker = os.environ.get("DOUZERO_FORMAL_LOCAL_DOCKER") == "true"
+    repository = (
+        os.environ.get("DOUZERO_FORMAL_REPOSITORY")
+        if local_docker
+        else os.environ.get("GITHUB_REPOSITORY")
+    )
     run_id = os.environ.get("GITHUB_RUN_ID")
     run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
     run_url = None
@@ -82,19 +87,35 @@ def _execution_environment_identity() -> dict[str, Any]:
         )
     return {
         "provider": (
-            "github_actions"
-            if os.environ.get("GITHUB_ACTIONS") == "true"
-            else "local"
+            "local_docker"
+            if local_docker
+            else (
+                "github_actions"
+                if os.environ.get("GITHUB_ACTIONS") == "true"
+                else "local"
+            )
         ),
         "repository": repository,
-        "workflow_ref": os.environ.get("GITHUB_WORKFLOW_REF"),
-        "workflow_sha": os.environ.get("GITHUB_WORKFLOW_SHA"),
-        "source_ref": os.environ.get("GITHUB_REF"),
-        "source_sha": os.environ.get("GITHUB_SHA"),
-        "run_id": run_id,
-        "run_attempt": run_attempt,
-        "run_url": run_url,
-        "runner_environment": os.environ.get("RUNNER_ENVIRONMENT"),
+        "workflow_ref": (
+            None if local_docker else os.environ.get("GITHUB_WORKFLOW_REF")
+        ),
+        "workflow_sha": (
+            None if local_docker else os.environ.get("GITHUB_WORKFLOW_SHA")
+        ),
+        "source_ref": None if local_docker else os.environ.get("GITHUB_REF"),
+        "source_sha": (
+            os.environ.get("DOUZERO_GIT_SHA")
+            if local_docker
+            else os.environ.get("GITHUB_SHA")
+        ),
+        "run_id": None if local_docker else run_id,
+        "run_attempt": None if local_docker else run_attempt,
+        "run_url": None if local_docker else run_url,
+        "runner_environment": (
+            "self-hosted"
+            if local_docker
+            else os.environ.get("RUNNER_ENVIRONMENT")
+        ),
         "container_image_digest": os.environ.get(
             "DOUZERO_EVALUATOR_IMAGE_DIGEST"
         ),
@@ -306,10 +327,7 @@ def validate_evaluation_runtime_identity(
         source_ref = execution.get("source_ref")
         run_id = execution.get("run_id")
         run_attempt = execution.get("run_attempt")
-        expected_run_url = (
-            f"https://github.com/{repository}/actions/runs/{run_id}/"
-            f"attempts/{run_attempt}"
-        )
+        provider = execution.get("provider")
         image_digest = execution.get("container_image_digest")
         hardware = execution.get("hardware")
         def full_oid(value: object) -> bool:
@@ -318,35 +336,59 @@ def validate_evaluation_runtime_identity(
                 and len(value) in (40, 64)
                 and all(char in "0123456789abcdef" for char in value)
             )
-        if (
-            execution.get("provider") != "github_actions"
-            or not isinstance(repository, str)
-            or repository.count("/") != 1
-            or not isinstance(workflow_ref, str)
-            or not workflow_ref.startswith(
-                f"{repository}/.github/workflows/"
-            )
-            or "@refs/" not in workflow_ref
-            or not full_oid(workflow_sha)
-            or not isinstance(source_ref, str)
-            or not source_ref.startswith("refs/")
-            or execution.get("source_sha") != source_sha
-            or not isinstance(run_id, str)
-            or not run_id.isdigit()
-            or int(run_id) < 1
-            or not isinstance(run_attempt, str)
-            or not run_attempt.isdigit()
-            or int(run_attempt) < 1
-            or execution.get("run_url") != expected_run_url
-            or execution.get("runner_environment")
-            not in {"github-hosted", "self-hosted"}
-            or not isinstance(image_digest, str)
+        image_invalid = (
+            not isinstance(image_digest, str)
             or len(image_digest) != 71
             or not image_digest.startswith("sha256:")
-            or any(
-                char not in "0123456789abcdef" for char in image_digest[7:]
+            or any(char not in "0123456789abcdef" for char in image_digest[7:])
+        )
+        if provider == "github_actions":
+            expected_run_url = (
+                f"https://github.com/{repository}/actions/runs/{run_id}/"
+                f"attempts/{run_attempt}"
             )
-        ):
+            execution_invalid = (
+                not isinstance(repository, str)
+                or repository.count("/") != 1
+                or not isinstance(workflow_ref, str)
+                or not workflow_ref.startswith(
+                    f"{repository}/.github/workflows/"
+                )
+                or "@refs/" not in workflow_ref
+                or not full_oid(workflow_sha)
+                or not isinstance(source_ref, str)
+                or not source_ref.startswith("refs/")
+                or execution.get("source_sha") != source_sha
+                or not isinstance(run_id, str)
+                or not run_id.isdigit()
+                or int(run_id) < 1
+                or not isinstance(run_attempt, str)
+                or not run_attempt.isdigit()
+                or int(run_attempt) < 1
+                or execution.get("run_url") != expected_run_url
+                or execution.get("runner_environment")
+                not in {"github-hosted", "self-hosted"}
+            )
+        elif provider == "local_docker":
+            execution_invalid = (
+                repository != "GentleKingson/DouZero"
+                or execution.get("source_sha") != source_sha
+                or execution.get("runner_environment") != "self-hosted"
+                or any(
+                    execution.get(name) is not None
+                    for name in (
+                        "workflow_ref",
+                        "workflow_sha",
+                        "source_ref",
+                        "run_id",
+                        "run_attempt",
+                        "run_url",
+                    )
+                )
+            )
+        else:
+            execution_invalid = True
+        if execution_invalid or image_invalid:
             raise ValueError(
                 "formal evaluation GitHub workflow/container identity is malformed"
             )
