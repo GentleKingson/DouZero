@@ -162,7 +162,8 @@ _IDENTITY_FIELDS = {
     "git_sha", "docker_image_digest", "driver", "cuda", "pytorch", "gpu",
     "cpu", "feature_schema_hash", "trainer_topology_hash",
     "replay_protocol_hash", "training_seeds", "evaluation_seed",
-    "wall_clock_budget_seconds", "sample_budget", "evaluation_deal_sets",
+    "wall_clock_budget_seconds", "sample_budget", "optimizer_step_budget",
+    "evaluation_deal_sets",
     "checkpoint_cadence_updates", "authorized_bc_data", "human_bc",
     "promotion_requested", "promotion_variant", "support_matrix_version",
     "support_matrix_hash",
@@ -203,6 +204,11 @@ def _validate_identity(identity: Mapping[str, Any]) -> None:
         "wall_clock_budget_seconds", minimum=1,
     )
     _integer(identity["sample_budget"], "sample_budget", minimum=1)
+    _integer(
+        identity["optimizer_step_budget"],
+        "optimizer_step_budget",
+        minimum=1,
+    )
     _integer(
         identity["checkpoint_cadence_updates"],
         "checkpoint_cadence_updates", minimum=1,
@@ -284,6 +290,7 @@ _TRAINING_FIELDS = {
     "variant", "seed", "git_sha", "docker_image_digest", "ruleset",
     "training_config_hash", "model_identity_hash", "initial_checkpoint_sha256",
     "model_checkpoint_sha256", "hardware_hash", "checkpoint_enabled", "samples",
+    "optimizer_steps",
     "wall_clock_seconds", "cumulative_training_seconds", "sigterm_observed",
     "fresh_container_resume", "counter_before_resume", "counter_after_resume",
     "model_hash_before_resume", "model_hash_after_resume",
@@ -324,6 +331,11 @@ def _validate_training_run(
     ):
         _digest(run[name], f"training run {variant}.{name}")
     samples = _integer(run["samples"], f"training run {variant}.samples", minimum=1)
+    optimizer_steps = _integer(
+        run["optimizer_steps"],
+        f"training run {variant}.optimizer_steps",
+        minimum=1,
+    )
     wall = _finite(
         run["wall_clock_seconds"], f"training run {variant}.wall_clock_seconds",
         minimum=0.0,
@@ -357,6 +369,7 @@ def _validate_training_run(
         if not run[name]:
             issues.append(f"{variant}/{ruleset}/seed-{seed}: {name} is false")
     sample_budget = identity["sample_budget"]
+    optimizer_budget = identity["optimizer_step_budget"]
     wall_budget = float(identity["wall_clock_budget_seconds"])
     # P1 freezes two matched stopping ceilings. A run completes when either
     # ceiling is reached; requiring both exact values is generally impossible
@@ -365,11 +378,19 @@ def _validate_training_run(
     wall_overshoot_limit = wall_budget * 1.01 + 60.0
     if samples > sample_budget:
         issues.append(f"{variant}/{ruleset}/seed-{seed}: sample budget exceeded")
+    if optimizer_steps > optimizer_budget:
+        issues.append(
+            f"{variant}/{ruleset}/seed-{seed}: optimizer-step budget exceeded"
+        )
     if wall > wall_overshoot_limit:
         issues.append(
             f"{variant}/{ruleset}/seed-{seed}: wall-clock budget exceeded"
         )
-    if samples < sample_budget and wall < wall_budget:
+    if (
+        samples < sample_budget
+        and optimizer_steps < optimizer_budget
+        and wall < wall_budget
+    ):
         issues.append(
             f"{variant}/{ruleset}/seed-{seed}: neither frozen budget was reached"
         )

@@ -14,7 +14,10 @@ import pytest
 import torch
 
 import benchmarks.freeze_v3_h7_protocol as freeze_h7
-from train_v3_h7 import _validate_formal_runtime_args
+from train_v3_h7 import (
+    _resolve_formal_budget,
+    _validate_formal_runtime_args,
+)
 from douzero.env.env import Env
 from douzero.env.rules import RuleSet
 from douzero.models_v2.batch import observation_to_model_inputs
@@ -163,6 +166,30 @@ def test_formal_runtime_cli_drift_fails_before_side_effects(tmp_path):
     with pytest.raises(ValueError, match="formal runtime arguments drifted"):
         _validate_formal_runtime_args(formal, args)
     assert not checkpoint.exists()
+
+
+def test_formal_budget_tier_binds_wall_and_optimizer_ceilings():
+    formal = load_formal_config(
+        ROOT / "configs/v3_formal/v3_full_hybrid_legacy.yaml"
+    )
+    args = SimpleNamespace(
+        formal_budget_tier="development",
+        max_wall_time_minutes=0.0,
+    )
+    budget = _resolve_formal_budget(formal, args)
+    assert budget is formal.budgets["development"]
+    assert args.max_wall_time_minutes == 240.0
+
+    args.max_wall_time_minutes = 239.0
+    with pytest.raises(ValueError, match="wall-clock limit drifted"):
+        _resolve_formal_budget(formal, args)
+
+    args = SimpleNamespace(
+        formal_budget_tier="development",
+        max_wall_time_minutes=0.0,
+    )
+    with pytest.raises(ValueError, match="requires --formal-config"):
+        _resolve_formal_budget(None, args)
 
 
 def test_partial_combined_transport_fails_closed():

@@ -117,6 +117,24 @@ def _resolve_runtime_args(formal, args: argparse.Namespace) -> None:
             setattr(args, name, default)
 
 
+def _resolve_formal_budget(formal, args: argparse.Namespace):
+    tier = args.formal_budget_tier
+    if tier is None:
+        return None
+    if formal is None:
+        raise ValueError("--formal-budget-tier requires --formal-config")
+    budget = formal.budgets[tier]
+    expected_minutes = budget.wall_clock_seconds / 60.0
+    if args.max_wall_time_minutes == 0.0:
+        args.max_wall_time_minutes = expected_minutes
+    elif args.max_wall_time_minutes != expected_minutes:
+        raise ValueError(
+            "H7 formal wall-clock limit drifted: "
+            f"{args.max_wall_time_minutes} != {expected_minutes}"
+        )
+    return budget
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     config = parser.add_mutually_exclusive_group(required=True)
@@ -167,6 +185,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--optimizer-steps-per-cycle", type=int, default=1)
     parser.add_argument("--max-cycles", type=int, default=0)
     parser.add_argument("--max-wall-time-minutes", type=float, default=0.0)
+    parser.add_argument(
+        "--formal-budget-tier",
+        choices=("pilot", "development", "promotion"),
+    )
     parser.add_argument("--checkpoint-path", required=True)
     parser.add_argument("--checkpoint-every-cycles", type=int, default=1)
     parser.add_argument("--checkpoint-every-steps", type=int)
@@ -187,6 +209,7 @@ def main() -> None:
         else load_formal_config(args.formal_config)
     )
     _resolve_runtime_args(formal, args)
+    formal_budget = _resolve_formal_budget(formal, args)
     if formal is not None:
         validate_v3_h7_formal_initialization(formal.initialization.kind)
         _validate_formal_runtime_args(formal, args)
@@ -305,8 +328,10 @@ def main() -> None:
     long_config = LongRunningConfig(
         episodes_per_cycle=args.episodes_per_cycle,
         optimizer_steps_per_cycle=args.optimizer_steps_per_cycle,
-        max_total_optimizer_steps=_oracle_update_limit(
-            learner, oracle_enabled
+        max_total_optimizer_steps=(
+            formal_budget.optimizer_step_budget
+            if formal_budget is not None
+            else _oracle_update_limit(learner, oracle_enabled)
         ),
         max_cycles=args.max_cycles,
         max_wall_time_minutes=args.max_wall_time_minutes,
@@ -332,6 +357,10 @@ def main() -> None:
         "config_hash": resolved.stable_hash(),
         "runtime_hash": runtime_config.stable_hash(),
         "model_hash": model.config.stable_hash(),
+        "formal_budget_tier": args.formal_budget_tier,
+        "formal_budget": (
+            None if formal_budget is None else vars(formal_budget)
+        ),
         "playing_strength": "not measured",
     }, sort_keys=True), flush=True)
     runner = LongRunningTrainer(

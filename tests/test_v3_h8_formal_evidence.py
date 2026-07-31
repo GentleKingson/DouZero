@@ -63,6 +63,7 @@ def _identity(*, promotion: bool = False, authorized_bc: bool = False):
         "evaluation_seed": 44,
         "wall_clock_budget_seconds": 7200,
         "sample_budget": 1_000_000,
+        "optimizer_step_budget": 50_000,
         "evaluation_deal_sets": {"legacy": "1" * 64, "standard": "2" * 64},
         "evaluation_baselines": {
             ruleset: _baseline(ruleset) for ruleset in ("legacy", "standard")
@@ -107,6 +108,7 @@ def _training(variant: str, ruleset: str, seed: int):
         "hardware_hash": SHA,
         "checkpoint_enabled": True,
         "samples": 1_000_000,
+        "optimizer_steps": 50_000,
         "wall_clock_seconds": 7200,
         "cumulative_training_seconds": 7200,
         "sigterm_observed": True,
@@ -264,7 +266,19 @@ def test_wall_clock_budget_can_complete_before_sample_ceiling() -> None:
     payload = _evidence()
     for index, run in enumerate(payload["training_runs"]):
         run["samples"] = 10_000 + index
+        run["optimizer_steps"] = 1_000 + index
         run["wall_clock_seconds"] = 7200.5
+    report = validate_h8_formal_evidence(payload)
+    assert report["development_status"] == "COMPLETE"
+
+
+def test_optimizer_budget_can_complete_before_other_ceilings() -> None:
+    payload = _evidence()
+    for index, run in enumerate(payload["training_runs"]):
+        run["samples"] = 10_000 + index
+        run["optimizer_steps"] = 50_000
+        run["wall_clock_seconds"] = 3600.0
+        run["cumulative_training_seconds"] = 7200.0
     report = validate_h8_formal_evidence(payload)
     assert report["development_status"] == "COMPLETE"
 
@@ -272,6 +286,7 @@ def test_wall_clock_budget_can_complete_before_sample_ceiling() -> None:
 def test_training_must_reach_one_frozen_budget_without_large_overshoot() -> None:
     payload = _evidence()
     payload["training_runs"][0]["samples"] = 999_999
+    payload["training_runs"][0]["optimizer_steps"] = 49_999
     payload["training_runs"][0]["wall_clock_seconds"] = 7199.0
     report = validate_h8_formal_evidence(payload)
     assert report["development_status"] == "INCOMPLETE"
@@ -286,6 +301,15 @@ def test_training_must_reach_one_frozen_budget_without_large_overshoot() -> None
     assert report["development_status"] == "INCOMPLETE"
     assert any(
         "sample budget exceeded" in issue for issue in report["issues"]
+    )
+
+    payload = _evidence()
+    payload["training_runs"][0]["optimizer_steps"] = 50_001
+    report = validate_h8_formal_evidence(payload)
+    assert report["development_status"] == "INCOMPLETE"
+    assert any(
+        "optimizer-step budget exceeded" in issue
+        for issue in report["issues"]
     )
 
     payload = _evidence()
